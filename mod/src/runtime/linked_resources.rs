@@ -79,6 +79,9 @@ impl LinkedClassTable {
 
     /// Total `data/` entries across all linked jar layers (used for cache invalidation).
     pub(crate) fn data_layer_entry_count(&self) -> usize {
-        self.data_layers.iter().map(|layer| layer.resources.len()).sum()
+        self.data_layers
+            .iter()
+            .map(|layer| layer.resources.len())
+            .sum()
     }
 }

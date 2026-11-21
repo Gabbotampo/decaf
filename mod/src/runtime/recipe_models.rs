@@ -27,7 +27,6 @@ pub(crate) const RECIPE_HOLDER: &str = "net/minecraft/world/item/crafting/Recipe
 pub(crate) const RECIPE_MANAGER: &str = "net/minecraft/world/item/crafting/RecipeManager";
 pub(crate) const RECIPE_ACCESS: &str = "net/minecraft/world/item/crafting/RecipeAccess";
 pub(crate) const TRANSMUTE_RECIPE: &str = "net/minecraft/world/item/crafting/TransmuteRecipe";
-pub(crate) const FEATURE_FLAGS: &str = "net/minecraft/world/flag/FeatureFlags";
 pub(crate) const MENU_TYPE: &str = "net/minecraft/world/inventory/MenuType";
 pub(crate) const EMPTY_PATCH_KEY: &str = "empty";
 pub(crate) const RECIPE_MANAGER_KEY: &str = "game/recipe-manager";
@@ -49,22 +48,67 @@ impl ComponentPatch {
 
 #[derive(Clone, Debug)]
 pub(crate) struct LiveStack {
-    pub(crate) item_id: String,
+    /// Exact `Item` object when constructed from an `Item`/`ItemLike` value (preserving jar
+    /// subclass identity, `toString()`, `isEnabled()`, and `requiredFeatures`), or `None` when
+    /// constructed purely from an item id (JSON/template/Holder).
+    pub(crate) item_value: Option<Value>,
+    /// Canonical `namespace:path` item id when known (`None` for unregistered custom items).
+    pub(crate) item_id: Option<String>,
     pub(crate) count: i32,
     pub(crate) patch: ComponentPatch,
 }
 
 impl LiveStack {
-    pub(crate) fn is_empty(&self) -> bool {
-        self.count <= 0 || self.item_id == "minecraft:air"
+    pub(crate) fn from_item_id(item_id: String, count: i32, patch: ComponentPatch) -> Self {
+        Self {
+            item_value: None,
+            item_id: Some(item_id),
+            count,
+            patch,
+        }
     }
 
-    pub(crate) fn effective_item_id(&self) -> &str {
-        if self.is_empty() {
-            "minecraft:air"
-        } else {
-            &self.item_id
+    pub(crate) fn from_item_value(host: &StdHost, item: Value, count: i32) -> Self {
+        let item_id = resolve_item_id(host, &item);
+        Self {
+            item_value: Some(item),
+            item_id,
+            count,
+            patch: ComponentPatch::default(),
         }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.count <= 0
+            || self.item_id.as_deref() == Some("minecraft:air")
+            || self
+                .item_value
+                .as_ref()
+                .is_some_and(crate::runtime::host_creative_tab::is_air_item)
+    }
+
+    pub(crate) fn resolved_item_id(&self, host: &StdHost) -> Option<String> {
+        if self.is_empty() {
+            return Some("minecraft:air".to_owned());
+        }
+        self.item_id.clone().or_else(|| {
+            self.item_value
+                .as_ref()
+                .and_then(|value| resolve_item_id(host, value))
+        })
+    }
+
+    pub(crate) fn effective_item_value(&self, host: &StdHost) -> Value {
+        if self.is_empty() {
+            return crate::runtime::host_creative_tab::air_item_value();
+        }
+        if let Some(value) = &self.item_value {
+            return value.clone();
+        }
+        if let Some(id) = &self.item_id {
+            return item_value_for_id(host, id);
+        }
+        crate::runtime::host_creative_tab::air_item_value()
     }
 
     pub(crate) fn effective_count(&self) -> i32 {
@@ -141,7 +185,7 @@ impl RecipeState {
     pub(crate) fn alloc_stack(&mut self, stack: LiveStack) -> Value {
         let key = self.next_key("recipe-stack");
         self.stacks.insert(key.clone(), stack);
-        Value::Host(HostRef::new(HostKind::LiveItemStack, key))
+        Value::Host(HostRef::new(HostKind::ItemStack, key))
     }
 
     pub(crate) fn alloc_template(&mut self, data: TemplateData) -> Value {
@@ -203,6 +247,9 @@ impl RecipeState {
             out.extend(crate::runtime::heap::value_texts(value));
         }
         for stack in self.stacks.values() {
+            if let Some(item) = &stack.item_value {
+                push_val(item, out);
+            }
             for val in stack.patch.entries.values().flatten() {
                 push_val(val, out);
             }
@@ -257,8 +304,7 @@ pub(crate) fn is_empty_stack_handle(value: &Value) -> bool {
 pub(crate) fn is_recipe_object_kind(kind: HostKind) -> bool {
     matches!(
         kind,
-        HostKind::LiveItemStack
-            | HostKind::ItemStackTemplate
+        HostKind::ItemStackTemplate
             | HostKind::DataComponentPatch
             | HostKind::DataComponentPatchBuilder
             | HostKind::Ingredient
@@ -293,22 +339,6 @@ fn identity_equals(
         _ => Some(false),
     })
 }
-
-pub(crate) const LIVE_STACK_METHODS: Methods = Methods {
-    to_string: |_, _| Ok(None),
-    hash_code: |_, _| Ok(None),
-    equals: identity_equals,
-    instance_of: |_, wanted, hierarchy| {
-        fixed_instance_of(
-            ITEM_STACK,
-            &[ITEM_INSTANCE, DATA_COMPONENT_HOLDER, DATA_COMPONENT_GETTER],
-            wanted,
-            hierarchy,
-        )
-    },
-    crosses_jars: |_, _| false,
-    compare_to: None,
-};
 
 pub(crate) const PATCH_METHODS: Methods = Methods {
     to_string: |handle, _| Ok((handle.key() == EMPTY_PATCH_KEY).then(|| "{}".to_owned())),
@@ -1163,14 +1193,11 @@ pub(crate) fn template_apply(
         patched_apply_patch(host, &tpl.item_id, &mut patch, base_patch)?;
         patched_apply_patch(host, &tpl.item_id, &mut patch, &tpl.patch)?;
     }
-    let stack = LiveStack {
-        item_id: tpl.item_id,
-        count,
-        patch,
-    };
+    let stack = LiveStack::from_item_id(tpl.item_id, count, patch);
     if stack.is_empty() {
         return Some(host.recipes.alloc_stack(stack));
     }
+    let item_id = stack.item_id.as_deref().unwrap_or("minecraft:air");
     // `ItemStack.validateComponents` validates nested item sizes on `CONTAINER`,
     // `BUNDLE_CONTENTS`, and `CHARGED_PROJECTILES` when present; default prototypes of those
     // items are empty, but patched values are not modelled here -> count rather than guess.
@@ -1184,61 +1211,87 @@ pub(crate) fn template_apply(
         }
     }
     let has_max_damage = !matches!(
-        stack_component_get(host, &stack.item_id, &stack.patch, "minecraft:max_damage")?,
+        stack_component_get(host, item_id, &stack.patch, "minecraft:max_damage")?,
         Value::Ref(None)
     );
-    let max_stack = max_stack_size_for_item(host, &stack.item_id, &stack.patch)?;
+    let max_stack = max_stack_size_for_item(host, item_id, &stack.patch)?;
     if (has_max_damage && max_stack > 1) || stack.count > max_stack {
         return Some(crate::runtime::menu_models::empty_stack());
     }
     Some(host.recipes.alloc_stack(stack))
 }
 
+pub(crate) fn read_live_stack_opt(host: &StdHost, stack: &Value) -> Option<LiveStack> {
+    let Value::Host(handle) = stack else {
+        return None;
+    };
+    if handle.kind() != HostKind::ItemStack {
+        return None;
+    }
+    if let Some(live) = host.recipes.stacks.get(handle.key()) {
+        return Some(live.clone());
+    }
+    crate::runtime::host_creative_tab::host_item_stack_data(stack)
+        .map(|data| LiveStack::from_item_value(host, data.item, data.count))
+}
+
+pub(crate) fn same_item_value(
+    host: &StdHost,
+    left_item: &Value,
+    left_id: Option<&str>,
+    right: &Value,
+) -> Option<bool> {
+    if matches!(right, Value::Ref(None)) {
+        return Some(false);
+    }
+    match (left_item, right) {
+        (Value::Host(a), Value::Host(b)) if a.same_object(b) == Some(true) => {
+            return Some(true);
+        }
+        _ if left_item == right => return Some(true),
+        _ => {}
+    }
+    let left_id = left_id
+        .map(str::to_owned)
+        .or_else(|| resolve_item_id(host, left_item));
+    let right_id = resolve_item_id(host, right);
+    if let (Some(a), Some(b)) = (left_id, right_id) {
+        return Some(a == b);
+    }
+    match (left_item, right) {
+        (Value::Host(a), Value::Host(b)) => a.same_object(b),
+        _ => Some(false),
+    }
+}
+
 pub(crate) fn stack_patch_clone(host: &StdHost, stack: &Value) -> Option<ComponentPatch> {
     if is_empty_stack_handle(stack) {
         return Some(ComponentPatch::default());
     }
-    let Value::Host(handle) = stack else {
-        return None;
-    };
-    if handle.kind() != HostKind::LiveItemStack {
-        return None;
-    }
-    let live = host.recipes.stacks.get(handle.key())?;
+    let live = read_live_stack_opt(host, stack)?;
     if live.is_empty() {
         return Some(ComponentPatch::default());
     }
-    Some(live.patch.clone())
+    Some(live.patch)
 }
 
 pub(crate) fn stack_is_empty(host: &StdHost, stack: &Value) -> Option<bool> {
     if is_empty_stack_handle(stack) {
         return Some(true);
     }
-    let Value::Host(handle) = stack else {
-        return None;
-    };
-    if handle.kind() != HostKind::LiveItemStack {
-        return None;
-    }
-    Some(host.recipes.stacks.get(handle.key())?.is_empty())
+    Some(read_live_stack_opt(host, stack)?.is_empty())
 }
 
 pub(crate) fn stack_max_stack_size(host: &StdHost, stack: &Value) -> Option<i32> {
     if is_empty_stack_handle(stack) {
         return Some(1);
     }
-    let Value::Host(handle) = stack else {
-        return None;
-    };
-    if handle.kind() != HostKind::LiveItemStack {
-        return None;
-    }
-    let live = host.recipes.stacks.get(handle.key())?;
+    let live = read_live_stack_opt(host, stack)?;
     if live.is_empty() {
         return Some(1);
     }
-    max_stack_size_for_item(host, &live.item_id, &live.patch)
+    let item_id = live.resolved_item_id(host)?;
+    max_stack_size_for_item(host, &item_id, &live.patch)
 }
 
 pub(crate) fn limit_stack_exact(host: &mut StdHost, stack: &Value, limit: i32) -> Option<()> {
@@ -1248,7 +1301,7 @@ pub(crate) fn limit_stack_exact(host: &mut StdHost, stack: &Value, limit: i32) -
     let Value::Host(handle) = stack else {
         return None;
     };
-    if handle.kind() != HostKind::LiveItemStack {
+    if handle.kind() != HostKind::ItemStack {
         return None;
     }
     let key = handle.key().to_owned();
@@ -1271,11 +1324,9 @@ pub(crate) fn limit_stack_for_container(
 
 pub(crate) fn random_new(host: &mut StdHost, class: &str) -> Option<Value> {
     match class {
-        ITEM_STACK if !host.in_client_frame() => Some(host.recipes.alloc_stack(LiveStack {
-            item_id: "minecraft:air".into(),
-            count: 0,
-            patch: ComponentPatch::default(),
-        })),
+        ITEM_STACK if !host.in_client_frame() => Some(host.recipes.alloc_stack(
+            LiveStack::from_item_id("minecraft:air".into(), 0, ComponentPatch::default()),
+        )),
         "net/minecraft/world/item/ItemStackTemplate" => {
             Some(host.recipes.alloc_template(TemplateData {
                 item_id: "minecraft:air".into(),
@@ -1302,13 +1353,6 @@ pub(crate) fn static_field(r: &MethodRef) -> Option<Value> {
                 crate::runtime::game_object::server_value(format!("game/data-component-type/{id}"))
             })
         }
-        (
-            FEATURE_FLAGS,
-            "VANILLA_SET" | "DEFAULT_FLAGS",
-            "Lnet/minecraft/world/flag/FeatureFlagSet;",
-        ) => Some(crate::runtime::game_object::server_value(
-            "game/feature-flag-set/vanilla".into(),
-        )),
         _ => None,
     }
 }
@@ -1345,20 +1389,15 @@ pub(crate) fn ingredient_test(
     if is_empty_stack_handle(stack) {
         return Some(false);
     }
-    let Value::Host(handle) = stack else {
-        return None;
-    };
-    if handle.kind() != HostKind::LiveItemStack {
-        return None;
-    }
-    let live = host.recipes.stacks.get(handle.key())?;
+    let live = read_live_stack_opt(host, stack)?;
     if live.is_empty() {
         return Some(false);
     }
+    let item_id = live.resolved_item_id(host)?;
     Some(match spec {
-        IngredientSpec::Items(ids) => ids.iter().any(|id| id == &live.item_id),
+        IngredientSpec::Items(ids) => ids.iter().any(|id| id == &item_id),
         IngredientSpec::Tag(tag_id) => {
-            resolve_item_tag(host, tag_id).is_some_and(|members| members.contains(&live.item_id))
+            resolve_item_tag(host, tag_id).is_some_and(|members| members.contains(&item_id))
         }
     })
 }
@@ -1533,7 +1572,9 @@ pub(crate) fn instance_call(
         return None;
     };
     match handle.kind() {
-        HostKind::LiveItemStack => live_stack_instance_call(host, handle, r, args),
+        HostKind::ItemStack if !host.in_client_frame() => {
+            live_stack_instance_call(host, handle, r, args)
+        }
         HostKind::DataComponentPatch => patch_instance_call(host, handle, r, args),
         HostKind::DataComponentPatchBuilder => patch_builder_instance_call(host, handle, r, args),
         HostKind::Ingredient => ingredient_instance_call(host, handle, r, args),
@@ -1555,17 +1596,22 @@ fn stack_instance_call_empty(
         // MC 26.3: ItemInstance.getMaxStackSize() = getOrDefault(MAX_STACK_SIZE, 1); EMPTY has empty map -> 1.
         ("getMaxStackSize", "()I") => Some(Ok(Value::Int(1))),
         ("getItem", "()Lnet/minecraft/world/item/Item;") => {
-            Some(Ok(item_value_for_id(host, "minecraft:air")))
+            Some(Ok(crate::runtime::host_creative_tab::air_item_value()))
         }
         ("typeHolder" | "getItemHolder", "()Lnet/minecraft/core/Holder;") => {
             Some(Ok(item_holder_for_id(host, "minecraft:air")))
         }
         ("is", "(Lnet/minecraft/world/item/Item;)Z") => {
-            let item_id = resolve_item_id(host, args.first()?)?;
-            Some(Ok(Value::Int(i32::from(item_id == "minecraft:air"))))
+            let air = crate::runtime::host_creative_tab::air_item_value();
+            let same = same_item_value(host, &air, Some("minecraft:air"), args.first()?)?;
+            Some(Ok(Value::Int(i32::from(same))))
         }
         ("is", "(Lnet/minecraft/core/Holder;)Z") => {
-            let item_id = resolve_item_id(host, args.first()?)?;
+            let arg = args.first()?;
+            if matches!(arg, Value::Ref(None)) {
+                return Some(Ok(Value::Int(0)));
+            }
+            let item_id = resolve_item_id(host, arg)?;
             Some(Ok(Value::Int(i32::from(item_id == "minecraft:air"))))
         }
         ("is", "(Lnet/minecraft/tags/TagKey;)Z") => Some(Ok(Value::Int(0))),
@@ -1600,48 +1646,82 @@ fn live_stack_instance_call(
 ) -> Option<Result<Value, NativeError>> {
     let key = handle.key().to_owned();
     if r.owner == ITEM_STACK && r.name == "<init>" {
-        let (item_arg, count, patch) = match r.descriptor.as_str() {
-            "(Lnet/minecraft/world/level/ItemLike;)V" | "(Lnet/minecraft/core/Holder;)V" => {
-                (args.first()?, 1, ComponentPatch::default())
-            }
-            "(Lnet/minecraft/world/level/ItemLike;I)V" | "(Lnet/minecraft/core/Holder;I)V" => {
-                let count = match expect_int(r, args.get(1)?) {
-                    Ok(c) => c,
-                    Err(e) => return Some(Err(e)),
+        match r.descriptor.as_str() {
+            "(Lnet/minecraft/world/level/ItemLike;)V"
+            | "(Lnet/minecraft/world/level/ItemLike;I)V" => {
+                let count = if r.descriptor == "(Lnet/minecraft/world/level/ItemLike;)V" {
+                    1
+                } else {
+                    match expect_int(r, args.get(1)?) {
+                        Ok(c) => c,
+                        Err(e) => return Some(Err(e)),
+                    }
                 };
-                (args.first()?, count, ComponentPatch::default())
+                let item_arg = args.first()?;
+                if matches!(item_arg, Value::Ref(None)) {
+                    return Some(Err(NativeError::UncaughtException {
+                        class: "java/lang/NullPointerException".into(),
+                        message: Some(
+                            "Cannot invoke \"net.minecraft.world.level.ItemLike.asItem()\" because \"item\" is null"
+                                .into(),
+                        ),
+                        frame: None,
+                    }));
+                }
+                let item_val = host.resolve_host_item_like_impl(item_arg);
+                let item_id = resolve_item_id(host, item_val.as_ref().unwrap_or(item_arg));
+                if item_val.is_none() && item_id.is_none() {
+                    return None;
+                }
+                host.recipes.stacks.insert(
+                    key,
+                    LiveStack {
+                        item_value: item_val,
+                        item_id,
+                        count,
+                        patch: ComponentPatch::default(),
+                    },
+                );
+                return Some(Ok(Value::Void));
             }
-            "(Lnet/minecraft/core/Holder;ILnet/minecraft/core/component/DataComponentPatch;)V" => {
-                let count = match expect_int(r, args.get(1)?) {
-                    Ok(c) => c,
-                    Err(e) => return Some(Err(e)),
+            "(Lnet/minecraft/core/Holder;)V"
+            | "(Lnet/minecraft/core/Holder;I)V"
+            | "(Lnet/minecraft/core/Holder;ILnet/minecraft/core/component/DataComponentPatch;)V" => {
+                let count = if r.descriptor == "(Lnet/minecraft/core/Holder;)V" {
+                    1
+                } else {
+                    match expect_int(r, args.get(1)?) {
+                        Ok(c) => c,
+                        Err(e) => return Some(Err(e)),
+                    }
                 };
-                let patch_arg = args.get(2)?;
-                if matches!(patch_arg, Value::Ref(None)) {
+                let patch = if r.descriptor
+                    == "(Lnet/minecraft/core/Holder;ILnet/minecraft/core/component/DataComponentPatch;)V"
+                {
+                    let patch_arg = args.get(2)?;
+                    if matches!(patch_arg, Value::Ref(None)) {
+                        return Some(Err(npe()));
+                    }
+                    host.recipes.patch_of(patch_arg)?.clone()
+                } else {
+                    ComponentPatch::default()
+                };
+                let item_arg = args.first()?;
+                if matches!(item_arg, Value::Ref(None)) {
                     return Some(Err(npe()));
                 }
-                let patch = host.recipes.patch_of(patch_arg)?.clone();
-                (args.first()?, count, patch)
+                let item_id = resolve_item_id(host, item_arg)?;
+                let mut sanitized = ComponentPatch::default();
+                if item_id != "minecraft:air" && !patch.is_empty() {
+                    patched_apply_patch(host, &item_id, &mut sanitized, &patch)?;
+                }
+                host.recipes
+                    .stacks
+                    .insert(key, LiveStack::from_item_id(item_id, count, sanitized));
+                return Some(Ok(Value::Void));
             }
             _ => return None,
-        };
-        if matches!(item_arg, Value::Ref(None)) {
-            return Some(Err(npe()));
         }
-        let item_id = resolve_item_id(host, item_arg)?;
-        let mut sanitized = ComponentPatch::default();
-        if item_id != "minecraft:air" && !patch.is_empty() {
-            patched_apply_patch(host, &item_id, &mut sanitized, &patch)?;
-        }
-        host.recipes.stacks.insert(
-            key,
-            LiveStack {
-                item_id,
-                count,
-                patch: sanitized,
-            },
-        );
-        return Some(Ok(Value::Void));
     }
 
     if !matches!(
@@ -1651,7 +1731,7 @@ fn live_stack_instance_call(
         return None;
     }
 
-    let live = host.recipes.stacks.get(&key)?.clone();
+    let live = read_live_stack_opt(host, &Value::Host(handle.clone()))?;
     match (r.name.as_str(), r.descriptor.as_str()) {
         ("isEmpty", "()Z") => Some(Ok(Value::Int(i32::from(live.is_empty())))),
         ("getCount" | "count", "()I") => Some(Ok(Value::Int(live.effective_count()))),
@@ -1660,9 +1740,8 @@ fn live_stack_instance_call(
                 Ok(c) => c,
                 Err(e) => return Some(Err(e)),
             };
-            if let Some(slot) = host.recipes.stacks.get_mut(&key) {
-                slot.count = count;
-            }
+            let slot = host.recipes.stacks.get_mut(&key)?;
+            slot.count = count;
             Some(Ok(Value::Void))
         }
         ("grow", "(I)V") => {
@@ -1670,9 +1749,8 @@ fn live_stack_instance_call(
                 Ok(c) => c,
                 Err(e) => return Some(Err(e)),
             };
-            if let Some(slot) = host.recipes.stacks.get_mut(&key) {
-                slot.count = slot.effective_count().wrapping_add(delta);
-            }
+            let slot = host.recipes.stacks.get_mut(&key)?;
+            slot.count = slot.effective_count().wrapping_add(delta);
             Some(Ok(Value::Void))
         }
         ("shrink", "(I)V") => {
@@ -1680,9 +1758,8 @@ fn live_stack_instance_call(
                 Ok(c) => c,
                 Err(e) => return Some(Err(e)),
             };
-            if let Some(slot) = host.recipes.stacks.get_mut(&key) {
-                slot.count = slot.effective_count().wrapping_sub(delta);
-            }
+            let slot = host.recipes.stacks.get_mut(&key)?;
+            slot.count = slot.effective_count().wrapping_sub(delta);
             Some(Ok(Value::Void))
         }
         ("limitSize", "(I)V") => {
@@ -1690,10 +1767,8 @@ fn live_stack_instance_call(
                 Ok(c) => c,
                 Err(e) => return Some(Err(e)),
             };
-            if let Some(slot) = host.recipes.stacks.get_mut(&key)
-                && !slot.is_empty()
-                && slot.count > max
-            {
+            let slot = host.recipes.stacks.get_mut(&key)?;
+            if !slot.is_empty() && slot.count > max {
                 slot.count = max;
             }
             Some(Ok(Value::Void))
@@ -1702,29 +1777,38 @@ fn live_stack_instance_call(
             if live.is_empty() {
                 return Some(Ok(Value::Int(1)));
             }
-            let max = max_stack_size_for_item(host, &live.item_id, &live.patch)?;
+            let item_id = live.resolved_item_id(host)?;
+            let max = max_stack_size_for_item(host, &item_id, &live.patch)?;
             Some(Ok(Value::Int(max)))
         }
         ("getItem", "()Lnet/minecraft/world/item/Item;") => {
-            Some(Ok(item_value_for_id(host, live.effective_item_id())))
+            Some(Ok(live.effective_item_value(host)))
         }
         ("typeHolder" | "getItemHolder", "()Lnet/minecraft/core/Holder;") => {
-            Some(Ok(item_holder_for_id(host, live.effective_item_id())))
+            let item_id = live.resolved_item_id(host)?;
+            Some(Ok(item_holder_for_id(host, &item_id)))
         }
-        ("is", "(Lnet/minecraft/world/item/Item;)Z") | ("is", "(Lnet/minecraft/core/Holder;)Z") => {
+        ("is", "(Lnet/minecraft/world/item/Item;)Z") => {
+            let arg = args.first()?;
+            let item_val = live.effective_item_value(host);
+            let item_id = live.resolved_item_id(host);
+            let same = same_item_value(host, &item_val, item_id.as_deref(), arg)?;
+            Some(Ok(Value::Int(i32::from(same))))
+        }
+        ("is", "(Lnet/minecraft/core/Holder;)Z") => {
             let arg = args.first()?;
             if matches!(arg, Value::Ref(None)) {
                 return Some(Ok(Value::Int(0)));
             }
             let other_id = resolve_item_id(host, arg)?;
-            Some(Ok(Value::Int(i32::from(
-                live.effective_item_id() == other_id,
-            ))))
+            let my_id = live.resolved_item_id(host)?;
+            Some(Ok(Value::Int(i32::from(my_id == other_id))))
         }
         ("is", "(Lnet/minecraft/tags/TagKey;)Z") => {
             if live.is_empty() {
                 return Some(Ok(Value::Int(0)));
             }
+            let item_id = live.resolved_item_id(host)?;
             let arg = args.first()?;
             let (reg, loc) = tag_key_parts(arg)?;
             if reg != "minecraft:item" {
@@ -1732,7 +1816,7 @@ fn live_stack_instance_call(
             }
             match resolve_item_tag_checked(host, &loc) {
                 Ok(members) => {
-                    let matched = members.is_some_and(|set| set.contains(&live.item_id));
+                    let matched = members.is_some_and(|set| set.contains(&item_id));
                     Some(Ok(Value::Int(i32::from(matched))))
                 }
                 Err(err) => Some(Err(err)),
@@ -1754,48 +1838,50 @@ fn live_stack_instance_call(
             if matches!(type_arg, Value::Ref(None)) {
                 return Some(Err(npe()));
             }
+            let item_id = live.resolved_item_id(host)?;
             let comp_id = resolve_data_component_type_id(host, type_arg)?;
             let mut next_patch = live.patch.clone();
-            let prev = patched_set(host, &live.item_id, &mut next_patch, &comp_id, val_arg)?;
-            if let Some(slot) = host.recipes.stacks.get_mut(&key) {
-                slot.patch = next_patch;
-            }
+            let prev = patched_set(host, &item_id, &mut next_patch, &comp_id, val_arg)?;
+            let slot = host.recipes.stacks.get_mut(&key)?;
+            slot.patch = next_patch;
             Some(Ok(prev))
         }
         ("get", "(Lnet/minecraft/core/component/DataComponentType;)Ljava/lang/Object;") => {
             if live.is_empty() {
                 return Some(Ok(Value::Ref(None)));
             }
+            let item_id = live.resolved_item_id(host)?;
             let type_arg = args.first()?;
             if matches!(type_arg, Value::Ref(None)) {
                 return Some(Err(npe()));
             }
             let comp_id = resolve_data_component_type_id(host, type_arg)?;
-            stack_component_get(host, &live.item_id, &live.patch, &comp_id).map(Ok)
+            stack_component_get(host, &item_id, &live.patch, &comp_id).map(Ok)
         }
         ("remove", "(Lnet/minecraft/core/component/DataComponentType;)Ljava/lang/Object;") => {
             let type_arg = args.first()?;
             if matches!(type_arg, Value::Ref(None)) {
                 return Some(Err(npe()));
             }
+            let item_id = live.resolved_item_id(host)?;
             let comp_id = resolve_data_component_type_id(host, type_arg)?;
             let mut next_patch = live.patch.clone();
-            let prev = patched_remove(host, &live.item_id, &mut next_patch, &comp_id)?;
-            if let Some(slot) = host.recipes.stacks.get_mut(&key) {
-                slot.patch = next_patch;
-            }
+            let prev = patched_remove(host, &item_id, &mut next_patch, &comp_id)?;
+            let slot = host.recipes.stacks.get_mut(&key)?;
+            slot.patch = next_patch;
             Some(Ok(prev))
         }
         ("has", "(Lnet/minecraft/core/component/DataComponentType;)Z") => {
             if live.is_empty() {
                 return Some(Ok(Value::Int(0)));
             }
+            let item_id = live.resolved_item_id(host)?;
             let type_arg = args.first()?;
             if matches!(type_arg, Value::Ref(None)) {
                 return Some(Err(npe()));
             }
             let comp_id = resolve_data_component_type_id(host, type_arg)?;
-            stack_component_get(host, &live.item_id, &live.patch, &comp_id)
+            stack_component_get(host, &item_id, &live.patch, &comp_id)
                 .map(|v| Ok(Value::Int(i32::from(!matches!(v, Value::Ref(None))))))
         }
         ("applyComponents", "(Lnet/minecraft/core/component/DataComponentPatch;)V") => {
@@ -1803,12 +1889,12 @@ fn live_stack_instance_call(
             if matches!(patch_arg, Value::Ref(None)) {
                 return Some(Err(npe()));
             }
+            let item_id = live.resolved_item_id(host)?;
             let overlay = host.recipes.patch_of(patch_arg)?.clone();
             let mut next_patch = live.patch.clone();
-            patched_apply_patch(host, &live.item_id, &mut next_patch, &overlay)?;
-            if let Some(slot) = host.recipes.stacks.get_mut(&key) {
-                slot.patch = next_patch;
-            }
+            patched_apply_patch(host, &item_id, &mut next_patch, &overlay)?;
+            let slot = host.recipes.stacks.get_mut(&key)?;
+            slot.patch = next_patch;
             Some(Ok(Value::Void))
         }
         ("copy", "()Lnet/minecraft/world/item/ItemStack;") => {
@@ -2014,14 +2100,6 @@ fn holder_instance_call(
 /// Stateful `toString` for recipe-model handles (invoked from both `Runtime` and `StdHost`).
 pub(crate) fn object_to_string(host: &StdHost, handle: &HostRef) -> Option<String> {
     match handle.kind() {
-        HostKind::LiveItemStack => {
-            let live = host.recipes.stacks.get(handle.key())?;
-            Some(format!(
-                "{} {}",
-                live.effective_count(),
-                live.effective_item_id()
-            ))
-        }
         HostKind::RecipeCommonInfo => {
             let flag = *host.recipes.common_infos.get(handle.key())?;
             Some(format!("CommonInfo[showNotification={flag}]"))
@@ -2052,7 +2130,7 @@ pub(crate) fn object_hash_code(host: &StdHost, handle: &HostRef) -> Option<i32> 
 /// Stateful `equals` for recipe-model handles that don't need recursive jar `equals`.
 pub(crate) fn host_object_equals(host: &StdHost, handle: &HostRef, other: &Value) -> Option<bool> {
     match handle.kind() {
-        HostKind::LiveItemStack | HostKind::DataComponentPatchBuilder => match other {
+        HostKind::DataComponentPatchBuilder => match other {
             Value::Host(other) => handle.same_object(other),
             _ => Some(false),
         },

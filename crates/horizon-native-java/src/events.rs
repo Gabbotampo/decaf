@@ -1016,12 +1016,370 @@ pub struct GameListeners {
     pub phase_orderings: Vec<PhaseOrdering>,
 }
 
+/// A Fabric creative-tab modify-output callback, retained separately from
+/// game events because the game supplies a tab-specific output collector when
+/// that tab is built.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CreativeTabListener {
+    pub invocation_index: usize,
+    pub tab: String,
+    pub phase: String,
+    pub callback: ListenerCallback,
+}
+
+/// The `ItemStack` values collected when building one creative tab
+/// (`FabricCreativeModeTabOutput`: `displayStacks` and `searchTabStacks`).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct CreativeTabContents {
+    pub display_stacks: Vec<Value>,
+    pub search_tab_stacks: Vec<Value>,
+}
+
+/// Build parameters for [`NativeJar::creative_tab_contents_with`], matching
+/// vanilla's `CreativeModeTab.ItemDisplayParameters` and `CreativeModeTabMixin.getStacks`
+/// (`fabric-creative-tab-api-v1` 5.0.21 offsets 0..205).
+#[derive(Clone, Debug, PartialEq)]
+pub struct CreativeTabBuildContext {
+    /// Enabled feature-flag bitmask (default: `FeatureFlags.VANILLA_SET`).
+    pub enabled_features: u64,
+    /// `ItemDisplayParameters.hasPermissions()` (default: `false`).
+    pub has_permissions: bool,
+    /// Override for `CreativeModeTab.isAlignedRight()` (`None` infers from a
+    /// registered tab builder or vanilla 26.3's 14 tabs).
+    pub aligned_right: Option<bool>,
+    /// Explicit `CreativeModeTab` instance passed to `MODIFY_OUTPUT_ALL`
+    /// (`None` resolves the tab registered under `tab_key`, or a canonical handle).
+    pub tab: Option<Value>,
+}
+
+impl Default for CreativeTabBuildContext {
+    fn default() -> Self {
+        Self {
+            enabled_features: crate::host_creative_tab::FEATURE_VANILLA_SET,
+            has_permissions: false,
+            aligned_right: None,
+            tab: None,
+        }
+    }
+}
+
 impl GameListeners {
     /// Bitmask of the events with at least one listener ([`GameEvent::bit`]).
     pub fn mask(&self) -> u64 {
         self.listeners
             .iter()
             .fold(0, |mask, listener| mask | listener.event.bit())
+    }
+}
+
+const CREATIVE_TAB_EVENTS_OWNER: &str =
+    "net/fabricmc/fabric/api/creativetab/v1/CreativeModeTabEvents";
+const CREATIVE_TAB_MODIFY_ALL_FIELD: &str = "MODIFY_OUTPUT_ALL";
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum CreativeTabEventTarget {
+    Tab(String),
+    All,
+}
+
+fn creative_tab_event_target(event: &Value) -> Option<CreativeTabEventTarget> {
+    if let Some(tab) = crate::host_events::fabric_tab_of(event) {
+        return Some(CreativeTabEventTarget::Tab(tab));
+    }
+    if let Some((owner, field)) = crate::host_events::fabric_field_of(event)
+        && owner == CREATIVE_TAB_EVENTS_OWNER
+        && field == CREATIVE_TAB_MODIFY_ALL_FIELD
+    {
+        return Some(CreativeTabEventTarget::All);
+    }
+    None
+}
+
+/// Normalize a tab key (`"minecraft:combat"`, `"combat"`, or
+/// `"minecraft:creative_mode_tab:minecraft:combat"`) to `(tab_id, event_key)`.
+fn normalize_creative_tab_key(tab_key: &str) -> (String, String) {
+    let raw = tab_key
+        .strip_prefix("minecraft:creative_mode_tab:")
+        .unwrap_or(tab_key);
+    let tab_id = if raw.contains(':') {
+        raw.to_owned()
+    } else {
+        format!("minecraft:{raw}")
+    };
+    let event_key = format!("minecraft:creative_mode_tab:{tab_id}");
+    (tab_id, event_key)
+}
+
+/// Validate and extract `(phase, listener_arg)` from a Fabric `Event.register` invocation.
+/// Returns `None` for calls that threw in `fabric_api_slice2::event_call` (null listener,
+/// null phase, or non-Identifier phase).
+fn fabric_register_parts(invocation: &HostInvocation) -> Option<(String, &Value)> {
+    let two_arg = invocation
+        .method
+        .descriptor
+        .starts_with("(Lnet/minecraft/resources/Identifier;")
+        || invocation.args.len() >= 2;
+    if two_arg {
+        let phase_arg = invocation.args.first()?;
+        let phase = crate::host_ids::identifier_key(phase_arg)?.to_owned();
+        let listener = invocation.args.last()?;
+        if matches!(listener, Value::Ref(None)) {
+            return None;
+        }
+        Some((phase, listener))
+    } else {
+        let listener = invocation.args.first()?;
+        if matches!(listener, Value::Ref(None)) {
+            return None;
+        }
+        Some((order::DEFAULT_PHASE.to_owned(), listener))
+    }
+}
+
+/// Extract a valid `(first, second)` phase ordering from an `Event.addPhaseOrdering` call.
+/// Returns `None` for calls that threw (null phase, self-ordering, or non-Identifier phase).
+fn fabric_phase_ordering_parts(invocation: &HostInvocation) -> Option<(String, String)> {
+    let [first, second] = invocation.args.as_slice() else {
+        return None;
+    };
+    let first = crate::host_ids::identifier_key(first)?;
+    let second = crate::host_ids::identifier_key(second)?;
+    (first != second).then(|| (first.to_owned(), second.to_owned()))
+}
+
+fn resolve_creative_tab_callback(
+    listener: &Value,
+    jar: &NativeJar,
+    descriptor: &str,
+) -> Option<ListenerCallback> {
+    if let Some(indy) = crate::callback_marker::read_lambda(listener) {
+        let marker = indy.ok()?;
+        return Some(ListenerCallback::Indy {
+            target: marker.target,
+            captures: marker.captures,
+        });
+    }
+    let (class, value) = jar_object(jar, listener)?;
+    let method = resolve_method(jar, class, "modifyOutput", descriptor)?;
+    Some(ListenerCallback::Object {
+        receiver: value.clone(),
+        method,
+    })
+}
+
+/// Return creative-tab listeners registered through `modifyOutputEvent(key)`.
+pub fn creative_tab_listeners(
+    invocations: &[HostInvocation],
+    jar: &NativeJar,
+) -> Vec<CreativeTabListener> {
+    let mut out = Vec::new();
+    for (invocation_index, invocation) in invocations.iter().enumerate() {
+        if invocation.method.owner != FABRIC_EVENT || invocation.method.name != "register" {
+            continue;
+        }
+        let Some(receiver) = invocation.receiver.as_ref() else {
+            continue;
+        };
+        let Some(CreativeTabEventTarget::Tab(tab)) = creative_tab_event_target(receiver) else {
+            continue;
+        };
+        let Some((phase, listener_arg)) = fabric_register_parts(invocation) else {
+            continue;
+        };
+        let Some(callback) = resolve_creative_tab_callback(
+            listener_arg,
+            jar,
+            "(Lnet/fabricmc/fabric/api/creativetab/v1/FabricCreativeModeTabOutput;)V",
+        ) else {
+            continue;
+        };
+        out.push(CreativeTabListener {
+            invocation_index,
+            tab,
+            phase,
+            callback,
+        });
+    }
+    out
+}
+
+/// Collect and phase-sort creative-tab listeners for `target`, following Fabric's
+/// `ArrayBackedEvent.update()` / `NodeSorting.sort` (`fabric-api-base` 2.0.6 offsets 0..662).
+fn sorted_creative_tab_listeners(
+    invocations: &[HostInvocation],
+    jar: &NativeJar,
+    target: &CreativeTabEventTarget,
+) -> Vec<(usize, ListenerCallback)> {
+    let descriptor = match target {
+        CreativeTabEventTarget::Tab(_) => {
+            "(Lnet/fabricmc/fabric/api/creativetab/v1/FabricCreativeModeTabOutput;)V"
+        }
+        CreativeTabEventTarget::All => {
+            "(Lnet/minecraft/world/item/CreativeModeTab;Lnet/fabricmc/fabric/api/creativetab/v1/FabricCreativeModeTabOutput;)V"
+        }
+    };
+    let mut entries: Vec<(usize, String, ListenerCallback)> = Vec::new();
+    let mut orderings: Vec<(String, String)> = Vec::new();
+    for (invocation_index, invocation) in invocations.iter().enumerate() {
+        if invocation.method.owner != FABRIC_EVENT {
+            continue;
+        }
+        let Some(receiver) = invocation.receiver.as_ref() else {
+            continue;
+        };
+        if creative_tab_event_target(receiver).as_ref() != Some(target) {
+            continue;
+        }
+        match invocation.method.name.as_str() {
+            "addPhaseOrdering" => {
+                if let Some(pair) = fabric_phase_ordering_parts(invocation) {
+                    orderings.push(pair);
+                }
+            }
+            "register" => {
+                let Some((phase, listener_arg)) = fabric_register_parts(invocation) else {
+                    continue;
+                };
+                let Some(callback) = resolve_creative_tab_callback(listener_arg, jar, descriptor)
+                else {
+                    continue;
+                };
+                entries.push((invocation_index, phase, callback));
+            }
+            _ => {}
+        }
+    }
+    if entries.len() <= 1 {
+        return entries
+            .into_iter()
+            .map(|(index, _, callback)| (index, callback))
+            .collect();
+    }
+    let link_refs: Vec<(&str, &str)> = orderings
+        .iter()
+        .map(|(first, second)| (first.as_str(), second.as_str()))
+        .collect();
+    let sorted_phases = order::sort_phases(
+        entries.iter().map(|(_, phase, _)| phase.as_str()),
+        &link_refs,
+    );
+    let ranks: BTreeMap<&str, usize> = sorted_phases
+        .iter()
+        .enumerate()
+        .map(|(rank, phase)| (phase.as_str(), rank))
+        .collect();
+    // Stable sort preserves registration order within each phase (matching `ArrayBackedEvent`).
+    entries.sort_by_key(|(_, phase, _)| ranks.get(phase.as_str()).copied().unwrap_or(usize::MAX));
+    entries
+        .into_iter()
+        .map(|(index, _, callback)| (index, callback))
+        .collect()
+}
+
+impl NativeJar {
+    /// Fire Fabric creative-tab modify-output callbacks for one built tab (`tab_key`)
+    /// using vanilla's default feature flags (`FeatureFlags.VANILLA_SET`) and non-OP
+    /// permissions.
+    ///
+    /// Matches `CreativeModeTabMixin.getStacks` (`fabric-creative-tab-api-v1` 5.0.21
+    /// offsets 0..205):
+    /// * skips right-aligned tabs other than `minecraft:op_blocks` (offsets 28..43);
+    /// * skips `minecraft:op_blocks` when `!has_permissions` (offsets 104..118);
+    /// * creates ONE shared `FabricCreativeModeTabOutput` collector (offsets 90..102);
+    /// * runs per-tab `modifyOutputEvent(key)` listeners first (offsets 119..145) and
+    ///   `MODIFY_OUTPUT_ALL` listeners second (offsets 146..162), each in Fabric
+    ///   `ArrayBackedEvent` / `NodeSorting` phase order over the listeners registered
+    ///   before this firing starts. Listeners registered during a callback are seen
+    ///   by later firings.
+    pub fn creative_tab_contents(
+        &self,
+        host: &mut StdHost,
+        tab_key: &str,
+    ) -> Result<CreativeTabContents, NativeError> {
+        self.creative_tab_contents_with(host, tab_key, CreativeTabBuildContext::default())
+    }
+
+    /// [`Self::creative_tab_contents`] with explicit build context (enabled feature flags,
+    /// OP permissions, alignment, or `CreativeModeTab` handle).
+    pub fn creative_tab_contents_with(
+        &self,
+        host: &mut StdHost,
+        tab_key: &str,
+        context: CreativeTabBuildContext,
+    ) -> Result<CreativeTabContents, NativeError> {
+        let (tab_id, event_key) = normalize_creative_tab_key(tab_key);
+        let tab_handle = context.tab.unwrap_or_else(|| {
+            host.observed_registry_entry("minecraft:creative_mode_tab", &tab_id)
+                .map(|entry| entry.value.clone())
+                .unwrap_or_else(|| crate::host_creative_tab::vanilla_tab_handle(&tab_id))
+        });
+        let aligned_right = context
+            .aligned_right
+            .or_else(|| {
+                crate::host_creative_tab::tab_aligned_right(&host.creative_tab, &tab_handle)
+            })
+            .or_else(|| crate::host_creative_tab::vanilla_tab_aligned_right(&tab_id))
+            .unwrap_or(false);
+        // `CreativeModeTabMixin.getStacks` offsets 28..43:
+        // `if (self.isAlignedRight() && resourceKey != CreativeModeTabs.OP_BLOCKS) return;`
+        if aligned_right && tab_id != "minecraft:op_blocks" {
+            return Ok(CreativeTabContents::default());
+        }
+        // `CreativeModeTabMixin.getStacks` offsets 104..118:
+        // `if (resourceKey != CreativeModeTabs.OP_BLOCKS || context.hasPermissions())`
+        if tab_id == "minecraft:op_blocks" && !context.has_permissions {
+            return Ok(CreativeTabContents::default());
+        }
+        // Snapshot the per-tab event's phase-sorted listeners BEFORE running any per-tab
+        // callback (`CreativeModeTabMixin.getStacks` offsets 119..145; `ArrayBackedEvent.invoker()`
+        // captures its `handlers[]` array before invocation).
+        let per_tab = sorted_creative_tab_listeners(
+            host.invocations(),
+            self,
+            &CreativeTabEventTarget::Tab(event_key.clone()),
+        );
+        // One shared collector across every listener of this tab firing (offsets 90..102).
+        let output = host.begin_creative_tab_output_with(
+            &event_key,
+            context.enabled_features,
+            context.has_permissions,
+        );
+        for (invocation_index, callback) in per_tab {
+            host.mark_creative_tab_registration_fired(invocation_index);
+            if let Err(error) = self.invoke_listener_callback(
+                &callback,
+                vec![output.clone()],
+                host,
+                &ExecutionBudget::UNBOUNDED,
+            ) {
+                let _ = host.take_creative_tab_output_lists(&output);
+                return Err(error);
+            }
+        }
+        // Snapshot `MODIFY_OUTPUT_ALL` AFTER the per-tab loop: `CreativeModeTabMixin.getStacks`
+        // reads `MODIFY_OUTPUT_ALL.invoker()` at offsets 146..162, so an all-tabs listener
+        // registered by a per-tab callback runs in this same firing.
+        let all_tabs =
+            sorted_creative_tab_listeners(host.invocations(), self, &CreativeTabEventTarget::All);
+        for (invocation_index, callback) in all_tabs {
+            host.mark_creative_tab_registration_fired(invocation_index);
+            if let Err(error) = self.invoke_listener_callback(
+                &callback,
+                vec![tab_handle.clone(), output.clone()],
+                host,
+                &ExecutionBudget::UNBOUNDED,
+            ) {
+                let _ = host.take_creative_tab_output_lists(&output);
+                return Err(error);
+            }
+        }
+        let (display_stacks, search_tab_stacks) = host
+            .take_creative_tab_output_lists(&output)
+            .unwrap_or_default();
+        Ok(CreativeTabContents {
+            display_stacks,
+            search_tab_stacks,
+        })
     }
 }
 
@@ -1897,8 +2255,14 @@ impl StdHost {
     /// them (`neoforge_inject.rs`).
     pub fn game_listeners(&self, jar: &NativeJar, server: bool) -> GameListeners {
         let mut out = GameListeners::default();
-        for invocation in &self.invocations {
-            listeners_from(invocation, jar, &mut out);
+        for (index, invocation) in self.invocations.iter().enumerate() {
+            listeners_from(
+                index,
+                invocation,
+                jar,
+                &self.fired_creative_tab_registrations,
+                &mut out,
+            );
         }
         // NeoForge bus-8 `addListener`s, each already checked to name a fired class.
         for listener in &self.neoforge_bus.listeners {
@@ -2090,7 +2454,13 @@ pub(crate) fn read_back_call(method: &MethodRef) -> bool {
         || (crate::is_event_bus_owner(owner) && matches!(name, "addListener" | "register"))
 }
 
-fn listeners_from(invocation: &HostInvocation, jar: &NativeJar, out: &mut GameListeners) {
+fn listeners_from(
+    invocation_index: usize,
+    invocation: &HostInvocation,
+    jar: &NativeJar,
+    fired_creative_tab: &std::collections::BTreeSet<usize>,
+    out: &mut GameListeners,
+) {
     // Every call read here keeps its values alive through the heap's roots.
     if !read_back_call(&invocation.method) {
         return;
@@ -2119,6 +2489,19 @@ fn listeners_from(invocation: &HostInvocation, jar: &NativeJar, out: &mut GameLi
         let Some(source) = crate::host_events::fabric_event_name(event) else {
             return;
         };
+        // Creative-tab modify-output listeners stay counted in `unsupported` until
+        // the game actually builds that tab (`NativeJar::creative_tab_contents`).
+        if creative_tab_event_target(event).is_some() {
+            // A throwing registration (`register(null)`, `register(null, l)`) registered nothing.
+            let threw_null = invocation.args.is_empty()
+                || matches!(invocation.args.last(), Some(Value::Ref(None)))
+                || (invocation.args.len() >= 2
+                    && matches!(invocation.args.first(), Some(Value::Ref(None))));
+            if !threw_null && !fired_creative_tab.contains(&invocation_index) {
+                count_unsupported(out, source);
+            }
+            return;
+        }
         if let Some((owner, field)) = crate::host_events::fabric_field_of(event)
             && unfired_client_fabric_field(&owner, &field)
         {

@@ -828,12 +828,10 @@ fn runtime_record_builder<H: Host>(
         return Ok(Some(crate::host_codec::opaque_codec(declared)));
     };
     if matches!(app, Value::Ref(None) | Value::Void) {
-        runtime_refuse(
-            runtime,
-            r,
-            "RecordCodecBuilder callback returned null".into(),
-        )?;
-        runtime.host.unknown_operand_call(r)?;
+        runtime.host.dfu_codec_refused(format!(
+            "{}#{}{}: RecordCodecBuilder callback returned null",
+            r.owner, r.name, r.descriptor
+        ));
         return Ok(Some(crate::host_codec::opaque_codec(declared)));
     }
     if !matches!(tag(&app).as_deref(), Some(APPLIED) | Some(POINT)) || is_opaque_app(&app) {

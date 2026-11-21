@@ -545,10 +545,8 @@ pub(crate) fn resolve_data_pack_order<'a>(
                 resource_load_order: entry.resource_load_order.as_ref(),
             });
             if valid_ns {
-                fabric_layers_by_id.insert(
-                    JavaStringKey(mod_id.to_owned()),
-                    (mod_id, &entry.resources),
-                );
+                fabric_layers_by_id
+                    .insert(JavaStringKey(mod_id.to_owned()), (mod_id, &entry.resources));
             }
         } else if !entry.resources.is_empty() {
             non_fabric_layers.push((entry.link_id.as_str(), &entry.resources));
@@ -772,20 +770,29 @@ mod tests {
             ],
             &all_ids,
         );
-        assert!(res.unsupported.contains(&UnsupportedLoadOrder::SelfDependency {
-            mod_id: "m1".into(),
-        }));
+        assert!(
+            res.unsupported
+                .contains(&UnsupportedLoadOrder::SelfDependency {
+                    mod_id: "m1".into(),
+                })
+        );
         assert!(res.unsupported.contains(&UnsupportedLoadOrder::UnknownKey {
             mod_id: "m2".into(),
             key: "priority".into(),
         }));
-        assert!(res.unsupported.contains(&UnsupportedLoadOrder::InvalidTargetList {
-            mod_id: "m2".into(),
-            key: "before".into(),
-        }));
-        assert!(res.unsupported.contains(&UnsupportedLoadOrder::NonStringTarget {
-            mod_id: "m2".into(),
-            key: "after".into(),
-        }));
+        assert!(
+            res.unsupported
+                .contains(&UnsupportedLoadOrder::InvalidTargetList {
+                    mod_id: "m2".into(),
+                    key: "before".into(),
+                })
+        );
+        assert!(
+            res.unsupported
+                .contains(&UnsupportedLoadOrder::NonStringTarget {
+                    mod_id: "m2".into(),
+                    key: "after".into(),
+                })
+        );
     }
 }

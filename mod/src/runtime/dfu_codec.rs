@@ -828,12 +828,10 @@ fn runtime_record_builder<H: Host>(
         return Ok(Some(crate::runtime::host_codec::opaque_codec(declared)));
     };
     if matches!(app, Value::Ref(None) | Value::Void) {
-        runtime_refuse(
-            runtime,
-            r,
-            "RecordCodecBuilder callback returned null".into(),
-        )?;
-        runtime.host.unknown_operand_call(r)?;
+        runtime.host.dfu_codec_refused(format!(
+            "{}#{}{}: RecordCodecBuilder callback returned null",
+            r.owner, r.name, r.descriptor
+        ));
         return Ok(Some(crate::runtime::host_codec::opaque_codec(declared)));
     }
     if !matches!(tag(&app).as_deref(), Some(APPLIED) | Some(POINT)) || is_opaque_app(&app) {
@@ -991,10 +989,9 @@ pub(crate) fn runtime_instance_call<H: Host>(
                     format!("RecordCodecBuilder group arity {} is outside 1..16", arity),
                 );
             }
-            if args
-                .iter()
-                .any(|arg| is_opaque_product(arg) || crate::runtime::host_codec::opaque_codec_type(arg).is_some())
-            {
+            if args.iter().any(|arg| {
+                is_opaque_product(arg) || crate::runtime::host_codec::opaque_codec_type(arg).is_some()
+            }) {
                 runtime.host.unknown_operand_call(r)?;
                 return Ok(Some(opaque_product(arity)));
             }

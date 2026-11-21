@@ -620,8 +620,6 @@ pub enum HostKind {
     RegexMatcher,
     /// Vanilla's ItemStackTemplate (`host_item_stack_template.rs`).
     ItemStackTemplate,
-    /// A live server-side `ItemStack` with item id, count, and component patch (`recipe_models.rs`).
-    LiveItemStack,
     /// Vanilla's `DataComponentPatch` (`recipe_models.rs`).
     DataComponentPatch,
     /// Vanilla's `DataComponentPatch$Builder` (`recipe_models.rs`).
@@ -635,6 +633,8 @@ pub enum HostKind {
     /// Fabric CreativeModeTab builder and built tab handles.
     CreativeModeTabBuilder,
     CreativeModeTab,
+    /// Output collector passed to Fabric creative-tab modify callbacks.
+    CreativeModeTabOutput,
     /// Fabric's `BlockApiLookup`, one per (id, API class, context class) (`fabric_block_api.rs`).
     FabricBlockApiLookup,
     Url,
@@ -645,6 +645,12 @@ pub enum HostKind {
     FabricBiomeModification,
     /// Vanilla 26.3's `RecipeSerializer` record (`recipe_serializer.rs`).
     RecipeSerializer,
+    /// An `ItemStack` value constructed by the host (e.g. `CreativeModeTab$Output.accept(ItemLike)`).
+    ItemStack,
+    /// Vanilla `FeatureFlag` singletons (`FeatureFlags.*`).
+    FeatureFlag,
+    /// Vanilla `FeatureFlagSet` values (`FeatureFlags.VANILLA_SET`, `FeatureFlagSet.of(...)`).
+    FeatureFlagSet,
 }
 
 /// How a kind's Java class follows from its key.
@@ -2762,13 +2768,6 @@ const KINDS: &[KindInfo] = &[
         methods: &crate::host_item_stack_template::METHODS,
     },
     KindInfo {
-        kind: HostKind::LiveItemStack,
-        tag: "istk",
-        class: ClassRule::FromKey(|_| crate::recipe_models::ITEM_STACK),
-        canonical: always_canonical,
-        methods: &crate::recipe_models::LIVE_STACK_METHODS,
-    },
-    KindInfo {
         kind: HostKind::DataComponentPatch,
         tag: "dcp",
         class: ClassRule::FromKey(|_| crate::recipe_models::DATA_COMPONENT_PATCH),
@@ -2815,9 +2814,20 @@ const KINDS: &[KindInfo] = &[
         kind: HostKind::CreativeModeTab,
         tag: "cmt",
         class: ClassRule::Fixed("net/minecraft/world/item/CreativeModeTab"),
-        canonical: never_canonical,
+        // Each `Builder.build()` uses a fresh serial (`t#<n>`) and each vanilla tab a unique id
+        // (`tab:<id>`), so equal keys are the same `CreativeModeTab` object.
+        canonical: always_canonical,
         // No overrides: identity `equals`, counted `hashCode`/`toString`.
         methods: &crate::host_events::DECLARED_TYPE_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::CreativeModeTabOutput,
+        tag: "ctout",
+        class: ClassRule::Fixed(
+            "net/fabricmc/fabric/api/creativetab/v1/FabricCreativeModeTabOutput",
+        ),
+        canonical: always_canonical,
+        methods: &crate::host_creative_tab::OUTPUT_METHODS,
     },
     KindInfo {
         kind: HostKind::FabricBlockApiLookup,
@@ -2862,6 +2872,32 @@ const KINDS: &[KindInfo] = &[
         // A serial per `new RecipeSerializer` allocation: one key, one object.
         canonical: always_canonical,
         methods: &crate::recipe_serializer::METHODS,
+    },
+    KindInfo {
+        kind: HostKind::ItemStack,
+        tag: "istk",
+        // `FromKey` rather than `Fixed`: `ItemStack.EMPTY` (`GameValue`), client-frame stacks
+        // (`GameTransient`), and jar-allocated `new ItemStack(...)` (`JarObject`) are also
+        // `ItemStack` instances.
+        class: ClassRule::FromKey(crate::host_creative_tab::item_stack_class),
+        canonical: always_canonical,
+        methods: &crate::host_creative_tab::ITEM_STACK_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::FeatureFlag,
+        tag: "fflg",
+        class: ClassRule::Fixed("net/minecraft/world/flag/FeatureFlag"),
+        canonical: always_canonical,
+        methods: &crate::host_creative_tab::FEATURE_FLAG_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::FeatureFlagSet,
+        tag: "ffset",
+        class: ClassRule::Fixed("net/minecraft/world/flag/FeatureFlagSet"),
+        // `empty:0` is `EMPTY`, `vanilla:1` is `VANILLA_SET`/`DEFAULT_FLAGS`, and every `of(...)`/
+        // `join`/`subtract` allocation carries its own serial `n:<serial>:<mask>`.
+        canonical: always_canonical,
+        methods: &crate::host_creative_tab::FEATURE_FLAG_SET_METHODS,
     },
 ];
 

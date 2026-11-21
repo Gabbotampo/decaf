@@ -86,7 +86,7 @@ fn server_kind(rest: &str) -> HostKind {
         "player" | "entity" | "original-player" => HostKind::GameEntity,
         "level" => HostKind::GameLevel,
         "server" | "player-list" | "commands" | "rules" | "registries" | "saved-data"
-        | "world-border" | "recipe-manager" | "feature-flag-set" => HostKind::GameSingleton,
+        | "world-border" | "recipe-manager" => HostKind::GameSingleton,
         "item" | "block" | "block-state" | "registry" | "entity_type" | "data-component-type" => {
             HostKind::GameRegistryObject
         }
@@ -395,7 +395,6 @@ pub(crate) fn declared_types(key: &str) -> &'static [&'static str] {
             "net/minecraft/world/item/crafting/RecipeAccess",
         ],
         (false, "data-component-type") => &["net/minecraft/core/component/DataComponentType"],
-        (false, "feature-flag-set") => &["net/minecraft/world/flag/FeatureFlagSet"],
         (false, "player-list") => &["net/minecraft/server/players/PlayerList"],
         (false, "commands") => &["net/minecraft/commands/Commands"],
         (false, "world-border") => &["net/minecraft/world/level/border/WorldBorder"],
@@ -562,6 +561,7 @@ pub(crate) const VALUE_METHODS: Methods = Methods {
     to_string: |handle, _| {
         let key = handle.key();
         if key == "client/stack/empty" {
+            // `ItemStack.EMPTY.toString()` (`server-26.3.jar` `ItemStack.toString` 0..16).
             return Ok(Some("0 minecraft:air".to_owned()));
         }
         if let Some(value) = crate::runtime::sound_event::to_string(key) {

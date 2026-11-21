@@ -7,8 +7,8 @@
 use crate::runtime::host_ref::{ClassHierarchy, HostKind, HostRef, Methods, Nested, exact_class_rules_out};
 use crate::runtime::recipe_models::{
     ComponentPatch, DATA_COMPONENT_GETTER, ITEM_INSTANCE, TemplateData, empty_patch,
-    is_empty_stack_handle, item_holder_for_id, item_stack_template_illegal_state, resolve_item_id,
-    resolve_item_tag, stack_component_get, template_apply,
+    is_empty_stack_handle, item_holder_for_id, item_stack_template_illegal_state,
+    read_live_stack_opt, resolve_item_id, resolve_item_tag, stack_component_get, template_apply,
 };
 use crate::runtime::{MethodRef, NativeError, StdHost, Value, expect_int};
 
@@ -48,7 +48,6 @@ pub(crate) const METHODS: Methods = Methods {
     crosses_jars: cr,
     compare_to: None,
 };
-
 fn npe() -> NativeError {
     NativeError::UncaughtException {
         class: "java/lang/NullPointerException".into(),
@@ -79,17 +78,15 @@ pub(crate) fn static_call(
                     "Stack must be non-empty",
                 )));
             }
-            if let Value::Host(handle) = stack
-                && handle.kind() == HostKind::LiveItemStack
-            {
-                let live = host.recipes.stacks.get(handle.key())?.clone();
+            if let Some(live) = read_live_stack_opt(host, stack) {
                 if live.is_empty() {
                     return Some(Err(item_stack_template_illegal_state(
                         "Stack must be non-empty",
                     )));
                 }
+                let item_id = live.resolved_item_id(host)?;
                 return Some(Ok(host.recipes.alloc_template(TemplateData {
-                    item_id: live.item_id,
+                    item_id,
                     count: live.count,
                     patch: live.patch,
                 })));
@@ -113,17 +110,15 @@ pub(crate) fn static_call(
                     "Stack must be non-empty",
                 )));
             }
-            if let Value::Host(handle) = stack
-                && handle.kind() == HostKind::LiveItemStack
-            {
-                let live = host.recipes.stacks.get(handle.key())?.clone();
+            if let Some(live) = read_live_stack_opt(host, stack) {
                 if live.is_empty() {
                     return Some(Err(item_stack_template_illegal_state(
                         "Stack must be non-empty",
                     )));
                 }
+                let item_id = live.resolved_item_id(host)?;
                 return Some(Ok(host.recipes.alloc_template(TemplateData {
-                    item_id: live.item_id,
+                    item_id,
                     count,
                     patch: live.patch,
                 })));
