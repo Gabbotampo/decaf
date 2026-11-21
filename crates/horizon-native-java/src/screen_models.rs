@@ -63,7 +63,7 @@ impl NativeJar {
         let menu = host.client_menu_value().ok_or_else(|| {
             NativeError::Metadata("no constructed menu is available for the client screen".into())
         })?;
-        let inventory = Value::Ref(Some("inventory/client-screen#0".into()));
+        let inventory = crate::game_object::client_value("client/inventory".to_owned());
         let screen = construct(self, host, constructor, menu, inventory, title)?;
         let layout = host.client_screen_layout(&screen).ok_or_else(|| {
             NativeError::Metadata("screen constructor did not initialize a container screen".into())
@@ -83,30 +83,46 @@ impl NativeJar {
         let menu = host.client_menu_value().ok_or_else(|| {
             NativeError::Metadata("no constructed menu is available for the client screen".into())
         })?;
-        let inventory = Value::Ref(Some("inventory/client-screen#0".into()));
+        let inventory = crate::game_object::client_value("client/inventory".to_owned());
         let screen = construct(self, host, constructor, menu, inventory, title)?;
         if !host.client_frame_active() {
             return Err(NativeError::Metadata("client frame is not active".into()));
         }
+        host.client_apply_screen_init(&screen);
         let before = host.client_draws().len();
         let class = crate::expect_ref(&screen)
             .and_then(|key| key.split_once('#').map(|(class, _)| class.to_owned()))
             .ok_or_else(|| NativeError::Metadata("screen is not a jar object".into()))?;
         let rendered = self.invoke_method_with_args(
             &class,
-            "renderBg",
-            "(Lnet/minecraft/client/gui/GuiGraphicsExtractor;FII)V",
+            "extractBackground",
+            "(Lnet/minecraft/client/gui/GuiGraphicsExtractor;IIF)V",
             Some(screen.clone()),
             &[
                 crate::game_object::client_value("client/gui-graphics".to_owned()),
+                Value::Int(0),
+                Value::Int(0),
                 Value::Float(0.0),
-                Value::Int(0),
-                Value::Int(0),
             ],
             host,
         );
         if matches!(rendered, Err(NativeError::MissingMethod(_))) {
             host.client_default_screen_bg(&screen)?;
+            let layout = host
+                .client_screen_layout(&screen)
+                .ok_or_else(|| NativeError::Metadata("screen layout is unavailable".into()))?;
+            let _ = self.invoke_method_with_args(
+                &class,
+                "extractErrorIcon",
+                "(Lnet/minecraft/client/gui/GuiGraphicsExtractor;II)V",
+                Some(screen),
+                &[
+                    crate::game_object::client_value("client/gui-graphics".to_owned()),
+                    Value::Int(layout.left_pos),
+                    Value::Int(layout.top_pos),
+                ],
+                host,
+            )?;
         } else {
             rendered?;
         }

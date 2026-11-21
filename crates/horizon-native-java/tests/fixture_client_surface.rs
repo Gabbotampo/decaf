@@ -219,6 +219,49 @@ const FABRIC_STUBS: &[(&str, &str)] = &[
     ),
 ];
 
+const SCREEN_STUBS: &[(&str, &str)] = &[
+    (
+        "net/minecraft/client/gui/screens/MenuScreens.java",
+        "package net.minecraft.client.gui.screens; import net.minecraft.network.chat.Component; import net.minecraft.world.entity.player.Inventory; public final class MenuScreens { public interface ScreenConstructor<M,S> { S create(M m, Inventory i, Component t); } public static <M,S> void register(net.minecraft.world.inventory.MenuType<M> t, ScreenConstructor<M,S> c) {} }",
+    ),
+    (
+        "net/minecraft/world/inventory/MenuType.java",
+        "package net.minecraft.world.inventory; public class MenuType<T> {}",
+    ),
+    (
+        "net/minecraft/world/entity/player/Inventory.java",
+        "package net.minecraft.world.entity.player; public class Inventory { public net.minecraft.network.chat.Component getDisplayName() { return null; } }",
+    ),
+    (
+        "net/minecraft/world/inventory/ItemCombinerMenuSlotDefinition.java",
+        "package net.minecraft.world.inventory; import java.util.function.Predicate; public class ItemCombinerMenuSlotDefinition { public static Builder create() { return null; } public static class Builder { public Builder withSlot(int i,int x,int y,Predicate<Object> p) { return this; } public Builder withResultSlot(int i,int x,int y) { return this; } public ItemCombinerMenuSlotDefinition build() { return null; } } }",
+    ),
+    (
+        "net/minecraft/world/inventory/ItemCombinerMenu.java",
+        "package net.minecraft.world.inventory; import net.minecraft.world.entity.player.Inventory; public class ItemCombinerMenu { protected ItemCombinerMenu(MenuType<?> t,int id,Inventory i,Object a,ItemCombinerMenuSlotDefinition d) {} }",
+    ),
+    (
+        "net/minecraft/client/gui/screens/inventory/AbstractContainerScreen.java",
+        "package net.minecraft.client.gui.screens.inventory; import net.minecraft.network.chat.Component; import net.minecraft.world.entity.player.Inventory; import net.minecraft.world.inventory.ItemCombinerMenu; public abstract class AbstractContainerScreen<T> { protected int imageWidth,imageHeight,titleLabelX,titleLabelY,inventoryLabelX,inventoryLabelY,leftPos,topPos; protected T menu; protected AbstractContainerScreen(T m,Inventory i,Component t) {} }",
+    ),
+    (
+        "net/minecraft/client/gui/screens/inventory/ItemCombinerScreen.java",
+        "package net.minecraft.client.gui.screens.inventory; import net.minecraft.resources.Identifier; import net.minecraft.network.chat.Component; import net.minecraft.world.entity.player.Inventory; import net.minecraft.world.inventory.ItemCombinerMenu; public abstract class ItemCombinerScreen<T extends ItemCombinerMenu> extends AbstractContainerScreen<T> { protected ItemCombinerScreen(T m,Inventory i,Component t,Identifier id) { super(m,i,t); } protected abstract void extractErrorIcon(net.minecraft.client.gui.GuiGraphicsExtractor g,int x,int y); }",
+    ),
+    (
+        "demo/Handler.java",
+        "package demo; import net.minecraft.world.inventory.*; import net.minecraft.world.entity.player.Inventory; public class Handler extends ItemCombinerMenu { public Handler(int id, Inventory i) { super(null,id,i,null,ItemCombinerMenuSlotDefinition.create().withSlot(0,27,47,null).withSlot(1,76,47,null).withResultSlot(2,134,47).build()); } }",
+    ),
+    (
+        "demo/Screen.java",
+        "package demo; import net.minecraft.client.gui.screens.inventory.*; import net.minecraft.network.chat.Component; import net.minecraft.resources.Identifier; import net.minecraft.world.entity.player.Inventory; public class Screen extends ItemCombinerScreen<Handler> { public static final Identifier TEXTURE = Identifier.fromNamespaceAndPath(\"demo\",\"textures/gui/test.png\"); public Screen(Handler m, Inventory i, Component t) { super(m,i,t,TEXTURE); titleLabelX=17; titleLabelY=19; inventoryLabelX=9; inventoryLabelY=71; } protected void extractErrorIcon(net.minecraft.client.gui.GuiGraphicsExtractor g,int x,int y) {} }",
+    ),
+    (
+        "demo/ScreenMod.java",
+        "package demo; import net.minecraft.client.gui.screens.MenuScreens; public class ScreenMod { public void onInitializeClient() { MenuScreens.register(null, Screen::new); } }",
+    ),
+];
+
 const FABRIC_MOD: &str = r#"
 package demo;
 import com.mojang.blaze3d.platform.InputConstants;
@@ -325,6 +368,123 @@ fn a_mappings_name_is_its_own_text_whatever_it_spells() {
             "true,16,true,false,true|true,27,false".into()
         )))
     );
+}
+
+#[test]
+fn a_javac_item_combiner_screen_exposes_layout_and_background() {
+    let root = scratch("screen-bridge");
+    let mut sources = GAME_STUBS.to_vec();
+    sources.extend_from_slice(SCREEN_STUBS);
+    let Some(jar_path) = build_jar(
+        &root,
+        &sources,
+        (
+            "fabric.mod.json",
+            r#"{"id":"demo-screen","version":"1","environment":"client","entrypoints":{"client":["demo.ScreenMod"]}}"#,
+        ),
+    ) else {
+        eprintln!("skipped: no javac");
+        return;
+    };
+    let jar = NativeJar::from_path(&jar_path).unwrap();
+    let entry = jar.discover_entrypoint("client").unwrap();
+    let mut host = StdHost::new();
+    host.begin_client_frame(frame(Some(0.0)), &[]);
+    jar.execute(&entry.class, entry.method.as_deref(), "client", &mut host)
+        .unwrap();
+    let handler = Value::Ref(Some("demo/Handler#0".into()));
+    jar.invoke_method_with_args(
+        "demo/Handler",
+        "<init>",
+        "(ILnet/minecraft/world/entity/player/Inventory;)V",
+        Some(handler),
+        &[Value::Int(1), host.client_inventory_value()],
+        &mut host,
+    )
+    .unwrap();
+    let layout = jar
+        .open_client_screen(&mut host, Value::Ref(None), Value::Ref(Some("Test".into())))
+        .unwrap();
+    assert_eq!(layout.layout.image_width, 176);
+    assert_eq!(layout.layout.image_height, 166);
+    assert_eq!(layout.layout.title_label, [17, 19]);
+    assert_eq!(layout.layout.inventory_label, [9, 71]);
+    assert_eq!(
+        &layout.layout.slots[..3],
+        &[[0, 27, 47], [1, 76, 47], [2, 134, 47]]
+    );
+    assert_eq!(layout.layout.slots.len(), 39);
+    let draws = jar
+        .draw_client_screen_bg(&mut host, Value::Ref(None), Value::Ref(Some("Test".into())))
+        .unwrap();
+    assert!(draws.iter().any(|draw| matches!(draw, DrawOp::Blit { texture, tex_size: [256, 256], .. } if texture == "demo:textures/gui/test.png")));
+    assert!(host.unknown_host_calls().is_empty());
+}
+
+#[test]
+fn a_real_runes_client_registers_its_container_screen() {
+    let jar = NativeJar::from_path(std::path::Path::new(
+        "/home/solenopsisbot/horizon-corpus/deps-pool/runes-fabric-1.3.2+26.3.jar",
+    ))
+    .unwrap();
+    let mut host = StdHost::new();
+    host.begin_client_frame(frame(Some(0.0)), &[]);
+    let result = jar.invoke_method(
+        "net/runes/fabric/client/FabricClientMod",
+        "onInitializeClient",
+        "()V",
+        Some(Value::Ref(Some(
+            "net/runes/fabric/client/FabricClientMod#0".into(),
+        ))),
+        &mut host,
+    );
+    assert!(result.is_ok(), "Runes client init failed: {result:?}");
+    let summary = host.client_registration_summary();
+    assert!(
+        summary["order"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|value| value == "menu_screen")
+    );
+    let root = scratch("runes-screen-menu");
+    let mut synthetic_sources = GAME_STUBS.to_vec();
+    synthetic_sources.extend_from_slice(SCREEN_STUBS);
+    let synthetic = build_jar(
+        &root,
+        &synthetic_sources,
+        ("fabric.mod.json", r#"{"id":"synthetic","version":"1"}"#),
+    )
+    .unwrap();
+    let synthetic = NativeJar::from_path(&synthetic).unwrap();
+    synthetic
+        .invoke_method_with_args(
+            "demo/Handler",
+            "<init>",
+            "(ILnet/minecraft/world/entity/player/Inventory;)V",
+            Some(Value::Ref(Some("demo/Handler#0".into()))),
+            &[Value::Int(1), Value::Ref(None)],
+            &mut host,
+        )
+        .unwrap();
+    let layout = jar
+        .open_client_screen(&mut host, Value::Ref(None), Value::Ref(Some("Test".into())))
+        .unwrap();
+    assert_eq!(layout.layout.image_width, 176);
+    assert_eq!(layout.layout.image_height, 166);
+    assert_eq!(layout.layout.title_label, [60, 18]);
+    assert_eq!(
+        &layout.layout.slots[..3],
+        &[[0, 27, 47], [1, 76, 47], [2, 134, 47]]
+    );
+    let draws = jar
+        .draw_client_screen_bg(&mut host, Value::Ref(None), Value::Ref(Some("Test".into())))
+        .unwrap();
+    assert!(draws.iter().any(|draw| matches!(draw, DrawOp::Blit { texture, tex_size: [256, 256], .. } if texture == "runes:textures/gui/crafting_altar.png")));
+    assert_eq!(
+        host.unknown_host_calls(),
+        vec![("net/minecraft/world/flag/FeatureFlags#VANILLA_SETLnet/minecraft/world/flag/FeatureFlagSet;".into(), 1)]
+    ); // Runes' static client bootstrap reads FeatureFlags.VANILLA_SET; this test does not guess it.
 }
 
 #[test]

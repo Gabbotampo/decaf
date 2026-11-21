@@ -6344,6 +6344,12 @@ impl Host for StdHost {
         if let Some(value) = self.menu_field(receiver, r) {
             return Ok(value);
         }
+        if crate::game_object::handle_key(receiver) == Some("client/inventory")
+            && r.owner == "net/minecraft/world/entity/player/Inventory"
+            && r.name == "player"
+        {
+            return Ok(crate::game_object::client_value("client/player".into()));
+        }
         if let Some(value) = vec2::get_field(&self.vec2, receiver, r) {
             return value;
         }

@@ -1025,6 +1025,10 @@ impl StdHost {
         crate::runtime::menu_models::first_menu(&self.menu_states)
     }
 
+    pub fn client_inventory_value(&self) -> Value {
+        crate::runtime::game_object::client_value("client/inventory".to_owned())
+    }
+
     pub(crate) fn client_default_screen_bg(&mut self, screen: &Value) -> Result<(), NativeError> {
         let layout = self
             .client_screen_layout(screen)
@@ -1045,6 +1049,42 @@ impl StdHost {
             tint: u32::MAX,
         });
         Ok(())
+    }
+
+    pub(crate) fn client_screen_init_positions(&self, screen: &Value) -> Option<[i32; 2]> {
+        let layout = self.client_screen_layout(screen)?;
+        let frame = self.client.frame.as_ref()?;
+        Some([
+            (frame.gui_size[0] - layout.image_width) / 2,
+            (frame.gui_size[1] - layout.image_height) / 2,
+        ])
+    }
+
+    pub(crate) fn client_apply_screen_init(&mut self, screen: &Value) {
+        if let Some([left, top]) = self.client_screen_init_positions(screen) {
+            let left_ref = MethodRef {
+                owner: "net/minecraft/client/gui/screens/inventory/AbstractContainerScreen".into(),
+                name: "leftPos".into(),
+                descriptor: "I".into(),
+            };
+            let top_ref = MethodRef {
+                owner: "net/minecraft/client/gui/screens/inventory/AbstractContainerScreen".into(),
+                name: "topPos".into(),
+                descriptor: "I".into(),
+            };
+            crate::runtime::menu_models::set_field(
+                &mut self.menu_states,
+                screen,
+                &left_ref,
+                &Value::Int(left),
+            );
+            crate::runtime::menu_models::set_field(
+                &mut self.menu_states,
+                screen,
+                &top_ref,
+                &Value::Int(top),
+            );
+        }
     }
 
     /// The key mappings this host's jar registered, in order.
@@ -2244,12 +2284,18 @@ impl StdHost {
                 let rect = state.posed_rect([v[0], v[1], v[0] + v[2], v[1] + v[3]]);
                 state.draw(DrawOp::Sprite { sprite, rect, argb })
             }
-            ("blit", descriptor) if descriptor.contains("Lnet/minecraft/resources/Identifier;") => {
-                let texture = crate::runtime::host_ids::identifier_key(args.first()?)?.to_owned();
-                let v = ints(1, 8)?;
-                let tint = args.get(9).and_then(|v| int_arg(std::slice::from_ref(v), 0)).unwrap_or(-1) as u32;
-                let rect = state.posed_rect([v[0], v[1], v[0] + v[2], v[1] + v[3]]);
-                state.draw(DrawOp::Blit { texture, src: [v[4], v[5], v[6], v[7]], dst: rect, tex_size: [v[6], v[7]], tint })
+            ("blit", "(Lcom/mojang/renderpearl/api/pipeline/RenderPipeline;Lnet/minecraft/resources/Identifier;IIFFIIII)V") => {
+                let texture = crate::runtime::host_ids::identifier_key(args.get(1)?)?.to_owned();
+                let x = int_arg(args, 2)?;
+                let y = int_arg(args, 3)?;
+                let u = float_arg(args, 4)? as i32;
+                let v = float_arg(args, 5)? as i32;
+                let w = int_arg(args, 6)?;
+                let h = int_arg(args, 7)?;
+                let tex_w = int_arg(args, 8)?;
+                let tex_h = int_arg(args, 9)?;
+                let rect = state.posed_rect([x, y, x + w, y + h]);
+                state.draw(DrawOp::Blit { texture, src: [u, v, w, h], dst: rect, tex_size: [tex_w, tex_h], tint: u32::MAX })
             }
             ("centeredText", descriptor)
                 if descriptor.starts_with("(Lnet/minecraft/client/gui/Font;") =>
