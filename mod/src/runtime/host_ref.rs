@@ -631,6 +631,18 @@ pub enum HostKind {
     /// A Fabric `BiomeModification` that `BiomeModifications.create` made
     /// (`fabric_biome_modifications.rs`).
     FabricBiomeModification,
+    /// Opaque `Consumer<Component>` sink passed to `Item.appendHoverText`
+    /// (`client_surface.rs`), matching vanilla's `lines::add` invokedynamic lambda.
+    TooltipConsumer,
+    /// `net.minecraft.world.item.Item$TooltipContext` passed to tooltip hooks
+    /// (`client_surface.rs`).
+    TooltipContext,
+    /// `net.minecraft.world.item.component.TooltipDisplay` passed to
+    /// `Item.appendHoverText` (`client_surface.rs`).
+    TooltipDisplay,
+    /// `net.minecraft.world.item.TooltipFlag` passed to tooltip hooks
+    /// (`client_surface.rs`).
+    TooltipFlag,
 }
 
 /// How a kind's Java class follows from its key.
@@ -2798,6 +2810,44 @@ const KINDS: &[KindInfo] = &[
         canonical: never_canonical,
         // It overrides nothing of `Object`: identity `equals`, `hashCode`/`toString` counted.
         methods: &crate::runtime::host_events::DECLARED_TYPE_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::TooltipConsumer,
+        tag: "tcs",
+        // Hidden lambda class (`lines::add` in `ItemStack.getTooltipLines`): `getClass()` is
+        // counted and `instanceof` is exact (`Consumer` and `Object` only).
+        class: ClassRule::Unknown {
+            declared: crate::runtime::client_surface::tooltip_consumer_types,
+        },
+        canonical: always_canonical,
+        methods: &crate::runtime::client_surface::TOOLTIP_CONSUMER_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::TooltipContext,
+        tag: "ttctx",
+        class: ClassRule::Unknown {
+            declared: crate::runtime::client_surface::tooltip_context_types,
+        },
+        canonical: never_canonical,
+        methods: &crate::runtime::client_surface::TOOLTIP_CONTEXT_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::TooltipDisplay,
+        tag: "ttdsp",
+        class: ClassRule::Unknown {
+            declared: crate::runtime::client_surface::tooltip_display_types,
+        },
+        canonical: never_canonical,
+        methods: &crate::runtime::client_surface::TOOLTIP_DISPLAY_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::TooltipFlag,
+        tag: "ttflg",
+        class: ClassRule::Unknown {
+            declared: crate::runtime::client_surface::tooltip_flag_types,
+        },
+        canonical: never_canonical,
+        methods: &crate::runtime::client_surface::TOOLTIP_FLAG_METHODS,
     },
 ];
 

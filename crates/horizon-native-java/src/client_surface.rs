@@ -45,10 +45,12 @@
 use std::{collections::BTreeMap, sync::Arc};
 
 use crate::{
-    ExecutionBudget, MethodRef, NativeError, NativeJar, StdHost, Value, boolean_value,
-    component_value,
+    ExecutionBudget, HostKind, HostRef, MethodRef, NativeError, NativeJar, StdHost, Value,
+    boolean_value, component_value,
     events::{self, GameEvent, ListenerCallback},
-    expect_ref, identifier_parts, return_desc, uuid_value,
+    expect_ref,
+    host_ref::{ClassHierarchy, Methods, exact_class_rules_out, instance_of_class},
+    identifier_parts, return_desc, uuid_value,
 };
 
 // The player's items and effects (`ItemStack`, `Inventory`, effects). A
@@ -111,20 +113,149 @@ use crate::client_values::VEC3;
 /// A tooltip listener's `List<Component>`: the host collection the game
 /// seeds with the tooltip's lines and reads back after the firing.
 const TOOLTIP_LIST: &str = "java/util/ArrayList#client-tooltip";
-const TOOLTIP_CONTEXT: &str = "client/tooltip-context";
-const TOOLTIP_FLAG: &str = "client/tooltip-flag";
-/// The default 26.3 `TooltipDisplay` passed to an item's own tooltip method.
-pub(crate) const TOOLTIP_DISPLAY: &str = "client/tooltip-display";
+const TOOLTIP_CONTEXT_CLASS: &str = "net/minecraft/world/item/Item$TooltipContext";
+const TOOLTIP_DISPLAY_CLASS: &str = "net/minecraft/world/item/component/TooltipDisplay";
+const TOOLTIP_FLAG_CLASS: &str = "net/minecraft/world/item/TooltipFlag";
 /// Lines a tooltip listener may leave; more are cut.
 const MAX_TOOLTIP_LINES: usize = 64;
+
+/// A `HostKind::GameTransient` handle for the tooltip's `ItemStack`.
+pub fn tooltip_stack() -> Value {
+    marker(format!("{}tooltip", items::STACK))
+}
+
+/// Dedicated host handle for `net.minecraft.world.item.Item$TooltipContext`.
+/// `tickRate()` reads the active client frame snapshot's `tick_rate` when
+/// supplied and counts otherwise; all other methods (including `Object`
+/// methods) are counted.
+pub fn tooltip_context() -> Value {
+    Value::Host(HostRef::new(HostKind::TooltipContext, "frame"))
+}
+
+/// Dedicated host handle for `net.minecraft.world.item.component.TooltipDisplay`.
+/// All methods (including `Object` methods) are counted.
+pub fn tooltip_display() -> Value {
+    Value::Host(HostRef::new(HostKind::TooltipDisplay, "default"))
+}
+
+/// Dedicated host handle for `net.minecraft.world.item.TooltipFlag` with
+/// explicit `isAdvanced()` and `isCreative()` answers.
+pub fn tooltip_flag(advanced: bool, creative: bool) -> Value {
+    Value::Host(HostRef::new(
+        HostKind::TooltipFlag,
+        format!("explicit:{},{}", u8::from(advanced), u8::from(creative)),
+    ))
+}
+
+/// Frame-backed `TooltipFlag` handle for client tooltip events whose flags come
+/// from the active [`ClientSnapshot`].
+pub(crate) fn tooltip_flag_from_frame() -> Value {
+    Value::Host(HostRef::new(HostKind::TooltipFlag, "frame"))
+}
+
+fn parse_explicit_tooltip_flag(key: &str) -> Option<(bool, bool)> {
+    let rest = key.strip_prefix("explicit:")?;
+    let (adv, cre) = rest.split_once(',')?;
+    let adv = match adv {
+        "0" => false,
+        "1" => true,
+        _ => return None,
+    };
+    let cre = match cre {
+        "0" => false,
+        "1" => true,
+        _ => return None,
+    };
+    Some((adv, cre))
+}
+
+pub(crate) fn tooltip_consumer_types(_: &str) -> &'static [&'static str] {
+    &["java/util/function/Consumer"]
+}
+
+pub(crate) fn tooltip_context_types(_: &str) -> &'static [&'static str] {
+    &[TOOLTIP_CONTEXT_CLASS]
+}
+
+pub(crate) fn tooltip_display_types(_: &str) -> &'static [&'static str] {
+    &[TOOLTIP_DISPLAY_CLASS, "java/lang/Record"]
+}
+
+pub(crate) fn tooltip_flag_types(_: &str) -> &'static [&'static str] {
+    &[TOOLTIP_FLAG_CLASS]
+}
+
+fn tooltip_display_instance_of(
+    _: &HostRef,
+    wanted: &str,
+    hierarchy: &dyn ClassHierarchy,
+) -> Option<bool> {
+    if matches!(
+        wanted,
+        "java/lang/Object" | "java/lang/Record" | TOOLTIP_DISPLAY_CLASS
+    ) || hierarchy.is_instance(TOOLTIP_DISPLAY_CLASS, wanted) == Some(true)
+    {
+        return Some(true);
+    }
+    (hierarchy.is_interface(wanted) == Some(false)
+        || exact_class_rules_out(TOOLTIP_DISPLAY_CLASS, wanted))
+    .then_some(false)
+}
+
+/// Opaque `Consumer<Component>` sink methods: `Object` methods are counted;
+/// `instanceof` is exact (`Consumer` and `Object` only, matching vanilla's
+/// `lines::add` invokedynamic lambda).
+pub(crate) const TOOLTIP_CONSUMER_METHODS: Methods = Methods {
+    to_string: |_, _| Ok(None),
+    hash_code: |_, _| Ok(None),
+    equals: |_, _, _| Ok(None),
+    instance_of: |_, wanted, _| {
+        Some(matches!(
+            wanted,
+            "java/lang/Object" | "java/util/function/Consumer"
+        ))
+    },
+    crosses_jars: |_, _| false,
+    compare_to: None,
+};
+
+/// `Item$TooltipContext` handle methods: `Object` methods are counted.
+pub(crate) const TOOLTIP_CONTEXT_METHODS: Methods = Methods {
+    to_string: |_, _| Ok(None),
+    hash_code: |_, _| Ok(None),
+    equals: |_, _, _| Ok(None),
+    instance_of: instance_of_class,
+    crosses_jars: |_, _| false,
+    compare_to: None,
+};
+
+/// `TooltipDisplay` handle methods: `Object` methods are counted.
+pub(crate) const TOOLTIP_DISPLAY_METHODS: Methods = Methods {
+    to_string: |_, _| Ok(None),
+    hash_code: |_, _| Ok(None),
+    equals: |_, _, _| Ok(None),
+    instance_of: tooltip_display_instance_of,
+    crosses_jars: |_, _| false,
+    compare_to: None,
+};
+
+/// `TooltipFlag` handle methods: `Object` methods are counted.
+pub(crate) const TOOLTIP_FLAG_METHODS: Methods = Methods {
+    to_string: |_, _| Ok(None),
+    hash_code: |_, _| Ok(None),
+    equals: |_, _, _| Ok(None),
+    instance_of: instance_of_class,
+    crosses_jars: |_, _| false,
+    compare_to: None,
+};
 
 /// A Fabric `ItemTooltipCallback`'s arguments: the stack, its context, the
 /// flag and the lines.
 pub(crate) fn tooltip_arguments() -> Vec<Value> {
     vec![
-        marker(format!("{}tooltip", items::STACK)),
-        marker(TOOLTIP_CONTEXT),
-        marker(TOOLTIP_FLAG),
+        tooltip_stack(),
+        tooltip_context(),
+        tooltip_flag_from_frame(),
         marker(TOOLTIP_LIST),
     ]
 }
@@ -462,6 +593,11 @@ pub struct ClientSnapshot {
     pub tooltip_lines: Vec<String>,
     /// `TooltipFlag.isAdvanced` (F3+H).
     pub advanced_tooltips: bool,
+    /// `TooltipFlag.isCreative` (creative inventory search tab).
+    pub creative_tooltips: bool,
+    /// `level.tickRateManager().tickrate()` for `TooltipContext.tickRate()`;
+    /// absent stays counted (never defaults to `20.0f`).
+    pub tick_rate: Option<f32>,
     /// Option values filled by the game snapshot; absent values stay counted.
     pub options: crate::client_frame::ClientOptions,
     /// The crosshair target (`Minecraft.hitResult`) filled by the game.
@@ -1124,10 +1260,16 @@ impl StdHost {
     /// (an instance field of a host object reaches the host as a static read
     /// without its receiver).
     pub(crate) fn client_static(&mut self, r: &MethodRef) -> Option<Result<Value, NativeError>> {
-        // Chat style/color values are shared by server-side callbacks too;
-        // their handles do not depend on a client frame.
+        // Chat style/color values and common tooltip constants are shared by
+        // server-side callbacks too; their handles do not depend on a frame.
         if let Some(value) = text::text_static(r) {
             return Some(Ok(value));
+        }
+        match (r.owner.as_str(), r.name.as_str()) {
+            (TOOLTIP_FLAG_CLASS, "NORMAL") => return Some(Ok(tooltip_flag(false, false))),
+            (TOOLTIP_FLAG_CLASS, "ADVANCED") => return Some(Ok(tooltip_flag(true, false))),
+            (TOOLTIP_DISPLAY_CLASS, "DEFAULT") => return Some(Ok(tooltip_display())),
+            _ => {}
         }
         // `java.awt.Color` is a JDK singleton family even on a server host;
         // model both the upper- and lower-case field spellings everywhere.
@@ -1639,9 +1781,9 @@ impl StdHost {
             let frame = state.frame.as_deref();
             return Some(match r.name.as_str() {
                 "getToolTip" => Ok(marker(TOOLTIP_LIST)),
-                "getItemStack" => Ok(marker(format!("{}tooltip", items::STACK))),
-                "getFlags" => Ok(marker(TOOLTIP_FLAG)),
-                "getContext" => Ok(marker(TOOLTIP_CONTEXT)),
+                "getItemStack" => Ok(tooltip_stack()),
+                "getFlags" => Ok(tooltip_flag_from_frame()),
+                "getContext" => Ok(tooltip_context()),
                 "getEntity" => Ok(frame
                     .and_then(|f| f.player.as_ref())
                     .map_or(Value::Ref(None), |_| marker(PLAYER))),
@@ -1987,31 +2129,6 @@ impl StdHost {
                     _ => None,
                 }
             }
-            TOOLTIP_FLAG => match (name, returns) {
-                ("isAdvanced", "Z") => Some(flag(frame.advanced_tooltips)),
-                ("isCreative", "Z") => Some(flag(false)),
-                _ => None,
-            },
-            TOOLTIP_CONTEXT => match (name, returns) {
-                // The context is deliberately frame-backed: a mod that asks
-                // for the client level/player sees the same objects as the
-                // tooltip callback, while an absent world remains null.
-                ("level", _) | ("level", "Lnet/minecraft/client/multiplayer/ClientLevel;")
-                    if frame.level.is_some() =>
-                {
-                    Some(marker(LEVEL))
-                }
-                ("player", _) | ("player", "Lnet/minecraft/world/entity/player/Player;")
-                    if frame.player.is_some() =>
-                {
-                    Some(marker(PLAYER))
-                }
-                ("tickRate", "F") => Some(Value::Float(20.0)),
-                _ => None,
-            },
-            // TooltipDisplay's default record has no observable members
-            // needed by vanilla item appenders; unknown access stays counted.
-            TOOLTIP_DISPLAY => None,
             GAME_RENDERER => match (name, returns) {
                 ("getMainCamera" | "mainCamera", _) if frame.camera.is_some() => {
                     Some(marker(CAMERA))
@@ -2341,11 +2458,84 @@ fn uuid_text(uuid: u128) -> String {
     )
 }
 
+impl StdHost {
+    /// Instance calls on dedicated tooltip handles (`TooltipConsumer`,
+    /// `TooltipContext`, `TooltipDisplay`, `TooltipFlag`). `Object` methods
+    /// (`toString`, `hashCode`, `equals`, `getClass`) are handled and counted
+    /// earlier via `host_ref.rs`.
+    pub(crate) fn tooltip_handle_call(
+        &mut self,
+        r: &MethodRef,
+        receiver: &Value,
+        args: &[Value],
+    ) -> Option<Result<Value, NativeError>> {
+        let Value::Host(handle) = receiver else {
+            return None;
+        };
+        match handle.kind() {
+            HostKind::TooltipConsumer => {
+                if r.name == "accept" && r.descriptor == "(Ljava/lang/Object;)V" {
+                    let Some(value) = args.first().cloned() else {
+                        return Some(self.unknown_host_call(r));
+                    };
+                    let Some(lines) = self.tooltip_sinks.get_mut(handle.key()) else {
+                        return Some(self.unknown_host_call(r));
+                    };
+                    lines.push(value);
+                    return Some(Ok(Value::Void));
+                }
+                Some(self.unknown_host_call(r))
+            }
+            HostKind::TooltipContext => {
+                if r.name == "tickRate"
+                    && r.descriptor == "()F"
+                    && let Some(rate) = self.client.frame.as_ref().and_then(|f| f.tick_rate)
+                {
+                    return Some(Ok(Value::Float(f64::from(rate))));
+                }
+                Some(self.unknown_host_call(r))
+            }
+            HostKind::TooltipDisplay => Some(self.unknown_host_call(r)),
+            HostKind::TooltipFlag => {
+                let flags = if let Some(explicit) = parse_explicit_tooltip_flag(handle.key()) {
+                    Some(explicit)
+                } else if handle.key() == "frame" {
+                    self.client
+                        .frame
+                        .as_ref()
+                        .map(|f| (f.advanced_tooltips, f.creative_tooltips))
+                } else {
+                    None
+                };
+                let Some((advanced, creative)) = flags else {
+                    return Some(self.unknown_host_call(r));
+                };
+                match (r.name.as_str(), r.descriptor.as_str()) {
+                    ("isAdvanced", "()Z") => Some(Ok(flag(advanced))),
+                    ("isCreative", "()Z") => Some(Ok(flag(creative))),
+                    ("asCreative", "()Lnet/minecraft/world/item/TooltipFlag$Default;") => {
+                        Some(Ok(tooltip_flag(advanced, true)))
+                    }
+                    _ => Some(self.unknown_host_call(r)),
+                }
+            }
+            _ => None,
+        }
+    }
+}
+
 impl NativeJar {
     /// Run an item's own 26.3 `appendHoverText` implementation. The caller
     /// supplies the item object and the real frame-equivalent arguments; this
-    /// helper only supplies the collecting `Consumer<Component>`, preserving
+    /// helper supplies an opaque `Consumer<Component>` sink, preserving
     /// translatable components and their styles for Sunrise to resolve.
+    ///
+    /// Override resolution walks the full linked class hierarchy (this jar and
+    /// linked library/mod jars) considering only non-static, non-private
+    /// instance overrides. Reaching vanilla `Item` or `BlockItem` proves there
+    /// is no jar override (`Item.appendHoverText` is `0: return` and
+    /// `BlockItem` does not override it in 26.3); an unresolvable superclass is
+    /// counted rather than assumed to be a no-op.
     pub fn run_item_tooltip(
         &self,
         item: &Value,
@@ -2356,34 +2546,63 @@ impl NativeJar {
         host: &mut StdHost,
         budget: &ExecutionBudget,
     ) -> Result<Vec<Value>, NativeError> {
-        let descriptor = "(Lnet/minecraft/world/item/ItemStack;Lnet/minecraft/world/item/Item$TooltipContext;Lnet/minecraft/world/item/component/TooltipDisplay;Ljava/util/function/Consumer;Lnet/minecraft/world/item/TooltipFlag;)V";
-        let mut owner = crate::jar_object::value_marker_class(item)
+        const DESCRIPTOR: &str = "(Lnet/minecraft/world/item/ItemStack;Lnet/minecraft/world/item/Item$TooltipContext;Lnet/minecraft/world/item/component/TooltipDisplay;Ljava/util/function/Consumer;Lnet/minecraft/world/item/TooltipFlag;)V";
+        const ACC_PRIVATE: u16 = 0x0002;
+        let mut current = crate::jar_object::value_marker_class(item)
             .ok_or_else(|| NativeError::MissingMethod("Item#appendHoverText receiver".into()))?
             .to_owned();
-        let mut jar_owned = false;
-        while let Some(class) = self.classes.get(&owner) {
-            if class.method("appendHoverText", descriptor).is_some() {
-                jar_owned = true;
+        let linked = crate::Host::linked_class_table(host)
+            .cloned()
+            .unwrap_or_default();
+        let mut override_owner = None;
+        let mut reached_known_noop = false;
+        for _ in 0..crate::MAX_SUPERCLASS_WALK {
+            if matches!(
+                current.as_str(),
+                "net/minecraft/world/item/Item" | "net/minecraft/world/item/BlockItem"
+            ) {
+                reached_known_noop = true;
                 break;
             }
-            if class.super_name.is_empty() {
+            let class = self.classes.get(&current).or_else(|| {
+                if crate::Host::models_class(host, &current) {
+                    None
+                } else {
+                    linked.get(&current)
+                }
+            });
+            let Some(class) = class else {
+                break;
+            };
+            if let Some(method) = class.method("appendHoverText", DESCRIPTOR)
+                && !method.is_static()
+                && (method.access & ACC_PRIVATE) == 0
+            {
+                override_owner = Some(current.clone());
                 break;
             }
-            owner = class.super_name.clone();
+            if class.super_name.is_empty() || class.super_name == current {
+                break;
+            }
+            current = class.super_name.clone();
         }
-        if !jar_owned {
-            // A vanilla item has no jar body to execute. Sunrise already owns
-            // the vanilla lines; returning an empty delta keeps this helper
-            // strictly about mod-owned overrides.
+        let Some(owner) = override_owner else {
+            if !reached_known_noop {
+                let _ = host.unknown_host_call(&MethodRef {
+                    owner: current,
+                    name: "appendHoverText".into(),
+                    descriptor: DESCRIPTOR.into(),
+                })?;
+            }
             return Ok(Vec::new());
-        }
+        };
         let sink = host.tooltip_sink();
         let args = [stack, context, display, sink.clone(), flag];
         let result = self.invoke_persistent(
             &MethodRef {
                 owner,
                 name: "appendHoverText".into(),
-                descriptor: descriptor.into(),
+                descriptor: DESCRIPTOR.into(),
             },
             Some(item.clone()),
             &args,

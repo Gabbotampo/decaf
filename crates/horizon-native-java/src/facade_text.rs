@@ -37,19 +37,25 @@
 
 use serde_json::{Map, Value as Json, json};
 
-use crate::host_component::{ComponentState, MAX_JSON_BYTES, States};
-use crate::{Boxed, Host, MethodRef, NativeError, Runtime, Value, expect_ref, format_java_float};
+use crate::host_component::{CODEC_STYLE_KEYS, ComponentState, MAX_JSON_BYTES, States};
+use crate::{Boxed, Host, MethodRef, NativeError, Runtime, Value, expect_ref};
 
 const COMPONENT: &str = "net/minecraft/network/chat/Component";
 const MUTABLE: &str = "net/minecraft/network/chat/MutableComponent";
 const FORMATTING_PREFIX: &str = "enum/net/minecraft/ChatFormatting/";
 const RETURNS_MUTABLE: &str = ")Lnet/minecraft/network/chat/MutableComponent;";
 
-/// The vanilla JSON a component holds now, its changed siblings and
+/// The structured object JSON a component holds now, its changed siblings and
 /// arguments resolved through `states` (`host_component.rs`), or `None` when
 /// `value` is not a component.
 pub(crate) fn json_now(value: &Value, states: Option<&States>) -> Option<Json> {
     crate::host_component::json_in(value, states, &argument)
+}
+
+/// Vanilla's `ComponentSerialization.CODEC` + `JsonOps.INSTANCE` JSON for
+/// `value` (plain literals collapsed to strings; fields in codec order).
+pub(crate) fn codec_json_now(value: &Value, states: Option<&States>) -> Option<Json> {
+    crate::host_component::codec_json_in(value, states, &argument)
 }
 
 /// A new component of `json`.
@@ -93,41 +99,34 @@ pub(crate) fn plain(json: &Json) -> String {
     out
 }
 
-/// One translation argument that is not a component, as vanilla's
-/// `TranslatableContents` serialises it: a primitive as a JSON primitive,
-/// anything else as its text (a component resolves through its host).
-pub(crate) fn argument(value: &Value) -> Json {
+/// One translation argument that is not a component, matching Minecraft 26.3's
+/// `TranslatableContents.isAllowedPrimitiveArgument`: only `Number`, `Boolean`,
+/// and `String` are allowed. Anything vanilla's codec rejects (`null`,
+/// `Character`, arbitrary objects, non-finite floats) returns `None` so callers
+/// count it rather than stringifying it.
+pub(crate) fn argument(value: &Value) -> Option<Json> {
     match value {
-        Value::Int(v) => json!(v),
-        Value::Long(v) => json!(v),
-        Value::Float(v) => serde_json::Number::from_f64(*v)
-            .map_or_else(|| json!(format_java_float(*v)), Json::Number),
-        Value::Ref(None) => json!("null"),
-        Value::Boxed(Boxed::Boolean(b)) => json!(b),
-        Value::Boxed(boxed @ Boxed::Character(_)) => json!(boxed.text()),
+        Value::Int(v) => Some(json!(v)),
+        Value::Long(v) => Some(json!(v)),
+        Value::Float(v) => serde_json::Number::from_f64(*v).map(Json::Number),
+        Value::Boxed(Boxed::Boolean(b)) => Some(json!(b)),
         Value::Boxed(Boxed::Float(bits)) => {
-            serde_json::Number::from_f64(f64::from(f32::from_bits(*bits))).map_or_else(
-                || json!(format_java_float(f64::from(f32::from_bits(*bits)))),
-                Json::Number,
-            )
+            serde_json::Number::from_f64(f64::from(f32::from_bits(*bits))).map(Json::Number)
         }
-        Value::Boxed(boxed) => json!(boxed.int()),
-        Value::Ref(Some(text)) => json!(text),
-        Value::Host(_) => json!(crate::value_text(value)),
-        Value::Void => json!(""),
+        Value::Boxed(Boxed::Byte(v)) => Some(json!(v)),
+        Value::Boxed(Boxed::Short(v)) => Some(json!(v)),
+        Value::Boxed(Boxed::Integer(v)) => Some(json!(v)),
+        Value::Ref(Some(text))
+            if !(text.starts_with("enum/") && !crate::value_class::is_plain_string(text)) =>
+        {
+            Some(json!(text))
+        }
+        Value::Ref(_) | Value::Boxed(Boxed::Character(_)) | Value::Host(_) | Value::Void => None,
     }
 }
 
 /// `Style.applyFormat`: the JSON style keys one `ChatFormatting` sets.
 fn apply_format(object: &mut Map<String, Json>, format: &str) -> Result<(), String> {
-    const STYLE_KEYS: [&str; 6] = [
-        "color",
-        "bold",
-        "italic",
-        "underlined",
-        "strikethrough",
-        "obfuscated",
-    ];
     let decoration = match format {
         "BOLD" => "bold",
         "ITALIC" => "italic",
@@ -135,7 +134,7 @@ fn apply_format(object: &mut Map<String, Json>, format: &str) -> Result<(), Stri
         "STRIKETHROUGH" => "strikethrough",
         "OBFUSCATED" => "obfuscated",
         "RESET" => {
-            STYLE_KEYS.iter().for_each(|key| {
+            CODEC_STYLE_KEYS.iter().for_each(|key| {
                 object.remove(*key);
             });
             return Ok(());
@@ -246,6 +245,19 @@ impl<H: Host> Runtime<'_, H> {
                 }
                 return Ok(Some(made));
             }
+            if name == "translatableWithFallback"
+                && descriptor == format!("(Ljava/lang/String;Ljava/lang/String;{RETURNS_MUTABLE}")
+                && let [key, fallback] = args
+            {
+                let Some(key) = expect_ref(key) else {
+                    return Ok(None);
+                };
+                let mut object = Map::from_iter([("translate".to_owned(), json!(key))]);
+                if let Some(fallback) = expect_ref(fallback) {
+                    object.insert("fallback".into(), json!(fallback));
+                }
+                return bounded(Json::Object(object)).map(Some);
+            }
             let (key, fallback, array) = match (name, args) {
                 ("translatable" | "translatableEscape", [key, array])
                     if descriptor
@@ -266,11 +278,41 @@ impl<H: Host> Runtime<'_, H> {
             let Some(key) = expect_ref(key) else {
                 return Ok(None);
             };
-            let values = self.array(array)?.into_owned();
-            let with: Vec<Json> = values
-                .iter()
-                .map(|value| self.component_now(value).unwrap_or_else(|| argument(value)))
-                .collect();
+            let raw_values = self.array(array)?.into_owned();
+            let escape = name == "translatableEscape";
+            let mut values = Vec::with_capacity(raw_values.len());
+            let mut with = Vec::with_capacity(raw_values.len());
+            for value in raw_values {
+                if crate::host_component::is_component(&value) {
+                    let Some(json) = self.component_now(&value) else {
+                        return self.host.unknown_operand_call(r).map(Some);
+                    };
+                    values.push(value);
+                    with.push(json);
+                } else if let Some(json) = argument(&value) {
+                    values.push(value);
+                    with.push(json);
+                } else if escape {
+                    // `Component.translatableEscape` converts non-component,
+                    // non-allowed arguments with `String.valueOf(arg)` before
+                    // delegating to `translatable`.
+                    let escaped = match &value {
+                        Value::Ref(None) => Some("null".to_owned()),
+                        Value::Boxed(boxed @ Boxed::Character(_)) => Some(boxed.text()),
+                        _ => None,
+                    };
+                    let Some(escaped) = escaped else {
+                        return self.host.unknown_operand_call(r).map(Some);
+                    };
+                    with.push(json!(escaped));
+                    values.push(Value::Ref(Some(escaped)));
+                } else {
+                    // Vanilla's `ComponentSerialization.CODEC` rejects this
+                    // argument ("This value needs to be parsed as component"):
+                    // count it rather than stringifying it.
+                    return self.host.unknown_operand_call(r).map(Some);
+                }
+            }
             let mut object = Map::from_iter([("translate".to_owned(), json!(key))]);
             if let Some(fallback) = fallback.and_then(expect_ref) {
                 object.insert("fallback".into(), json!(fallback));
@@ -287,7 +329,7 @@ impl<H: Host> Runtime<'_, H> {
                     ComponentState {
                         base: object,
                         siblings: Vec::new(),
-                        args: Some(values),
+                        args: (!values.is_empty()).then_some(values),
                     },
                 );
             }
@@ -345,8 +387,13 @@ impl<H: Host> Runtime<'_, H> {
                     formats.push(format.to_owned());
                 }
                 self.change_component(r, receiver, |state| {
+                    // `Style.applyFormats` returns `Style.EMPTY` immediately on `RESET`,
+                    // ignoring any remaining formats in the varargs array.
                     for format in &formats {
                         let _ = apply_format(&mut state.base, format);
+                        if format == "RESET" {
+                            break;
+                        }
                     }
                 })
             }
@@ -434,19 +481,40 @@ mod tests {
 
     #[test]
     fn arguments_serialise_as_vanilla_keeps_them() {
-        assert_eq!(argument(&Value::Int(7)), json!(7));
-        assert_eq!(argument(&Value::Boxed(Boxed::Integer(3))), json!(3));
+        assert_eq!(argument(&Value::Int(7)), Some(json!(7)));
+        assert_eq!(argument(&Value::Boxed(Boxed::Integer(3))), Some(json!(3)));
+        assert_eq!(
+            argument(&Value::Boxed(Boxed::Boolean(true))),
+            Some(json!(true))
+        );
+        assert_eq!(argument(&Value::Long(42)), Some(json!(42)));
+        assert_eq!(argument(&Value::Float(1.5)), Some(json!(1.5)));
         // A String spelled like the old box marker is text.
         assert_eq!(
             argument(&Value::Ref(Some("integer:3".into()))),
-            json!("integer:3")
+            Some(json!("integer:3"))
         );
-        assert_eq!(argument(&Value::Ref(Some("Alex".into()))), json!("Alex"));
+        assert_eq!(
+            argument(&Value::Ref(Some("Alex".into()))),
+            Some(json!("Alex"))
+        );
         // A String spelled like the old component marker is a String argument.
         assert_eq!(
             argument(&Value::Ref(Some("component/literal/Alex".into()))),
-            json!("component/literal/Alex")
+            Some(json!("component/literal/Alex"))
         );
+        // Arguments rejected by vanilla's `TranslatableContents.isAllowedPrimitiveArgument`:
+        // `null`, `Character`, arbitrary host objects, and non-finite floats.
+        assert_eq!(argument(&Value::Ref(None)), None);
+        assert_eq!(argument(&Value::Boxed(Boxed::Character('c' as u16))), None);
+        assert_eq!(
+            argument(&Value::Host(crate::HostRef::new(
+                crate::HostKind::JarObject,
+                "java/lang/Object#0",
+            ))),
+            None
+        );
+        assert_eq!(argument(&Value::Float(f64::NAN)), None);
         assert_eq!(
             plain(&json!({"text": "a", "extra": ["b", {"translate": "k"}]})),
             "abk"

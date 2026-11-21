@@ -420,8 +420,13 @@ impl StdHost {
         if let Some(text) = crate::menu_models::keyed_text(&self.menu_states, marker) {
             out.push(text);
         }
-        if self.tooltip_sinks.contains(marker) {
+        if let Some(lines) = self.tooltip_sinks.get(marker) {
             out.push(marker.to_owned());
+            for line in lines {
+                for text in value_texts(line) {
+                    out.push(text.to_owned());
+                }
+            }
         }
     }
 
@@ -460,7 +465,7 @@ impl StdHost {
             .chain(self.render_objects.keys())
             .chain(self.ranged_attributes.keys())
             .chain(self.menu_states.keys())
-            .chain(self.tooltip_sinks.iter())
+            .chain(self.tooltip_sinks.keys())
             .map(String::as_str)
     }
 
@@ -501,7 +506,7 @@ impl StdHost {
         self.empty_collections.retain(|key| keep(key));
         self.ranged_attributes.retain(|key, _| keep(key));
         self.menu_states.retain(|key, _| keep(key));
-        self.tooltip_sinks.retain(|key| keep(key));
+        self.tooltip_sinks.retain(|key, _| keep(key));
         self.jdk_list_of.retain(|key| keep(key));
         self.render_objects.retain(|key, _| keep(key));
     }

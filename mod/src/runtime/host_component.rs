@@ -191,68 +191,209 @@ pub(crate) fn state_of(value: &Value, states: Option<&States>) -> Option<Compone
     })
 }
 
-/// The vanilla JSON `value` stands for now, its siblings and component arguments as they are
-/// now; `None` for any other value, and for a tree past [`MAX_JSON_BYTES`] as rendered or
-/// nested past [`MAX_DEPTH`] (a reader counts it). Every read is bounded here, so a child that
-/// grows after it was appended cannot carry its parent past the bound. `argument` writes a
-/// translation argument that is not a component.
-pub(crate) fn json_in(
+/// `Style$Serializer.MAP_CODEC` field order (Minecraft 26.3 bytecode).
+pub(crate) const CODEC_STYLE_KEYS: [&str; 11] = [
+    "color",
+    "shadow_color",
+    "bold",
+    "italic",
+    "underlined",
+    "strikethrough",
+    "obfuscated",
+    "click_event",
+    "hover_event",
+    "insertion",
+    "font",
+];
+
+/// Reorder a component object's JSON members into Minecraft 26.3's
+/// `ComponentSerialization.CODEC` order: content fields (`text`, or `translate`
+/// / `fallback` / `with`), then `extra`, then `Style$Serializer` fields.
+fn order_codec_fields(
+    mut base: Map<String, Json>,
+    with: Option<Vec<Json>>,
+    extra: Option<Vec<Json>>,
+) -> Map<String, Json> {
+    let mut ordered = Map::new();
+    if let Some(text) = base.remove("text") {
+        ordered.insert("text".into(), text);
+    }
+    if let Some(translate) = base.remove("translate") {
+        ordered.insert("translate".into(), translate);
+    }
+    if let Some(fallback) = base.remove("fallback") {
+        ordered.insert("fallback".into(), fallback);
+    }
+    let existing_with = base.remove("with");
+    if let Some(with) = with {
+        if !with.is_empty() {
+            ordered.insert("with".into(), Json::Array(with));
+        }
+    } else if let Some(Json::Array(with)) = existing_with
+        && !with.is_empty()
+    {
+        ordered.insert("with".into(), Json::Array(with));
+    }
+    base.remove("extra");
+    let mut style = Vec::new();
+    for key in CODEC_STYLE_KEYS {
+        if let Some(value) = base.remove(key) {
+            style.push((key, value));
+        }
+    }
+    // Any other content fields (e.g. from decoded JSON) stay in the content section.
+    for (key, value) in base {
+        ordered.insert(key, value);
+    }
+    if let Some(extra) = extra
+        && !extra.is_empty()
+    {
+        ordered.insert("extra".into(), Json::Array(extra));
+    }
+    for (key, value) in style {
+        ordered.insert(key.into(), value);
+    }
+    ordered
+}
+
+/// Recursively collapse plain literal JSON objects (`{"text": s}` with no style
+/// or siblings) and order members in vanilla codec order, for pre-existing JSON
+/// inside `with` or `extra` of a decoded component.
+fn normalize_codec_json(json: Json) -> Json {
+    match json {
+        Json::Object(mut object) => {
+            let with = match object.remove("with") {
+                Some(Json::Array(items)) => {
+                    Some(items.into_iter().map(normalize_codec_json).collect())
+                }
+                _ => None,
+            };
+            let extra = match object.remove("extra") {
+                Some(Json::Array(items)) => {
+                    Some(items.into_iter().map(normalize_codec_json).collect())
+                }
+                _ => None,
+            };
+            let ordered = order_codec_fields(object, with, extra);
+            if ordered.len() == 1
+                && let Some(Json::String(text)) = ordered.get("text")
+            {
+                return Json::String(text.clone());
+            }
+            Json::Object(ordered)
+        }
+        other => other,
+    }
+}
+
+fn resolve_component(
     value: &Value,
     states: Option<&States>,
-    argument: &dyn Fn(&Value) -> Json,
+    argument: &dyn Fn(&Value) -> Option<Json>,
+    collapse_plain: bool,
+    depth: usize,
+    budget: &mut usize,
 ) -> Option<Json> {
-    fn resolve(
-        value: &Value,
-        states: Option<&States>,
-        argument: &dyn Fn(&Value) -> Json,
-        depth: usize,
-        budget: &mut usize,
-    ) -> Option<Json> {
-        if depth > MAX_DEPTH {
-            return None;
-        }
-        let state = state_of(value, states)?;
-        // The node's own contents and style, as written (its children are charged below).
-        let own: usize = state
-            .base
-            .iter()
-            .filter(|(key, _)| !matches!(key.as_str(), "extra" | "with"))
-            .map(|(key, value)| key.len() + value.to_string().len() + 4)
-            .sum();
-        *budget = budget.checked_sub(own + 2)?;
-        let mut object = state.base;
-        if let Some(args) = &state.args {
+    if depth > MAX_DEPTH {
+        return None;
+    }
+    let state = state_of(value, states)?;
+    // The node's own contents and style, as written (its children are charged below).
+    let own: usize = state
+        .base
+        .iter()
+        .filter(|(key, _)| !matches!(key.as_str(), "extra" | "with"))
+        .map(|(key, value)| key.len() + value.to_string().len() + 4)
+        .sum();
+    *budget = budget.checked_sub(own + 2)?;
+    let mut base = state.base;
+    let with = if let Some(args) = &state.args {
+        if args.is_empty() {
+            None
+        } else {
             let mut with = Vec::with_capacity(args.len());
             for arg in args {
                 with.push(if is_component(arg) {
-                    resolve(arg, states, argument, depth + 1, budget)?
+                    resolve_component(arg, states, argument, collapse_plain, depth + 1, budget)?
                 } else {
-                    let arg = argument(arg);
+                    let arg = argument(arg)?;
                     *budget = budget.checked_sub(arg.to_string().len() + 1)?;
                     arg
                 });
             }
-            object.insert("with".into(), Json::Array(with));
-        } else if let Some(with) = object.get("with") {
-            *budget = budget.checked_sub(with.to_string().len())?;
+            Some(with)
         }
-        if let Some(extra) = object.get("extra") {
-            *budget = budget.checked_sub(extra.to_string().len())?;
+    } else if let Some(existing) = base.get("with") {
+        *budget = budget.checked_sub(existing.to_string().len())?;
+        if collapse_plain && let Some(Json::Array(items)) = base.remove("with") {
+            Some(items.into_iter().map(normalize_codec_json).collect())
+        } else {
+            None
         }
-        if !state.siblings.is_empty() {
-            let mut extra = match object.remove("extra") {
-                Some(Json::Array(extra)) => extra,
-                _ => Vec::new(),
-            };
-            for sibling in &state.siblings {
-                extra.push(resolve(sibling, states, argument, depth + 1, budget)?);
-            }
-            object.insert("extra".into(), Json::Array(extra));
-        }
-        Some(Json::Object(object))
+    } else {
+        None
+    };
+    if let Some(extra) = base.get("extra") {
+        *budget = budget.checked_sub(extra.to_string().len())?;
     }
+    let mut extra = match base.remove("extra") {
+        Some(Json::Array(existing)) => {
+            if collapse_plain {
+                existing.into_iter().map(normalize_codec_json).collect()
+            } else {
+                existing
+            }
+        }
+        _ => Vec::new(),
+    };
+    for sibling in &state.siblings {
+        extra.push(resolve_component(
+            sibling,
+            states,
+            argument,
+            collapse_plain,
+            depth + 1,
+            budget,
+        )?);
+    }
+    let extra = (!extra.is_empty()).then_some(extra);
+    let ordered = order_codec_fields(base, with, extra);
+    if collapse_plain
+        && ordered.len() == 1
+        && let Some(Json::String(text)) = ordered.get("text")
+    {
+        return Some(Json::String(text.clone()));
+    }
+    Some(Json::Object(ordered))
+}
+
+/// The structured object JSON `value` stands for now, its siblings and component
+/// arguments as they are now (each component node kept as a JSON object for
+/// internal readers such as `plain_tree`, `tree_hash`, and `bare_literal`);
+/// `None` for any other value, an unsupported translation argument, or a tree
+/// past [`MAX_JSON_BYTES`] as rendered or nested past [`MAX_DEPTH`].
+pub(crate) fn json_in(
+    value: &Value,
+    states: Option<&States>,
+    argument: &dyn Fn(&Value) -> Option<Json>,
+) -> Option<Json> {
     let mut budget = MAX_JSON_BYTES;
-    resolve(value, states, argument, 0, &mut budget)
+    resolve_component(value, states, argument, false, 0, &mut budget)
+}
+
+/// The vanilla `ComponentSerialization.CODEC` + `JsonOps.INSTANCE` JSON `value`
+/// encodes to now: plain literal components (no style, no siblings) collapse to
+/// JSON strings at every level (`Component.tryCollapseToString`), and object
+/// members follow vanilla's codec order (content fields, then `extra`, then
+/// `Style$Serializer` fields). `None` for non-components, unsupported
+/// translation arguments, or trees past the resolution bounds.
+pub(crate) fn codec_json_in(
+    value: &Value,
+    states: Option<&States>,
+    argument: &dyn Fn(&Value) -> Option<Json>,
+) -> Option<Json> {
+    let mut budget = MAX_JSON_BYTES;
+    resolve_component(value, states, argument, true, 0, &mut budget)
 }
 
 /// Change the component `receiver` in place: `change` its state, then keep it in `states`. The
@@ -262,7 +403,7 @@ pub(crate) fn json_in(
 pub(crate) fn change(
     states: &mut States,
     receiver: &Value,
-    _argument: &dyn Fn(&Value) -> Json,
+    _argument: &dyn Fn(&Value) -> Option<Json>,
     change: impl FnOnce(&mut ComponentState),
 ) -> Result<(), NativeError> {
     let (Some(handle), Some(mut state)) = (handle_of(receiver), state_of(receiver, Some(states)))
