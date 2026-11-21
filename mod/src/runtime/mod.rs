@@ -33642,6 +33642,11 @@ impl<H: Host> Runtime<'_, H> {
         }
         let receiver = receiver.expect("checked above");
         let other = args.first().unwrap_or(&Value::Ref(None));
+        if self.uncertain_identity_root(receiver, r).is_some()
+            || self.uncertain_identity_root(other, r).is_some()
+        {
+            return None;
+        }
         Some(
             self.abstract_set_equals(receiver, other)
                 .map(|equal| Value::Int(i32::from(equal))),
@@ -33728,6 +33733,29 @@ impl<H: Host> Runtime<'_, H> {
         Some(self.host.unknown_operand_call(r))
     }
 
+    /// Guard uncertain identity collections and any handle derived from them
+    /// ahead of JDK skeletons, spliterators, streams, iterators, and collection
+    /// models, then fall through to `unmodifiable_member`.
+    #[inline(never)]
+    fn invoke_uncertain_identity_or_unmodifiable(
+        &mut self,
+        r: &MethodRef,
+        op: u8,
+        receiver: Option<&Value>,
+        args: &[Value],
+    ) -> Result<Option<Value>, NativeError> {
+        if let Some(value) = self.count_if_uncertain_identity_operand(r, op, receiver, args)? {
+            return Ok(Some(value));
+        }
+        if let Some(marker) = receiver.and_then(expect_ref)
+            && is_collection_owner(&r.owner)
+            && let Some(result) = self.host.unmodifiable_member(r, marker, args)
+        {
+            return result.map(Some);
+        }
+        Ok(None)
+    }
+
     /// Dispatch the collection/library models as one out-of-line stage. Each
     /// model is tried in the same order as the flat dispatcher; propagating an
     /// error lets the caller deliver it through the current jar frame.
@@ -33742,9 +33770,6 @@ impl<H: Host> Runtime<'_, H> {
         class: &str,
         method: &str,
     ) -> Result<Option<Value>, NativeError> {
-        if let Some(value) = self.count_if_uncertain_identity_operand(r, op, receiver, args)? {
-            return Ok(Some(value));
-        }
         if let Some(value) = self.invoke_enum_set_text(r, receiver)? {
             return Ok(Some(value));
         }
@@ -36092,14 +36117,17 @@ impl<H: Host> Runtime<'_, H> {
                         dispatched = Some(invoke_or_catch!(at, value));
                     }
                     if dispatched.is_none()
-                        && let Some(value) =
-                            receiver.as_ref().and_then(expect_ref).and_then(|marker| {
-                                is_collection_owner(&r.owner)
-                                    .then(|| self.host.unmodifiable_member(&r, marker, &args))
-                                    .flatten()
-                            })
+                        && let Some(value) = invoke_or_catch!(
+                            at,
+                            self.invoke_uncertain_identity_or_unmodifiable(
+                                &r,
+                                op,
+                                receiver.as_ref(),
+                                &args
+                            )
+                        )
                     {
-                        dispatched = Some(invoke_or_catch!(at, value));
+                        dispatched = Some(value);
                     }
                     if dispatched.is_none()
                         && let Some(value) = invoke_or_catch!(
@@ -36933,6 +36961,13 @@ impl<H: Host> Runtime<'_, H> {
                         );
                     }
                     let value = self.materialize_host_value(value);
+                    self.record_identity_derivation(
+                        &r,
+                        jar_body,
+                        taint_receiver.as_ref(),
+                        &args,
+                        &value,
+                    );
                     // No JDK or library API answers a `null` Optional: a host
                     // answer of null for one is its empty value.
                     let value = match empty_optional_for(&r.descriptor) {

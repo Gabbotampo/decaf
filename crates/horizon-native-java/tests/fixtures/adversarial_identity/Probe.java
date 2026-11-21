@@ -1,6 +1,7 @@
 package demo;
 import java.util.*;
 import java.util.function.*;
+import java.util.stream.*;
 public class Probe {
   static final IdentityHashMap<String,Integer> shared = new IdentityHashMap<>();
   static String result(String s) { return s; }
@@ -339,6 +340,173 @@ public class Probe {
       return "ex:" + e.getClass().getSimpleName();
     }
   }
+  static final class EqAtom {
+    final String label;
+    EqAtom(String label) { this.label = label; }
+    @Override public boolean equals(Object o) { return o instanceof EqAtom a && label.equals(a.label); }
+    @Override public int hashCode() { return label.hashCode(); }
+  }
+  static String idMapOneEntryDistinctEq() {
+    IdentityHashMap<String, String> a = new IdentityHashMap<>();
+    IdentityHashMap<String, String> b = new IdentityHashMap<>();
+    a.put(new String("k"), new String("v"));
+    b.put(new String("k"), new String("v"));
+    return a.equals(b) + ":" + b.equals(a);
+  }
+  static String idMapOneEntrySameKDistinctVEq() {
+    IdentityHashMap<String, String> a = new IdentityHashMap<>();
+    IdentityHashMap<String, String> b = new IdentityHashMap<>();
+    String k = new String("k");
+    a.put(k, new String("v"));
+    b.put(k, new String("v"));
+    return String.valueOf(a.equals(b));
+  }
+  static String idMapOneEntrySameKVEq() {
+    IdentityHashMap<String, String> a = new IdentityHashMap<>();
+    IdentityHashMap<String, String> b = new IdentityHashMap<>();
+    String k = new String("k"), v = new String("v");
+    a.put(k, v);
+    b.put(k, v);
+    IdentityHashMap<String, String> e1 = new IdentityHashMap<>();
+    IdentityHashMap<String, String> e2 = new IdentityHashMap<>();
+    IdentityHashMap<String, String> n = new IdentityHashMap<>();
+    n.put(null, null);
+    return a.equals(b) + ":" + e1.equals(e2) + ":" + e1.hashCode() + ":" + n.hashCode();
+  }
+  static String idMapOneEntryHashCode() {
+    IdentityHashMap<String, String> a = new IdentityHashMap<>();
+    IdentityHashMap<String, String> b = new IdentityHashMap<>();
+    a.put(new String("k"), new String("v"));
+    b.put(new String("k"), new String("v"));
+    return a.equals(b) + ":" + b.equals(a) + ":" + (a.hashCode() == b.hashCode());
+  }
+  static String idMapVsHashMapJarKeys() {
+    EqAtom k1 = new EqAtom("k"), k2 = new EqAtom("k");
+    EqAtom v1 = new EqAtom("v"), v2 = new EqAtom("v");
+    IdentityHashMap<EqAtom, EqAtom> id = new IdentityHashMap<>();
+    id.put(k1, v1);
+    HashMap<EqAtom, EqAtom> sameKV = new HashMap<>(); sameKV.put(k1, v1);
+    HashMap<EqAtom, EqAtom> sameKDiffV = new HashMap<>(); sameKDiffV.put(k1, v2);
+    HashMap<EqAtom, EqAtom> diffKSameV = new HashMap<>(); diffKSameV.put(k2, v1);
+    HashMap<EqAtom, EqAtom> diffKDiffV = new HashMap<>(); diffKDiffV.put(k2, v2);
+    IdentityHashMap<EqAtom, EqAtom> idEmpty = new IdentityHashMap<>();
+    HashMap<EqAtom, EqAtom> hmEmpty = new HashMap<>();
+    return id.equals(sameKV) + ":" + sameKV.equals(id) + "|"
+        + id.equals(sameKDiffV) + ":" + sameKDiffV.equals(id) + "|"
+        + id.equals(diffKSameV) + ":" + diffKSameV.equals(id) + "|"
+        + id.equals(diffKDiffV) + ":" + diffKDiffV.equals(id) + "|"
+        + idEmpty.equals(hmEmpty) + ":" + hmEmpty.equals(idEmpty);
+  }
+  static String idMapVsHashMapStringKeys() {
+    IdentityHashMap<String, String> id = new IdentityHashMap<>();
+    id.put(new String("k"), new String("v"));
+    HashMap<String, String> hm = new HashMap<>();
+    hm.put(new String("k"), new String("v"));
+    return id.equals(hm) + ":" + hm.equals(id);
+  }
+  static String idMapKeySetEntrySetEq() {
+    String k1 = new String("k"), k2 = new String("k");
+    String v1 = new String("v"), v2 = new String("v");
+    IdentityHashMap<String, String> m1 = new IdentityHashMap<>(); m1.put(k1, v1);
+    IdentityHashMap<String, String> m2 = new IdentityHashMap<>(); m2.put(k2, v2);
+    IdentityHashMap<String, String> m3 = new IdentityHashMap<>(); m3.put(k1, v2);
+    return m1.keySet().equals(m2.keySet()) + ":"
+        + m1.keySet().equals(m3.keySet()) + ":"
+        + m1.entrySet().equals(m2.entrySet()) + ":"
+        + m1.entrySet().equals(m3.entrySet());
+  }
+  static String idMapKeySetHashCode() {
+    IdentityHashMap<String, String> m = new IdentityHashMap<>();
+    m.put(new String("k"), new String("v"));
+    return String.valueOf(m.keySet().hashCode() != 0 || m.keySet().hashCode() == 0);
+  }
+  static String reflectPutThenIterator() {
+    try {
+      IdentityHashMap<String, Integer> m = new IdentityHashMap<>();
+      m.put("a", 1);
+      Iterator<String> it = m.keySet().iterator();
+      java.lang.reflect.Method put = Map.class.getMethod("put", Object.class, Object.class);
+      put.invoke(m, "b", 2);
+      try {
+        int n = 0;
+        while (it.hasNext()) { it.next(); n++; }
+        return "n=" + n;
+      } catch (ConcurrentModificationException e) {
+        return "CME";
+      }
+    } catch (Exception e) {
+      return "ex:" + e.getClass().getSimpleName();
+    }
+  }
+  static String reflectPutThenStream() {
+    try {
+      IdentityHashMap<String, Integer> m = new IdentityHashMap<>();
+      m.put("a", 1);
+      Stream<String> st = m.keySet().stream();
+      java.lang.reflect.Method put = Map.class.getMethod("put", Object.class, Object.class);
+      put.invoke(m, "b", 2);
+      return "n=" + st.count();
+    } catch (Exception e) {
+      return "ex:" + e.getClass().getSimpleName();
+    }
+  }
+  static String reflectPutThenFilteredStream() {
+    try {
+      IdentityHashMap<String, Integer> m = new IdentityHashMap<>();
+      m.put("a", 1);
+      Stream<String> st = m.keySet().stream().filter(s -> s != null);
+      java.lang.reflect.Method put = Map.class.getMethod("put", Object.class, Object.class);
+      put.invoke(m, "b", 2);
+      return "n=" + st.toList().size();
+    } catch (Exception e) {
+      return "ex:" + e.getClass().getSimpleName();
+    }
+  }
+  static String reflectPutThenSpliterator() {
+    try {
+      IdentityHashMap<String, Integer> m = new IdentityHashMap<>();
+      m.put("a", 1);
+      Spliterator<String> sp = Spliterators.spliterator(m.keySet(), 0);
+      java.lang.reflect.Method put = Map.class.getMethod("put", Object.class, Object.class);
+      put.invoke(m, "b", 2);
+      int[] c = { 0 };
+      sp.forEachRemaining(x -> c[0]++);
+      return "n=" + c[0];
+    } catch (Exception e) {
+      return "ex:" + e.getClass().getSimpleName();
+    }
+  }
+  static String reflectPutThenStreamSupport() {
+    try {
+      IdentityHashMap<String, Integer> m = new IdentityHashMap<>();
+      m.put("a", 1);
+      Spliterator<String> sp = Spliterators.spliterator(m.keySet(), 0);
+      Stream<String> st = StreamSupport.stream(sp, false).map(s -> s + "!");
+      java.lang.reflect.Method put = Map.class.getMethod("put", Object.class, Object.class);
+      put.invoke(m, "b", 2);
+      return "n=" + st.count();
+    } catch (Exception e) {
+      return "ex:" + e.getClass().getSimpleName();
+    }
+  }
+  static String reflectPutThenIterSpliterator() {
+    try {
+      IdentityHashMap<String, Integer> m = new IdentityHashMap<>();
+      m.put("a", 1);
+      Spliterator<String> sp = Spliterators.spliterator(m.keySet().iterator(), 1, 0);
+      java.lang.reflect.Method put = Map.class.getMethod("put", Object.class, Object.class);
+      put.invoke(m, "b", 2);
+      try {
+        int[] c = { 0 };
+        sp.forEachRemaining(x -> c[0]++);
+        return "n=" + c[0];
+      } catch (ConcurrentModificationException e) {
+        return "CME";
+      }
+    } catch (Exception e) {
+      return "ex:" + e.getClass().getSimpleName();
+    }
+  }
   public static String sameClassCallsOut(){return sameClassCalls();}
   public static String computeCallsOut(){return computeCalls();}
   public static String classCallsOut(){return classCalls();}
@@ -378,4 +546,18 @@ public class Probe {
   public static String mutatingKeyDeepEqualsOut(){return mutatingKeyDeepEquals();}
   public static String reflectStaticUncachedTaintOut(){return reflectStaticUncachedTaint();}
   public static String reflectDeepChain600TaintOut(){return reflectDeepChain600Taint();}
+  public static String idMapOneEntryDistinctEqOut(){return idMapOneEntryDistinctEq();}
+  public static String idMapOneEntrySameKDistinctVEqOut(){return idMapOneEntrySameKDistinctVEq();}
+  public static String idMapOneEntrySameKVEqOut(){return idMapOneEntrySameKVEq();}
+  public static String idMapOneEntryHashCodeOut(){return idMapOneEntryHashCode();}
+  public static String idMapVsHashMapJarKeysOut(){return idMapVsHashMapJarKeys();}
+  public static String idMapVsHashMapStringKeysOut(){return idMapVsHashMapStringKeys();}
+  public static String idMapKeySetEntrySetEqOut(){return idMapKeySetEntrySetEq();}
+  public static String idMapKeySetHashCodeOut(){return idMapKeySetHashCode();}
+  public static String reflectPutThenIteratorOut(){return reflectPutThenIterator();}
+  public static String reflectPutThenStreamOut(){return reflectPutThenStream();}
+  public static String reflectPutThenFilteredStreamOut(){return reflectPutThenFilteredStream();}
+  public static String reflectPutThenSpliteratorOut(){return reflectPutThenSpliterator();}
+  public static String reflectPutThenStreamSupportOut(){return reflectPutThenStreamSupport();}
+  public static String reflectPutThenIterSpliteratorOut(){return reflectPutThenIterSpliterator();}
 }

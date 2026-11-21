@@ -71,6 +71,27 @@ fn adversarial_identity_review() {
         ("mutatingKeyDeepEqualsOut", "false:2"),
         ("reflectStaticUncachedTaintOut", "1"),
         ("reflectDeepChain600TaintOut", "1"),
+        // Round-5 findings: exact IdentityHashMap equals/hashCode at every size
+        // (including size 0/1 and cross-direction HashMap.equals(IdentityHashMap)),
+        // plus derived handles (iterator/stream/filtered stream/spliterator/StreamSupport)
+        // invalidated by the identity epoch after a reflective put.
+        ("idMapOneEntryDistinctEqOut", "false:false"),
+        ("idMapOneEntrySameKDistinctVEqOut", "false"),
+        ("idMapOneEntrySameKVEqOut", "true:true:0:0"),
+        ("idMapOneEntryHashCodeOut", "false:false:false"),
+        (
+            "idMapVsHashMapJarKeysOut",
+            "true:true|false:true|false:false|false:false|true:true",
+        ),
+        ("idMapVsHashMapStringKeysOut", "false:false"),
+        ("idMapKeySetEntrySetEqOut", "false:true:false:false"),
+        ("idMapKeySetHashCodeOut", "true"),
+        ("reflectPutThenIteratorOut", "CME"),
+        ("reflectPutThenStreamOut", "n=2"),
+        ("reflectPutThenFilteredStreamOut", "n=2"),
+        ("reflectPutThenSpliteratorOut", "n=2"),
+        ("reflectPutThenStreamSupportOut", "n=2"),
+        ("reflectPutThenIterSpliteratorOut", "CME"),
     ];
     let exact = [
         "sameClassCallsOut",
@@ -89,6 +110,11 @@ fn adversarial_identity_review() {
         "unmodEntryToArrayTypedOut",
         "unmodSyncEntryToArrayFnOut",
         "unmodUnmodEntryToArrayFnOut",
+        "idMapOneEntryDistinctEqOut",
+        "idMapOneEntrySameKDistinctVEqOut",
+        "idMapOneEntrySameKVEqOut",
+        "idMapVsHashMapJarKeysOut",
+        "idMapKeySetEntrySetEqOut",
     ];
     let must_count = [
         "loopAllocOut",
@@ -109,6 +135,15 @@ fn adversarial_identity_review() {
         "mutatingKeyDeepEqualsOut",
         "reflectStaticUncachedTaintOut",
         "reflectDeepChain600TaintOut",
+        "idMapOneEntryHashCodeOut",
+        "idMapVsHashMapStringKeysOut",
+        "idMapKeySetHashCodeOut",
+        "reflectPutThenIteratorOut",
+        "reflectPutThenStreamOut",
+        "reflectPutThenFilteredStreamOut",
+        "reflectPutThenSpliteratorOut",
+        "reflectPutThenStreamSupportOut",
+        "reflectPutThenIterSpliteratorOut",
     ];
     for (method, expected) in cases {
         let mut host = fixture.jar.seed_host(StdHost::new());
@@ -264,6 +299,81 @@ fn adversarial_identity_review() {
                     "mutatingKeyDeepEqualsOut must bump identity epoch and count IdentityHashMap#get: {calls:?}"
                 );
             }
+            if method == "idMapOneEntryHashCodeOut" {
+                let calls = host.unknown_host_calls();
+                assert!(
+                    calls
+                        .iter()
+                        .any(|(call, _)| call == "java/util/IdentityHashMap#hashCode()I"),
+                    "idMapOneEntryHashCodeOut must count IdentityHashMap#hashCode: {calls:?}"
+                );
+            }
+            if method == "idMapVsHashMapStringKeysOut" {
+                let calls = host.unknown_host_calls();
+                assert!(
+                    calls
+                        .iter()
+                        .any(|(call, _)| call
+                            == "java/util/IdentityHashMap#equals(Ljava/lang/Object;)Z"),
+                    "idMapVsHashMapStringKeysOut must count IdentityHashMap#equals: {calls:?}"
+                );
+                assert!(
+                    calls
+                        .iter()
+                        .any(|(call, _)| call == "java/util/HashMap#equals(Ljava/lang/Object;)Z"),
+                    "idMapVsHashMapStringKeysOut must count HashMap#equals: {calls:?}"
+                );
+            }
+            if method == "idMapKeySetHashCodeOut" {
+                let calls = host.unknown_host_calls();
+                assert!(
+                    calls
+                        .iter()
+                        .any(|(call, _)| call == "java/util/Set#hashCode()I"),
+                    "idMapKeySetHashCodeOut must count Set#hashCode: {calls:?}"
+                );
+            }
+            if method == "reflectPutThenIteratorOut" {
+                let calls = host.unknown_host_calls();
+                assert!(
+                    calls
+                        .iter()
+                        .any(|(call, _)| call == "java/util/Iterator#hasNext()Z"),
+                    "reflectPutThenIteratorOut must count Iterator#hasNext after epoch bump: {calls:?}"
+                );
+            }
+            if matches!(
+                method,
+                "reflectPutThenStreamOut" | "reflectPutThenStreamSupportOut"
+            ) {
+                let calls = host.unknown_host_calls();
+                assert!(
+                    calls
+                        .iter()
+                        .any(|(call, _)| call == "java/util/stream/Stream#count()J"),
+                    "{method} must count Stream#count after epoch bump: {calls:?}"
+                );
+            }
+            if method == "reflectPutThenFilteredStreamOut" {
+                let calls = host.unknown_host_calls();
+                assert!(
+                    calls
+                        .iter()
+                        .any(|(call, _)| call == "java/util/stream/Stream#toList()Ljava/util/List;"),
+                    "reflectPutThenFilteredStreamOut must count Stream#toList after epoch bump: {calls:?}"
+                );
+            }
+            if matches!(
+                method,
+                "reflectPutThenSpliteratorOut" | "reflectPutThenIterSpliteratorOut"
+            ) {
+                let calls = host.unknown_host_calls();
+                assert!(
+                    calls.iter().any(|(call, _)| call
+                        == "java/util/Spliterator#forEachRemaining(Ljava/util/function/Consumer;)V"),
+                    "{method} must count Spliterator#forEachRemaining after epoch bump: {calls:?}"
+                );
+            }
         } else if counted == 0 {
             assert_eq!(actual, expected, "{method}");
         } else {
@@ -309,6 +419,92 @@ public final class Probe {
             .any(|(call, _)| call == "java/util/Set#contains(Ljava/lang/Object;)Z"),
         "interned fresh key vs literal in IdentityHashSet must count Set#contains: {calls:?}"
     );
+}
+
+#[test]
+fn guava_identity_set_equals_hash_code_and_derived_handles() {
+    let sets_stub = r#"package com.google.common.collect;
+public final class Sets {
+  public static <E> java.util.Set<E> newIdentityHashSet() { throw new AssertionError(); }
+}"#;
+    let probe = r#"package demo;
+import com.google.common.collect.Sets;
+import java.lang.reflect.Method;
+import java.util.*;
+import java.util.stream.*;
+public final class Probe {
+  public static String exactEqAndEmptyHash() {
+    Set<String> s1 = Sets.newIdentityHashSet();
+    Set<String> s2 = Sets.newIdentityHashSet();
+    Set<String> sSame = Sets.newIdentityHashSet();
+    String k = new String("k");
+    s1.add(k);
+    s2.add(new String("k"));
+    sSame.add(k);
+    Set<String> empty = Sets.newIdentityHashSet();
+    return s1.equals(s2) + ":" + s1.equals(sSame) + ":" + empty.hashCode();
+  }
+  public static String nonEmptyHash() {
+    Set<String> s = Sets.newIdentityHashSet();
+    s.add(new String("k"));
+    return String.valueOf(s.hashCode());
+  }
+  public static String reflectAddThenDerived() throws Exception {
+    Set<String> s = Sets.newIdentityHashSet();
+    s.add("a");
+    Iterator<String> it = s.iterator();
+    Stream<String> st = s.stream().filter(x -> x != null);
+    Spliterator<String> sp = Spliterators.spliterator(s, 0);
+    Method add = Set.class.getMethod("add", Object.class);
+    add.invoke(s, "b");
+    boolean hn = it.hasNext();
+    long c = st.count();
+    int[] n = { 0 };
+    sp.forEachRemaining(x -> n[0]++);
+    return hn + ":" + c + ":" + n[0];
+  }
+}"#;
+    let fixture = Fixture::build(
+        "guava-identity-set-round5",
+        &[
+            ("com/google/common/collect/Sets.java", sets_stub),
+            ("demo/Probe.java", probe),
+        ],
+    );
+    let mut host = fixture.jar.seed_host(StdHost::new());
+    let actual = fixture.text_on(&mut host, "exactEqAndEmptyHash");
+    assert_eq!(
+        host.unknown_host_call_count(),
+        0,
+        "exactEqAndEmptyHash counted: {:?}",
+        host.unknown_host_calls()
+    );
+    assert_eq!(actual, "false:true:0");
+
+    let mut host = fixture.jar.seed_host(StdHost::new());
+    let _ = fixture.text_on(&mut host, "nonEmptyHash");
+    let calls = host.unknown_host_calls();
+    assert!(
+        calls
+            .iter()
+            .any(|(call, _)| call == "java/util/Set#hashCode()I"),
+        "non-empty IdentityHashSet#hashCode must be counted: {calls:?}"
+    );
+
+    let mut host = fixture.jar.seed_host(StdHost::new());
+    let _ = fixture.text_on(&mut host, "reflectAddThenDerived");
+    let calls = host.unknown_host_calls();
+    for expected in [
+        "java/lang/reflect/Method#invoke(Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;",
+        "java/util/Iterator#hasNext()Z",
+        "java/util/stream/Stream#count()J",
+        "java/util/Spliterator#forEachRemaining(Ljava/util/function/Consumer;)V",
+    ] {
+        assert!(
+            calls.iter().any(|(call, _)| call == expected),
+            "reflectAddThenDerived must count {expected}: {calls:?}"
+        );
+    }
 }
 
 #[test]

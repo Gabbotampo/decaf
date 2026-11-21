@@ -341,7 +341,13 @@ impl<H: Host> Runtime<'_, H> {
             let other = args.first().unwrap_or(&Value::Ref(None));
             return Ok(Value::Int(self.natural_order(receiver, other)?));
         }
+        if let Some(value) =
+            self.count_if_uncertain_identity_operand(&r, opcode, Some(receiver), args)?
+        {
+            return Ok(value);
+        }
         if let Some(value) = self.invoke_jdk_skeleton(&r, opcode, Some(receiver), args)? {
+            self.record_identity_derivation(&r, false, Some(receiver), args, &value);
             return Ok(value);
         }
         let mut values = Vec::with_capacity(args.len() + 1);
