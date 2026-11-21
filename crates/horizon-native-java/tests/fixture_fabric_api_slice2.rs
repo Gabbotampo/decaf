@@ -254,12 +254,12 @@ fn fabric_api_slice2_matches_java25_oracle() {
 
 #[test]
 fn runes_recipe_sync_entrypoint_registers_serializer() {
-    let path =
-        Path::new("/home/solenopsisbot/horizon-corpus/deps-pool/runes-fabric-1.3.2+26.3.jar");
-    if !path.exists() {
+    // The real Runes 1.3.2 jar isn't in the repo or on CI: point RUNES_JAR at it to run this.
+    let Some(path) = std::env::var_os("RUNES_JAR") else {
+        eprintln!("RUNES_JAR is unset; real Runes recipe-sync test skipped");
         return;
-    }
-    let jar = NativeJar::from_path(path).unwrap();
+    };
+    let jar = NativeJar::from_path(Path::new(&path)).unwrap();
     let mut host = StdHost::new();
     let entries = jar.discover_entrypoints("main");
     assert!(!entries.is_empty());
