@@ -1321,7 +1321,9 @@ fn semantic_string(components: &[i64], prerelease: Option<&str>) -> String {
 }
 
 fn fabric_predicate_matches(range: &str, version: Option<&str>) -> Option<bool> {
-    let version = version?;
+    // `VersionParser.parse` throws "Version must be a non-empty string!" for
+    // an empty version, so there is no answer to give.
+    let version = version.filter(|version| !version.is_empty())?;
     let terms = fabric_predicate_terms(range)?;
     let candidate = fabric_version(Some(version));
     Some(terms.iter().all(|term| {
@@ -2486,11 +2488,19 @@ mod tests {
         predicate.split(' ').any(|token| {
             let token = token.trim_start_matches(['>', '<', '=', '~', '^']);
             let numbers = token.split('+').next().unwrap_or("");
-            numbers.split_once('-').is_some_and(|(numbers, _)| {
-                numbers
-                    .split('.')
-                    .any(|part| matches!(part, "x" | "X" | "*"))
-            })
+            // Only a well-formed prerelease (non-empty dot-separated
+            // alphanumeric/hyphen identifiers) is exempt.
+            numbers
+                .split_once('-')
+                .is_some_and(|(numbers, prerelease)| {
+                    numbers
+                        .split('.')
+                        .any(|part| matches!(part, "x" | "X" | "*"))
+                        && prerelease.split('.').all(|part| {
+                            !part.is_empty()
+                                && part.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+                        })
+                })
         })
     }
 

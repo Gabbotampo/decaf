@@ -1629,3 +1629,9 @@
 {"predicate":"1.2.X-alpha","version":"\u00091.0","ok":false}
 {"predicate":"1.2.X-alpha","version":"1.0-beta","ok":false}
 {"predicate":"1.2.X-alpha","version":"1.2.3+build","ok":false}
+{"predicate":"","version":"","error":"net.fabricmc.loader.api.VersionParsingException: Version must be a non-empty string!"}
+{"predicate":"*","version":"","error":"net.fabricmc.loader.api.VersionParsingException: Version must be a non-empty string!"}
+{"predicate":">=1.0","version":"","error":"net.fabricmc.loader.api.VersionParsingException: Version must be a non-empty string!"}
+{"predicate":"1.0","version":"","error":"net.fabricmc.loader.api.VersionParsingException: Version must be a non-empty string!"}
+{"predicate":"1.2.x-alpha","version":"","error":"net.fabricmc.loader.api.VersionParsingException: Version must be a non-empty string!"}
+{"predicate":" ","version":"","error":"net.fabricmc.loader.api.VersionParsingException: Version must be a non-empty string!"}
