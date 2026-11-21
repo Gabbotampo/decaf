@@ -1374,6 +1374,7 @@ impl NativeJar {
             stream_plan: Default::default(),
             store_verdict: Default::default(),
             depth: 0,
+            next_frame_id: 0,
             budget,
         };
         let resident = runtime.adopt_resident_heap();

@@ -20965,6 +20965,7 @@ impl NativeJar {
             stream_plan: Default::default(),
             store_verdict: Default::default(),
             depth: 0,
+            next_frame_id: 0,
             budget,
         };
         if !runtime.classes.contains_key(&class_name) {
@@ -21192,6 +21193,7 @@ impl NativeJar {
             stream_plan: Default::default(),
             store_verdict: Default::default(),
             depth: 0,
+            next_frame_id: 0,
             budget,
         };
         // The callback sees the objects its entrypoint built, and the next
@@ -21375,6 +21377,7 @@ impl NativeJar {
             stream_plan: Default::default(),
             store_verdict: Default::default(),
             depth: 0,
+            next_frame_id: 0,
             budget: &ExecutionBudget::UNBOUNDED,
         };
         let resident = runtime.adopt_resident_heap();
@@ -23644,6 +23647,10 @@ struct Runtime<'a, H> {
     /// thread's stack (`frame_bound.rs`) in [`Runtime::invoke`] before a frame
     /// starts.
     depth: usize,
+    /// Monotonically increasing identity for each interpreter frame invocation.
+    /// A depth is insufficient because two sequential calls at the same depth
+    /// must still get distinct allocation provenance.
+    next_frame_id: u64,
     /// The wall-clock budget this execution honours, checked with
     /// [`BUDGET_CHECK_INSTRUCTIONS`] and in [`Runtime::invoke`].
     budget: &'a ExecutionBudget,
@@ -31417,9 +31424,11 @@ impl<H: Host> Runtime<'_, H> {
         if self.depth == 0 {
             jar_throwables::start_execution();
         }
+        let frame_id = self.next_frame_id;
+        self.next_frame_id = self.next_frame_id.wrapping_add(1);
         self.depth += 1;
         stack_walk::enter(class, method);
-        let result = self.invoke_frame(class, method, desc, receiver, args);
+        let result = self.invoke_frame(class, method, desc, receiver, args, frame_id);
         stack_walk::leave();
         self.depth -= 1;
         // An execution's end: a host walk's refusal no jar frame saw (the entrypoint's own
@@ -31743,6 +31752,7 @@ impl<H: Host> Runtime<'_, H> {
         desc: &str,
         receiver: Option<Value>,
         args: &[Value],
+        frame_id: u64,
     ) -> Result<Value, NativeError> {
         // Kotlin stdlib facades and holder methods are registration/runtime
         // surfaces: the native interpreter records their exact bounded result
@@ -33171,10 +33181,12 @@ impl<H: Host> Runtime<'_, H> {
                                 Value::Ref(Some(text)) if value_class::is_plain_string(text) => {
                                     reference_identity::call_identity(
                                         file,
+                                        class,
                                         method,
                                         desc,
                                         target.is_static(),
                                         code,
+                                        frame_id,
                                         at,
                                         index,
                                         text,
@@ -39499,6 +39511,7 @@ mod tests {
             stream_plan: Default::default(),
             store_verdict: Default::default(),
             depth: 0,
+            next_frame_id: 0,
             budget: &ExecutionBudget::UNBOUNDED,
         };
         let method = MethodRef {
@@ -39583,6 +39596,7 @@ mod tests {
             stream_plan: Default::default(),
             store_verdict: Default::default(),
             depth: 0,
+            next_frame_id: 0,
             budget: &ExecutionBudget::UNBOUNDED,
         };
         let method = MethodRef {
@@ -46747,6 +46761,7 @@ mandatory = true
             stream_plan: Default::default(),
             store_verdict: Default::default(),
             depth: 0,
+            next_frame_id: 0,
             budget: &ExecutionBudget::UNBOUNDED,
         };
         let first = runtime.new_object("demo/Fields");
@@ -46973,6 +46988,7 @@ mandatory = true
             stream_plan: Default::default(),
             store_verdict: Default::default(),
             depth: 0,
+            next_frame_id: 0,
             budget: &ExecutionBudget::UNBOUNDED,
         };
         let new_instance = MethodRef {
@@ -47174,6 +47190,7 @@ mandatory = true
             stream_plan: Default::default(),
             store_verdict: Default::default(),
             depth: 0,
+            next_frame_id: 0,
             budget: &ExecutionBudget::UNBOUNDED,
         };
         // A stream takes one stage or terminal (`linkedOrConsumed`): each
@@ -47551,6 +47568,7 @@ mandatory = true
             stream_plan: Default::default(),
             store_verdict: Default::default(),
             depth: 0,
+            next_frame_id: 0,
             budget: &ExecutionBudget::UNBOUNDED,
         };
         let lookup = MethodRef {
@@ -47872,6 +47890,7 @@ mandatory = true
             stream_plan: Default::default(),
             store_verdict: Default::default(),
             depth: 0,
+            next_frame_id: 0,
             budget: &ExecutionBudget::UNBOUNDED,
         };
         let class = host_class::class_value("demo/ReflectiveFields");
@@ -53151,6 +53170,7 @@ mandatory = true
             stream_plan: Default::default(),
             store_verdict: Default::default(),
             depth: 0,
+            next_frame_id: 0,
             budget: &ExecutionBudget::UNBOUNDED,
         };
         let grid = runtime.new_multidim_array("[[I", &[2, 3]).unwrap();
@@ -53222,6 +53242,7 @@ mandatory = true
             stream_plan: Default::default(),
             store_verdict: Default::default(),
             depth: 0,
+            next_frame_id: 0,
             budget: &ExecutionBudget::UNBOUNDED,
         };
         let error = runtime

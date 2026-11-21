@@ -279,10 +279,12 @@ pub(crate) type CallIdentity = Option<String>;
 /// copied `new String` remains distinct after its text is materialised.
 pub(crate) fn call_identity(
     file: &ClassFile,
+    class: &str,
     method: &str,
     desc: &str,
     is_static: bool,
     code: &[u8],
+    frame_id: u64,
     at: usize,
     index: usize,
     text: &str,
@@ -295,7 +297,7 @@ pub(crate) fn call_identity(
     let key = match operand.kind {
         Kind::Fresh | Kind::BuilderText if !text.is_empty() => {
             format!(
-                "fresh:{method}:{}",
+                "fresh:{class}.{method}{desc}#{frame_id}:{}",
                 operand.source.map_or(0, |source| match source {
                     Source::At(pc) => pc,
                     Source::Param(_) => 0,

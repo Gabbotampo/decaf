@@ -2074,6 +2074,7 @@ impl NativeJar {
             stream_plan: Default::default(),
             store_verdict: Default::default(),
             depth: 0,
+            next_frame_id: 0,
             budget,
         };
         // `game_hook_callback_values` answers whether the callback is an
