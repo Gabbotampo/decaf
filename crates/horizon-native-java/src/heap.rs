@@ -2062,6 +2062,7 @@ mod tests {
             "holder_binding",
             "charset_decoders",
             "persistent_initialized_classes",
+            "initialized_game_mixins",
             "dfu_codec_nodes",
             "dfu_codec_callback_roots",
             "dfu_codec_refusals",

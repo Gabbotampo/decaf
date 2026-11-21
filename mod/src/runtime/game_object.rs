@@ -417,7 +417,14 @@ pub(crate) fn declared_types(key: &str) -> &'static [&'static str] {
         (_, "sound-event") => &["net/minecraft/sounds/SoundEvent"],
         (true, "minecraft") => &["net/minecraft/client/Minecraft"],
         (true, "level") => &["net/minecraft/client/multiplayer/ClientLevel"],
-        (true, "player") => &["net/minecraft/client/player/LocalPlayer"],
+        (true, "player") => &[
+            "net/minecraft/client/player/LocalPlayer",
+            "net/minecraft/client/player/AbstractClientPlayer",
+            "net/minecraft/world/entity/player/Player",
+            "net/minecraft/world/entity/Avatar",
+            "net/minecraft/world/entity/LivingEntity",
+            "net/minecraft/world/entity/Entity",
+        ],
         (true, "stack") => &[
             "net/minecraft/world/item/ItemStack",
             "net/minecraft/world/item/ItemInstance",

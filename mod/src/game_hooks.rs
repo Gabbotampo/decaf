@@ -336,6 +336,7 @@ pub(crate) fn forget(state: &mut State, object: &GameObject) {
     let marker = object.marker();
     for loaded in &mut state.jars {
         loaded.hook_state.forget_object(&marker);
+        loaded.host.forget_game_object(&marker);
     }
 }
 
@@ -441,6 +442,7 @@ pub(crate) fn fire(
 pub(crate) fn forget_world(state: &mut State) {
     for loaded in &mut state.jars {
         loaded.hook_state = crate::runtime::GameHookState::default();
+        loaded.host.forget_all_game_objects();
     }
 }
 

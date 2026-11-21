@@ -1325,7 +1325,7 @@ impl NativeJar {
         let mut callback_infos = crate::runtime::CallbackInfos::new();
         let mut runtime = Runtime {
             classes: &self.classes,
-            mixin_index: std::cell::OnceCell::new(),
+            mixin_index: crate::runtime::interface_mixins::RuntimeMixinState::from_jar(self, host),
             linked: host.linked_class_table().cloned().unwrap_or_default(),
             host,
             calls: 0,

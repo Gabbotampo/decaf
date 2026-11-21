@@ -110,6 +110,8 @@ mod hash_map_order;
 mod hash_table;
 mod heap;
 mod hook_shapes;
+mod interface_mixins;
+pub use interface_mixins::MixinInterfacePlan;
 mod host_array;
 mod host_attachment;
 mod host_brigadier;
@@ -1450,6 +1452,9 @@ pub struct LoadTimeMixinWeave {
     pub game_hooks: Vec<GameHookPlan>,
     /// The `@Accessor`/`@Invoker` members the interpreter runs natively.
     pub accessors: Vec<MixinAccessorPlan>,
+    /// The interface-injection `@Mixin` plans (`implements X` + added fields/methods)
+    /// applied natively to host-modelled game classes (`interface_mixins.rs`).
+    pub interface_mixins: Vec<MixinInterfacePlan>,
     /// Everything else the jar's Mixin classes declare.
     pub skipped: Vec<SkippedMixinPlan>,
     /// What each config plugin's session did (`mixin_plugins.rs`): why a
@@ -3562,6 +3567,43 @@ pub trait Host {
     /// Record that a `HostKind::ShapeProbe` attempted an escaping operation
     /// (stored, passed to a non-forwarding call, returned, thrown, or captured).
     fn note_retained_shape_probe(&mut self) {}
+
+    /// Physical Mixin side for config gating on this host.
+    fn mixin_side(&self) -> MixinSide {
+        MixinSide::Server
+    }
+
+    /// Record `(mixin, object)` as having run its no-argument `<init>()V` field
+    /// initialiser on this host, returning `true` only the first time.
+    fn mark_game_mixin_initialized(&mut self, _mixin: &str, _object: &str) -> bool {
+        false
+    }
+
+    /// Snapshot of `(mixin|object)` entries already initialised on this host.
+    fn initialized_game_mixins(&self) -> Option<&BTreeSet<String>> {
+        None
+    }
+
+    /// Merge initialised `(mixin|object)` records from a game-hook firing and
+    /// drop any forgotten game-object markers.
+    fn update_initialized_game_mixins(
+        &mut self,
+        _initialized: &BTreeSet<String>,
+        _forgotten: &BTreeSet<String>,
+    ) {
+    }
+
+    /// Whether the host performs its own end-of-firing check for unmodelled
+    /// game-class / `@Shadow` field writes (`GameHookHost`).
+    fn defers_game_field_write_check(&self) -> bool {
+        false
+    }
+
+    /// Explicit vanilla class hierarchy for a game handle key when the host holds
+    /// a richer description than `game_object::declared_types` (`GameHookHost`).
+    fn game_object_types(&self, _key: &str) -> Option<Vec<String>> {
+        None
+    }
 }
 
 #[derive(Debug, Default)]
@@ -3983,6 +4025,9 @@ pub struct StdHost {
     dfu_codec_callback_roots: BTreeSet<String>,
     dfu_codec_refusals: Vec<String>,
     persistent_initialized_classes: std::collections::BTreeSet<String>,
+    /// `mixin|game_object_key` pairs whose interface-injection Mixin `<init>()V`
+    /// field initialiser has already run on this host (`interface_mixins.rs`).
+    initialized_game_mixins: BTreeSet<String>,
     /// The jar's objects retained across invocations (`heap.rs`): instance
     /// fields, arrays, builders and enum identity of what its statics and
     /// registered callbacks still reach.
@@ -4226,6 +4271,7 @@ impl StdHost {
             dfu_codec_callback_roots: BTreeSet::new(),
             dfu_codec_refusals: Vec::new(),
             persistent_initialized_classes: std::collections::BTreeSet::new(),
+            initialized_game_mixins: BTreeSet::new(),
             heap: heap::JavaHeap::default(),
             log4j_levels: crate::runtime::host_log4j_level::CustomLevels::new(),
             retained: BTreeMap::new(),
@@ -4271,6 +4317,27 @@ impl StdHost {
 
     pub(crate) fn owns_render_handle(&self, key: &str) -> bool {
         self.render_handles.contains(key)
+    }
+
+    /// Drop per-object Mixin fields and `<init>()V` records kept on `marker`
+    /// (for example a player who respawned or disconnected) so a later object
+    /// starts fresh and GC can reclaim any objects those fields rooted.
+    pub fn forget_game_object(&mut self, marker: &str) {
+        let prefix = format!("{marker}|");
+        self.heap.fields.retain(|key, _| !key.starts_with(&prefix));
+        let suffix = format!("|{marker}");
+        self.initialized_game_mixins
+            .retain(|entry| !entry.ends_with(&suffix));
+    }
+
+    /// Drop every game object's per-instance Mixin fields and `<init>()V`
+    /// records (for example when a server world stops).
+    pub fn forget_all_game_objects(&mut self) {
+        self.heap.fields.retain(|key, _| {
+            let receiver = key.split_once('|').map_or(key.as_str(), |(obj, _)| obj);
+            !receiver.starts_with("game/") && !receiver.starts_with("client/")
+        });
+        self.initialized_game_mixins.clear();
     }
 
     /// Make an unmodeled host call fail instead of returning its neutral Java
@@ -8069,6 +8136,39 @@ impl Host for StdHost {
 
     fn mutable_collection_values(&self, value: &Value) -> Option<Vec<Value>> {
         self.mutable_values(value)
+    }
+
+    fn mixin_side(&self) -> MixinSide {
+        if self.environment_type.eq_ignore_ascii_case("CLIENT") {
+            MixinSide::Client
+        } else {
+            MixinSide::Server
+        }
+    }
+
+    fn mark_game_mixin_initialized(&mut self, mixin: &str, object: &str) -> bool {
+        self.initialized_game_mixins
+            .insert(format!("{mixin}|{object}"))
+    }
+
+    fn initialized_game_mixins(&self) -> Option<&BTreeSet<String>> {
+        Some(&self.initialized_game_mixins)
+    }
+
+    fn update_initialized_game_mixins(
+        &mut self,
+        initialized: &BTreeSet<String>,
+        forgotten: &BTreeSet<String>,
+    ) {
+        if !forgotten.is_empty() {
+            self.initialized_game_mixins.retain(|entry| {
+                !entry
+                    .split_once('|')
+                    .is_some_and(|(_, marker)| forgotten.contains(marker))
+            });
+        }
+        self.initialized_game_mixins
+            .extend(initialized.iter().cloned());
     }
 
     fn sub_list_class(&self, value: &Value) -> Option<Option<String>> {
@@ -19774,6 +19874,13 @@ pub struct LinkedClassTable {
     resources: BTreeMap<String, (String, Vec<u8>)>,
     /// Per-jar `data/` resource layers with Fabric metadata for datapack recipe/tag ordering.
     data_layers: Vec<pack_order::JarDataLayer>,
+    /// Per-linked-jar Mixin configs, config sides, and declared class names, so
+    /// interface-injection Mixins from linked jars honour config gating.
+    mixin_configs: Vec<(
+        Vec<MixinConfig>,
+        BTreeMap<String, MixinSide>,
+        BTreeSet<String>,
+    )>,
 }
 
 impl LinkedClassTable {
@@ -19804,6 +19911,14 @@ impl LinkedClassTable {
         let added = self.link_classes(id.clone(), jar.classes.values().cloned())?;
         self.link_resources(&id, jar);
         self.link_services(jar);
+        let configs = jar.mixin_configs();
+        if !configs.is_empty() {
+            self.mixin_configs.push((
+                configs,
+                jar.mixin_config_sides(),
+                jar.classes.keys().cloned().collect(),
+            ));
+        }
         Ok(added)
     }
 
@@ -19911,6 +20026,20 @@ impl LinkedClassTable {
     /// declares it.
     pub fn get(&self, name: &str) -> Option<&ClassFile> {
         self.classes.get(name)
+    }
+
+    pub(crate) fn mixin_config_sets(
+        &self,
+    ) -> &[(
+        Vec<MixinConfig>,
+        BTreeMap<String, MixinSide>,
+        BTreeSet<String>,
+    )] {
+        &self.mixin_configs
+    }
+
+    pub(crate) fn all_classes(&self) -> &BTreeMap<String, ClassFile> {
+        &self.classes
     }
 
     /// Whether any linked jar declares `name`.
@@ -21940,14 +22069,37 @@ impl NativeJar {
                         reason: MixinSkipReason::Unresolved,
                     }),
             );
-        self.unwoven_mixin_members(&mut weave.skipped);
+        // Config plugins run once per weave, as Mixin runs each once per
+        // config (`mixin_plugins.rs`); only the hook tier asks them.
+        let plugins = if game_hooks {
+            self.run_config_plugins(&configs, &config_sides, side)
+        } else {
+            ConfigPlugins::default()
+        };
+        weave.config_plugins = plugins.reports();
+        let interface_summary = self.plan_interface_mixins(
+            side,
+            &configs,
+            &config_sides,
+            game_hooks.then_some(&plugins),
+            &mut weave,
+        );
+        self.unwoven_mixin_members(&interface_summary, &mut weave.skipped);
         // `@Accessor`/`@Invoker` members have no injected body. The
-        // interpreter runs their contract directly, so a member a readable
-        // config claims is applied rather than skipped; the gate's reason is
-        // kept for a class the config does not apply on this side.
+        // interpreter runs their contract directly for targets held in the jar;
+        // targets outside the jar stay skipped as `target-outside-jar`, and
+        // classes outside the config keep the config gate's reason.
         for plan in self.mixin_accessor_plans() {
             match mixin_config_gate(&configs, &config_sides, &plan.accessor.owner, side) {
-                Ok(()) => weave.accessors.push(plan),
+                Ok(()) if self.classes.contains_key(&plan.target.owner) => {
+                    weave.accessors.push(plan);
+                }
+                Ok(()) => weave.skipped.push(SkippedMixinPlan {
+                    target: plan.target,
+                    callback: plan.accessor,
+                    at: mixin_accessor_label(plan.kind).to_owned(),
+                    reason: MixinSkipReason::TargetOutsideJar,
+                }),
                 Err(reason) => weave.skipped.push(SkippedMixinPlan {
                     target: plan.target,
                     callback: plan.accessor,
@@ -21961,14 +22113,6 @@ impl NativeJar {
         let mut modify_arg_by_owner: BTreeMap<String, Vec<MixinModifyArgPlan>> = BTreeMap::new();
         let mut modify_variable_by_owner: BTreeMap<String, Vec<MixinModifyVariablePlan>> =
             BTreeMap::new();
-        // Config plugins run once per weave, as Mixin runs each once per
-        // config (`mixin_plugins.rs`); only the hook tier asks them.
-        let plugins = if game_hooks {
-            self.run_config_plugins(&configs, &config_sides, side)
-        } else {
-            ConfigPlugins::default()
-        };
-        weave.config_plugins = plugins.reports();
         for plan in &plans {
             if game_hooks {
                 match self.game_hook_plan(plan, side, &configs, &config_sides, &plugins) {
@@ -22088,6 +22232,13 @@ impl NativeJar {
                 modify_variable_by_owner
                     .values()
                     .flat_map(|plans| plans.iter().map(|plan| plan.callback.owner.clone())),
+            )
+            .chain(weave.interface_mixins.iter().map(|plan| plan.mixin.clone()))
+            .chain(
+                weave
+                    .accessors
+                    .iter()
+                    .map(|plan| plan.accessor.owner.clone()),
             )
             .collect::<BTreeSet<_>>();
         listed_without_plan(&configs, &all_plans, &extra_owners, &mut weave.skipped);
@@ -22702,15 +22853,11 @@ impl NativeJar {
     /// Preserve the report row for a mixin member that real Mixin would merge
     /// into its target, without treating executable plan families as
     /// unsupported before the extended weaver sees them.
-    fn unwoven_mixin_members(&self, skipped: &mut Vec<SkippedMixinPlan>) {
-        const SYNTHETIC: u16 = 0x1000;
-        const PLANNED: [&str; 5] = [
-            "Lorg/spongepowered/asm/mixin/injection/Inject;",
-            "Lorg/spongepowered/asm/mixin/injection/Redirect;",
-            "Lorg/spongepowered/asm/mixin/injection/ModifyArg;",
-            "Lorg/spongepowered/asm/mixin/injection/ModifyVariable;",
-            "Lorg/spongepowered/asm/mixin/Overwrite;",
-        ];
+    fn unwoven_mixin_members(
+        &self,
+        interface_summary: &interface_mixins::InterfaceWeaveSummary,
+        skipped: &mut Vec<SkippedMixinPlan>,
+    ) {
         for class in self.classes.values() {
             if !class
                 .annotations
@@ -22719,37 +22866,13 @@ impl NativeJar {
             {
                 continue;
             }
-            let field = class
-                .fields
-                .iter()
-                .find(|field| field.access & SYNTHETIC == 0)
-                .map(|field| (&field.name, &field.descriptor));
-            let method = class
-                .methods
-                .iter()
-                .find(|method| {
-                    !method.is_static()
-                        && method.name != "<init>"
-                        && method.access & SYNTHETIC == 0
-                        && !method.annotations.iter().any(|annotation| {
-                            PLANNED.contains(&annotation.descriptor.as_str())
-                                // A MixinExtras injector has its own row
-                                // (`mixin_extras.rs`).
-                                || MixinExtrasKind::from_descriptor(&annotation.descriptor)
-                                    .is_some()
-                        })
-                        // A resolvable `@Accessor`/`@Invoker` is applied by
-                        // the interpreter, not a generic merged member. One
-                        // whose contract cannot be named stays in the report
-                        // through this row.
-                        && resolve_mixin_accessor(class, method).is_none()
-                })
-                .map(|method| (&method.name, &method.descriptor));
-            if let Some((name, descriptor)) = field.or(method) {
+            if let Some((name, descriptor)) =
+                self.unwoven_member_for_class(class, interface_summary)
+            {
                 let member = MethodRef {
                     owner: class.name.clone(),
-                    name: name.clone(),
-                    descriptor: descriptor.clone(),
+                    name,
+                    descriptor,
                 };
                 skipped.push(SkippedMixinPlan {
                     target: member.clone(),
@@ -23075,7 +23198,7 @@ impl NativeJar {
         let (io_paths, io_files, io_file_bytes, io_dirs) = host.persistent_io_state();
         let mut runtime = Runtime {
             classes: &self.classes,
-            mixin_index: std::cell::OnceCell::new(),
+            mixin_index: interface_mixins::RuntimeMixinState::from_jar(self, host),
             linked: host.linked_class_table().cloned().unwrap_or_default(),
             host,
             calls: 0,
@@ -23325,7 +23448,7 @@ impl NativeJar {
         let check_shape_probes = shape_extraction.is_some() || host.has_retained_shape_probes();
         let mut runtime = Runtime {
             classes: &self.classes,
-            mixin_index: std::cell::OnceCell::new(),
+            mixin_index: interface_mixins::RuntimeMixinState::from_jar(self, host),
             linked: host.linked_class_table().cloned().unwrap_or_default(),
             host,
             calls: 0,
@@ -23425,7 +23548,7 @@ impl NativeJar {
         let mut callback_infos = CallbackInfos::new();
         let mut runtime = Runtime {
             classes: &self.classes,
-            mixin_index: std::cell::OnceCell::new(),
+            mixin_index: interface_mixins::RuntimeMixinState::from_jar(self, host),
             linked: host.linked_class_table().cloned().unwrap_or_default(),
             host,
             calls: 0,
@@ -23594,7 +23717,7 @@ impl NativeJar {
         let (io_paths, io_files, io_file_bytes, io_dirs) = host.persistent_io_state();
         let mut runtime = Runtime {
             classes: &self.classes,
-            mixin_index: std::cell::OnceCell::new(),
+            mixin_index: interface_mixins::RuntimeMixinState::from_jar(self, host),
             linked: host.linked_class_table().cloned().unwrap_or_default(),
             host,
             calls: 0,
@@ -25797,7 +25920,7 @@ struct Runtime<'a, H> {
     /// step of a superclass walk; without the index each question scanned
     /// every class of the jar (#166's re-check measured a 10M-store loop at
     /// 1.3 s → 114 s) (`checkcast.rs`).
-    mixin_index: std::cell::OnceCell<BTreeMap<String, Vec<String>>>,
+    mixin_index: interface_mixins::RuntimeMixinState,
     /// Sibling-jar tables this execution may link, snapshotted from the host
     /// so a frame that keeps a class reference does not borrow the host.
     linked: Arc<LinkedClassTable>,
@@ -26824,7 +26947,13 @@ impl<H: Host> Runtime<'_, H> {
                 let value = match value {
                     Some(value) => value,
                     None if !self.has_class(&target.owner) => {
-                        let value = self.host.get_static(&target)?;
+                        let value = if !plan.static_target
+                            && let Some(receiver) = receiver
+                        {
+                            self.host.get_field(receiver, &target)?
+                        } else {
+                            self.host.get_static(&target)?
+                        };
                         if value != Value::Ref(None) {
                             if plan.static_target {
                                 self.static_fields
@@ -26846,6 +26975,9 @@ impl<H: Host> Runtime<'_, H> {
                 }))
             }
             MixinAccessorKind::Setter => {
+                if !self.has_class(&target.owner) {
+                    self.host.unknown_operand_call(&target)?;
+                }
                 let value = args.first().cloned().unwrap_or(Value::Void);
                 if plan.static_target {
                     self.static_fields
@@ -36496,6 +36628,10 @@ impl<H: Host> Runtime<'_, H> {
                             self.refuse_collected(&receiver, &r)?;
                             if let Some(value) = self.host.menu_field(&receiver, &r) {
                                 value
+                            } else if let Some(value) =
+                                invoke_or_catch!(at, self.game_handle_get_field(&receiver, &r))
+                            {
+                                value
                             } else {
                                 match instance_field_key(&receiver, &r)
                                     .and_then(|key| self.fields.get(&key).cloned())
@@ -36549,7 +36685,16 @@ impl<H: Host> Runtime<'_, H> {
                         match self.host.menu_field_set(&receiver, &r, &value) {
                             menu_models::FieldSetResult::Written => {}
                             menu_models::FieldSetResult::NotOwned => {
-                                self.fields.insert(key, value);
+                                match invoke_or_catch!(
+                                    at,
+                                    self.game_handle_put_field(&receiver, &r, &value)
+                                ) {
+                                    interface_mixins::GameFieldWrite::Stored
+                                    | interface_mixins::GameFieldWrite::Handled => {}
+                                    interface_mixins::GameFieldWrite::Fallthrough => {
+                                        self.fields.insert(key, value);
+                                    }
+                                }
                             }
                             menu_models::FieldSetResult::Counted => {
                                 invoke_or_catch!(at, self.host.unknown_operand_call(&r));
@@ -37749,6 +37894,15 @@ impl<H: Host> Runtime<'_, H> {
                             self.invoke_game_helpers(&r, receiver.as_ref(), &args, class, method)
                         )
                     {
+                        dispatched = Some(value);
+                    }
+                    if dispatched.is_none()
+                        && let Some(value) = invoke_or_catch!(
+                            at,
+                            self.invoke_interface_mixin(&r, op, receiver.as_ref(), &args)
+                        )
+                    {
+                        jar_body = true;
                         dispatched = Some(value);
                     }
                     if dispatched.is_none()
@@ -42796,7 +42950,7 @@ mod tests {
         let mut host = NullHost;
         let mut runtime = Runtime {
             classes: &BTreeMap::new(),
-            mixin_index: std::cell::OnceCell::new(),
+            mixin_index: interface_mixins::RuntimeMixinState::unconfigured(),
             linked: Arc::default(),
             host: &mut host,
             calls: 0,
@@ -42870,7 +43024,7 @@ mod tests {
         let mut host = StdHost::new();
         let mut runtime = Runtime {
             classes: &BTreeMap::new(),
-            mixin_index: std::cell::OnceCell::new(),
+            mixin_index: interface_mixins::RuntimeMixinState::unconfigured(),
             linked: Arc::default(),
             host: &mut host,
             calls: 0,
@@ -50043,7 +50197,7 @@ mandatory = true
         let mut host = NullHost;
         let mut runtime = Runtime {
             classes: &classes,
-            mixin_index: std::cell::OnceCell::new(),
+            mixin_index: interface_mixins::RuntimeMixinState::unconfigured(),
             linked: Arc::default(),
             host: &mut host,
             calls: 0,
@@ -50267,7 +50421,7 @@ mandatory = true
         let mut host = NullHost;
         let mut runtime = Runtime {
             classes: &classes,
-            mixin_index: std::cell::OnceCell::new(),
+            mixin_index: interface_mixins::RuntimeMixinState::unconfigured(),
             linked: Arc::default(),
             host: &mut host,
             calls: 0,
@@ -50466,7 +50620,7 @@ mandatory = true
             .unwrap();
         let mut runtime = Runtime {
             classes: &classes,
-            mixin_index: std::cell::OnceCell::new(),
+            mixin_index: interface_mixins::RuntimeMixinState::unconfigured(),
             linked: Arc::default(),
             host: &mut host,
             calls: 0,
@@ -50833,7 +50987,7 @@ mandatory = true
         let mut host = NullHost;
         let mut runtime = Runtime {
             classes: &classes,
-            mixin_index: std::cell::OnceCell::new(),
+            mixin_index: interface_mixins::RuntimeMixinState::unconfigured(),
             linked: Arc::default(),
             host: &mut host,
             calls: 0,
@@ -51160,7 +51314,7 @@ mandatory = true
         let mut host = NullHost;
         let mut runtime = Runtime {
             classes: &classes,
-            mixin_index: std::cell::OnceCell::new(),
+            mixin_index: interface_mixins::RuntimeMixinState::unconfigured(),
             linked: Arc::default(),
             host: &mut host,
             calls: 0,
@@ -56437,7 +56591,7 @@ mandatory = true
         let classes = BTreeMap::new();
         let mut runtime = Runtime {
             classes: &classes,
-            mixin_index: std::cell::OnceCell::new(),
+            mixin_index: interface_mixins::RuntimeMixinState::unconfigured(),
             linked: Arc::default(),
             host: &mut host,
             calls: 0,
@@ -56506,7 +56660,7 @@ mandatory = true
         let classes = BTreeMap::new();
         let mut runtime = Runtime {
             classes: &classes,
-            mixin_index: std::cell::OnceCell::new(),
+            mixin_index: interface_mixins::RuntimeMixinState::unconfigured(),
             linked: Arc::default(),
             host: &mut host,
             calls: 0,

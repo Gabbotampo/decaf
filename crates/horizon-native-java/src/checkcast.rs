@@ -1018,7 +1018,7 @@ impl<H: Host> Runtime<'_, H> {
     pub(crate) fn mixin_adds_interface(&self, class: &str, target: &str) -> bool {
         self.mixins_targeting(class)
             .iter()
-            .filter_map(|name| self.classes.get(name))
+            .filter_map(|name| self.class(name))
             .any(|mixin| {
                 mixin.name == target
                     || mixin.interface_names().iter().any(|interface| {
@@ -1036,7 +1036,7 @@ impl<H: Host> Runtime<'_, H> {
         for mixin in self
             .mixins_targeting(class)
             .iter()
-            .filter_map(|name| self.classes.get(name))
+            .filter_map(|name| self.class(name))
         {
             let accessor = class_access(mixin).is_some_and(|access| access & ACC_INTERFACE != 0);
             let interfaces = if accessor {
@@ -1051,32 +1051,6 @@ impl<H: Host> Runtime<'_, H> {
             }
         }
         added
-    }
-
-    /// The jar's `@Mixin` classes that name `class` among their targets, from
-    /// the index built once per runtime (`Runtime::mixin_index`).
-    fn mixins_targeting(&self, class: &str) -> &[String] {
-        self.mixin_index
-            .get_or_init(|| {
-                let mut index: BTreeMap<String, Vec<String>> = BTreeMap::new();
-                for mixin in self.classes.values() {
-                    for annotation in mixin
-                        .annotations
-                        .iter()
-                        .filter(|annotation| annotation.descriptor == MIXIN_ANNOTATION_DESCRIPTOR)
-                    {
-                        for owner in mixin_target_owners(annotation) {
-                            let mixins = index.entry(owner).or_default();
-                            if !mixins.contains(&mixin.name) {
-                                mixins.push(mixin.name.clone());
-                            }
-                        }
-                    }
-                }
-                index
-            })
-            .get(class)
-            .map_or(&[], Vec::as_slice)
     }
 }
 
