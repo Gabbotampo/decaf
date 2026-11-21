@@ -374,6 +374,10 @@ pub(crate) fn call(
             Object::Screen(ScreenState {
                 menu,
                 title,
+                // 26.3 AbstractContainerScreen.<init>(..., int, int) offsets
+                // 32-73: image dimensions are constructor arguments; the
+                // one-argument overload supplies 176/166 (offsets 0-12),
+                // labels are 8/6 and 8/(imageHeight-94).
                 image_width: 176,
                 image_height: 166,
                 title_label_x: 8,

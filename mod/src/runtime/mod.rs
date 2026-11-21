@@ -18318,6 +18318,23 @@ fn mixin_accessor_label(kind: MixinAccessorKind) -> &'static str {
 }
 
 impl NativeJar {
+    pub(crate) fn jar_extends_class(&self, class: &str, wanted: &str) -> bool {
+        let mut current = class;
+        for _ in 0..MAX_SUPERCLASS_WALK {
+            if current == wanted {
+                return true;
+            }
+            let Some(file) = self.classes.get(current) else {
+                return false;
+            };
+            if file.super_name.is_empty() || file.super_name == current {
+                return false;
+            }
+            current = &file.super_name;
+        }
+        false
+    }
+
     pub fn from_classes(classes: impl IntoIterator<Item = ClassFile>) -> Self {
         let classes = classes.into_iter().collect::<Vec<_>>();
         let neoforge_entrypoints = classes

@@ -1036,6 +1036,9 @@ impl StdHost {
         let texture = layout
             .menu_resource
             .ok_or_else(|| NativeError::Metadata("screen has no menu texture".into()))?;
+        // 26.3 ItemCombinerScreen.extractBackground javap offsets 1863-1895:
+        // blit(pipeline, menuResource, leftPos, topPos, 0F, 0F, imageWidth,
+        // imageHeight, 256, 256), then extractErrorIcon(leftPos, topPos).
         self.client.draws.push(DrawOp::Blit {
             texture,
             src: [0, 0, layout.image_width, layout.image_height],
@@ -1054,6 +1057,8 @@ impl StdHost {
     pub(crate) fn client_screen_init_positions(&self, screen: &Value) -> Option<[i32; 2]> {
         let layout = self.client_screen_layout(screen)?;
         let frame = self.client.frame.as_ref()?;
+        // 26.3 AbstractContainerScreen.init offsets 0-30: (width-imageWidth)/2
+        // and (height-imageHeight)/2, integer division.
         Some([
             (frame.gui_size[0] - layout.image_width) / 2,
             (frame.gui_size[1] - layout.image_height) / 2,

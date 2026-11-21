@@ -106,7 +106,12 @@ impl NativeJar {
             ],
             host,
         );
-        if matches!(rendered, Err(NativeError::MissingMethod(_))) {
+        if matches!(rendered, Err(NativeError::MissingMethod(_)))
+            && self.jar_extends_class(
+                &class,
+                "net/minecraft/client/gui/screens/inventory/ItemCombinerScreen",
+            )
+        {
             host.client_default_screen_bg(&screen)?;
             let layout = host
                 .client_screen_layout(&screen)
@@ -124,6 +129,14 @@ impl NativeJar {
                 host,
             )?;
         } else {
+            if matches!(rendered, Err(NativeError::MissingMethod(_))) {
+                let method = crate::runtime::MethodRef {
+                    owner: class,
+                    name: "extractBackground".into(),
+                    descriptor: "(Lnet/minecraft/client/gui/GuiGraphicsExtractor;IIF)V".into(),
+                };
+                return host.unknown_host_call(&method).map(|_| Vec::new());
+            }
             rendered?;
         }
         Ok(host.client_draws()[before..].to_vec())
