@@ -154,6 +154,13 @@ public final class TooltipComponentsOracle {
         Component.translatableEscape(
             "demo.esc_nf", Double.NaN, Float.POSITIVE_INFINITY, Float.NEGATIVE_INFINITY)
       },
+      {"translatable_float_decimal", Component.translatable("demo.fdec", 1.234567f)},
+      {"translatable_float_third", Component.translatable("demo.fthird", 1.0f / 3.0f)},
+      {"translatable_float_neg_zero", Component.translatable("demo.fnz", -0.0f)},
+      {"translatable_float_sci", Component.translatable("demo.fsci", 1e8f)},
+      {"translatable_double_sci", Component.translatable("demo.dsci", 1e10)},
+      {"translatable_double_neg_zero", Component.translatable("demo.dnz", -0.0)},
+      {"translatable_double_small", Component.translatable("demo.dsmall", 1e-4)},
     };
     for (Object[] row : componentCases) {
       System.out.println("CASE:" + row[0] + "=" + encode((Component) row[1]));

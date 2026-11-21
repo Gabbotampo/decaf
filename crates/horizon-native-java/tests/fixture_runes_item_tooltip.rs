@@ -197,6 +197,13 @@ public final class TooltipProbe {
       out.accept(Component.translatable("demo.finf", Float.POSITIVE_INFINITY));
       out.accept(Component.translatable("demo.fninf", Float.NEGATIVE_INFINITY));
       out.accept(Component.translatableEscape("demo.esc_nf", Double.NaN, Float.POSITIVE_INFINITY, Float.NEGATIVE_INFINITY));
+      out.accept(Component.translatable("demo.fdec", 1.234567f));
+      out.accept(Component.translatable("demo.fthird", 1.0f / 3.0f));
+      out.accept(Component.translatable("demo.fnz", -0.0f));
+      out.accept(Component.translatable("demo.fsci", 1e8f));
+      out.accept(Component.translatable("demo.dsci", 1e10));
+      out.accept(Component.translatable("demo.dnz", -0.0));
+      out.accept(Component.translatable("demo.dsmall", 1e-4));
     }
   }
 

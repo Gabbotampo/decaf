@@ -1889,6 +1889,9 @@ impl StdHost {
             // Outside a firing: what the host answered before this surface.
             return None;
         };
+        if text == GRAPHICS {
+            return Some(self.graphics_call(&frame, r, args).unwrap_or_else(refuse));
+        }
         let answer = self.client_answer(&text, &frame, r, args);
         Some(answer.map_or_else(refuse, Ok))
     }
@@ -2356,10 +2359,41 @@ impl StdHost {
                 ("getGameTimeDeltaTicks" | "getRealtimeDeltaTicks", "F") => float(1.0),
                 _ => None,
             },
-            GRAPHICS => self.graphics_call(frame, r, args),
             POSE => self.pose_call(r, args),
             _ => self.client_item_answer(object, frame, r, args).flatten(),
         }
+    }
+
+    /// Resolve a `GuiGraphicsExtractor.text` / `centeredText` text argument.
+    /// In Minecraft 26.3, the `String` overloads return early on `null`
+    /// (drawing nothing), whereas the `Component` overloads immediately invoke
+    /// `Component.getVisualOrderText()` and throw `NullPointerException`.
+    fn graphics_text_arg(
+        &self,
+        arg: &Value,
+        descriptor: &str,
+    ) -> Result<Option<ClientText>, Option<NativeError>> {
+        if let Some(text) = text_arg(arg, &self.component_states) {
+            return Ok(Some(text));
+        }
+        if *arg == Value::Ref(None) {
+            if descriptor.starts_with("(Lnet/minecraft/client/gui/Font;Ljava/lang/String;") {
+                return Ok(None);
+            }
+            if descriptor.starts_with(
+                "(Lnet/minecraft/client/gui/Font;Lnet/minecraft/network/chat/Component;",
+            ) {
+                return Err(Some(NativeError::UncaughtException {
+                    class: "java/lang/NullPointerException".into(),
+                    message: Some(
+                        r#"Cannot invoke "net.minecraft.network.chat.Component.getVisualOrderText()" because "text" is null"#
+                            .into(),
+                    ),
+                    frame: None,
+                }));
+            }
+        }
+        Err(None)
     }
 
     /// `GuiGraphicsExtractor` members: drawing records a [`DrawOp`]; one past
@@ -2369,23 +2403,22 @@ impl StdHost {
         frame: &ClientSnapshot,
         r: &MethodRef,
         args: &[Value],
-    ) -> Option<Value> {
-        let state = &mut self.client;
+    ) -> Option<Result<Value, NativeError>> {
         let ints = |from: usize, n: usize| -> Option<Vec<i32>> {
             (from..from + n).map(|at| int_arg(args, at)).collect()
         };
         let drawn = match (r.name.as_str(), r.descriptor.as_str()) {
-            ("guiWidth", "()I") => return Some(Value::Int(frame.gui_size[0])),
-            ("guiHeight", "()I") => return Some(Value::Int(frame.gui_size[1])),
-            ("pose", _) => return Some(marker(POSE)),
+            ("guiWidth", "()I") => return Some(Ok(Value::Int(frame.gui_size[0]))),
+            ("guiHeight", "()I") => return Some(Ok(Value::Int(frame.gui_size[1]))),
+            ("pose", _) => return Some(Ok(marker(POSE))),
             ("fill", "(IIIII)V") => {
                 let v = ints(0, 5)?;
-                state.fill([v[0], v[1], v[2], v[3]], v[4] as u32)
+                self.client.fill([v[0], v[1], v[2], v[3]], v[4] as u32)
             }
             ("fillGradient", "(IIIIII)V") => {
                 let v = ints(0, 6)?;
-                let rect = state.posed_rect([v[0], v[1], v[2], v[3]]);
-                state.draw(DrawOp::Gradient {
+                let rect = self.client.posed_rect([v[0], v[1], v[2], v[3]]);
+                self.client.draw(DrawOp::Gradient {
                     rect,
                     top: v[4] as u32,
                     bottom: v[5] as u32,
@@ -2395,38 +2428,39 @@ impl StdHost {
             ("outline", "(IIIII)V") => {
                 let v = ints(0, 5)?;
                 let (x, y, w, h, c) = (v[0], v[1], v[2], v[3], v[4] as u32);
-                state
+                self.client
                     .fill([x, y, x + w, y + 1], c)
-                    .and_then(|()| state.fill([x, y + h - 1, x + w, y + h], c))
-                    .and_then(|()| state.fill([x, y + 1, x + 1, y + h - 1], c))
-                    .and_then(|()| state.fill([x + w - 1, y + 1, x + w, y + h - 1], c))
+                    .and_then(|()| self.client.fill([x, y + h - 1, x + w, y + h], c))
+                    .and_then(|()| self.client.fill([x, y + 1, x + 1, y + h - 1], c))
+                    .and_then(|()| self.client.fill([x + w - 1, y + 1, x + w, y + h - 1], c))
             }
             ("text", descriptor) if descriptor.starts_with("(Lnet/minecraft/client/gui/Font;") => {
-                // A null string draws nothing (`text` returns early); an
-                // unresolvable component refuses rather than drawing nothing.
                 let arg = args.get(1)?;
-                let Some(text) = text_arg(arg, &self.component_states) else {
-                    return (*arg == Value::Ref(None)).then_some(Value::Void);
+                let text = match self.graphics_text_arg(arg, descriptor) {
+                    Ok(Some(text)) => text,
+                    Ok(None) => return Some(Ok(Value::Void)),
+                    Err(Some(err)) => return Some(Err(err)),
+                    Err(None) => return None,
                 };
                 let v = ints(2, 3)?;
                 // The five-argument overloads draw with a shadow.
                 let shadow = int_arg(args, 5).is_none_or(|v| v != 0);
-                state.text(text, v[0], v[1], v[2] as u32, shadow)
+                self.client.text(text, v[0], v[1], v[2] as u32, shadow)
             }
             ("horizontalLine", "(IIII)V") => {
                 let v = ints(0, 4)?;
                 let (x0, x1) = (v[0].min(v[1]), v[0].max(v[1]));
-                state.fill([x0, v[2], x1 + 1, v[2] + 1], v[3] as u32)
+                self.client.fill([x0, v[2], x1 + 1, v[2] + 1], v[3] as u32)
             }
             ("verticalLine", "(IIII)V") => {
                 let v = ints(0, 4)?;
                 let (y0, y1) = (v[1].min(v[2]), v[1].max(v[2]));
-                state.fill([v[0], y0 + 1, v[0] + 1, y1], v[3] as u32)
+                self.client.fill([v[0], y0 + 1, v[0] + 1, y1], v[3] as u32)
             }
             // A fill through an explicit pipeline (`RenderPipelines.GUI`).
             ("fill", "(Lcom/mojang/blaze3d/pipeline/RenderPipeline;IIIII)V") => {
                 let v = ints(1, 5)?;
-                state.fill([v[0], v[1], v[2], v[3]], v[4] as u32)
+                self.client.fill([v[0], v[1], v[2], v[3]], v[4] as u32)
             }
             ("item" | "fakeItem", descriptor)
                 if descriptor.starts_with("(Lnet/minecraft/world/item/ItemStack;II") =>
@@ -2435,7 +2469,7 @@ impl StdHost {
                 let v = ints(1, 2)?;
                 return self
                     .client_item_draw(frame, slot, [v[0], v[1]], true, None)
-                    .map(|()| Value::Void);
+                    .map(|()| Ok(Value::Void));
             }
             // `item(owner, stack, x, y, seed)`: the owner only seeds animation.
             ("item", "(Lnet/minecraft/world/entity/LivingEntity;Lnet/minecraft/world/item/ItemStack;III)V") => {
@@ -2443,7 +2477,7 @@ impl StdHost {
                 let v = ints(2, 2)?;
                 return self
                     .client_item_draw(frame, slot, [v[0], v[1]], true, None)
-                    .map(|()| Value::Void);
+                    .map(|()| Ok(Value::Void));
             }
             ("itemDecorations", descriptor)
                 if descriptor.starts_with("(Lnet/minecraft/client/gui/Font;Lnet/minecraft/world/item/ItemStack;II") =>
@@ -2465,7 +2499,7 @@ impl StdHost {
                 };
                 return self
                     .client_item_draw(frame, slot, [v[0], v[1]], false, Some(count.flatten()))
-                    .map(|()| Value::Void);
+                    .map(|()| Ok(Value::Void));
             }
             // `blitSprite(pipeline, sprite, x, y, w, h[, colour | alpha])`.
             ("blitSprite", descriptor)
@@ -2490,24 +2524,27 @@ impl StdHost {
                 } else {
                     format!("{namespace}:{path}")
                 };
-                let rect = state.posed_rect([v[0], v[1], v[0] + v[2], v[1] + v[3]]);
-                state.draw(DrawOp::Sprite { sprite, rect, argb })
+                let rect = self.client.posed_rect([v[0], v[1], v[0] + v[2], v[1] + v[3]]);
+                self.client.draw(DrawOp::Sprite { sprite, rect, argb })
             }
             ("centeredText", descriptor)
                 if descriptor.starts_with("(Lnet/minecraft/client/gui/Font;") =>
             {
                 let arg = args.get(1)?;
-                let Some(text) = text_arg(arg, &self.component_states) else {
-                    return (*arg == Value::Ref(None)).then_some(Value::Void);
+                let text = match self.graphics_text_arg(arg, descriptor) {
+                    Ok(Some(text)) => text,
+                    Ok(None) => return Some(Ok(Value::Void)),
+                    Err(Some(err)) => return Some(Err(err)),
+                    Err(None) => return None,
                 };
                 let v = ints(2, 3)?;
                 // `x - font.width(text) / 2`, Java's integer division.
                 let width = frame.metrics.width(&frame.metrics.resolve(&text));
-                state.text(text, v[0] - width / 2, v[1], v[2] as u32, true)
+                self.client.text(text, v[0] - width / 2, v[1], v[2] as u32, true)
             }
             _ => return None,
         };
-        drawn.ok().map(|()| Value::Void)
+        drawn.ok().map(|()| Ok(Value::Void))
     }
 
     /// Records one item draw; `None` past [`MAX_DRAWS_PER_CALL`].
@@ -3513,15 +3550,20 @@ mod tests {
         let gfx = marker(GRAPHICS);
         let font = marker(FONT);
         for name in ["text", "centeredText"] {
-            let r = method(
+            let str_overload = method(
+                "net/minecraft/client/gui/GuiGraphicsExtractor",
+                name,
+                "(Lnet/minecraft/client/gui/Font;Ljava/lang/String;III)V",
+            );
+            let comp_overload = method(
                 "net/minecraft/client/gui/GuiGraphicsExtractor",
                 name,
                 "(Lnet/minecraft/client/gui/Font;Lnet/minecraft/network/chat/Component;III)V",
             );
-            // Null draws nothing; an unresolvable component must refuse.
+            // Null String draws nothing; null Component throws NPE; unresolvable Component refuses.
             assert_eq!(
                 host.client_call(
-                    &r,
+                    &str_overload,
                     &gfx,
                     &[
                         font.clone(),
@@ -3534,12 +3576,30 @@ mod tests {
                 .unwrap()
                 .unwrap(),
                 Value::Void,
-                "{name}(null)"
+                "{name}(String null)"
             );
             assert!(
                 matches!(
                     host.client_call(
-                        &r,
+                        &comp_overload,
+                        &gfx,
+                        &[
+                            font.clone(),
+                            Value::Ref(None),
+                            Value::Int(0),
+                            Value::Int(0),
+                            Value::Int(0),
+                        ],
+                    ),
+                    Some(Err(NativeError::UncaughtException { ref class, .. }))
+                        if class == "java/lang/NullPointerException"
+                ),
+                "{name}(Component null)"
+            );
+            assert!(
+                matches!(
+                    host.client_call(
+                        &comp_overload,
                         &gfx,
                         &[
                             font.clone(),

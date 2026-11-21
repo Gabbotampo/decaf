@@ -34,6 +34,13 @@ translatable_float_nan={"translate":"demo.fnan","with":[NaN]}
 translatable_float_pos_inf={"translate":"demo.finf","with":[Infinity]}
 translatable_float_neg_inf={"translate":"demo.fninf","with":[-Infinity]}
 escape_nonfinite={"translate":"demo.esc_nf","with":[NaN,Infinity,-Infinity]}
+translatable_float_decimal={"translate":"demo.fdec","with":[1.234567]}
+translatable_float_third={"translate":"demo.fthird","with":[0.33333334]}
+translatable_float_neg_zero={"translate":"demo.fnz","with":[-0.0]}
+translatable_float_sci={"translate":"demo.fsci","with":[1.0E8]}
+translatable_double_sci={"translate":"demo.dsci","with":[1.0E10]}
+translatable_double_neg_zero={"translate":"demo.dnz","with":[-0.0]}
+translatable_double_small={"translate":"demo.dsmall","with":[1.0E-4]}
 flag_default_strings=Default[advanced=false, creative=false]|Default[advanced=true, creative=false]|Default[advanced=false, creative=true]|Default[advanced=true, creative=true]
 flag_default_hashes=39584,39398,39578,39392
 flag_default_accessors=false,false,false,false|true,true,true,true

@@ -157,34 +157,19 @@ pub(crate) fn argument(value: &Value) -> Option<Json> {
     }
 }
 
-fn float_codec_json(v: f64) -> CodecJson {
-    if v.is_nan() {
-        CodecJson::RawNumber("NaN")
-    } else if v.is_infinite() {
-        CodecJson::RawNumber(if v.is_sign_negative() {
-            "-Infinity"
-        } else {
-            "Infinity"
-        })
-    } else {
-        match serde_json::Number::from_f64(v) {
-            Some(number) => CodecJson::Json(Json::Number(number)),
-            None => CodecJson::RawNumber("NaN"),
-        }
-    }
-}
-
 /// One translation argument encoded for vanilla's `ComponentSerialization.CODEC`
 /// with `JsonOps.INSTANCE` and Gson output (`StdHost::component_json`): matches
-/// `TranslatableContents.isAllowedPrimitiveArgument`, emitting Gson's literal
-/// `NaN`, `Infinity`, and `-Infinity` tokens for non-finite `Float`/`Double`
-/// values.
+/// `TranslatableContents.isAllowedPrimitiveArgument`, formatting `Float` and
+/// `Double` values with Java 25's `Float.toString` / `Double.toString` (including
+/// Gson's literal `NaN`, `Infinity`, and `-Infinity` tokens).
 pub(crate) fn codec_argument(value: &Value) -> Option<CodecJson> {
     match value {
-        Value::Float(v) => Some(float_codec_json(*v)),
-        Value::Boxed(Boxed::Float(bits)) => {
-            Some(float_codec_json(f64::from(f32::from_bits(*bits))))
-        }
+        Value::Float(v) => Some(CodecJson::RawNumber(
+            crate::jdk_float_text::double_to_string(*v),
+        )),
+        Value::Boxed(Boxed::Float(bits)) => Some(CodecJson::RawNumber(
+            crate::jdk_float_text::float_to_string(f64::from(f32::from_bits(*bits))),
+        )),
         other => argument(other).map(CodecJson::Json),
     }
 }
@@ -624,27 +609,43 @@ mod tests {
         assert_eq!(argument(&Value::Float(f64::NAN)), None);
         assert_eq!(
             codec_argument(&Value::Float(f64::NAN)),
-            Some(CodecJson::RawNumber("NaN"))
+            Some(CodecJson::RawNumber("NaN".into()))
         );
         assert_eq!(
             codec_argument(&Value::Float(f64::INFINITY)),
-            Some(CodecJson::RawNumber("Infinity"))
+            Some(CodecJson::RawNumber("Infinity".into()))
         );
         assert_eq!(
             codec_argument(&Value::Float(f64::NEG_INFINITY)),
-            Some(CodecJson::RawNumber("-Infinity"))
+            Some(CodecJson::RawNumber("-Infinity".into()))
+        );
+        assert_eq!(
+            codec_argument(&Value::Float(1e10)),
+            Some(CodecJson::RawNumber("1.0E10".into()))
+        );
+        assert_eq!(
+            codec_argument(&Value::Float(-0.0)),
+            Some(CodecJson::RawNumber("-0.0".into()))
+        );
+        assert_eq!(
+            codec_argument(&Value::Boxed(Boxed::Float(1.234567_f32.to_bits()))),
+            Some(CodecJson::RawNumber("1.234567".into()))
+        );
+        assert_eq!(
+            codec_argument(&Value::Boxed(Boxed::Float((1.0_f32 / 3.0_f32).to_bits()))),
+            Some(CodecJson::RawNumber("0.33333334".into()))
         );
         assert_eq!(
             codec_argument(&Value::Boxed(Boxed::Float(f32::NAN.to_bits()))),
-            Some(CodecJson::RawNumber("NaN"))
+            Some(CodecJson::RawNumber("NaN".into()))
         );
         assert_eq!(
             codec_argument(&Value::Boxed(Boxed::Float(f32::INFINITY.to_bits()))),
-            Some(CodecJson::RawNumber("Infinity"))
+            Some(CodecJson::RawNumber("Infinity".into()))
         );
         assert_eq!(
             codec_argument(&Value::Boxed(Boxed::Float(f32::NEG_INFINITY.to_bits()))),
-            Some(CodecJson::RawNumber("-Infinity"))
+            Some(CodecJson::RawNumber("-Infinity".into()))
         );
         assert_eq!(
             plain(&json!({"text": "a", "extra": ["b", {"translate": "k"}]})),

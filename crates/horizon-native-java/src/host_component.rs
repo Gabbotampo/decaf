@@ -382,12 +382,13 @@ pub(crate) fn json_in(
 }
 
 /// One JSON node produced by vanilla's `ComponentSerialization.CODEC` +
-/// `JsonOps.INSTANCE`, including Gson's lenient non-finite number literals
-/// (`NaN`, `Infinity`, `-Infinity`) that `serde_json::Number` cannot hold.
+/// `JsonOps.INSTANCE`, including Java-formatted `Float`/`Double` numbers and
+/// Gson's lenient non-finite literals (`NaN`, `Infinity`, `-Infinity`) that
+/// `serde_json::Number` cannot represent identically.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum CodecJson {
     Json(Json),
-    RawNumber(&'static str),
+    RawNumber(String),
     Array(Vec<CodecJson>),
     Object(Vec<(String, CodecJson)>),
 }
