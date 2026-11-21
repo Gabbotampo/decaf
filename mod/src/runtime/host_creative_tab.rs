@@ -210,6 +210,7 @@ fn item_stack_instance_of(
         wanted,
         ITEM_STACK
             | "net/minecraft/core/component/DataComponentHolder"
+            | "net/minecraft/core/component/DataComponentGetter"
             | "net/minecraft/world/item/ItemInstance"
             | "java/lang/Object"
     ) || hierarchy.is_instance(ITEM_STACK, wanted) == Some(true)
@@ -577,9 +578,9 @@ pub(crate) fn is_empty_stack_data(item: &Value, count: i32) -> bool {
     count <= 0 || is_air_item(item)
 }
 
-/// Allocate a host-constructed `ItemStack` handle (used by `CreativeModeTab$Output.accept(ItemLike)`
-/// which executes `new ItemStack(item)` at offsets 1..6).
-pub(crate) fn new_host_item_stack(state: &mut State, item: Value, count: i32) -> Value {
+/// Allocate a standalone `ItemStack` handle for unit tests in `output_tests`.
+#[cfg(test)]
+fn new_host_item_stack(state: &mut State, item: Value, count: i32) -> Value {
     state.next += 1;
     Value::Host(HostRef::of_values(
         HostKind::ItemStack,

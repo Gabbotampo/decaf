@@ -86,8 +86,8 @@ fn server_kind(rest: &str) -> HostKind {
         "player" | "entity" | "original-player" => HostKind::GameEntity,
         "level" => HostKind::GameLevel,
         "server" | "player-list" | "commands" | "rules" | "registries" | "saved-data"
-        | "world-border" => HostKind::GameSingleton,
-        "item" | "block" | "block-state" | "registry" | "entity_type" => {
+        | "world-border" | "recipe-manager" => HostKind::GameSingleton,
+        "item" | "block" | "block-state" | "registry" | "entity_type" | "data-component-type" => {
             HostKind::GameRegistryObject
         }
         // `damage`, `stack`, `block-hit`, `connection`, `packet-sender`,
@@ -385,15 +385,31 @@ pub(crate) fn declared_types(key: &str) -> &'static [&'static str] {
             "net/minecraft/world/entity/Entity",
         ],
         (false, "entity") => &["net/minecraft/world/entity/Entity"],
-        (false, "level") => &["net/minecraft/server/level/ServerLevel"],
+        (false, "level") => &[
+            "net/minecraft/server/level/ServerLevel",
+            "net/minecraft/world/level/Level",
+        ],
         (false, "server") => &["net/minecraft/server/MinecraftServer"],
+        (false, "recipe-manager") => &[
+            "net/minecraft/world/item/crafting/RecipeManager",
+            "net/minecraft/world/item/crafting/RecipeAccess",
+        ],
+        (false, "data-component-type") => &["net/minecraft/core/component/DataComponentType"],
         (false, "player-list") => &["net/minecraft/server/players/PlayerList"],
         (false, "commands") => &["net/minecraft/commands/Commands"],
         (false, "world-border") => &["net/minecraft/world/level/border/WorldBorder"],
-        (false, "item") => &["net/minecraft/world/item/Item"],
+        (false, "item") => &[
+            "net/minecraft/world/item/Item",
+            "net/minecraft/world/level/ItemLike",
+        ],
         (false, "block") => &["net/minecraft/world/level/block/Block"],
         (false, "block-state") => &["net/minecraft/world/level/block/state/BlockState"],
-        (false, "stack") => &["net/minecraft/world/item/ItemStack"],
+        (false, "stack") => &[
+            "net/minecraft/world/item/ItemStack",
+            "net/minecraft/world/item/ItemInstance",
+            "net/minecraft/core/component/DataComponentHolder",
+            "net/minecraft/core/component/DataComponentGetter",
+        ],
         (false, "damage") => &["net/minecraft/world/damagesource/DamageSource"],
         (_, "block-pos") => &["net/minecraft/core/BlockPos"],
         (_, "level-resource") => &["net/minecraft/world/level/storage/LevelResource"],
@@ -402,7 +418,12 @@ pub(crate) fn declared_types(key: &str) -> &'static [&'static str] {
         (true, "minecraft") => &["net/minecraft/client/Minecraft"],
         (true, "level") => &["net/minecraft/client/multiplayer/ClientLevel"],
         (true, "player") => &["net/minecraft/client/player/LocalPlayer"],
-        (true, "stack") => &["net/minecraft/world/item/ItemStack"],
+        (true, "stack") => &[
+            "net/minecraft/world/item/ItemStack",
+            "net/minecraft/world/item/ItemInstance",
+            "net/minecraft/core/component/DataComponentHolder",
+            "net/minecraft/core/component/DataComponentGetter",
+        ],
         (true, "item") => &["net/minecraft/world/item/Item"],
         (true, "mob-effect") => &["net/minecraft/world/effect/MobEffect"],
         (true, "attribute") => &["net/minecraft/world/entity/ai/attributes/Attribute"],

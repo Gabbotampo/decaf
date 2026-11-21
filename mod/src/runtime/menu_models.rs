@@ -1040,6 +1040,50 @@ pub(crate) fn keyed_text(states: &States, key: &str) -> Option<String> {
     states.get(key).map(|object| format!("{object:?}"))
 }
 
+/// Default vanilla `Container.getMaxStackSize()` in Minecraft 26.3 (`Container.DEFAULT_MAX_STACK_SIZE`).
+pub(crate) const DEFAULT_CONTAINER_MAX_STACK_SIZE: i32 = 99;
+
+/// How `SimpleContainer.setItem` should clamp the placed stack:
+/// - `ContainerMax(n)` computes `min(n, stack.getMaxStackSize())` (vanilla `Container.getMaxStackSize(ItemStack)`).
+/// - `Exact(limit)` uses the value returned by a mod subclass's overridden `getMaxStackSize(ItemStack)`.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum ContainerClamp {
+    ContainerMax(i32),
+    Exact(i32),
+}
+
+pub(crate) trait StackOps {
+    fn is_empty(&self, value: &Value) -> Option<bool>;
+    fn max_stack_size(&self, value: &Value) -> Option<i32>;
+    fn clamp_for_container(&mut self, value: &Value, container_max: i32) -> Option<()>;
+    fn clamp_exact(&mut self, value: &Value, limit: i32) -> Option<()>;
+    fn take_pending_clamp(&mut self) -> Option<ContainerClamp> {
+        None
+    }
+}
+
+#[cfg(test)]
+struct EmptyOnlyStacks;
+
+#[cfg(test)]
+impl StackOps for EmptyOnlyStacks {
+    fn is_empty(&self, value: &Value) -> Option<bool> {
+        (*value == empty_stack()).then_some(true)
+    }
+
+    fn max_stack_size(&self, value: &Value) -> Option<i32> {
+        (*value == empty_stack()).then_some(1)
+    }
+
+    fn clamp_for_container(&mut self, value: &Value, _max: i32) -> Option<()> {
+        (*value == empty_stack()).then_some(())
+    }
+
+    fn clamp_exact(&mut self, value: &Value, _limit: i32) -> Option<()> {
+        (*value == empty_stack()).then_some(())
+    }
+}
+
 fn inventory_display_name(
     states: &States,
     inventory: &Value,
@@ -1153,15 +1197,24 @@ pub(crate) fn call(
     receiver: &Value,
     args: &[Value],
 ) -> Option<Result<Value, NativeError>> {
-    call_with_client_player(states, next_id, r, receiver, args, None)
+    call_with_stacks_and_client_player(
+        states,
+        next_id,
+        r,
+        receiver,
+        args,
+        &mut EmptyOnlyStacks,
+        None,
+    )
 }
 
-pub(crate) fn call_with_client_player(
+pub(crate) fn call_with_stacks_and_client_player(
     states: &mut States,
     next_id: &mut u64,
     r: &MethodRef,
     receiver: &Value,
     args: &[Value],
+    stacks: &mut dyn StackOps,
     client_player: Option<Value>,
 ) -> Option<Result<Value, NativeError>> {
     let key = expect_ref(receiver)?.to_owned();
@@ -2104,17 +2157,33 @@ pub(crate) fn call_with_client_player(
         let mut pending_action = None;
         let answer = match r.name.as_str() {
             "getContainerSize" => Ok(Value::Int(*size)),
-            "isEmpty" => {
-                // Only `ItemStack.EMPTY` is known to be empty. A Java `null` here (a mod's
-                // `setItem(i, null)`, which this model refuses below) would make
-                // `ItemStack.isEmpty()` throw, so it is never answered as empty.
-                if items.iter().all(|v| *v == empty_stack()) {
-                    Ok(Value::Int(1))
-                } else {
-                    // ItemStack.isEmpty is observable per element.  An arbitrary
-                    // marker does not tell us whether its count/item is empty.
-                    return None;
+            "getMaxStackSize" => match r.descriptor.as_str() {
+                "()I" => Ok(Value::Int(DEFAULT_CONTAINER_MAX_STACK_SIZE)),
+                "(Lnet/minecraft/world/item/ItemStack;)I" => {
+                    let stack = args.first()?;
+                    if matches!(stack, Value::Ref(None)) {
+                        return None;
+                    }
+                    let smax = stacks.max_stack_size(stack)?;
+                    Ok(Value::Int(DEFAULT_CONTAINER_MAX_STACK_SIZE.min(smax)))
                 }
+                _ => return None,
+            },
+            "isEmpty" => {
+                // Only `ItemStack.EMPTY` and known live stacks have known emptiness.
+                // Any unknown stack marker stays counted so we never guess.
+                let mut all_empty = true;
+                for v in items.iter() {
+                    match stacks.is_empty(v) {
+                        Some(true) => {}
+                        Some(false) => {
+                            all_empty = false;
+                            break;
+                        }
+                        None => return None,
+                    }
+                }
+                Ok(Value::Int(i32::from(all_empty)))
             }
             "getItem" => {
                 let position = if *result { 0 } else { index };
@@ -2134,12 +2203,19 @@ pub(crate) fn call_with_client_player(
                 if matches!(value, Value::Ref(None)) {
                     return None;
                 }
-                // SimpleContainer clamps through getMaxStackSize(stack) and
-                // ItemStack.limitSize(max).  Only EMPTY is fully known here;
-                // refuse to mutate for an unknown stack so Java's clamp cannot
-                // be silently skipped. ResultContainer has no clamp in 26.3.
-                if !*result && *value != empty_stack() {
-                    return None;
+                // SimpleContainer clamps through `this.getMaxStackSize(stack)` (default 99
+                // bounded by `stack.getMaxStackSize()`, or a mod container's virtual override)
+                // and `ItemStack.limitSize(max)`. Refuse to mutate for an unknown stack so Java's
+                // clamp cannot be silently skipped. ResultContainer has no clamp in 26.3.
+                let pending_clamp = stacks.take_pending_clamp();
+                if !*result {
+                    match pending_clamp {
+                        Some(ContainerClamp::Exact(limit)) => stacks.clamp_exact(value, limit),
+                        Some(ContainerClamp::ContainerMax(max)) => {
+                            stacks.clamp_for_container(value, max)
+                        }
+                        None => stacks.clamp_for_container(value, DEFAULT_CONTAINER_MAX_STACK_SIZE),
+                    }?;
                 }
                 let item = items.get_mut(index)?;
                 *item = value.clone();

@@ -1,0 +1,20 @@
+recipe=runes:arcane_rune_medium_altar|notify=true|result=runes:arcane_stone|count=16
+recipe=runes:arcane_rune_small_altar|notify=true|result=runes:arcane_stone|count=8
+recipe=runes:fire_rune_medium_altar|notify=true|result=runes:fire_stone|count=16
+recipe=runes:fire_rune_small_altar|notify=true|result=runes:fire_stone|count=8
+recipe=runes:frost_rune_medium_altar|notify=true|result=runes:frost_stone|count=16
+recipe=runes:frost_rune_small_altar|notify=true|result=runes:frost_stone|count=8
+recipe=runes:healing_rune_medium_altar|notify=true|result=runes:healing_stone|count=16
+recipe=runes:healing_rune_small_altar|notify=true|result=runes:healing_stone|count=8
+decodedCount=8
+case:cobble+amethyst_shard|recipe=runes:arcane_rune_small_altar|out=8 runes:arcane_stone|empty=false|repairCost=0
+case:cobble+ender_pearl|recipe=runes:arcane_rune_medium_altar|out=16 runes:arcane_stone|empty=false|repairCost=0
+case:blackstone+blaze_powder|recipe=runes:fire_rune_medium_altar|out=16 runes:fire_stone|empty=false|repairCost=0
+case:cobble+coal|recipe=runes:fire_rune_small_altar|out=8 runes:fire_stone|empty=false|repairCost=0
+case:deepslate+snowball|recipe=runes:frost_rune_small_altar|out=8 runes:frost_stone|empty=false|repairCost=0
+case:cobble+ice|recipe=runes:frost_rune_medium_altar|out=16 runes:frost_stone|empty=false|repairCost=0
+case:cobble+gold_nugget|recipe=runes:healing_rune_small_altar|out=8 runes:healing_stone|empty=false|repairCost=0
+case:cobble+honeycomb|recipe=runes:healing_rune_medium_altar|out=16 runes:healing_stone|empty=false|repairCost=0
+case:cobble_repair9+amethyst_shard|recipe=runes:arcane_rune_small_altar|out=8 runes:arcane_stone|empty=false|repairCost=9
+case:dirt+amethyst_shard|recipe=empty|out=0 minecraft:air|empty=true|repairCost=null
+case:empty+empty|recipe=empty|out=0 minecraft:air|empty=true|repairCost=null
