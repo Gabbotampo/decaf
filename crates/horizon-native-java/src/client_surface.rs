@@ -2368,10 +2368,16 @@ impl StdHost {
     /// In Minecraft 26.3, the `String` overloads return early on `null`
     /// (drawing nothing), whereas the `Component` overloads immediately invoke
     /// `Component.getVisualOrderText()` and throw `NullPointerException`.
+    ///
+    /// `param` is the `Component` parameter's name in the real method's
+    /// LocalVariableTable, which Java 25's helpful NPE message quotes: `str` in
+    /// both `text(Font, Component, …)` overloads, `text` in
+    /// `centeredText(Font, Component, …)` (javap -l of the 26.3 client jar).
     fn graphics_text_arg(
         &self,
         arg: &Value,
         descriptor: &str,
+        param: &str,
     ) -> Result<Option<ClientText>, Option<NativeError>> {
         if let Some(text) = text_arg(arg, &self.component_states) {
             return Ok(Some(text));
@@ -2385,10 +2391,9 @@ impl StdHost {
             ) {
                 return Err(Some(NativeError::UncaughtException {
                     class: "java/lang/NullPointerException".into(),
-                    message: Some(
-                        r#"Cannot invoke "net.minecraft.network.chat.Component.getVisualOrderText()" because "text" is null"#
-                            .into(),
-                    ),
+                    message: Some(format!(
+                        r#"Cannot invoke "net.minecraft.network.chat.Component.getVisualOrderText()" because "{param}" is null"#
+                    )),
                     frame: None,
                 }));
             }
@@ -2436,7 +2441,7 @@ impl StdHost {
             }
             ("text", descriptor) if descriptor.starts_with("(Lnet/minecraft/client/gui/Font;") => {
                 let arg = args.get(1)?;
-                let text = match self.graphics_text_arg(arg, descriptor) {
+                let text = match self.graphics_text_arg(arg, descriptor, "str") {
                     Ok(Some(text)) => text,
                     Ok(None) => return Some(Ok(Value::Void)),
                     Err(Some(err)) => return Some(Err(err)),
@@ -2531,7 +2536,7 @@ impl StdHost {
                 if descriptor.starts_with("(Lnet/minecraft/client/gui/Font;") =>
             {
                 let arg = args.get(1)?;
-                let text = match self.graphics_text_arg(arg, descriptor) {
+                let text = match self.graphics_text_arg(arg, descriptor, "text") {
                     Ok(Some(text)) => text,
                     Ok(None) => return Some(Ok(Value::Void)),
                     Err(Some(err)) => return Some(Err(err)),

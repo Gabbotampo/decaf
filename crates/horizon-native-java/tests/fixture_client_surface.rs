@@ -698,12 +698,22 @@ public final class NullTextHud {
           try {
             graphics.text(font, (Component) null, 0, 0, 0xFFFFFF, true);
           } catch (NullPointerException expected) {
-            nullComponentNpe = 1;
+            // Java 25's helpful message names the real parameter (str).
+            nullComponentNpe =
+                ("Cannot invoke \"net.minecraft.network.chat.Component.getVisualOrderText()\" because \"str\" is null")
+                        .equals(expected.getMessage())
+                    ? 1
+                    : 2;
           }
           try {
             graphics.centeredText(font, (Component) null, 10, 0, 0xFFFFFF);
           } catch (NullPointerException expected) {
-            nullCenteredComponentNpe = 1;
+            // Java 25's helpful message names the real parameter (text).
+            nullCenteredComponentNpe =
+                ("Cannot invoke \"net.minecraft.network.chat.Component.getVisualOrderText()\" because \"text\" is null")
+                        .equals(expected.getMessage())
+                    ? 1
+                    : 2;
           }
         });
   }
