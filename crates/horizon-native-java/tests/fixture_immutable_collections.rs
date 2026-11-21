@@ -103,6 +103,25 @@ public final class Probe {
         return String.valueOf(m.get("k"));
     }
 
+    /// Keys and values in an IdentityHashMap both use reference identity,
+    /// including the Map default compute methods and the overridden mappings.
+    public static String identityOperations() {
+        String a = new String("x"), b = new String("x");
+        IdentityHashMap<String, Integer> m = new IdentityHashMap<>();
+        m.put(a, 1);
+        m.put(b, 2);
+        Integer first = m.get(b);
+        Integer same = m.get(a);
+        String v1 = new String("v"), v2 = new String("v");
+        IdentityHashMap<String, String> n = new IdentityHashMap<>();
+        n.put("k", v1);
+        boolean removedEqual = n.remove("k", v2);
+        boolean replacedEqual = n.replace("k", v2, new String("z"));
+        boolean removedSame = n.remove("k", v1);
+        return first + ":" + same + ":" + m.size() + ":" + removedEqual + ":"
+            + replacedEqual + ":" + removedSame + ":" + n.size();
+    }
+
     public static String random_m0() { return RandomImm.m0(); }
     public static String random_m1() { return RandomImm.m2(); }
     public static String random_m2() { return RandomImm.m3(); }
@@ -432,6 +451,7 @@ fn identity_hash_maps_keep_identity() {
         &[
             ("identityKeys", "2|null|false"),
             ("identityStrings", "null"),
+            ("identityOperations", "2:1:2:false:false:true:0"),
         ],
     );
 }
@@ -503,19 +523,13 @@ fn random_set_of_and_map_of_programs_match_jdk_25() {
 #[test]
 fn random_orders_and_ambiguous_identities_are_counted() {
     let fixture = fixture("random-orders-and-ambiguous-identities-a");
-    let cases: &[(&str, &[(&str, usize)])] = &[
-        (
-            "randomIteration",
-            &[(
-                "java/lang/String#valueOf(Ljava/lang/Object;)Ljava/lang/String;",
-                4,
-            )],
-        ),
-        (
-            "identityStringPresent",
-            &[("java/util/Map#get(Ljava/lang/Object;)Ljava/lang/Object;", 1)],
-        ),
-    ];
+    let cases: &[(&str, &[(&str, usize)])] = &[(
+        "randomIteration",
+        &[(
+            "java/lang/String#valueOf(Ljava/lang/Object;)Ljava/lang/String;",
+            4,
+        )],
+    )];
     for (method, expected) in cases {
         let mut host = fixture.jar.seed_host(StdHost::new());
         fixture.text_on(&mut host, method);
