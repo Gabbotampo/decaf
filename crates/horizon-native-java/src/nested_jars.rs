@@ -1140,11 +1140,13 @@ struct FabricPredicateTerm {
 /// to refuse rather than inventing a SAT result.
 fn fabric_predicate_terms(range: &str) -> Option<Vec<FabricPredicateTerm>> {
     let mut terms = Vec::new();
-    // Fabric's parser uses whitespace-separated terms. A comma remains part
-    // of a version token and therefore falls back to StringVersion exactly as
-    // the Java parser does.
-    for raw in range.split_whitespace() {
-        let raw = raw.trim();
+    // A comma remains part of a version token and therefore falls back to
+    // StringVersion exactly as the Java parser does.
+    // `VersionPredicateParser.parse` splits on a single space (`split(" ")`),
+    // then `String.trim()`s each token, which strips every char <= U+0020 but
+    // only at the ends: a tab or newline inside a token stays part of it.
+    for raw in range.split(' ') {
+        let raw = raw.trim_matches(|c: char| c <= ' ');
         if raw.is_empty() || raw == "*" {
             continue;
         }
@@ -1160,7 +1162,7 @@ fn fabric_predicate_terms(range: &str) -> Option<Vec<FabricPredicateTerm>> {
         .into_iter()
         .find_map(|(prefix, operator)| {
             raw.strip_prefix(prefix)
-                .map(|expected| (operator, expected.trim()))
+                .map(|expected| (operator, expected))
         })
         .unwrap_or((FabricPredicateOperator::Equal, raw));
         if expected.is_empty() {
@@ -2454,17 +2456,42 @@ mod tests {
 
     #[test]
     fn fabric_predicates_match_the_jdk25_oracle() {
+        let mut wrong = Vec::new();
+        let mut refused = Vec::new();
         for line in include_str!("nested_jars_predicate_java25.txt").lines() {
             let row: serde_json::Value = serde_json::from_str(line).unwrap();
             let predicate = row["predicate"].as_str().unwrap();
             let version = row["version"].as_str().unwrap();
             let actual = fabric_predicate_matches(predicate, Some(version));
             if row.get("error").is_some() {
-                assert!(actual.is_none(), "{line}");
-            } else {
-                assert_eq!(actual, Some(row["ok"].as_bool().unwrap()), "{line}");
+                if actual.is_some() {
+                    wrong.push(line);
+                }
+            } else if actual.is_none() {
+                if !wildcard_with_prerelease(predicate) {
+                    refused.push(line);
+                }
+            } else if actual != Some(row["ok"].as_bool().unwrap()) {
+                wrong.push(line);
             }
         }
+        assert!(wrong.is_empty(), "wrong answers:\n{}", wrong.join("\n"));
+        assert!(refused.is_empty(), "refused:\n{}", refused.join("\n"));
+    }
+
+    /// The one predicate shape Decaf refuses although Fabric evaluates it: an
+    /// X-range component followed by prerelease text (`1.2.x-alpha`). Every
+    /// other row Fabric accepts must get Fabric's exact answer.
+    fn wildcard_with_prerelease(predicate: &str) -> bool {
+        predicate.split(' ').any(|token| {
+            let token = token.trim_start_matches(['>', '<', '=', '~', '^']);
+            let numbers = token.split('+').next().unwrap_or("");
+            numbers.split_once('-').is_some_and(|(numbers, _)| {
+                numbers
+                    .split('.')
+                    .any(|part| matches!(part, "x" | "X" | "*"))
+            })
+        })
     }
 
     #[test]

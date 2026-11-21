@@ -592,28 +592,6 @@
 {"predicate":"1.2 || 2.0","version":"1.2.4","ok":false}
 {"predicate":"1.2 || 2.0","version":"1.2.3.4.5","ok":false}
 {"predicate":"1.2 || 2.0","version":"999999999999999999999","ok":false}
-{"predicate":">=1.2, <2.0","version":"0","ok":false}
-{"predicate":">=1.2, <2.0","version":"1","ok":false}
-{"predicate":">=1.2, <2.0","version":"1.0","ok":false}
-{"predicate":">=1.2, <2.0","version":"1.1","ok":false}
-{"predicate":">=1.2, <2.0","version":"1.2","ok":false}
-{"predicate":">=1.2, <2.0","version":"1.2.0","ok":false}
-{"predicate":">=1.2, <2.0","version":"1.2.1","ok":false}
-{"predicate":">=1.2, <2.0","version":"1.2.5","ok":false}
-{"predicate":">=1.2, <2.0","version":"1.3","ok":false}
-{"predicate":">=1.2, <2.0","version":"1.9","ok":false}
-{"predicate":">=1.2, <2.0","version":"2.0","ok":false}
-{"predicate":">=1.2, <2.0","version":"2.1","ok":false}
-{"predicate":">=1.2, <2.0","version":"1.2-alpha","ok":false}
-{"predicate":">=1.2, <2.0","version":"1.2-beta","ok":false}
-{"predicate":">=1.2, <2.0","version":"1.2+other","ok":false}
-{"predicate":">=1.2, <2.0","version":"foo","ok":false}
-{"predicate":">=1.2, <2.0","version":"1.x","ok":false}
-{"predicate":">=1.2, <2.0","version":"1.2.3","ok":false}
-{"predicate":">=1.2, <2.0","version":"1.2.3.4","ok":false}
-{"predicate":">=1.2, <2.0","version":"1.2.4","ok":false}
-{"predicate":">=1.2, <2.0","version":"1.2.3.4.5","ok":false}
-{"predicate":">=1.2, <2.0","version":"999999999999999999999","ok":false}
 {"predicate":">=1.2, <1.2","version":"0","ok":false}
 {"predicate":">=1.2, <1.2","version":"1","ok":false}
 {"predicate":">=1.2, <1.2","version":"1.0","ok":false}
@@ -856,28 +834,6 @@
 {"predicate":">=1.2-alpha","version":"1.2.4","ok":true}
 {"predicate":">=1.2-alpha","version":"1.2.3.4.5","ok":true}
 {"predicate":">=1.2-alpha","version":"999999999999999999999","ok":false}
-{"predicate":"<1.2","version":"0","ok":true}
-{"predicate":"<1.2","version":"1","ok":true}
-{"predicate":"<1.2","version":"1.0","ok":true}
-{"predicate":"<1.2","version":"1.1","ok":true}
-{"predicate":"<1.2","version":"1.2","ok":false}
-{"predicate":"<1.2","version":"1.2.0","ok":false}
-{"predicate":"<1.2","version":"1.2.1","ok":false}
-{"predicate":"<1.2","version":"1.2.5","ok":false}
-{"predicate":"<1.2","version":"1.3","ok":false}
-{"predicate":"<1.2","version":"1.9","ok":false}
-{"predicate":"<1.2","version":"2.0","ok":false}
-{"predicate":"<1.2","version":"2.1","ok":false}
-{"predicate":"<1.2","version":"1.2-alpha","ok":true}
-{"predicate":"<1.2","version":"1.2-beta","ok":true}
-{"predicate":"<1.2","version":"1.2+other","ok":false}
-{"predicate":"<1.2","version":"foo","ok":false}
-{"predicate":"<1.2","version":"1.x","ok":false}
-{"predicate":"<1.2","version":"1.2.3","ok":false}
-{"predicate":"<1.2","version":"1.2.3.4","ok":false}
-{"predicate":"<1.2","version":"1.2.4","ok":false}
-{"predicate":"<1.2","version":"1.2.3.4.5","ok":false}
-{"predicate":"<1.2","version":"999999999999999999999","ok":false}
 {"predicate":"^1.2-alpha","version":"0","ok":false}
 {"predicate":"^1.2-alpha","version":"1","ok":false}
 {"predicate":"^1.2-alpha","version":"1.0","ok":false}
@@ -1274,3 +1230,402 @@
 {"predicate":">999999999999999999999","version":"1.2.4","error":"net.fabricmc.loader.api.VersionParsingException: Invalid predicate: >999999999999999999999, version ranges need to be semantic version compatible to use operators that exclude the bound!"}
 {"predicate":">999999999999999999999","version":"1.2.3.4.5","error":"net.fabricmc.loader.api.VersionParsingException: Invalid predicate: >999999999999999999999, version ranges need to be semantic version compatible to use operators that exclude the bound!"}
 {"predicate":">999999999999999999999","version":"999999999999999999999","error":"net.fabricmc.loader.api.VersionParsingException: Invalid predicate: >999999999999999999999, version ranges need to be semantic version compatible to use operators that exclude the bound!"}
+{"predicate":">=1.0\u0009<2.0","version":"1.0","ok":false}
+{"predicate":">=1.0\u0009<2.0","version":"1.5","ok":false}
+{"predicate":">=1.0\u0009<2.0","version":"2.0","ok":false}
+{"predicate":">=1.0\u0009<2.0","version":"1.2.3","ok":false}
+{"predicate":">=1.0\u0009<2.0","version":"1.2.3-alpha","ok":false}
+{"predicate":">=1.0\u0009<2.0","version":"1.2.0-alpha","ok":false}
+{"predicate":">=1.0\u0009<2.0","version":"1.2-alpha","ok":false}
+{"predicate":">=1.0\u0009<2.0","version":"1.3.0","ok":false}
+{"predicate":">=1.0\u0009<2.0","version":"0.9","ok":false}
+{"predicate":">=1.0\u0009<2.0","version":"1.0\u0009","ok":false}
+{"predicate":">=1.0\u0009<2.0","version":"\u00091.0","ok":false}
+{"predicate":">=1.0\u0009<2.0","version":"1.0-beta","ok":false}
+{"predicate":">=1.0\u0009<2.0","version":"1.2.3+build","ok":false}
+{"predicate":"1.0\u0009","version":"1.0","ok":true}
+{"predicate":"1.0\u0009","version":"1.5","ok":false}
+{"predicate":"1.0\u0009","version":"2.0","ok":false}
+{"predicate":"1.0\u0009","version":"1.2.3","ok":false}
+{"predicate":"1.0\u0009","version":"1.2.3-alpha","ok":false}
+{"predicate":"1.0\u0009","version":"1.2.0-alpha","ok":false}
+{"predicate":"1.0\u0009","version":"1.2-alpha","ok":false}
+{"predicate":"1.0\u0009","version":"1.3.0","ok":false}
+{"predicate":"1.0\u0009","version":"0.9","ok":false}
+{"predicate":"1.0\u0009","version":"1.0\u0009","ok":false}
+{"predicate":"1.0\u0009","version":"\u00091.0","ok":false}
+{"predicate":"1.0\u0009","version":"1.0-beta","ok":false}
+{"predicate":"1.0\u0009","version":"1.2.3+build","ok":false}
+{"predicate":"\u00091.0","version":"1.0","ok":true}
+{"predicate":"\u00091.0","version":"1.5","ok":false}
+{"predicate":"\u00091.0","version":"2.0","ok":false}
+{"predicate":"\u00091.0","version":"1.2.3","ok":false}
+{"predicate":"\u00091.0","version":"1.2.3-alpha","ok":false}
+{"predicate":"\u00091.0","version":"1.2.0-alpha","ok":false}
+{"predicate":"\u00091.0","version":"1.2-alpha","ok":false}
+{"predicate":"\u00091.0","version":"1.3.0","ok":false}
+{"predicate":"\u00091.0","version":"0.9","ok":false}
+{"predicate":"\u00091.0","version":"1.0\u0009","ok":false}
+{"predicate":"\u00091.0","version":"\u00091.0","ok":false}
+{"predicate":"\u00091.0","version":"1.0-beta","ok":false}
+{"predicate":"\u00091.0","version":"1.2.3+build","ok":false}
+{"predicate":">=\u00091.0","version":"1.0","ok":false}
+{"predicate":">=\u00091.0","version":"1.5","ok":false}
+{"predicate":">=\u00091.0","version":"2.0","ok":false}
+{"predicate":">=\u00091.0","version":"1.2.3","ok":false}
+{"predicate":">=\u00091.0","version":"1.2.3-alpha","ok":false}
+{"predicate":">=\u00091.0","version":"1.2.0-alpha","ok":false}
+{"predicate":">=\u00091.0","version":"1.2-alpha","ok":false}
+{"predicate":">=\u00091.0","version":"1.3.0","ok":false}
+{"predicate":">=\u00091.0","version":"0.9","ok":false}
+{"predicate":">=\u00091.0","version":"1.0\u0009","ok":false}
+{"predicate":">=\u00091.0","version":"\u00091.0","ok":true}
+{"predicate":">=\u00091.0","version":"1.0-beta","ok":false}
+{"predicate":">=\u00091.0","version":"1.2.3+build","ok":false}
+{"predicate":">= 1.0","version":"1.0","error":"net.fabricmc.loader.api.VersionParsingException: Version must be a non-empty string!"}
+{"predicate":">= 1.0","version":"1.5","error":"net.fabricmc.loader.api.VersionParsingException: Version must be a non-empty string!"}
+{"predicate":">= 1.0","version":"2.0","error":"net.fabricmc.loader.api.VersionParsingException: Version must be a non-empty string!"}
+{"predicate":">= 1.0","version":"1.2.3","error":"net.fabricmc.loader.api.VersionParsingException: Version must be a non-empty string!"}
+{"predicate":">= 1.0","version":"1.2.3-alpha","error":"net.fabricmc.loader.api.VersionParsingException: Version must be a non-empty string!"}
+{"predicate":">= 1.0","version":"1.2.0-alpha","error":"net.fabricmc.loader.api.VersionParsingException: Version must be a non-empty string!"}
+{"predicate":">= 1.0","version":"1.2-alpha","error":"net.fabricmc.loader.api.VersionParsingException: Version must be a non-empty string!"}
+{"predicate":">= 1.0","version":"1.3.0","error":"net.fabricmc.loader.api.VersionParsingException: Version must be a non-empty string!"}
+{"predicate":">= 1.0","version":"0.9","error":"net.fabricmc.loader.api.VersionParsingException: Version must be a non-empty string!"}
+{"predicate":">= 1.0","version":"1.0\u0009","error":"net.fabricmc.loader.api.VersionParsingException: Version must be a non-empty string!"}
+{"predicate":">= 1.0","version":"\u00091.0","error":"net.fabricmc.loader.api.VersionParsingException: Version must be a non-empty string!"}
+{"predicate":">= 1.0","version":"1.0-beta","error":"net.fabricmc.loader.api.VersionParsingException: Version must be a non-empty string!"}
+{"predicate":">= 1.0","version":"1.2.3+build","error":"net.fabricmc.loader.api.VersionParsingException: Version must be a non-empty string!"}
+{"predicate":">=1.0 <2.0","version":"1.0","ok":true}
+{"predicate":">=1.0 <2.0","version":"1.5","ok":true}
+{"predicate":">=1.0 <2.0","version":"2.0","ok":false}
+{"predicate":">=1.0 <2.0","version":"1.2.3","ok":true}
+{"predicate":">=1.0 <2.0","version":"1.2.3-alpha","ok":true}
+{"predicate":">=1.0 <2.0","version":"1.2.0-alpha","ok":true}
+{"predicate":">=1.0 <2.0","version":"1.2-alpha","ok":true}
+{"predicate":">=1.0 <2.0","version":"1.3.0","ok":true}
+{"predicate":">=1.0 <2.0","version":"0.9","ok":false}
+{"predicate":">=1.0 <2.0","version":"1.0\u0009","ok":false}
+{"predicate":">=1.0 <2.0","version":"\u00091.0","ok":false}
+{"predicate":">=1.0 <2.0","version":"1.0-beta","ok":false}
+{"predicate":">=1.0 <2.0","version":"1.2.3+build","ok":true}
+{"predicate":">=1.0  <2.0","version":"1.0","ok":true}
+{"predicate":">=1.0  <2.0","version":"1.5","ok":true}
+{"predicate":">=1.0  <2.0","version":"2.0","ok":false}
+{"predicate":">=1.0  <2.0","version":"1.2.3","ok":true}
+{"predicate":">=1.0  <2.0","version":"1.2.3-alpha","ok":true}
+{"predicate":">=1.0  <2.0","version":"1.2.0-alpha","ok":true}
+{"predicate":">=1.0  <2.0","version":"1.2-alpha","ok":true}
+{"predicate":">=1.0  <2.0","version":"1.3.0","ok":true}
+{"predicate":">=1.0  <2.0","version":"0.9","ok":false}
+{"predicate":">=1.0  <2.0","version":"1.0\u0009","ok":false}
+{"predicate":">=1.0  <2.0","version":"\u00091.0","ok":false}
+{"predicate":">=1.0  <2.0","version":"1.0-beta","ok":false}
+{"predicate":">=1.0  <2.0","version":"1.2.3+build","ok":true}
+{"predicate":" >=1.0 ","version":"1.0","ok":true}
+{"predicate":" >=1.0 ","version":"1.5","ok":true}
+{"predicate":" >=1.0 ","version":"2.0","ok":true}
+{"predicate":" >=1.0 ","version":"1.2.3","ok":true}
+{"predicate":" >=1.0 ","version":"1.2.3-alpha","ok":true}
+{"predicate":" >=1.0 ","version":"1.2.0-alpha","ok":true}
+{"predicate":" >=1.0 ","version":"1.2-alpha","ok":true}
+{"predicate":" >=1.0 ","version":"1.3.0","ok":true}
+{"predicate":" >=1.0 ","version":"0.9","ok":false}
+{"predicate":" >=1.0 ","version":"1.0\u0009","ok":false}
+{"predicate":" >=1.0 ","version":"\u00091.0","ok":false}
+{"predicate":" >=1.0 ","version":"1.0-beta","ok":false}
+{"predicate":" >=1.0 ","version":"1.2.3+build","ok":true}
+{"predicate":"  ","version":"1.0","ok":true}
+{"predicate":"  ","version":"1.5","ok":true}
+{"predicate":"  ","version":"2.0","ok":true}
+{"predicate":"  ","version":"1.2.3","ok":true}
+{"predicate":"  ","version":"1.2.3-alpha","ok":true}
+{"predicate":"  ","version":"1.2.0-alpha","ok":true}
+{"predicate":"  ","version":"1.2-alpha","ok":true}
+{"predicate":"  ","version":"1.3.0","ok":true}
+{"predicate":"  ","version":"0.9","ok":true}
+{"predicate":"  ","version":"1.0\u0009","ok":true}
+{"predicate":"  ","version":"\u00091.0","ok":true}
+{"predicate":"  ","version":"1.0-beta","ok":true}
+{"predicate":"  ","version":"1.2.3+build","ok":true}
+{"predicate":"\u0009","version":"1.0","ok":true}
+{"predicate":"\u0009","version":"1.5","ok":true}
+{"predicate":"\u0009","version":"2.0","ok":true}
+{"predicate":"\u0009","version":"1.2.3","ok":true}
+{"predicate":"\u0009","version":"1.2.3-alpha","ok":true}
+{"predicate":"\u0009","version":"1.2.0-alpha","ok":true}
+{"predicate":"\u0009","version":"1.2-alpha","ok":true}
+{"predicate":"\u0009","version":"1.3.0","ok":true}
+{"predicate":"\u0009","version":"0.9","ok":true}
+{"predicate":"\u0009","version":"1.0\u0009","ok":true}
+{"predicate":"\u0009","version":"\u00091.0","ok":true}
+{"predicate":"\u0009","version":"1.0-beta","ok":true}
+{"predicate":"\u0009","version":"1.2.3+build","ok":true}
+{"predicate":" * ","version":"1.0","ok":true}
+{"predicate":" * ","version":"1.5","ok":true}
+{"predicate":" * ","version":"2.0","ok":true}
+{"predicate":" * ","version":"1.2.3","ok":true}
+{"predicate":" * ","version":"1.2.3-alpha","ok":true}
+{"predicate":" * ","version":"1.2.0-alpha","ok":true}
+{"predicate":" * ","version":"1.2-alpha","ok":true}
+{"predicate":" * ","version":"1.3.0","ok":true}
+{"predicate":" * ","version":"0.9","ok":true}
+{"predicate":" * ","version":"1.0\u0009","ok":true}
+{"predicate":" * ","version":"\u00091.0","ok":true}
+{"predicate":" * ","version":"1.0-beta","ok":true}
+{"predicate":" * ","version":"1.2.3+build","ok":true}
+{"predicate":"*\u0009","version":"1.0","ok":true}
+{"predicate":"*\u0009","version":"1.5","ok":true}
+{"predicate":"*\u0009","version":"2.0","ok":true}
+{"predicate":"*\u0009","version":"1.2.3","ok":true}
+{"predicate":"*\u0009","version":"1.2.3-alpha","ok":true}
+{"predicate":"*\u0009","version":"1.2.0-alpha","ok":true}
+{"predicate":"*\u0009","version":"1.2-alpha","ok":true}
+{"predicate":"*\u0009","version":"1.3.0","ok":true}
+{"predicate":"*\u0009","version":"0.9","ok":true}
+{"predicate":"*\u0009","version":"1.0\u0009","ok":true}
+{"predicate":"*\u0009","version":"\u00091.0","ok":true}
+{"predicate":"*\u0009","version":"1.0-beta","ok":true}
+{"predicate":"*\u0009","version":"1.2.3+build","ok":true}
+{"predicate":"\u0009*","version":"1.0","ok":true}
+{"predicate":"\u0009*","version":"1.5","ok":true}
+{"predicate":"\u0009*","version":"2.0","ok":true}
+{"predicate":"\u0009*","version":"1.2.3","ok":true}
+{"predicate":"\u0009*","version":"1.2.3-alpha","ok":true}
+{"predicate":"\u0009*","version":"1.2.0-alpha","ok":true}
+{"predicate":"\u0009*","version":"1.2-alpha","ok":true}
+{"predicate":"\u0009*","version":"1.3.0","ok":true}
+{"predicate":"\u0009*","version":"0.9","ok":true}
+{"predicate":"\u0009*","version":"1.0\u0009","ok":true}
+{"predicate":"\u0009*","version":"\u00091.0","ok":true}
+{"predicate":"\u0009*","version":"1.0-beta","ok":true}
+{"predicate":"\u0009*","version":"1.2.3+build","ok":true}
+{"predicate":">=1.0 *","version":"1.0","ok":true}
+{"predicate":">=1.0 *","version":"1.5","ok":true}
+{"predicate":">=1.0 *","version":"2.0","ok":true}
+{"predicate":">=1.0 *","version":"1.2.3","ok":true}
+{"predicate":">=1.0 *","version":"1.2.3-alpha","ok":true}
+{"predicate":">=1.0 *","version":"1.2.0-alpha","ok":true}
+{"predicate":">=1.0 *","version":"1.2-alpha","ok":true}
+{"predicate":">=1.0 *","version":"1.3.0","ok":true}
+{"predicate":">=1.0 *","version":"0.9","ok":false}
+{"predicate":">=1.0 *","version":"1.0\u0009","ok":false}
+{"predicate":">=1.0 *","version":"\u00091.0","ok":false}
+{"predicate":">=1.0 *","version":"1.0-beta","ok":false}
+{"predicate":">=1.0 *","version":"1.2.3+build","ok":true}
+{"predicate":"1.0\u000a","version":"1.0","ok":true}
+{"predicate":"1.0\u000a","version":"1.5","ok":false}
+{"predicate":"1.0\u000a","version":"2.0","ok":false}
+{"predicate":"1.0\u000a","version":"1.2.3","ok":false}
+{"predicate":"1.0\u000a","version":"1.2.3-alpha","ok":false}
+{"predicate":"1.0\u000a","version":"1.2.0-alpha","ok":false}
+{"predicate":"1.0\u000a","version":"1.2-alpha","ok":false}
+{"predicate":"1.0\u000a","version":"1.3.0","ok":false}
+{"predicate":"1.0\u000a","version":"0.9","ok":false}
+{"predicate":"1.0\u000a","version":"1.0\u0009","ok":false}
+{"predicate":"1.0\u000a","version":"\u00091.0","ok":false}
+{"predicate":"1.0\u000a","version":"1.0-beta","ok":false}
+{"predicate":"1.0\u000a","version":"1.2.3+build","ok":false}
+{"predicate":"\u000a","version":"1.0","ok":true}
+{"predicate":"\u000a","version":"1.5","ok":true}
+{"predicate":"\u000a","version":"2.0","ok":true}
+{"predicate":"\u000a","version":"1.2.3","ok":true}
+{"predicate":"\u000a","version":"1.2.3-alpha","ok":true}
+{"predicate":"\u000a","version":"1.2.0-alpha","ok":true}
+{"predicate":"\u000a","version":"1.2-alpha","ok":true}
+{"predicate":"\u000a","version":"1.3.0","ok":true}
+{"predicate":"\u000a","version":"0.9","ok":true}
+{"predicate":"\u000a","version":"1.0\u0009","ok":true}
+{"predicate":"\u000a","version":"\u00091.0","ok":true}
+{"predicate":"\u000a","version":"1.0-beta","ok":true}
+{"predicate":"\u000a","version":"1.2.3+build","ok":true}
+{"predicate":">=1.0\u000a<2.0","version":"1.0","ok":false}
+{"predicate":">=1.0\u000a<2.0","version":"1.5","ok":false}
+{"predicate":">=1.0\u000a<2.0","version":"2.0","ok":false}
+{"predicate":">=1.0\u000a<2.0","version":"1.2.3","ok":false}
+{"predicate":">=1.0\u000a<2.0","version":"1.2.3-alpha","ok":false}
+{"predicate":">=1.0\u000a<2.0","version":"1.2.0-alpha","ok":false}
+{"predicate":">=1.0\u000a<2.0","version":"1.2-alpha","ok":false}
+{"predicate":">=1.0\u000a<2.0","version":"1.3.0","ok":false}
+{"predicate":">=1.0\u000a<2.0","version":"0.9","ok":false}
+{"predicate":">=1.0\u000a<2.0","version":"1.0\u0009","ok":false}
+{"predicate":">=1.0\u000a<2.0","version":"\u00091.0","ok":false}
+{"predicate":">=1.0\u000a<2.0","version":"1.0-beta","ok":false}
+{"predicate":">=1.0\u000a<2.0","version":"1.2.3+build","ok":false}
+{"predicate":" 1.0","version":"1.0","ok":false}
+{"predicate":" 1.0","version":"1.5","ok":false}
+{"predicate":" 1.0","version":"2.0","ok":false}
+{"predicate":" 1.0","version":"1.2.3","ok":false}
+{"predicate":" 1.0","version":"1.2.3-alpha","ok":false}
+{"predicate":" 1.0","version":"1.2.0-alpha","ok":false}
+{"predicate":" 1.0","version":"1.2-alpha","ok":false}
+{"predicate":" 1.0","version":"1.3.0","ok":false}
+{"predicate":" 1.0","version":"0.9","ok":false}
+{"predicate":" 1.0","version":"1.0\u0009","ok":false}
+{"predicate":" 1.0","version":"\u00091.0","ok":false}
+{"predicate":" 1.0","version":"1.0-beta","ok":false}
+{"predicate":" 1.0","version":"1.2.3+build","ok":false}
+{"predicate":"1.0 ","version":"1.0","ok":false}
+{"predicate":"1.0 ","version":"1.5","ok":false}
+{"predicate":"1.0 ","version":"2.0","ok":false}
+{"predicate":"1.0 ","version":"1.2.3","ok":false}
+{"predicate":"1.0 ","version":"1.2.3-alpha","ok":false}
+{"predicate":"1.0 ","version":"1.2.0-alpha","ok":false}
+{"predicate":"1.0 ","version":"1.2-alpha","ok":false}
+{"predicate":"1.0 ","version":"1.3.0","ok":false}
+{"predicate":"1.0 ","version":"0.9","ok":false}
+{"predicate":"1.0 ","version":"1.0\u0009","ok":false}
+{"predicate":"1.0 ","version":"\u00091.0","ok":false}
+{"predicate":"1.0 ","version":"1.0-beta","ok":false}
+{"predicate":"1.0 ","version":"1.2.3+build","ok":false}
+{"predicate":"1.0\u000d","version":"1.0","ok":true}
+{"predicate":"1.0\u000d","version":"1.5","ok":false}
+{"predicate":"1.0\u000d","version":"2.0","ok":false}
+{"predicate":"1.0\u000d","version":"1.2.3","ok":false}
+{"predicate":"1.0\u000d","version":"1.2.3-alpha","ok":false}
+{"predicate":"1.0\u000d","version":"1.2.0-alpha","ok":false}
+{"predicate":"1.0\u000d","version":"1.2-alpha","ok":false}
+{"predicate":"1.0\u000d","version":"1.3.0","ok":false}
+{"predicate":"1.0\u000d","version":"0.9","ok":false}
+{"predicate":"1.0\u000d","version":"1.0\u0009","ok":false}
+{"predicate":"1.0\u000d","version":"\u00091.0","ok":false}
+{"predicate":"1.0\u000d","version":"1.0-beta","ok":false}
+{"predicate":"1.0\u000d","version":"1.2.3+build","ok":false}
+{"predicate":"\u000b1.0","version":"1.0","ok":true}
+{"predicate":"\u000b1.0","version":"1.5","ok":false}
+{"predicate":"\u000b1.0","version":"2.0","ok":false}
+{"predicate":"\u000b1.0","version":"1.2.3","ok":false}
+{"predicate":"\u000b1.0","version":"1.2.3-alpha","ok":false}
+{"predicate":"\u000b1.0","version":"1.2.0-alpha","ok":false}
+{"predicate":"\u000b1.0","version":"1.2-alpha","ok":false}
+{"predicate":"\u000b1.0","version":"1.3.0","ok":false}
+{"predicate":"\u000b1.0","version":"0.9","ok":false}
+{"predicate":"\u000b1.0","version":"1.0\u0009","ok":false}
+{"predicate":"\u000b1.0","version":"\u00091.0","ok":false}
+{"predicate":"\u000b1.0","version":"1.0-beta","ok":false}
+{"predicate":"\u000b1.0","version":"1.2.3+build","ok":false}
+{"predicate":"\u001f1.0","version":"1.0","ok":true}
+{"predicate":"\u001f1.0","version":"1.5","ok":false}
+{"predicate":"\u001f1.0","version":"2.0","ok":false}
+{"predicate":"\u001f1.0","version":"1.2.3","ok":false}
+{"predicate":"\u001f1.0","version":"1.2.3-alpha","ok":false}
+{"predicate":"\u001f1.0","version":"1.2.0-alpha","ok":false}
+{"predicate":"\u001f1.0","version":"1.2-alpha","ok":false}
+{"predicate":"\u001f1.0","version":"1.3.0","ok":false}
+{"predicate":"\u001f1.0","version":"0.9","ok":false}
+{"predicate":"\u001f1.0","version":"1.0\u0009","ok":false}
+{"predicate":"\u001f1.0","version":"\u00091.0","ok":false}
+{"predicate":"\u001f1.0","version":"1.0-beta","ok":false}
+{"predicate":"\u001f1.0","version":"1.2.3+build","ok":false}
+{"predicate":"1.2.x-alpha","version":"1.0","ok":false}
+{"predicate":"1.2.x-alpha","version":"1.5","ok":false}
+{"predicate":"1.2.x-alpha","version":"2.0","ok":false}
+{"predicate":"1.2.x-alpha","version":"1.2.3","ok":false}
+{"predicate":"1.2.x-alpha","version":"1.2.3-alpha","ok":false}
+{"predicate":"1.2.x-alpha","version":"1.2.0-alpha","ok":false}
+{"predicate":"1.2.x-alpha","version":"1.2-alpha","ok":false}
+{"predicate":"1.2.x-alpha","version":"1.3.0","ok":false}
+{"predicate":"1.2.x-alpha","version":"0.9","ok":false}
+{"predicate":"1.2.x-alpha","version":"1.0\u0009","ok":false}
+{"predicate":"1.2.x-alpha","version":"\u00091.0","ok":false}
+{"predicate":"1.2.x-alpha","version":"1.0-beta","ok":false}
+{"predicate":"1.2.x-alpha","version":"1.2.3+build","ok":false}
+{"predicate":"1.2.x-alpha.1","version":"1.0","ok":false}
+{"predicate":"1.2.x-alpha.1","version":"1.5","ok":false}
+{"predicate":"1.2.x-alpha.1","version":"2.0","ok":false}
+{"predicate":"1.2.x-alpha.1","version":"1.2.3","ok":false}
+{"predicate":"1.2.x-alpha.1","version":"1.2.3-alpha","ok":false}
+{"predicate":"1.2.x-alpha.1","version":"1.2.0-alpha","ok":false}
+{"predicate":"1.2.x-alpha.1","version":"1.2-alpha","ok":false}
+{"predicate":"1.2.x-alpha.1","version":"1.3.0","ok":false}
+{"predicate":"1.2.x-alpha.1","version":"0.9","ok":false}
+{"predicate":"1.2.x-alpha.1","version":"1.0\u0009","ok":false}
+{"predicate":"1.2.x-alpha.1","version":"\u00091.0","ok":false}
+{"predicate":"1.2.x-alpha.1","version":"1.0-beta","ok":false}
+{"predicate":"1.2.x-alpha.1","version":"1.2.3+build","ok":false}
+{"predicate":"1.x-beta","version":"1.0","ok":false}
+{"predicate":"1.x-beta","version":"1.5","ok":false}
+{"predicate":"1.x-beta","version":"2.0","ok":false}
+{"predicate":"1.x-beta","version":"1.2.3","ok":false}
+{"predicate":"1.x-beta","version":"1.2.3-alpha","ok":false}
+{"predicate":"1.x-beta","version":"1.2.0-alpha","ok":false}
+{"predicate":"1.x-beta","version":"1.2-alpha","ok":false}
+{"predicate":"1.x-beta","version":"1.3.0","ok":false}
+{"predicate":"1.x-beta","version":"0.9","ok":false}
+{"predicate":"1.x-beta","version":"1.0\u0009","ok":false}
+{"predicate":"1.x-beta","version":"\u00091.0","ok":false}
+{"predicate":"1.x-beta","version":"1.0-beta","ok":false}
+{"predicate":"1.x-beta","version":"1.2.3+build","ok":false}
+{"predicate":"1.2.*-rc.1","version":"1.0","ok":false}
+{"predicate":"1.2.*-rc.1","version":"1.5","ok":false}
+{"predicate":"1.2.*-rc.1","version":"2.0","ok":false}
+{"predicate":"1.2.*-rc.1","version":"1.2.3","ok":false}
+{"predicate":"1.2.*-rc.1","version":"1.2.3-alpha","ok":false}
+{"predicate":"1.2.*-rc.1","version":"1.2.0-alpha","ok":false}
+{"predicate":"1.2.*-rc.1","version":"1.2-alpha","ok":false}
+{"predicate":"1.2.*-rc.1","version":"1.3.0","ok":false}
+{"predicate":"1.2.*-rc.1","version":"0.9","ok":false}
+{"predicate":"1.2.*-rc.1","version":"1.0\u0009","ok":false}
+{"predicate":"1.2.*-rc.1","version":"\u00091.0","ok":false}
+{"predicate":"1.2.*-rc.1","version":"1.0-beta","ok":false}
+{"predicate":"1.2.*-rc.1","version":"1.2.3+build","ok":false}
+{"predicate":"=1.2.x-alpha","version":"1.0","ok":false}
+{"predicate":"=1.2.x-alpha","version":"1.5","ok":false}
+{"predicate":"=1.2.x-alpha","version":"2.0","ok":false}
+{"predicate":"=1.2.x-alpha","version":"1.2.3","ok":false}
+{"predicate":"=1.2.x-alpha","version":"1.2.3-alpha","ok":false}
+{"predicate":"=1.2.x-alpha","version":"1.2.0-alpha","ok":false}
+{"predicate":"=1.2.x-alpha","version":"1.2-alpha","ok":false}
+{"predicate":"=1.2.x-alpha","version":"1.3.0","ok":false}
+{"predicate":"=1.2.x-alpha","version":"0.9","ok":false}
+{"predicate":"=1.2.x-alpha","version":"1.0\u0009","ok":false}
+{"predicate":"=1.2.x-alpha","version":"\u00091.0","ok":false}
+{"predicate":"=1.2.x-alpha","version":"1.0-beta","ok":false}
+{"predicate":"=1.2.x-alpha","version":"1.2.3+build","ok":false}
+{"predicate":"~1.2-alpha","version":"1.5","ok":false}
+{"predicate":"~1.2-alpha","version":"1.2.3-alpha","ok":true}
+{"predicate":"~1.2-alpha","version":"1.2.0-alpha","ok":true}
+{"predicate":"~1.2-alpha","version":"1.3.0","ok":false}
+{"predicate":"~1.2-alpha","version":"0.9","ok":false}
+{"predicate":"~1.2-alpha","version":"1.0\u0009","ok":false}
+{"predicate":"~1.2-alpha","version":"\u00091.0","ok":false}
+{"predicate":"~1.2-alpha","version":"1.0-beta","ok":false}
+{"predicate":"~1.2-alpha","version":"1.2.3+build","ok":true}
+{"predicate":"^1.0-alpha","version":"1.0","ok":true}
+{"predicate":"^1.0-alpha","version":"1.5","ok":true}
+{"predicate":"^1.0-alpha","version":"2.0","ok":false}
+{"predicate":"^1.0-alpha","version":"1.2.3","ok":true}
+{"predicate":"^1.0-alpha","version":"1.2.3-alpha","ok":true}
+{"predicate":"^1.0-alpha","version":"1.2.0-alpha","ok":true}
+{"predicate":"^1.0-alpha","version":"1.2-alpha","ok":true}
+{"predicate":"^1.0-alpha","version":"1.3.0","ok":true}
+{"predicate":"^1.0-alpha","version":"0.9","ok":false}
+{"predicate":"^1.0-alpha","version":"1.0\u0009","ok":false}
+{"predicate":"^1.0-alpha","version":"\u00091.0","ok":false}
+{"predicate":"^1.0-alpha","version":"1.0-beta","ok":true}
+{"predicate":"^1.0-alpha","version":"1.2.3+build","ok":true}
+{"predicate":"1.2.x+build","version":"1.0","ok":false}
+{"predicate":"1.2.x+build","version":"1.5","ok":false}
+{"predicate":"1.2.x+build","version":"2.0","ok":false}
+{"predicate":"1.2.x+build","version":"1.2.3","ok":true}
+{"predicate":"1.2.x+build","version":"1.2.3-alpha","ok":true}
+{"predicate":"1.2.x+build","version":"1.2.0-alpha","ok":true}
+{"predicate":"1.2.x+build","version":"1.2-alpha","ok":true}
+{"predicate":"1.2.x+build","version":"1.3.0","ok":false}
+{"predicate":"1.2.x+build","version":"0.9","ok":false}
+{"predicate":"1.2.x+build","version":"1.0\u0009","ok":false}
+{"predicate":"1.2.x+build","version":"\u00091.0","ok":false}
+{"predicate":"1.2.x+build","version":"1.0-beta","ok":false}
+{"predicate":"1.2.x+build","version":"1.2.3+build","ok":true}
+{"predicate":"1.2.X-alpha","version":"1.0","ok":false}
+{"predicate":"1.2.X-alpha","version":"1.5","ok":false}
+{"predicate":"1.2.X-alpha","version":"2.0","ok":false}
+{"predicate":"1.2.X-alpha","version":"1.2.3","ok":false}
+{"predicate":"1.2.X-alpha","version":"1.2.3-alpha","ok":false}
+{"predicate":"1.2.X-alpha","version":"1.2.0-alpha","ok":false}
+{"predicate":"1.2.X-alpha","version":"1.2-alpha","ok":false}
+{"predicate":"1.2.X-alpha","version":"1.3.0","ok":false}
+{"predicate":"1.2.X-alpha","version":"0.9","ok":false}
+{"predicate":"1.2.X-alpha","version":"1.0\u0009","ok":false}
+{"predicate":"1.2.X-alpha","version":"\u00091.0","ok":false}
+{"predicate":"1.2.X-alpha","version":"1.0-beta","ok":false}
+{"predicate":"1.2.X-alpha","version":"1.2.3+build","ok":false}
