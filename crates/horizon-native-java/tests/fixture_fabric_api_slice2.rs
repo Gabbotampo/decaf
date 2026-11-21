@@ -119,7 +119,13 @@ public final class RecipeSynchronization {
 "#,
         "net/minecraft/world/item/crafting/RecipeSerializer.java" => r#"
 package net.minecraft.world.item.crafting;
-public interface RecipeSerializer<T> { }
+public interface RecipeSerializer<T> {
+  net.minecraft.network.codec.StreamCodec<T, T> streamCodec();
+}
+"#,
+        "net/minecraft/network/codec/StreamCodec.java" => r#"
+package net.minecraft.network.codec;
+public interface StreamCodec<A, B> { }
 "#,
         "net/fabricmc/api/ModInitializer.java" => r#"
 package net.fabricmc.api;
@@ -129,7 +135,16 @@ public interface ModInitializer { void onInitialize(); }
     let mod_sources = sources! {
         "demo/Serializer.java" => r#"
 package demo;
-public final class Serializer implements net.minecraft.world.item.crafting.RecipeSerializer<Object> { }
+public final class Serializer implements net.minecraft.world.item.crafting.RecipeSerializer<Object> {
+  public net.minecraft.network.codec.StreamCodec<Object, Object> streamCodec() { return new Codec(); }
+}
+final class NullSerializer implements net.minecraft.world.item.crafting.RecipeSerializer<Object> {
+  public net.minecraft.network.codec.StreamCodec<Object, Object> streamCodec() { return null; }
+}
+final class ThrowSerializer implements net.minecraft.world.item.crafting.RecipeSerializer<Object> {
+  public net.minecraft.network.codec.StreamCodec<Object, Object> streamCodec() { throw new IllegalStateException("codec boom"); }
+}
+final class Codec implements net.minecraft.network.codec.StreamCodec<Object, Object> { }
 "#,
         "demo/PhaseProbe.java" => r#"
 package demo;
@@ -171,6 +186,10 @@ public final class PhaseProbe implements ModInitializer {
     net.fabricmc.fabric.api.recipe.v1.sync.RecipeSynchronization.synchronizeRecipeSerializer(SERIALIZER);
     try { net.fabricmc.fabric.api.recipe.v1.sync.RecipeSynchronization.synchronizeRecipeSerializer(null); }
     catch (NullPointerException e) { result.append("|").append(e.getMessage()); }
+    try { net.fabricmc.fabric.api.recipe.v1.sync.RecipeSynchronization.synchronizeRecipeSerializer(new NullSerializer()); }
+    catch (NullPointerException e) { result.append("|").append(e.getMessage()); }
+    try { net.fabricmc.fabric.api.recipe.v1.sync.RecipeSynchronization.synchronizeRecipeSerializer(new ThrowSerializer()); }
+    catch (IllegalStateException e) { result.append("|").append(e.getMessage()); }
     result.append("cycle-ok");
     return result.toString();
   }
@@ -225,6 +244,32 @@ fn fabric_api_slice2_matches_java25_oracle() {
             .iter()
             .any(|call| call.method.name == "addPhaseOrdering")
     );
-    assert_eq!(host.synced_recipe_serializers().len(), 1);
-    assert!(host.unknown_host_calls().is_empty());
+    assert_eq!(host.synced_recipe_serializers().len(), 3);
+    assert!(
+        host.unknown_host_calls()
+            .iter()
+            .any(|(call, _)| call.contains("streamCodec"))
+    );
+}
+
+#[test]
+fn runes_recipe_sync_entrypoint_registers_serializer() {
+    let path =
+        Path::new("/home/solenopsisbot/horizon-corpus/deps-pool/runes-fabric-1.3.2+26.3.jar");
+    if !path.exists() {
+        return;
+    }
+    let jar = NativeJar::from_path(path).unwrap();
+    let mut host = StdHost::new();
+    let entries = jar.discover_entrypoints("main");
+    assert!(!entries.is_empty());
+    for entry in entries {
+        let _ = jar.execute(&entry.class, entry.method.as_deref(), "main", &mut host);
+    }
+    assert!(
+        host.unknown_host_calls()
+            .iter()
+            .all(|(call, _)| !call.contains("RecipeSynchronization#synchronizeRecipeSerializer"))
+    );
+    assert!(!host.synced_recipe_serializers().is_empty());
 }

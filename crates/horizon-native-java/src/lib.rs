@@ -7436,9 +7436,37 @@ impl Host for StdHost {
     }
 
     fn invoke(&mut self, r: &MethodRef, args: &[Value]) -> Result<Value, NativeError> {
-        if let Some(value) =
-            fabric_api_slice2::recipe_sync_call(r, args, &mut self.recipe_sync_serializers)
+        let stream_codec = if r.owner
+            == "net/fabricmc/fabric/api/recipe/v1/sync/RecipeSynchronization"
+            && r.name == "synchronizeRecipeSerializer"
         {
+            args.first().and_then(|serializer| {
+                if matches!(serializer, Value::Ref(None)) {
+                    None
+                } else {
+                    let owner = jar_object::value_marker_class(serializer)
+                        .unwrap_or("net/minecraft/world/item/crafting/RecipeSerializer")
+                        .to_owned();
+                    Some(self.invoke_instance(
+                        &MethodRef {
+                            owner,
+                            name: "streamCodec".into(),
+                            descriptor: "()Lnet/minecraft/network/codec/StreamCodec;".into(),
+                        },
+                        serializer,
+                        &[],
+                    ))
+                }
+            })
+        } else {
+            None
+        };
+        if let Some(value) = fabric_api_slice2::recipe_sync_call(
+            r,
+            args,
+            stream_codec,
+            &mut self.recipe_sync_serializers,
+        ) {
             return value;
         }
         if menu_models::is_menu_class(&r.owner)

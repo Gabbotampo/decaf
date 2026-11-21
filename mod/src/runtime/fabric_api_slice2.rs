@@ -118,6 +118,7 @@ pub(crate) fn event_call(
 pub(crate) fn recipe_sync_call(
     r: &MethodRef,
     args: &[Value],
+    stream_codec: Option<Result<Value, NativeError>>,
     synced: &mut BTreeSet<String>,
 ) -> Option<Result<Value, NativeError>> {
     let is_add = r.owner == "net/fabricmc/fabric/impl/recipe/sync/RecipeSyncImpl"
@@ -136,11 +137,23 @@ pub(crate) fn recipe_sync_call(
             "serializer can't be null!",
         ));
     }
+    if is_public {
+        match stream_codec {
+            Some(Ok(Value::Ref(None))) => {
+                return Some(thrown(
+                    "java/lang/NullPointerException",
+                    "StreamCodec can't be null!",
+                ));
+            }
+            Some(Ok(_)) => {}
+            Some(Err(error)) => return Some(Err(error)),
+            None => return None,
+        }
+    }
     if let Some(value) = serializer {
         let key = match value {
             Value::Host(handle) => handle.key().to_owned(),
-            Value::Ref(Some(text)) => text.clone(),
-            _ => format!("{value:?}"),
+            _ => return None,
         };
         synced.insert(key);
     }
@@ -225,20 +238,70 @@ mod tests {
             descriptor: "(Lnet/minecraft/world/item/crafting/RecipeSerializer;)V".into(),
         };
         let mut synced = BTreeSet::new();
-        let serializer = Value::Ref(Some("serializer".into()));
+        let serializer = Value::Host(HostRef::new(HostKind::JarObject, "demo/Serializer#0"));
         assert!(matches!(
-            recipe_sync_call(&method, std::slice::from_ref(&serializer), &mut synced),
+            recipe_sync_call(
+                &method,
+                std::slice::from_ref(&serializer),
+                Some(Ok(Value::Ref(Some("codec".into())))),
+                &mut synced,
+            ),
             Some(Ok(Value::Void))
         ));
         assert!(matches!(
-            recipe_sync_call(&method, std::slice::from_ref(&serializer), &mut synced),
+            recipe_sync_call(
+                &method,
+                std::slice::from_ref(&serializer),
+                Some(Ok(Value::Ref(Some("codec".into())))),
+                &mut synced,
+            ),
             Some(Ok(Value::Void))
         ));
-        assert_eq!(synced.into_iter().collect::<Vec<_>>(), ["serializer"]);
+        assert_eq!(
+            synced.into_iter().collect::<Vec<_>>(),
+            ["demo/Serializer#0"]
+        );
         assert!(matches!(
-            recipe_sync_call(&method, &[Value::Ref(None)], &mut BTreeSet::new()),
+            recipe_sync_call(&method, &[Value::Ref(None)], None, &mut BTreeSet::new()),
             Some(Err(NativeError::UncaughtException { class, message: Some(message), .. }))
                 if class == "java/lang/NullPointerException" && message == "serializer can't be null!"
         ));
+    }
+
+    #[test]
+    fn recipe_serializer_codec_null_and_throw_propagate_exactly() {
+        let method = MethodRef {
+            owner: "net/fabricmc/fabric/api/recipe/v1/sync/RecipeSynchronization".into(),
+            name: "synchronizeRecipeSerializer".into(),
+            descriptor: "(Lnet/minecraft/world/item/crafting/RecipeSerializer;)V".into(),
+        };
+        let serializer = Value::Host(HostRef::new(HostKind::JarObject, "demo/Serializer#0"));
+        let mut synced = BTreeSet::new();
+        assert!(matches!(
+            recipe_sync_call(
+                &method,
+                std::slice::from_ref(&serializer),
+                Some(Ok(Value::Ref(None))),
+                &mut synced,
+            ),
+            Some(Err(NativeError::UncaughtException { class, message: Some(message), .. }))
+                if class == "java/lang/NullPointerException" && message == "StreamCodec can't be null!"
+        ));
+        let thrown = NativeError::UncaughtException {
+            class: "java/lang/IllegalStateException".into(),
+            message: Some("codec boom".into()),
+            frame: None,
+        };
+        assert!(matches!(
+            recipe_sync_call(
+                &method,
+                std::slice::from_ref(&serializer),
+                Some(Err(thrown)),
+                &mut synced,
+            ),
+            Some(Err(NativeError::UncaughtException { class, message: Some(message), .. }))
+                if class == "java/lang/IllegalStateException" && message == "codec boom"
+        ));
+        assert!(synced.is_empty());
     }
 }
