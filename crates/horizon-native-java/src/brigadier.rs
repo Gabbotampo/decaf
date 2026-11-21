@@ -2008,8 +2008,11 @@ impl StdHost {
                 } else {
                     MessageKind::System
                 };
-                let text = CommandText::of(first.ok_or_else(unknown)?, &self.component_states)
-                    .ok_or_else(unknown)?;
+                let Some(text) =
+                    CommandText::of(first.ok_or_else(unknown)?, &self.component_states)
+                else {
+                    return self.unknown_host_call(r);
+                };
                 self.brigadier
                     .queue(Pending::Text(CommandMessage { kind, text }))?;
                 Ok(Value::Void)
@@ -2718,5 +2721,44 @@ mod tests {
         assert!(
             matches!(result, Err(NativeError::UncaughtException { class, .. }) if class == "java/lang/IllegalStateException")
         );
+    }
+
+    #[test]
+    fn source_send_failure_and_system_message_count_unresolvable_component() {
+        let mut h = host();
+        let component = crate::host_component::translatable("k");
+        let bad_arg = crate::jar_object::handle("java/lang/Object#0".into());
+        crate::host_component::change(
+            &mut h.component_states,
+            &component,
+            &crate::facade_text::argument,
+            |state| state.args = Some(vec![bad_arg]),
+        )
+        .unwrap();
+        h.brigadier.exec = Some(Box::new(Execution {
+            run: 0,
+            invocation: None,
+            sources: vec![CommandSource {
+                name: "Server".into(),
+                level: 4,
+                player: None,
+                dimension: None,
+            }],
+            pending: Vec::new(),
+        }));
+        let source = handles::source(0, 0);
+        for name in ["sendFailure", "sendSystemMessage"] {
+            let r = MethodRef {
+                owner: "net/minecraft/commands/CommandSourceStack".into(),
+                name: name.into(),
+                descriptor: "(Lnet/minecraft/network/chat/Component;)V".into(),
+            };
+            let result = h
+                .brigadier_call(&r, &source, std::slice::from_ref(&component))
+                .unwrap();
+            assert_eq!(result.unwrap(), Value::Void, "{name}");
+        }
+        assert!(h.brigadier.exec.as_ref().unwrap().pending.is_empty());
+        assert_eq!(h.unknown_host_call_count(), 2);
     }
 }

@@ -3823,6 +3823,9 @@ pub struct StdHost {
     /// Every mutable collection's list, by marker, each with a generation
     /// (`collection_store.rs`).
     mutable_collections: collection_store::CollectionStore,
+    /// Opaque `Consumer<Component>` sinks while an item's own `appendHoverText`
+    /// runs, keyed by `HostKind::TooltipConsumer` handle key.
+    tooltip_sinks: BTreeMap<String, Vec<Value>>,
     guava_tables: guava_table::Store,
     /// O(1) `Collections.nCopies` rows: logical length and the repeated value.
     repeated_collections: BTreeMap<String, (usize, Value)>,
@@ -4120,6 +4123,7 @@ impl StdHost {
             holder_rows: Vec::new(),
             holder_binding: host_registry::Binding::Construct,
             mutable_collections: collection_store::CollectionStore::default(),
+            tooltip_sinks: BTreeMap::new(),
             guava_tables: guava_table::Store::default(),
             repeated_collections: BTreeMap::new(),
             detached_sub_lists: BTreeSet::new(),
@@ -4242,6 +4246,12 @@ impl StdHost {
             })
             .map(|(method, count)| (method.clone(), *count))
             .collect()
+    }
+
+    /// The current bounded vanilla `ComponentSerialization.CODEC` +
+    /// `JsonOps.INSTANCE` JSON representation of a component value.
+    pub fn component_json(&self, value: &Value) -> Option<String> {
+        crate::facade_text::codec_json_now(value, Some(&self.component_states))
     }
 
     pub fn unknown_host_call_count(&self) -> usize {
@@ -4534,6 +4544,27 @@ impl StdHost {
             self.cached_collections.insert(cache, marker.clone());
         }
         made
+    }
+
+    /// Make an opaque `Consumer<Component>` host handle for an item's
+    /// `appendHoverText`, matching vanilla's invokedynamic `lines::add` lambda.
+    pub(crate) fn tooltip_sink(&mut self) -> Value {
+        static NEXT_TOOLTIP_SINK: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(0);
+        let serial = NEXT_TOOLTIP_SINK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let key = format!("tooltip-consumer#{serial}");
+        self.tooltip_sinks.insert(key.clone(), Vec::new());
+        Value::Host(HostRef::new(HostKind::TooltipConsumer, key))
+    }
+
+    pub(crate) fn take_tooltip_sink(&mut self, sink: &Value) -> Vec<Value> {
+        let Value::Host(handle) = sink else {
+            return Vec::new();
+        };
+        if handle.kind() != HostKind::TooltipConsumer {
+            return Vec::new();
+        }
+        self.tooltip_sinks.remove(handle.key()).unwrap_or_default()
     }
 
     /// The loader wraps metadata collections in a fresh unmodifiable view,
@@ -10332,6 +10363,20 @@ impl Host for StdHost {
         if let Some(value) = self.menu_instance_call(r, receiver, args) {
             return value;
         }
+        // 26.3's vanilla Item/BlockItem implementation is `0: return`. Mod-owned
+        // overrides dispatch in the Runtime, so only jar-object super calls or
+        // inherited no-op calls land here.
+        if jar_object::is_object(receiver)
+            && matches!(
+                r.owner.as_str(),
+                "net/minecraft/world/item/Item" | "net/minecraft/world/item/BlockItem"
+            )
+            && r.name == "appendHoverText"
+            && r.descriptor
+                == "(Lnet/minecraft/world/item/ItemStack;Lnet/minecraft/world/item/Item$TooltipContext;Lnet/minecraft/world/item/component/TooltipDisplay;Ljava/util/function/Consumer;Lnet/minecraft/world/item/TooltipFlag;)V"
+        {
+            return Ok(Value::Void);
+        }
         if let Some(value) =
             host_creative_tab::instance_call(&mut self.creative_tab, r, receiver, args)
         {
@@ -10703,6 +10748,12 @@ impl Host for StdHost {
         }
         if let Some(value) = self.payload_type_registry_call(r, Some(receiver), args) {
             return Ok(value);
+        }
+        // Dedicated tooltip handles (`TooltipConsumer`, `TooltipContext`,
+        // `TooltipDisplay`, `TooltipFlag`) work both inside and outside a
+        // client frame.
+        if let Some(answer) = self.tooltip_handle_call(r, receiver, args) {
+            return answer;
         }
         // A client stand-in (`client/...`), a mod's `KeyMapping`, or a client
         // registration event answers the client surface first.
@@ -37014,7 +37065,7 @@ impl<H: Host> Runtime<'_, H> {
                     if dispatched.is_none()
                         && let Some(value) = invoke_or_catch!(
                             at,
-                            self.invoke_server_facade(&r, receiver.as_ref(), &args)
+                            self.invoke_server_facade(&r, receiver.as_ref(), &args, class, method)
                         )
                     {
                         dispatched = Some(value);

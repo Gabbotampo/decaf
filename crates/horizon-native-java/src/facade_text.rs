@@ -37,19 +37,28 @@
 
 use serde_json::{Map, Value as Json, json};
 
-use crate::host_component::{ComponentState, MAX_JSON_BYTES, States};
-use crate::{Boxed, Host, MethodRef, NativeError, Runtime, Value, expect_ref, format_java_float};
+use crate::host_component::{CODEC_STYLE_KEYS, CodecJson, ComponentState, MAX_JSON_BYTES, States};
+use crate::{Boxed, Host, MethodRef, NativeError, Runtime, Value, expect_ref};
 
 const COMPONENT: &str = "net/minecraft/network/chat/Component";
 const MUTABLE: &str = "net/minecraft/network/chat/MutableComponent";
 const FORMATTING_PREFIX: &str = "enum/net/minecraft/ChatFormatting/";
 const RETURNS_MUTABLE: &str = ")Lnet/minecraft/network/chat/MutableComponent;";
 
-/// The vanilla JSON a component holds now, its changed siblings and
+/// The structured object JSON a component holds now, its changed siblings and
 /// arguments resolved through `states` (`host_component.rs`), or `None` when
 /// `value` is not a component.
 pub(crate) fn json_now(value: &Value, states: Option<&States>) -> Option<Json> {
     crate::host_component::json_in(value, states, &argument)
+}
+
+/// Vanilla's `ComponentSerialization.CODEC` + `JsonOps.INSTANCE` JSON string
+/// for `value` (plain literals collapsed to strings; fields in codec order;
+/// non-finite `Float`/`Double` arguments emitted as Gson's `NaN`, `Infinity`,
+/// `-Infinity`).
+pub(crate) fn codec_json_now(value: &Value, states: Option<&States>) -> Option<String> {
+    crate::host_component::codec_json_in(value, states, &codec_argument)
+        .map(|json| json.to_json_string())
 }
 
 /// A new component of `json`.
@@ -93,41 +102,80 @@ pub(crate) fn plain(json: &Json) -> String {
     out
 }
 
-/// One translation argument that is not a component, as vanilla's
-/// `TranslatableContents` serialises it: a primitive as a JSON primitive,
-/// anything else as its text (a component resolves through its host).
-pub(crate) fn argument(value: &Value) -> Json {
+fn is_plain_string_arg(text: &str) -> bool {
+    !(text.starts_with("enum/") && !crate::value_class::is_plain_string(text))
+        && !text.starts_with("string-builder/")
+        && !crate::stream_pipeline::is_stream_marker(text)
+}
+
+/// Whether `value` satisfies Minecraft 26.3's
+/// `TranslatableContents.isAllowedPrimitiveArgument`: `Number`, `Boolean`, or
+/// `String`. Note that `Component.translatableEscape` uses this predicate
+/// before falling back to `String.valueOf`, so non-finite floats remain
+/// allowed primitives here and are only refused when encoding to JSON.
+fn is_allowed_primitive_argument(value: &Value) -> bool {
     match value {
-        Value::Int(v) => json!(v),
-        Value::Long(v) => json!(v),
-        Value::Float(v) => serde_json::Number::from_f64(*v)
-            .map_or_else(|| json!(format_java_float(*v)), Json::Number),
-        Value::Ref(None) => json!("null"),
-        Value::Boxed(Boxed::Boolean(b)) => json!(b),
-        Value::Boxed(boxed @ Boxed::Character(_)) => json!(boxed.text()),
-        Value::Boxed(Boxed::Float(bits)) => {
-            serde_json::Number::from_f64(f64::from(f32::from_bits(*bits))).map_or_else(
-                || json!(format_java_float(f64::from(f32::from_bits(*bits)))),
-                Json::Number,
-            )
+        Value::Int(_)
+        | Value::Long(_)
+        | Value::Float(_)
+        | Value::Boxed(
+            Boxed::Boolean(_)
+            | Boxed::Byte(_)
+            | Boxed::Short(_)
+            | Boxed::Integer(_)
+            | Boxed::Float(_),
+        ) => true,
+        Value::Ref(Some(text)) => is_plain_string_arg(text),
+        Value::Ref(None) | Value::Boxed(Boxed::Character(_)) | Value::Host(_) | Value::Void => {
+            false
         }
-        Value::Boxed(boxed) => json!(boxed.int()),
-        Value::Ref(Some(text)) => json!(text),
-        Value::Host(_) => json!(crate::value_text(value)),
-        Value::Void => json!(""),
+    }
+}
+
+/// One translation argument encoded for strict RFC 8259 `serde_json::Value`
+/// consumers (`json_now`, `CommandText`, `ClientText::Json`): matches
+/// Minecraft 26.3's `TranslatableContents.isAllowedPrimitiveArgument`
+/// (`Number`, `Boolean`, `String`), returning `None` for disallowed objects
+/// (`null`, `Character`, arbitrary objects) and for non-finite floats that
+/// `serde_json::Number` cannot represent (callers count those rather than
+/// dropping or stringifying them; [`codec_argument`] handles non-finite floats
+/// verbatim for Gson-compatible codec output).
+pub(crate) fn argument(value: &Value) -> Option<Json> {
+    match value {
+        Value::Int(v) => Some(json!(v)),
+        Value::Long(v) => Some(json!(v)),
+        Value::Float(v) => serde_json::Number::from_f64(*v).map(Json::Number),
+        Value::Boxed(Boxed::Boolean(b)) => Some(json!(b)),
+        Value::Boxed(Boxed::Float(bits)) => {
+            serde_json::Number::from_f64(f64::from(f32::from_bits(*bits))).map(Json::Number)
+        }
+        Value::Boxed(Boxed::Byte(v)) => Some(json!(v)),
+        Value::Boxed(Boxed::Short(v)) => Some(json!(v)),
+        Value::Boxed(Boxed::Integer(v)) => Some(json!(v)),
+        Value::Ref(Some(text)) if is_plain_string_arg(text) => Some(json!(text)),
+        Value::Ref(_) | Value::Boxed(Boxed::Character(_)) | Value::Host(_) | Value::Void => None,
+    }
+}
+
+/// One translation argument encoded for vanilla's `ComponentSerialization.CODEC`
+/// with `JsonOps.INSTANCE` and Gson output (`StdHost::component_json`): matches
+/// `TranslatableContents.isAllowedPrimitiveArgument`, formatting `Float` and
+/// `Double` values with Java 25's `Float.toString` / `Double.toString` (including
+/// Gson's literal `NaN`, `Infinity`, and `-Infinity` tokens).
+pub(crate) fn codec_argument(value: &Value) -> Option<CodecJson> {
+    match value {
+        Value::Float(v) => Some(CodecJson::RawNumber(
+            crate::jdk_float_text::double_to_string(*v),
+        )),
+        Value::Boxed(Boxed::Float(bits)) => Some(CodecJson::RawNumber(
+            crate::jdk_float_text::float_to_string(f64::from(f32::from_bits(*bits))),
+        )),
+        other => argument(other).map(CodecJson::Json),
     }
 }
 
 /// `Style.applyFormat`: the JSON style keys one `ChatFormatting` sets.
 fn apply_format(object: &mut Map<String, Json>, format: &str) -> Result<(), String> {
-    const STYLE_KEYS: [&str; 6] = [
-        "color",
-        "bold",
-        "italic",
-        "underlined",
-        "strikethrough",
-        "obfuscated",
-    ];
     let decoration = match format {
         "BOLD" => "bold",
         "ITALIC" => "italic",
@@ -135,7 +183,7 @@ fn apply_format(object: &mut Map<String, Json>, format: &str) -> Result<(), Stri
         "STRIKETHROUGH" => "strikethrough",
         "OBFUSCATED" => "obfuscated",
         "RESET" => {
-            STYLE_KEYS.iter().for_each(|key| {
+            CODEC_STYLE_KEYS.iter().for_each(|key| {
                 object.remove(*key);
             });
             return Ok(());
@@ -204,6 +252,32 @@ impl<H: Host> Runtime<'_, H> {
         Ok(Some(receiver.clone()))
     }
 
+    /// `String.valueOf(value)` for `Component.translatableEscape`: runs
+    /// `value.toString()` through the runtime (jar overrides, records, enums,
+    /// host handles, modelled markers) and counts `Object.toString()` when
+    /// unknown. Preserves `null` returned by a custom `toString()`.
+    fn escape_translation_arg(
+        &mut self,
+        value: &Value,
+        class: &str,
+        method: &str,
+    ) -> Result<Value, NativeError> {
+        if *value == Value::Ref(None) {
+            return Ok(Value::Ref(Some("null".into())));
+        }
+        if let Value::Boxed(boxed) = value {
+            return Ok(Value::Ref(Some(boxed.text())));
+        }
+        if let Some(text) = self.runtime_value_of(value, class, method)? {
+            return Ok(text);
+        }
+        if let Some(text) = self.host.modelled_to_string_checked(value)? {
+            return Ok(Value::Ref(Some(text)));
+        }
+        self.host
+            .unknown_operand_call(&crate::jar_text::object_to_string())
+    }
+
     /// The component calls this module answers; `None` for every other call
     /// (the host's text-only surface answers those).
     pub(crate) fn invoke_text(
@@ -211,6 +285,8 @@ impl<H: Host> Runtime<'_, H> {
         r: &MethodRef,
         receiver: Option<&Value>,
         args: &[Value],
+        class: &str,
+        method: &str,
     ) -> Result<Option<Value>, NativeError> {
         if r.owner != COMPONENT && r.owner != MUTABLE {
             return Ok(None);
@@ -219,6 +295,46 @@ impl<H: Host> Runtime<'_, H> {
         let descriptor = r.descriptor.as_str();
         let Some(receiver) = receiver else {
             // Static factories with arguments.
+            if name == "literal"
+                && descriptor == "(Ljava/lang/String;)Lnet/minecraft/network/chat/MutableComponent;"
+            {
+                let made = crate::host_component::literal(
+                    expect_ref(
+                        args.first()
+                            .ok_or_else(|| NativeError::Metadata("literal missing text".into()))?,
+                    )
+                    .map_or("", String::as_str),
+                );
+                if let Some(states) = self.host.component_states_mut()
+                    && let Value::Host(handle) = &made
+                {
+                    states.insert(
+                        crate::host_component::marker(handle).to_owned(),
+                        ComponentState {
+                            base: Map::from_iter([(
+                                "text".into(),
+                                json!(expect_ref(args.first().unwrap()).map_or("", String::as_str)),
+                            )]),
+                            siblings: Vec::new(),
+                            args: None,
+                        },
+                    );
+                }
+                return Ok(Some(made));
+            }
+            if name == "translatableWithFallback"
+                && descriptor == format!("(Ljava/lang/String;Ljava/lang/String;{RETURNS_MUTABLE}")
+                && let [key, fallback] = args
+            {
+                let Some(key) = expect_ref(key) else {
+                    return Ok(None);
+                };
+                let mut object = Map::from_iter([("translate".to_owned(), json!(key))]);
+                if let Some(fallback) = expect_ref(fallback) {
+                    object.insert("fallback".into(), json!(fallback));
+                }
+                return bounded(Json::Object(object)).map(Some);
+            }
             let (key, fallback, array) = match (name, args) {
                 ("translatable" | "translatableEscape", [key, array])
                     if descriptor
@@ -239,33 +355,75 @@ impl<H: Host> Runtime<'_, H> {
             let Some(key) = expect_ref(key) else {
                 return Ok(None);
             };
-            let values = self.array(array)?.into_owned();
-            let with: Vec<Json> = values
-                .iter()
-                .map(|value| self.component_now(value).unwrap_or_else(|| argument(value)))
-                .collect();
+            let raw_values = self.array(array)?.into_owned();
+            let escape = name == "translatableEscape";
+            let mut values = Vec::with_capacity(raw_values.len());
+            for (index, value) in raw_values.into_iter().enumerate() {
+                if escape
+                    && !crate::host_component::is_component(&value)
+                    && !is_allowed_primitive_argument(&value)
+                {
+                    // `Component.translatableEscape` replaces any non-allowed,
+                    // non-Component element in `args` with `String.valueOf(arg)`
+                    // before delegating to `translatable`.
+                    let escaped = self.escape_translation_arg(&value, class, method)?;
+                    if let Some(array_key) = crate::host_array::array_key(array)
+                        && let Some(crate::array_data::ArrayData::Ref(elements)) =
+                            self.arrays.get_mut(array_key)
+                        && let Some(slot) = elements.get_mut(index)
+                    {
+                        *slot = escaped.clone();
+                    }
+                    values.push(escaped);
+                } else {
+                    values.push(value);
+                }
+            }
             let mut object = Map::from_iter([("translate".to_owned(), json!(key))]);
             if let Some(fallback) = fallback.and_then(expect_ref) {
                 object.insert("fallback".into(), json!(fallback));
             }
-            if !with.is_empty() {
+            // Populate `"with"` in the seed JSON only when every argument
+            // currently serialises; otherwise preserve all constructor
+            // arguments verbatim in `ComponentState` without counting here
+            // (`TranslatableContents` stores any `Object[]` and only rejects
+            // disallowed arguments when its codec serialises).
+            let mut with = Vec::with_capacity(values.len());
+            let mut all_serialisable = true;
+            for value in &values {
+                if crate::host_component::is_component(value) {
+                    match self.component_now(value) {
+                        Some(json) => with.push(json),
+                        None => {
+                            all_serialisable = false;
+                            break;
+                        }
+                    }
+                } else if let Some(json) = argument(value) {
+                    with.push(json);
+                } else {
+                    all_serialisable = false;
+                    break;
+                }
+            }
+            if all_serialisable && !with.is_empty() {
                 object.insert("with".into(), Json::Array(with));
             }
             let made = bounded(Json::Object(object.clone()))?;
             // `TranslatableContents` keeps its arguments: a component one
-            // changed later shows in this one.
-            if values.iter().any(crate::host_component::is_component)
-                && let (Some(states), Value::Host(handle)) =
-                    (self.host.component_states_mut(), &made)
-            {
+            // changed later shows in this one, and non-codec arguments stay
+            // intact until serialization refuses or counts them.
+            if let (Some(states), Value::Host(handle)) = (self.host.component_states_mut(), &made) {
                 states.insert(
                     crate::host_component::marker(handle).to_owned(),
                     ComponentState {
                         base: object,
                         siblings: Vec::new(),
-                        args: Some(values),
+                        args: (!values.is_empty()).then_some(values),
                     },
                 );
+            } else if !all_serialisable {
+                return self.host.unknown_operand_call(r).map(Some);
             }
             return Ok(Some(made));
         };
@@ -321,8 +479,13 @@ impl<H: Host> Runtime<'_, H> {
                     formats.push(format.to_owned());
                 }
                 self.change_component(r, receiver, |state| {
+                    // `Style.applyFormats` returns `Style.EMPTY` immediately on `RESET`,
+                    // ignoring any remaining formats in the varargs array.
                     for format in &formats {
                         let _ = apply_format(&mut state.base, format);
+                        if format == "RESET" {
+                            break;
+                        }
                     }
                 })
             }
@@ -410,18 +573,79 @@ mod tests {
 
     #[test]
     fn arguments_serialise_as_vanilla_keeps_them() {
-        assert_eq!(argument(&Value::Int(7)), json!(7));
-        assert_eq!(argument(&Value::Boxed(Boxed::Integer(3))), json!(3));
+        assert_eq!(argument(&Value::Int(7)), Some(json!(7)));
+        assert_eq!(argument(&Value::Boxed(Boxed::Integer(3))), Some(json!(3)));
+        assert_eq!(
+            argument(&Value::Boxed(Boxed::Boolean(true))),
+            Some(json!(true))
+        );
+        assert_eq!(argument(&Value::Long(42)), Some(json!(42)));
+        assert_eq!(argument(&Value::Float(1.5)), Some(json!(1.5)));
         // A String spelled like the old box marker is text.
         assert_eq!(
             argument(&Value::Ref(Some("integer:3".into()))),
-            json!("integer:3")
+            Some(json!("integer:3"))
         );
-        assert_eq!(argument(&Value::Ref(Some("Alex".into()))), json!("Alex"));
+        assert_eq!(
+            argument(&Value::Ref(Some("Alex".into()))),
+            Some(json!("Alex"))
+        );
         // A String spelled like the old component marker is a String argument.
         assert_eq!(
             argument(&Value::Ref(Some("component/literal/Alex".into()))),
-            json!("component/literal/Alex")
+            Some(json!("component/literal/Alex"))
+        );
+        // Arguments rejected by vanilla's `TranslatableContents.isAllowedPrimitiveArgument`:
+        // `null`, `Character`, arbitrary host objects, and non-finite floats.
+        assert_eq!(argument(&Value::Ref(None)), None);
+        assert_eq!(argument(&Value::Boxed(Boxed::Character('c' as u16))), None);
+        assert_eq!(
+            argument(&Value::Host(crate::HostRef::new(
+                crate::HostKind::JarObject,
+                "java/lang/Object#0",
+            ))),
+            None
+        );
+        assert_eq!(argument(&Value::Float(f64::NAN)), None);
+        assert_eq!(
+            codec_argument(&Value::Float(f64::NAN)),
+            Some(CodecJson::RawNumber("NaN".into()))
+        );
+        assert_eq!(
+            codec_argument(&Value::Float(f64::INFINITY)),
+            Some(CodecJson::RawNumber("Infinity".into()))
+        );
+        assert_eq!(
+            codec_argument(&Value::Float(f64::NEG_INFINITY)),
+            Some(CodecJson::RawNumber("-Infinity".into()))
+        );
+        assert_eq!(
+            codec_argument(&Value::Float(1e10)),
+            Some(CodecJson::RawNumber("1.0E10".into()))
+        );
+        assert_eq!(
+            codec_argument(&Value::Float(-0.0)),
+            Some(CodecJson::RawNumber("-0.0".into()))
+        );
+        assert_eq!(
+            codec_argument(&Value::Boxed(Boxed::Float(1.234567_f32.to_bits()))),
+            Some(CodecJson::RawNumber("1.234567".into()))
+        );
+        assert_eq!(
+            codec_argument(&Value::Boxed(Boxed::Float((1.0_f32 / 3.0_f32).to_bits()))),
+            Some(CodecJson::RawNumber("0.33333334".into()))
+        );
+        assert_eq!(
+            codec_argument(&Value::Boxed(Boxed::Float(f32::NAN.to_bits()))),
+            Some(CodecJson::RawNumber("NaN".into()))
+        );
+        assert_eq!(
+            codec_argument(&Value::Boxed(Boxed::Float(f32::INFINITY.to_bits()))),
+            Some(CodecJson::RawNumber("Infinity".into()))
+        );
+        assert_eq!(
+            codec_argument(&Value::Boxed(Boxed::Float(f32::NEG_INFINITY.to_bits()))),
+            Some(CodecJson::RawNumber("-Infinity".into()))
         );
         assert_eq!(
             plain(&json!({"text": "a", "extra": ["b", {"translate": "k"}]})),
