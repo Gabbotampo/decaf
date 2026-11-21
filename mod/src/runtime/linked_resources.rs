@@ -21,22 +21,19 @@ impl LinkedClassTable {
     /// and record `jar`'s `data/` resources with its Fabric metadata for pack-ordered recipe/tag loading.
     pub(crate) fn link_resources(&mut self, id: &str, jar: &NativeJar) {
         let mut data_layer = BTreeMap::new();
-        let mut data_namespaces = jar.data_namespaces.clone();
         for (name, bytes) in &jar.resource_bytes {
             if name.ends_with(".class") {
                 continue;
             }
-            if name.starts_with("data/") {
-                if let Some(ns) = crate::runtime::pack_order::valid_data_namespace_from_entry(name) {
-                    data_namespaces.insert(ns);
-                }
+            if !jar.data_namespaces_unknown && name.starts_with("data/") {
                 data_layer.insert(name.clone(), bytes.clone());
             }
             self.resources
                 .entry(name.clone())
                 .or_insert_with(|| (format!("resource-bytes/{name}"), bytes.clone()));
         }
-        if !data_layer.is_empty() || !data_namespaces.is_empty() {
+        if !data_layer.is_empty() || !jar.data_namespaces.is_empty() || jar.data_namespaces_unknown
+        {
             let fabric_doc = jar
                 .resource_bytes
                 .get("fabric.mod.json")
@@ -57,7 +54,12 @@ impl LinkedClassTable {
                 link_id: id.to_owned(),
                 fabric_mod_id,
                 resource_load_order,
-                data_namespaces,
+                data_namespaces: if jar.data_namespaces_unknown {
+                    BTreeSet::new()
+                } else {
+                    jar.data_namespaces.clone()
+                },
+                data_namespaces_unknown: jar.data_namespaces_unknown,
                 resources: data_layer,
             });
         }
@@ -86,7 +88,11 @@ impl LinkedClassTable {
     pub(crate) fn data_layer_entry_count(&self) -> usize {
         self.data_layers
             .iter()
-            .map(|layer| layer.resources.len() + layer.data_namespaces.len())
+            .map(|layer| {
+                layer.resources.len()
+                    + layer.data_namespaces.len()
+                    + usize::from(layer.data_namespaces_unknown)
+            })
             .sum()
     }
 }

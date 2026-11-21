@@ -606,6 +606,8 @@ impl<H: crate::runtime::Host> crate::runtime::Runtime<'_, H> {
         r: &MethodRef,
         receiver: Option<&Value>,
         args: &[Value],
+        class: &str,
+        method: &str,
     ) -> Result<Option<Value>, NativeError> {
         if let Some(value) = self.invoke_saved_data(r, receiver, args)? {
             return Ok(Some(value));
@@ -614,7 +616,7 @@ impl<H: crate::runtime::Host> crate::runtime::Runtime<'_, H> {
             return Ok(Some(value));
         }
         // Chat components with style and arguments (`facade_text.rs`).
-        if let Some(value) = self.invoke_text(r, receiver, args)? {
+        if let Some(value) = self.invoke_text(r, receiver, args, class, method)? {
             return Ok(Some(value));
         }
         // `server.execute(task)` on the server thread: vanilla's

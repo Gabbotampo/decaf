@@ -185,6 +185,8 @@ const GAME_STUBS: &[(&str, &str)] = &[
          public class GuiGraphicsExtractor {\n\
            public void text(Font f, String s, int x, int y, int c) {}\n\
            public void text(Font f, net.minecraft.network.chat.Component s, int x, int y, int c, boolean shadow) {}\n\
+           public void centeredText(Font f, String s, int x, int y, int c) {}\n\
+           public void centeredText(Font f, net.minecraft.network.chat.Component s, int x, int y, int c) {}\n\
            public void fill(int a, int b, int c, int d, int e) {}\n\
            public void blit(RenderPipeline p, Identifier id, int x, int y, float u, float v, int w, int h, int tw, int th) {}\n\
            public void blit(RenderPipeline p, Identifier id, int x, int y, float u, float v, int w, int h, int uw, int vh, int tw, int th) {}\n\
@@ -2630,5 +2632,108 @@ public class Round3Mod {
         host.unknown_host_calls()
     );
 
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn gui_graphics_null_string_draws_nothing_and_null_component_throws_npe() {
+    const NULL_TEXT_MOD: &str = r#"
+package demo;
+import net.fabricmc.fabric.api.client.rendering.v1.hud.HudElementRegistry;
+import net.minecraft.client.Minecraft;
+import net.minecraft.network.chat.Component;
+import net.minecraft.resources.Identifier;
+
+public final class NullTextHud {
+  public static int nullStringOk;
+  public static int nullCenteredStringOk;
+  public static int nullComponentNpe;
+  public static int nullCenteredComponentNpe;
+
+  public void onInitializeClient() {
+    HudElementRegistry.addLast(
+        Identifier.fromNamespaceAndPath("demo", "null_text"),
+        (graphics, delta) -> {
+          var font = Minecraft.getInstance().font;
+          graphics.text(font, (String) null, 0, 0, 0xFFFFFF);
+          nullStringOk = 1;
+          graphics.centeredText(font, (String) null, 10, 0, 0xFFFFFF);
+          nullCenteredStringOk = 1;
+          try {
+            graphics.text(font, (Component) null, 0, 0, 0xFFFFFF, true);
+          } catch (NullPointerException expected) {
+            // Java 25's helpful message names the real parameter (str).
+            nullComponentNpe =
+                ("Cannot invoke \"net.minecraft.network.chat.Component.getVisualOrderText()\" because \"str\" is null")
+                        .equals(expected.getMessage())
+                    ? 1
+                    : 2;
+          }
+          try {
+            graphics.centeredText(font, (Component) null, 10, 0, 0xFFFFFF);
+          } catch (NullPointerException expected) {
+            // Java 25's helpful message names the real parameter (text).
+            nullCenteredComponentNpe =
+                ("Cannot invoke \"net.minecraft.network.chat.Component.getVisualOrderText()\" because \"text\" is null")
+                        .equals(expected.getMessage())
+                    ? 1
+                    : 2;
+          }
+        });
+  }
+}
+"#;
+
+    let root = scratch("null-text-npe");
+    let mut sources = Vec::new();
+    sources.extend_from_slice(GAME_STUBS);
+    sources.extend_from_slice(FABRIC_STUBS);
+    sources.push(("demo/NullTextHud.java", NULL_TEXT_MOD));
+    let Some(jar_path) = build_jar(
+        &root,
+        &sources,
+        (
+            "fabric.mod.json",
+            r#"{"id":"demo","version":"1","environment":"client","entrypoints":{"client":["demo.NullTextHud"]}}"#,
+        ),
+    ) else {
+        eprintln!("skipped: no javac");
+        let _ = fs::remove_dir_all(root);
+        return;
+    };
+    let jar = NativeJar::from_path(&jar_path).unwrap();
+    let entry = jar.discover_entrypoint("client").unwrap();
+    let mut host = StdHost::new();
+    jar.execute(&entry.class, entry.method.as_deref(), "client", &mut host)
+        .unwrap();
+    let (layers, unsupported) = host.client_hud_layers(&jar);
+    assert!(unsupported.is_empty(), "{unsupported:?}");
+    assert_eq!(layers.len(), 1);
+
+    host.begin_client_frame(frame(Some(0.0)), &[]);
+    jar.run_hud_layer(&layers[0], &mut host, &ExecutionBudget::UNBOUNDED)
+        .unwrap();
+    let output = host.end_client_frame();
+    assert!(
+        output.draws.is_empty(),
+        "null String/Component calls must draw nothing: {:?}",
+        output.draws
+    );
+    assert_eq!(
+        static_value(&host, "demo/NullTextHud", "nullStringOkI"),
+        Some(Value::Int(1))
+    );
+    assert_eq!(
+        static_value(&host, "demo/NullTextHud", "nullCenteredStringOkI"),
+        Some(Value::Int(1))
+    );
+    assert_eq!(
+        static_value(&host, "demo/NullTextHud", "nullComponentNpeI"),
+        Some(Value::Int(1))
+    );
+    assert_eq!(
+        static_value(&host, "demo/NullTextHud", "nullCenteredComponentNpeI"),
+        Some(Value::Int(1))
+    );
     let _ = fs::remove_dir_all(root);
 }

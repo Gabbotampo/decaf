@@ -2155,6 +2155,257 @@ fn empty_data_namespace_directory_participates_in_pack_order_matching_oracle() {
 }
 
 #[test]
+fn malformed_and_conflicting_zip_data_entries_are_counted_and_excluded_matching_jdk25_probe() {
+    const JDK25_ZIPFS_ORACLE: &str = include_str!("fixtures/recipes/jdk25_zipfs_namespaces.txt");
+    let oracle: BTreeMap<&str, &str> = JDK25_ZIPFS_ORACLE
+        .lines()
+        .filter_map(|line| line.split_once('='))
+        .collect();
+
+    // Verify expected JDK 25 ZipFS probe facts we are matching against.
+    assert_eq!(
+        oracle["data_file_then_child"],
+        "open=OK|dataIsDir=false|namespaces=[]"
+    );
+    assert_eq!(
+        oracle["child_then_data_file"],
+        "open=OK|dataIsDir=false|namespaces=[]"
+    );
+    assert_eq!(
+        oracle["ns_file_then_child"],
+        "open=OK|dataIsDir=true|namespaces=[]"
+    );
+    assert_eq!(
+        oracle["child_then_ns_file"],
+        "open=OK|dataIsDir=true|namespaces=[]"
+    );
+    assert_eq!(
+        oracle["ns_file_plus_other_ns"],
+        "open=OK|dataIsDir=true|namespaces=[other]"
+    );
+    assert_eq!(oracle["dot_in_data_empty_dir"], "open=THROW|ZipException");
+    assert_eq!(oracle["dot_in_data_file"], "open=THROW|ZipException");
+    assert_eq!(oracle["dot_outside_data"], "open=THROW|ZipException");
+    assert_eq!(oracle["dotdot_in_data"], "open=THROW|ZipException");
+    assert_eq!(
+        oracle["bare_data_file_only"],
+        "open=OK|dataIsDir=false|namespaces=[]"
+    );
+    assert_eq!(
+        oracle["valid_dotted_ns"],
+        "open=OK|dataIsDir=true|namespaces=[a.b, c..d]"
+    );
+
+    let mut probe_sources = STUBS.to_vec();
+    probe_sources.push(("demo/AlloyInput.java", DEMO_RECIPE_INPUT));
+    probe_sources.push(("demo/AlloyRecipe.java", DEMO_RECIPE));
+    probe_sources.push((
+        "demo/ZipNsProbe.java",
+        r#"
+package demo;
+import net.fabricmc.fabric.api.event.player.UseItemCallback;
+import net.minecraft.core.Registry;
+import net.minecraft.core.registries.*;
+import net.minecraft.resources.*;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.world.*;
+import net.minecraft.world.item.crafting.*;
+
+public final class ZipNsProbe {
+  public static void onInitialize() {
+    Identifier id = Identifier.parse("demo:alloy");
+    Registry.register(BuiltInRegistries.RECIPE_TYPE, id, AlloyRecipe.TYPE);
+    Registry.register(BuiltInRegistries.RECIPE_SERIALIZER, id, AlloyRecipe.SERIALIZER);
+    UseItemCallback.EVENT.register((player, level, hand) -> {
+      RecipeManager mgr = ((ServerLevel) level).recipeAccess();
+      mgr.byKey(ResourceKey.create(Registries.RECIPE, Identifier.parse("ns:r")));
+      return InteractionResult.PASS;
+    });
+  }
+}
+"#,
+    ));
+
+    const ALLOY_JSON: &[u8] = br#"{"type":"demo:alloy","base":"minecraft:iron_ingot","catalyst":"minecraft:coal","result":"minecraft:stick","tier":1}"#;
+    const READ_NS_KEY: &str = "net/fabricmc/fabric/impl/resource/pack/ModNioPackResources#readNamespaces(Ljava/util/List;Ljava/lang/String;)Ljava/util/Map;";
+
+    let emp_a = javac_fixture::Fixture::build_with_mod_json_and_extra(
+        "zipfs-emp-a",
+        &probe_sources,
+        r#"{"schemaVersion":1,"id":"emp_a","version":"1.0.0","entrypoints":{"main":"demo.ZipNsProbe"}}"#,
+        &[("data/demo/recipe/emp_a_only.json", ALLOY_JSON)],
+    );
+    let emp_z = javac_fixture::Fixture::build_with_mod_json_and_extra(
+        "zipfs-emp-z",
+        &[("dummy/EZ.java", "package dummy; public class EZ {}")],
+        r#"{"schemaVersion":1,"id":"emp_z","version":"1.0.0"}"#,
+        &[("data/demo/recipe/emp_z_only.json", ALLOY_JSON)],
+    );
+
+    let malformed_cases: &[(&str, &[(&str, &[u8])])] = &[
+        (
+            "data_file_then_child",
+            &[("data", b"file"), ("data/ns/recipe/r.json", ALLOY_JSON)],
+        ),
+        (
+            "child_then_data_file",
+            &[("data/ns/recipe/r.json", ALLOY_JSON), ("data", b"file")],
+        ),
+        (
+            "ns_file_then_child",
+            &[("data/ns", b"file"), ("data/ns/recipe/r.json", ALLOY_JSON)],
+        ),
+        (
+            "ns_file_plus_other_ns",
+            &[
+                ("data/ns", b"file"),
+                ("data/ns/recipe/r.json", ALLOY_JSON),
+                ("data/other/recipe/o.json", ALLOY_JSON),
+            ],
+        ),
+        ("dot_in_data_empty_dir", &[("data/./empty_ns/", b"")]),
+        (
+            "dotdot_in_data",
+            &[("data/ns/../other/recipe/r.json", ALLOY_JSON)],
+        ),
+        (
+            "dot_outside_data",
+            &[
+                ("foo/./bar.txt", b"x"),
+                ("data/ns/recipe/r.json", ALLOY_JSON),
+            ],
+        ),
+    ];
+
+    for (case_name, entries) in malformed_cases {
+        let mod_json = format!(
+            r#"{{"schemaVersion":1,"id":"{case_name}","version":"1.0.0","custom":{{"fabric:resource_load_order":{{"before":["emp_z"],"after":["emp_a"]}}}}}}"#
+        );
+        let bad_jar = javac_fixture::Fixture::build_with_mod_json_and_extra(
+            &format!("zipfs-{case_name}"),
+            &[("dummy/B.java", "package dummy; public class B {}")],
+            &mod_json,
+            entries,
+        );
+
+        let mut host = emp_a.jar.seed_host(StdHost::new());
+        host.link_jar("emp_z", &emp_z.jar).unwrap();
+        host.link_jar(*case_name, &bad_jar.jar).unwrap();
+
+        // Must NOT be included as a pack and must NOT flip `emp_z` ahead of `emp_a`.
+        assert_eq!(
+            host.mod_pack_sorter_order(),
+            vec!["emp_a", "emp_z"],
+            "case {case_name}: malformed jar must be excluded from sorter"
+        );
+
+        emp_a
+            .jar
+            .execute("demo.ZipNsProbe", None, "main", &mut host)
+            .unwrap();
+        fire_use_item(&emp_a.jar, &mut host);
+
+        let unknowns: BTreeMap<String, usize> = host.unknown_host_calls().into_iter().collect();
+        assert_eq!(
+            unknowns.get(READ_NS_KEY),
+            Some(&1),
+            "case {case_name}: expected ModNioPackResources#readNamespaces to be counted once, got {unknowns:?}"
+        );
+        assert!(
+            !host.loaded_recipe_ids().iter().any(|id| id == "ns:r"),
+            "case {case_name}: recipe from malformed jar must not be decoded: {:?}",
+            host.loaded_recipe_ids()
+        );
+    }
+
+    // Primary-seeded malformed jars (both regular-file `data` collision and `.` entry segment)
+    // must also be excluded and counted when seeded directly.
+    for (case_name, entries) in [
+        (
+            "primary_data_file",
+            &[
+                ("data", b"file" as &[u8]),
+                ("data/ns/recipe/r.json", ALLOY_JSON),
+            ][..],
+        ),
+        ("primary_dot_dir", &[("data/./empty_ns/", b"" as &[u8])][..]),
+    ] {
+        let mod_json = format!(
+            r#"{{"schemaVersion":1,"id":"{case_name}","version":"1.0.0","entrypoints":{{"main":"demo.ZipNsProbe"}},"custom":{{"fabric:resource_load_order":{{"before":["emp_z"],"after":["emp_a"]}}}}}}"#
+        );
+        let primary_bad = javac_fixture::Fixture::build_with_mod_json_and_extra(
+            &format!("zipfs-{case_name}"),
+            &probe_sources,
+            &mod_json,
+            entries,
+        );
+        let mut host = primary_bad.jar.seed_host(StdHost::new());
+        host.link_jar("emp_a", &emp_a.jar).unwrap();
+        host.link_jar("emp_z", &emp_z.jar).unwrap();
+        assert_eq!(
+            host.mod_pack_sorter_order(),
+            vec!["emp_a", "emp_z"],
+            "primary case {case_name}: malformed jar must be excluded"
+        );
+        primary_bad
+            .jar
+            .execute("demo.ZipNsProbe", None, "main", &mut host)
+            .unwrap();
+        fire_use_item(&primary_bad.jar, &mut host);
+        let unknowns: BTreeMap<String, usize> = host.unknown_host_calls().into_iter().collect();
+        assert_eq!(
+            unknowns.get(READ_NS_KEY),
+            Some(&1),
+            "primary case {case_name}: expected ModNioPackResources#readNamespaces to be counted, got {unknowns:?}"
+        );
+    }
+
+    // Clean controls matching JDK 25 ZipFS with ZERO unknown calls:
+    // 1. Bare regular file `data` with no children under `data/` -> excluded cleanly, not counted.
+    // 2. Valid dotted namespaces `data/a.b/` + `data/c..d/` -> included cleanly, not counted.
+    let bare_data_only = javac_fixture::Fixture::build_with_mod_json_and_extra(
+        "zipfs-bare-data-only",
+        &[("dummy/D.java", "package dummy; public class D {}")],
+        r#"{"schemaVersion":1,"id":"bare_data","version":"1.0.0","custom":{"fabric:resource_load_order":{"before":["emp_z"],"after":["emp_a"]}}}"#,
+        &[("data", b"not a directory")],
+    );
+    let valid_dotted = javac_fixture::Fixture::build_with_mod_json_and_extra(
+        "zipfs-valid-dotted",
+        &[("dummy/V.java", "package dummy; public class V {}")],
+        r#"{"schemaVersion":1,"id":"dotted_ns","version":"1.0.0","custom":{"fabric:resource_load_order":{"before":["emp_z"],"after":["emp_a"]}}}"#,
+        &[("data/a.b/recipe/ok.json", ALLOY_JSON), ("data/c..d/", b"")],
+    );
+    let mut clean_host = emp_a.jar.seed_host(StdHost::new());
+    clean_host.link_jar("emp_z", &emp_z.jar).unwrap();
+    clean_host
+        .link_jar("bare_data", &bare_data_only.jar)
+        .unwrap();
+    clean_host.link_jar("dotted_ns", &valid_dotted.jar).unwrap();
+    assert_eq!(
+        clean_host.mod_pack_sorter_order(),
+        vec!["emp_z", "dotted_ns", "emp_a"]
+    );
+    emp_a
+        .jar
+        .execute("demo.ZipNsProbe", None, "main", &mut clean_host)
+        .unwrap();
+    fire_use_item(&emp_a.jar, &mut clean_host);
+    assert!(
+        clean_host.unknown_host_calls().is_empty(),
+        "expected zero unknown calls for clean bare `data` and dotted namespaces, got {:?}",
+        clean_host.unknown_host_calls()
+    );
+    assert!(
+        clean_host
+            .loaded_recipe_ids()
+            .iter()
+            .any(|id| id == "a.b:ok"),
+        "expected recipe from valid dotted namespace to load: {:?}",
+        clean_host.loaded_recipe_ids()
+    );
+}
+
+#[test]
 fn unsupported_resource_load_order_constraints_are_counted() {
     let mut sources = STUBS.to_vec();
     sources.push(("demo/AlloyInput.java", DEMO_RECIPE_INPUT));

@@ -89,12 +89,17 @@ pub(crate) struct JarDataLayer {
     /// Valid immediate `data/<ns>/` namespace directories discovered in the jar (including empty
     /// `data/<ns>/` directory entries with no files inside, matching `ModNioPackResources.readNamespaces`).
     pub(crate) data_namespaces: BTreeSet<String>,
+    /// True when the jar has malformed/conflicting ZIP paths (`.`/`..` segments, non-canonical
+    /// leading/`//` under `data`, or a regular-file `data` / `data/<ns>` colliding with children),
+    /// so its namespace set is unknown and `ModNioPackResources.readNamespaces` must be counted.
+    pub(crate) data_namespaces_unknown: bool,
     /// All `data/` file entries belonging to this jar.
     pub(crate) resources: BTreeMap<String, Vec<u8>>,
 }
 
-/// An unsupported or malformed `fabric:resource_load_order` constraint form discovered while
-/// running `ModPackResourcesUtil.getModResourcePacks` + `ModPackResourcesSorter`.
+/// An unsupported or malformed `fabric:resource_load_order` constraint or data-namespace layout
+/// discovered while running `ModNioPackResources.readNamespaces`,
+/// `ModPackResourcesUtil.getModResourcePacks`, and `ModPackResourcesSorter`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum UnsupportedLoadOrder {
     /// `custom["fabric:resource_load_order"]` is not a JSON object (`getModResourcePacks:165..221`).
@@ -108,6 +113,11 @@ pub(crate) enum UnsupportedLoadOrder {
     /// A mod declared `before` or `after` against its own mod id, which throws
     /// `IllegalArgumentException` in `ModPackResourcesSorter.addLoadOrdering:14..31`.
     SelfDependency { mod_id: String },
+    /// A jar contains malformed or conflicting ZIP entry paths (`.`/`..` segments rejected by
+    /// JDK 25 `ZipFileSystem`, non-canonical `/` paths under `data`, or a regular-file `data` /
+    /// `data/<ns>` colliding with child entries), so `ModNioPackResources.readNamespaces` cannot
+    /// be answered without guessing.
+    MalformedDataNamespaces { mod_id: String },
 }
 
 impl UnsupportedLoadOrder {
@@ -117,6 +127,11 @@ impl UnsupportedLoadOrder {
                 owner: "net/fabricmc/fabric/impl/resource/pack/ModPackResourcesSorter".into(),
                 name: "addLoadOrdering".into(),
                 descriptor: "(Ljava/lang/String;Ljava/lang/String;Lnet/fabricmc/fabric/impl/resource/pack/ModPackResourcesUtil$Order;)V".into(),
+            },
+            Self::MalformedDataNamespaces { .. } => crate::runtime::MethodRef {
+                owner: "net/fabricmc/fabric/impl/resource/pack/ModNioPackResources".into(),
+                name: "readNamespaces".into(),
+                descriptor: "(Ljava/util/List;Ljava/lang/String;)Ljava/util/Map;".into(),
             },
             Self::NotAnObject { .. }
             | Self::UnknownKey { .. }
@@ -194,34 +209,179 @@ pub(crate) fn is_valid_namespace(ns: &str) -> bool {
             .all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.'))
 }
 
-/// Extract a valid Fabric `ModNioPackResources` server-data namespace from a ZIP entry path
-/// (`ModNioPackResources.readNamespaces:55..244`, `Files.isDirectory` at `87, 152`,
+/// Extract a valid Fabric `ModNioPackResources` server-data namespace from a single well-formed
+/// ZIP entry path (`ModNioPackResources.readNamespaces:55..244`, `Files.isDirectory` at `87, 152`,
 /// `RESOURCE_PACK_PATH` match at `186..214`).
 ///
-/// Matches JDK `ZipFileSystem` directory semantics:
-/// - Any entry under `data/<ns>/...` — including an empty directory entry `data/<ns>/` with no
-///   files inside — yields an immediate child directory `<ns>` of `data/`.
-/// - A bare file directly inside `data/` (`data/<file>`, no slash after `<file>`) fails
-///   `Files.isDirectory` (`readNamespaces:152`) and returns `None`.
-/// - `.` and `..` path segments normalize as in `ZipFileSystem`.
-/// - `<ns>` must match `[a-z0-9-_.]+`.
+/// Never normalizes `.`/`..`, leading `/`, or repeated `//` segments: JDK 25 `ZipFileSystem`
+/// rejects any ZIP containing `.` or `..` entry segments with `ZipException`, and whole-jar
+/// scanning via [`DataNamespaceScanner`] marks `.`/`..`, non-canonical `/` paths under `data`,
+/// and conflicting regular-file `data` / `data/<ns>` entries as unknown so they are counted.
 pub(crate) fn valid_data_namespace_from_entry(entry_name: &str) -> Option<String> {
-    let mut normalized: Vec<&str> = Vec::new();
-    for seg in entry_name.split('/') {
-        match seg {
-            "" | "." => {}
-            ".." => {
-                normalized.pop();
-            }
-            other => normalized.push(other),
-        }
-    }
-    if normalized.first().copied() != Some("data") {
+    if entry_name.starts_with('/')
+        || entry_name.contains("//")
+        || entry_name.split('/').any(|seg| seg == "." || seg == "..")
+    {
         return None;
     }
-    let ns = *normalized.get(1)?;
-    let is_dir = normalized.len() >= 3 || (normalized.len() == 2 && entry_name.ends_with('/'));
-    (is_dir && is_valid_namespace(ns)).then(|| ns.to_owned())
+    let rest = entry_name.strip_prefix("data/")?;
+    let (ns, _tail) = rest.split_once('/')?;
+    is_valid_namespace(ns).then(|| ns.to_owned())
+}
+
+/// Whole-jar scanner for `ModNioPackResources.readNamespaces` on JDK 25 `ZipFileSystem`.
+///
+/// Tracks every raw ZIP entry before filtering so that:
+/// - Any entry anywhere in the jar with a `.` or `..` segment (which causes JDK 25
+///   `FileSystems.newFileSystem` to throw `ZipException`) marks the namespace set as unknown.
+/// - Non-canonical leading `/` or repeated `//` paths under `data` mark the namespace set as
+///   unknown rather than diverging from `ZipFileSystem`'s slash collapsing.
+/// - A regular-file `data` entry alongside `data/` or `data/...` children, or a regular-file
+///   `data/<ns>` entry alongside `data/<ns>/` or `data/<ns>/...` children, marks the namespace
+///   set as unknown rather than guessing over file/directory collisions.
+/// - Well-formed bare regular files (`data` alone with no children, or `data/plain_file.txt`
+///   with no children under it) and invalid directory names (`data/Bad_NS/`) are cleanly ignored
+///   with no unknown flag, matching `ModNioPackResources.readNamespaces`.
+#[derive(Clone, Debug)]
+pub(crate) struct DataNamespaceScanner {
+    max_namespaces: usize,
+    unknown: bool,
+    data_file: bool,
+    data_dir: bool,
+    data_has_children: bool,
+    ns_files: BTreeSet<String>,
+    ns_dirs_or_children: BTreeSet<String>,
+    valid_namespaces: BTreeSet<String>,
+}
+
+impl DataNamespaceScanner {
+    pub(crate) fn new(max_namespaces: usize) -> Self {
+        Self {
+            max_namespaces,
+            unknown: false,
+            data_file: false,
+            data_dir: false,
+            data_has_children: false,
+            ns_files: BTreeSet::new(),
+            ns_dirs_or_children: BTreeSet::new(),
+            valid_namespaces: BTreeSet::new(),
+        }
+    }
+
+    fn insert_bounded(set: &mut BTreeSet<String>, value: &str, max: usize, unknown: &mut bool) {
+        if set.contains(value) {
+            return;
+        }
+        if set.len() < max {
+            set.insert(value.to_owned());
+        } else {
+            *unknown = true;
+        }
+    }
+
+    pub(crate) fn record_entry(&mut self, entry_name: &str) {
+        if entry_name.split('/').any(|seg| seg == "." || seg == "..") {
+            self.unknown = true;
+            return;
+        }
+        if (entry_name.starts_with('/') || entry_name.contains("//"))
+            && entry_name.split('/').find(|seg| !seg.is_empty()) == Some("data")
+        {
+            self.unknown = true;
+            return;
+        }
+        if entry_name == "data" {
+            self.data_file = true;
+            return;
+        }
+        if entry_name == "data/" {
+            self.data_dir = true;
+            return;
+        }
+        let Some(rest) = entry_name.strip_prefix("data/") else {
+            return;
+        };
+        self.data_has_children = true;
+        if let Some((ns, _tail)) = rest.split_once('/') {
+            Self::insert_bounded(
+                &mut self.ns_dirs_or_children,
+                ns,
+                self.max_namespaces,
+                &mut self.unknown,
+            );
+            if is_valid_namespace(ns) {
+                Self::insert_bounded(
+                    &mut self.valid_namespaces,
+                    ns,
+                    self.max_namespaces,
+                    &mut self.unknown,
+                );
+            }
+        } else {
+            Self::insert_bounded(
+                &mut self.ns_files,
+                rest,
+                self.max_namespaces,
+                &mut self.unknown,
+            );
+        }
+    }
+
+    pub(crate) fn merge_scan(&mut self, namespaces: &BTreeSet<String>, unknown: bool) {
+        if unknown {
+            self.unknown = true;
+            return;
+        }
+        for ns in namespaces {
+            self.data_has_children = true;
+            Self::insert_bounded(
+                &mut self.ns_dirs_or_children,
+                ns,
+                self.max_namespaces,
+                &mut self.unknown,
+            );
+            if is_valid_namespace(ns) {
+                Self::insert_bounded(
+                    &mut self.valid_namespaces,
+                    ns,
+                    self.max_namespaces,
+                    &mut self.unknown,
+                );
+            }
+        }
+    }
+
+    pub(crate) fn is_unknown(&self) -> bool {
+        self.unknown
+            || (self.data_file && (self.data_dir || self.data_has_children))
+            || self
+                .ns_files
+                .iter()
+                .any(|ns| self.ns_dirs_or_children.contains(ns))
+    }
+
+    pub(crate) fn namespaces(&self) -> BTreeSet<String> {
+        if self.is_unknown() {
+            BTreeSet::new()
+        } else {
+            self.valid_namespaces.clone()
+        }
+    }
+
+    pub(crate) fn finish(self) -> (BTreeSet<String>, bool) {
+        if self.is_unknown() {
+            (BTreeSet::new(), true)
+        } else {
+            (self.valid_namespaces, false)
+        }
+    }
+
+    pub(crate) fn fingerprint(&self) -> u64 {
+        (self.valid_namespaces.len() as u64)
+            .wrapping_add((self.ns_files.len() as u64) << 16)
+            .wrapping_add((self.ns_dirs_or_children.len() as u64) << 32)
+            .wrapping_add(u64::from(self.is_unknown()) << 48)
+    }
 }
 
 /// Check whether a jar exposes at least one valid `data/<ns>/` namespace directory matching
@@ -563,6 +723,7 @@ pub(crate) fn resolve_data_pack_order<'a>(
     primary_load_order: Option<&'a serde_json::Value>,
     primary_data_layer: &'a BTreeMap<String, Vec<u8>>,
     primary_data_namespaces: &BTreeSet<String>,
+    primary_data_namespaces_unknown: bool,
     all_loaded_mod_ids: &BTreeSet<String>,
     explicit_datapacks: &'a [(String, BTreeMap<String, Vec<u8>>)],
 ) -> OrderedDataPacks<'a> {
@@ -570,8 +731,18 @@ pub(crate) fn resolve_data_pack_order<'a>(
     let mut fabric_layers_by_id: BTreeMap<JavaStringKey, (&'a str, &'a BTreeMap<String, Vec<u8>>)> =
         BTreeMap::new();
     let mut non_fabric_layers: Vec<(&'a str, &'a BTreeMap<String, Vec<u8>>)> = Vec::new();
+    let mut malformed_namespaces: Vec<UnsupportedLoadOrder> = Vec::new();
 
     for entry in linked_layers {
+        if entry.data_namespaces_unknown {
+            malformed_namespaces.push(UnsupportedLoadOrder::MalformedDataNamespaces {
+                mod_id: entry
+                    .fabric_mod_id
+                    .clone()
+                    .unwrap_or_else(|| entry.link_id.clone()),
+            });
+            continue;
+        }
         if let Some(mod_id) = entry.fabric_mod_id.as_deref() {
             let valid_ns = has_valid_data_namespace(&entry.resources, &entry.data_namespaces);
             fabric_inputs.push(ModPackInput {
@@ -589,7 +760,11 @@ pub(crate) fn resolve_data_pack_order<'a>(
         }
     }
 
-    if !primary_data_layer.is_empty() || !primary_data_namespaces.is_empty() {
+    if primary_data_namespaces_unknown {
+        malformed_namespaces.push(UnsupportedLoadOrder::MalformedDataNamespaces {
+            mod_id: primary_mod_id.unwrap_or("primary").to_owned(),
+        });
+    } else if !primary_data_layer.is_empty() || !primary_data_namespaces.is_empty() {
         if let Some(mod_id) = primary_mod_id {
             let valid_ns = has_valid_data_namespace(primary_data_layer, primary_data_namespaces);
             fabric_inputs.push(ModPackInput {
@@ -610,7 +785,8 @@ pub(crate) fn resolve_data_pack_order<'a>(
     }
 
     // Stage 1: run ModPackResourcesUtil.getModResourcePacks + ModPackResourcesSorter + NodeSorting.
-    let sorter = sort_mod_pack_resources(&fabric_inputs, all_loaded_mod_ids);
+    let mut sorter = sort_mod_pack_resources(&fabric_inputs, all_loaded_mod_ids);
+    sorter.unsupported.extend(malformed_namespaces);
 
     // Stage 2: MC 26.3 PackRepository.discoverAvailable (`Maps.newTreeMap()`, server-26.3.jar:0..52)
     // + PackRepositoryMixin.handleAutoEnableDisable -> ModPackResourcesUtil.refreshAutoEnabledPacks
@@ -676,6 +852,7 @@ mod tests {
                 fabric_mod_id: Some("mod_c".into()),
                 resource_load_order: None,
                 data_namespaces: BTreeSet::new(),
+                data_namespaces_unknown: false,
                 resources: map_with_recipe("orderprobe"),
             },
             JarDataLayer {
@@ -683,6 +860,7 @@ mod tests {
                 fabric_mod_id: Some("mod_a".into()),
                 resource_load_order: Some(before_c),
                 data_namespaces: BTreeSet::new(),
+                data_namespaces_unknown: false,
                 resources: map_with_recipe("orderprobe"),
             },
             JarDataLayer {
@@ -690,6 +868,7 @@ mod tests {
                 fabric_mod_id: Some("mod_b".into()),
                 resource_load_order: None,
                 data_namespaces: BTreeSet::new(),
+                data_namespaces_unknown: false,
                 resources: map_with_recipe("orderprobe"),
             },
             JarDataLayer {
@@ -697,6 +876,7 @@ mod tests {
                 fabric_mod_id: Some("mod_z".into()),
                 resource_load_order: Some(after_x),
                 data_namespaces: BTreeSet::new(),
+                data_namespaces_unknown: false,
                 resources: map_with_recipe("orderprobe"),
             },
             JarDataLayer {
@@ -704,6 +884,7 @@ mod tests {
                 fabric_mod_id: Some("mod_x".into()),
                 resource_load_order: None,
                 data_namespaces: BTreeSet::new(),
+                data_namespaces_unknown: false,
                 resources: map_with_recipe("orderprobe"),
             },
             JarDataLayer {
@@ -711,6 +892,7 @@ mod tests {
                 fabric_mod_id: Some("mod_y".into()),
                 resource_load_order: None,
                 data_namespaces: BTreeSet::new(),
+                data_namespaces_unknown: false,
                 resources: map_with_recipe("orderprobe"),
             },
             JarDataLayer {
@@ -718,6 +900,7 @@ mod tests {
                 fabric_mod_id: Some("nested_zzz".into()),
                 resource_load_order: None,
                 data_namespaces: BTreeSet::new(),
+                data_namespaces_unknown: false,
                 resources: map_with_recipe("orderprobe"),
             },
             JarDataLayer {
@@ -725,6 +908,7 @@ mod tests {
                 fabric_mod_id: Some("nested_aaa".into()),
                 resource_load_order: None,
                 data_namespaces: BTreeSet::new(),
+                data_namespaces_unknown: false,
                 resources: map_with_recipe("orderprobe"),
             },
             JarDataLayer {
@@ -732,6 +916,7 @@ mod tests {
                 fabric_mod_id: Some("cyc_b".into()),
                 resource_load_order: Some(cyc_a),
                 data_namespaces: BTreeSet::new(),
+                data_namespaces_unknown: false,
                 resources: map_with_recipe("orderprobe"),
             },
             JarDataLayer {
@@ -739,6 +924,7 @@ mod tests {
                 fabric_mod_id: Some("cyc_a".into()),
                 resource_load_order: Some(cyc_b),
                 data_namespaces: BTreeSet::new(),
+                data_namespaces_unknown: false,
                 resources: map_with_recipe("orderprobe"),
             },
             JarDataLayer {
@@ -746,6 +932,7 @@ mod tests {
                 fabric_mod_id: Some("bad_form".into()),
                 resource_load_order: Some(bad_form),
                 data_namespaces: BTreeSet::new(),
+                data_namespaces_unknown: false,
                 resources: map_with_recipe("orderprobe"),
             },
             JarDataLayer {
@@ -753,6 +940,7 @@ mod tests {
                 fabric_mod_id: Some("emp_a".into()),
                 resource_load_order: None,
                 data_namespaces: BTreeSet::new(),
+                data_namespaces_unknown: false,
                 resources: map_with_recipe("orderprobe"),
             },
             JarDataLayer {
@@ -760,6 +948,7 @@ mod tests {
                 fabric_mod_id: Some("emp_z".into()),
                 resource_load_order: None,
                 data_namespaces: BTreeSet::new(),
+                data_namespaces_unknown: false,
                 resources: map_with_recipe("orderprobe"),
             },
             // Empty `data/empty_ns/` directory with ZERO files inside `resources`:
@@ -768,6 +957,7 @@ mod tests {
                 fabric_mod_id: Some("empty_bridge".into()),
                 resource_load_order: Some(empty_bridge_order),
                 data_namespaces: BTreeSet::from(["empty_ns".to_owned()]),
+                data_namespaces_unknown: false,
                 resources: BTreeMap::new(),
             },
             JarDataLayer {
@@ -775,6 +965,7 @@ mod tests {
                 fabric_mod_id: Some("inv_a".into()),
                 resource_load_order: None,
                 data_namespaces: BTreeSet::new(),
+                data_namespaces_unknown: false,
                 resources: map_with_recipe("orderprobe"),
             },
             JarDataLayer {
@@ -782,6 +973,7 @@ mod tests {
                 fabric_mod_id: Some("inv_z".into()),
                 resource_load_order: None,
                 data_namespaces: BTreeSet::new(),
+                data_namespaces_unknown: false,
                 resources: map_with_recipe("orderprobe"),
             },
             // Invalid uppercase dir + bare file under `data/`: must be excluded with its edges.
@@ -790,6 +982,7 @@ mod tests {
                 fabric_mod_id: Some("empty_invalid".into()),
                 resource_load_order: Some(empty_invalid_order),
                 data_namespaces: BTreeSet::new(),
+                data_namespaces_unknown: false,
                 resources: BTreeMap::from([(
                     "data/plain_file.txt".to_owned(),
                     b"not a directory".to_vec(),
@@ -802,7 +995,7 @@ mod tests {
         let empty_ns = BTreeSet::new();
         let all_ids = BTreeSet::new();
         let ordered =
-            resolve_data_pack_order(&linked, None, None, &empty, &empty_ns, &all_ids, &dp);
+            resolve_data_pack_order(&linked, None, None, &empty, &empty_ns, false, &all_ids, &dp);
 
         // Stage 1 matches `SORTER_MOD_ORDER` captured from real Fabric 26.3:
         assert_eq!(
@@ -869,13 +1062,26 @@ mod tests {
             Some("a-b_c.0".to_owned())
         );
         assert_eq!(
+            valid_data_namespace_from_entry("data/a.b/recipe/x.json"),
+            Some("a.b".to_owned())
+        );
+        assert_eq!(
+            valid_data_namespace_from_entry("data/c..d/"),
+            Some("c..d".to_owned())
+        );
+        assert_eq!(
             valid_data_namespace_from_entry("data/mod_x/recipe/a.json"),
             Some("mod_x".to_owned())
         );
+        // Never normalize `.`/`..`, leading `/`, or repeated `//`.
+        assert_eq!(valid_data_namespace_from_entry("data/./empty_ns/"), None);
         assert_eq!(
-            valid_data_namespace_from_entry("data/./empty_ns/"),
-            Some("empty_ns".to_owned())
+            valid_data_namespace_from_entry("data/ns/../other/a.json"),
+            None
         );
+        assert_eq!(valid_data_namespace_from_entry("/data/ns/a.json"), None);
+        assert_eq!(valid_data_namespace_from_entry("data//ns/a.json"), None);
+        assert_eq!(valid_data_namespace_from_entry("data"), None);
         assert_eq!(valid_data_namespace_from_entry("data/"), None);
         assert_eq!(valid_data_namespace_from_entry("data/plain_file.txt"), None);
         assert_eq!(valid_data_namespace_from_entry("data/Bad_NS/"), None);
@@ -884,6 +1090,80 @@ mod tests {
         assert_eq!(valid_data_namespace_from_entry("data/./"), None);
         assert_eq!(valid_data_namespace_from_entry("data/../"), None);
         assert_eq!(valid_data_namespace_from_entry("assets/empty_ns/"), None);
+        assert_eq!(valid_data_namespace_from_entry("data\\ns\\a.json"), None);
+    }
+
+    #[test]
+    fn data_namespace_scanner_flags_dot_segments_and_file_dir_conflicts() {
+        let scan = |entries: &[&str]| {
+            let mut s = DataNamespaceScanner::new(64);
+            for e in entries {
+                s.record_entry(e);
+            }
+            s.finish()
+        };
+
+        // Clean cases: exact namespaces, never unknown.
+        assert_eq!(
+            scan(&["data/", "data/empty_ns/"]),
+            (BTreeSet::from(["empty_ns".to_owned()]), false)
+        );
+        assert_eq!(
+            scan(&["data/a.b/recipe/a.json", "data/c..d/"]),
+            (BTreeSet::from(["a.b".to_owned(), "c..d".to_owned()]), false)
+        );
+        assert_eq!(scan(&["data"]), (BTreeSet::new(), false));
+        assert_eq!(
+            scan(&["data/", "data/Bad_NS/", "data/plain_file.txt"]),
+            (BTreeSet::new(), false)
+        );
+
+        // Conflicting regular-file `data` or `data/<ns>` with children -> unknown (never guessed).
+        assert_eq!(
+            scan(&["data", "data/ns/recipe/a.json"]),
+            (BTreeSet::new(), true)
+        );
+        assert_eq!(
+            scan(&["data/ns/recipe/a.json", "data"]),
+            (BTreeSet::new(), true)
+        );
+        assert_eq!(
+            scan(&["data", "data/", "data/ns/recipe/a.json"]),
+            (BTreeSet::new(), true)
+        );
+        assert_eq!(
+            scan(&["data/ns", "data/ns/recipe/a.json"]),
+            (BTreeSet::new(), true)
+        );
+        assert_eq!(
+            scan(&["data/ns/recipe/a.json", "data/ns"]),
+            (BTreeSet::new(), true)
+        );
+        assert_eq!(
+            scan(&[
+                "data/ns",
+                "data/ns/recipe/a.json",
+                "data/other/recipe/b.json"
+            ]),
+            (BTreeSet::new(), true)
+        );
+
+        // Any `.`/`..` segment anywhere in the jar -> unknown (JDK 25 ZipFS throws ZipException).
+        assert_eq!(scan(&["data/./empty_ns/"]), (BTreeSet::new(), true));
+        assert_eq!(
+            scan(&["foo/./bar.txt", "data/ns/recipe/a.json"]),
+            (BTreeSet::new(), true)
+        );
+        assert_eq!(
+            scan(&["data/ns/../other/recipe/a.json"]),
+            (BTreeSet::new(), true)
+        );
+        assert_eq!(scan(&["data/./"]), (BTreeSet::new(), true));
+        assert_eq!(scan(&["data/../"]), (BTreeSet::new(), true));
+
+        // Non-canonical leading `/` or repeated `//` under `data` -> unknown.
+        assert_eq!(scan(&["/data/ns/recipe/a.json"]), (BTreeSet::new(), true));
+        assert_eq!(scan(&["data//ns/recipe/a.json"]), (BTreeSet::new(), true));
     }
 
     #[test]

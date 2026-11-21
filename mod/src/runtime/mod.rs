@@ -3651,9 +3651,9 @@ pub struct StdHost {
     /// kept separate from `resource_bytes` (which also merges linked-jar classpath resources
     /// first-wins for `ClassLoader.getResourceAsStream`).
     primary_data_layer: BTreeMap<String, Vec<u8>>,
-    /// Valid `data/<ns>/` namespace directories discovered on the primary seeded jar (including
-    /// empty `data/<ns>/` directories with no files inside).
-    primary_data_namespaces: BTreeSet<String>,
+    /// Scanner tracking `data/` namespaces (and malformed/conflicting entries) on the primary
+    /// seeded jar or direct `with_resource_bytes` entries.
+    primary_data_scanner: pack_order::DataNamespaceScanner,
     /// Ordered explicit datapack layers stacked above all loaded jars (lowest -> highest).
     data_pack_layers: Vec<(String, BTreeMap<String, Vec<u8>>)>,
     /// Monotonic counter bumped whenever resources, linked jars, or datapack layers change.
@@ -3826,6 +3826,9 @@ pub struct StdHost {
     /// Every mutable collection's list, by marker, each with a generation
     /// (`collection_store.rs`).
     mutable_collections: collection_store::CollectionStore,
+    /// Opaque `Consumer<Component>` sinks while an item's own `appendHoverText`
+    /// runs, keyed by `HostKind::TooltipConsumer` handle key.
+    tooltip_sinks: BTreeMap<String, Vec<Value>>,
     guava_tables: guava_table::Store,
     pub(crate) recipes: recipe_models::RecipeState,
     /// O(1) `Collections.nCopies` rows: logical length and the repeated value.
@@ -4054,7 +4057,7 @@ impl StdHost {
             resources: BTreeMap::new(),
             resource_bytes: BTreeMap::new(),
             primary_data_layer: BTreeMap::new(),
-            primary_data_namespaces: BTreeSet::new(),
+            primary_data_scanner: pack_order::DataNamespaceScanner::new(MAX_DATA_NAMESPACES),
             data_pack_layers: Vec::new(),
             resource_generation: 0,
             pending_container_clamp: None,
@@ -4125,6 +4128,7 @@ impl StdHost {
             holder_rows: Vec::new(),
             holder_binding: host_registry::Binding::Construct,
             mutable_collections: collection_store::CollectionStore::default(),
+            tooltip_sinks: BTreeMap::new(),
             guava_tables: guava_table::Store::default(),
             recipes: recipe_models::RecipeState::default(),
             repeated_collections: BTreeMap::new(),
@@ -4248,6 +4252,12 @@ impl StdHost {
             .collect()
     }
 
+    /// The current bounded vanilla `ComponentSerialization.CODEC` +
+    /// `JsonOps.INSTANCE` JSON representation of a component value.
+    pub fn component_json(&self, value: &Value) -> Option<String> {
+        crate::runtime::facade_text::codec_json_now(value, Some(&self.component_states))
+    }
+
     pub fn unknown_host_call_count(&self) -> usize {
         self.unknown_host_calls.values().sum()
     }
@@ -4335,7 +4345,7 @@ impl StdHost {
             .wrapping_add(self.linked_classes.data_layer_entry_count() as u64)
             .wrapping_add((self.linked_classes.data_layers().len() as u64) << 32)
             .wrapping_add((self.primary_data_layer.len() as u64) << 16)
-            .wrapping_add((self.primary_data_namespaces.len() as u64) << 8)
+            .wrapping_add(self.primary_data_scanner.fingerprint() << 8)
     }
 
     /// Stack an explicit datapack layer (e.g. a world datapack or test override) above all
@@ -4393,12 +4403,15 @@ impl StdHost {
                 all_loaded_mod_ids.insert((*provided).to_owned());
             }
         }
+        let primary_ns_unknown = self.primary_data_scanner.is_unknown();
+        let primary_namespaces = self.primary_data_scanner.namespaces();
         pack_order::resolve_data_pack_order(
             self.linked_classes.data_layers(),
             primary_mod_id,
             primary_load_order,
             &self.primary_data_layer,
-            &self.primary_data_namespaces,
+            &primary_namespaces,
+            primary_ns_unknown,
             &all_loaded_mod_ids,
             &self.data_pack_layers,
         )
@@ -4676,6 +4689,27 @@ impl StdHost {
         made
     }
 
+    /// Make an opaque `Consumer<Component>` host handle for an item's
+    /// `appendHoverText`, matching vanilla's invokedynamic `lines::add` lambda.
+    pub(crate) fn tooltip_sink(&mut self) -> Value {
+        static NEXT_TOOLTIP_SINK: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(0);
+        let serial = NEXT_TOOLTIP_SINK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let key = format!("tooltip-consumer#{serial}");
+        self.tooltip_sinks.insert(key.clone(), Vec::new());
+        Value::Host(HostRef::new(HostKind::TooltipConsumer, key))
+    }
+
+    pub(crate) fn take_tooltip_sink(&mut self, sink: &Value) -> Vec<Value> {
+        let Value::Host(handle) = sink else {
+            return Vec::new();
+        };
+        if handle.kind() != HostKind::TooltipConsumer {
+            return Vec::new();
+        }
+        self.tooltip_sinks.remove(handle.key()).unwrap_or_default()
+    }
+
     /// The loader wraps metadata collections in a fresh unmodifiable view,
     /// cached per receiver and getter just like the mutable stand-ins.
     pub(crate) fn cached_unmodifiable_collection(
@@ -4788,7 +4822,9 @@ impl StdHost {
     /// Seed bounded bytes for an explicitly supplied resource. This never
     /// opens a host path or consults a process classpath.
     pub fn with_resource_bytes(mut self, name: impl Into<String>, bytes: Vec<u8>) -> Self {
-        let name = name.into().trim_start_matches('/').to_owned();
+        let raw_name = name.into();
+        self.primary_data_scanner.record_entry(&raw_name);
+        let name = raw_name.trim_start_matches('/').to_owned();
         let marker = self
             .resources
             .get(&name)
@@ -4796,9 +4832,6 @@ impl StdHost {
             .unwrap_or_else(|| format!("resource-bytes/{name}"));
         self.resources.insert(name.clone(), marker.clone());
         if name.starts_with("data/") {
-            if let Some(ns) = pack_order::valid_data_namespace_from_entry(&name) {
-                self.primary_data_namespaces.insert(ns);
-            }
             self.primary_data_layer.insert(name.clone(), bytes.clone());
         }
         self.resource_bytes.insert(name, bytes.clone());
@@ -9966,6 +9999,20 @@ impl Host for StdHost {
         if let Some(value) = self.menu_instance_call(r, receiver, args) {
             return value;
         }
+        // 26.3's vanilla Item/BlockItem implementation is `0: return`. Mod-owned
+        // overrides dispatch in the Runtime, so only jar-object super calls or
+        // inherited no-op calls land here.
+        if jar_object::is_object(receiver)
+            && matches!(
+                r.owner.as_str(),
+                "net/minecraft/world/item/Item" | "net/minecraft/world/item/BlockItem"
+            )
+            && r.name == "appendHoverText"
+            && r.descriptor
+                == "(Lnet/minecraft/world/item/ItemStack;Lnet/minecraft/world/item/Item$TooltipContext;Lnet/minecraft/world/item/component/TooltipDisplay;Ljava/util/function/Consumer;Lnet/minecraft/world/item/TooltipFlag;)V"
+        {
+            return Ok(Value::Void);
+        }
         if let Some(value) =
             host_creative_tab::instance_call(&mut self.creative_tab, r, receiver, args)
         {
@@ -10312,6 +10359,12 @@ impl Host for StdHost {
         }
         if let Some(value) = self.payload_type_registry_call(r, Some(receiver), args) {
             return Ok(value);
+        }
+        // Dedicated tooltip handles (`TooltipConsumer`, `TooltipContext`,
+        // `TooltipDisplay`, `TooltipFlag`) work both inside and outside a
+        // client frame.
+        if let Some(answer) = self.tooltip_handle_call(r, receiver, args) {
+            return answer;
         }
         // A client stand-in (`client/...`), a mod's `KeyMapping`, or a client
         // registration event answers the client surface first.
@@ -19103,6 +19156,10 @@ pub struct NativeJar {
     /// Valid immediate `data/<ns>/` namespace directories discovered in the jar (including empty
     /// `data/<ns>/` directory entries with no files inside, matching `ModNioPackResources.readNamespaces`).
     data_namespaces: BTreeSet<String>,
+    /// True when the jar contains `.`/`..` entry segments, non-canonical `/` paths under `data`,
+    /// or regular-file `data` / `data/<ns>` entries conflicting with child entries (causing
+    /// `ModNioPackResources.readNamespaces` to be counted rather than guessed).
+    data_namespaces_unknown: bool,
     pub fabric_id: Option<String>,
     pub fabric_version: Option<String>,
     /// Aliases declared by Fabric metadata's `provides` array.
@@ -20727,7 +20784,7 @@ impl NativeJar {
         let mut classes = Vec::new();
         let mut resources = BTreeMap::new();
         let mut resource_bytes = BTreeMap::new();
-        let mut data_namespaces = BTreeSet::new();
+        let mut data_ns_scanner = pack_order::DataNamespaceScanner::new(MAX_DATA_NAMESPACES);
         let mut resource_total = 0usize;
         let mut neoforge_entrypoints = Vec::new();
         let mut metadata = None;
@@ -20743,14 +20800,11 @@ impl NativeJar {
                 .name()
                 .map_err(|e| NativeError::Zip(e.to_string()))?
                 .into_owned();
-            // Record every valid immediate `data/<ns>/` directory (including empty directory
-            // entries ending in `/`) before directory/class/size filters run, matching
-            // Fabric's `ModNioPackResources.readNamespaces` on JDK `ZipFileSystem`.
-            if data_namespaces.len() < MAX_DATA_NAMESPACES
-                && let Some(ns) = pack_order::valid_data_namespace_from_entry(&name)
-            {
-                data_namespaces.insert(ns);
-            }
+            // Scan every raw ZIP entry name (including directory entries, `.class` files, and
+            // bare `data`/`data/<ns>` regular files) before filters run, matching Fabric's
+            // `ModNioPackResources.readNamespaces` on JDK 25 `ZipFileSystem` and flagging
+            // malformed `.`/`..` or conflicting file/directory entries as unknown.
+            data_ns_scanner.record_entry(&name);
             // A module descriptor's name is kept (not its bytes): it decides
             // the jar's module under NeoForge (`reflect_override`).
             if reflect_override::is_module_descriptor(&name) {
@@ -20876,9 +20930,11 @@ impl NativeJar {
         let native_declarations =
             declarations_content::with_data_recipes(&mut zip, native_declarations);
         let mut jar = Self::from_classes(classes);
+        let (data_namespaces, data_namespaces_unknown) = data_ns_scanner.finish();
         jar.resources = resources;
         jar.resource_bytes = resource_bytes;
         jar.data_namespaces = data_namespaces;
+        jar.data_namespaces_unknown = data_namespaces_unknown;
         jar.fabric_id = fabric_id;
         jar.fabric_version = fabric_version;
         jar.fabric_provides = jar
@@ -22036,9 +22092,9 @@ impl NativeJar {
                 host = host.with_resource_bytes(name, bytes.clone());
             }
         }
-        if !self.data_namespaces.is_empty() {
-            host.primary_data_namespaces
-                .extend(self.data_namespaces.iter().cloned());
+        if !self.data_namespaces.is_empty() || self.data_namespaces_unknown {
+            host.primary_data_scanner
+                .merge_scan(&self.data_namespaces, self.data_namespaces_unknown);
             host.resource_generation = host.resource_generation.wrapping_add(1);
         }
         // The jar's own `META-INF/services` files are what a real
@@ -36345,7 +36401,7 @@ impl<H: Host> Runtime<'_, H> {
                     if dispatched.is_none()
                         && let Some(value) = invoke_or_catch!(
                             at,
-                            self.invoke_server_facade(&r, receiver.as_ref(), &args)
+                            self.invoke_server_facade(&r, receiver.as_ref(), &args, class, method)
                         )
                     {
                         dispatched = Some(value);
