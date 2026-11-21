@@ -275,6 +275,7 @@ mod tree_map;
 mod type_switch;
 mod value_class;
 mod vanilla_block_items;
+mod vanilla_block_shapes;
 mod vanilla_block_state_definers;
 mod vanilla_block_state_properties;
 mod vanilla_blocks;
@@ -288,8 +289,11 @@ mod vanilla_registry_keys;
 mod vanilla_static;
 mod vanilla_values;
 pub mod verdict;
+mod voxel_shape;
 mod watch_service;
 pub mod weaver;
+
+pub use voxel_shape::{BlockShapes, BlockStateShape};
 
 pub use events::{CreativeTabBuildContext, CreativeTabContents, CreativeTabListener};
 pub use facade_server::{GameRuleValue, ServerFacts};
@@ -2531,6 +2535,23 @@ pub trait Host {
     fn finish_block_state_definition(&mut self, _block: &Value, _builder: &Value) {}
     fn block_state_definition_unknown(&mut self, _block: &Value, _method: &MethodRef) {}
     fn block_placement_unknown(&mut self) {}
+    fn voxel_shape_or_array(
+        &mut self,
+        r: &MethodRef,
+        _first: &Value,
+        _others: &[Value],
+    ) -> Result<Value, NativeError> {
+        Err(NativeError::UnknownHostCall(r.clone()))
+    }
+    fn block_state_block(&self, _state: &Value) -> Option<Value> {
+        None
+    }
+    fn block_has_collision(&self, _block: &Value) -> Option<bool> {
+        None
+    }
+    fn voxel_shape_to_string(&self, _key: &str) -> Option<String> {
+        None
+    }
     fn properties_put_all(&mut self, _marker: &str, _entries: Vec<(String, String)>) -> bool {
         false
     }
@@ -3576,6 +3597,17 @@ pub trait Host {
     fn level_resource_id(&self, _marker: &str) -> Option<String> {
         None
     }
+
+    /// Whether an earlier leaky block-shape extraction may have left a live
+    /// `HostKind::ShapeProbe` in persistent state, keeping the structural probe
+    /// allow-list armed across later invocations until GC finds no probes left.
+    fn has_retained_shape_probes(&self) -> bool {
+        false
+    }
+
+    /// Record that a `HostKind::ShapeProbe` attempted an escaping operation
+    /// (stored, passed to a non-forwarding call, returned, thrown, or captured).
+    fn note_retained_shape_probe(&mut self) {}
 }
 
 #[derive(Debug, Default)]
@@ -3614,6 +3646,7 @@ const INFERRED_BLOCK_TEMPLATE: &str = "minecraft:stone";
 const MAX_PROPERTY_BUILDERS: usize = 512;
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct StatePropertyInfo {
+    field: String,
     kind: String,
     values: Vec<String>,
 }
@@ -3811,13 +3844,15 @@ pub struct StdHost {
     item_property_builders: BTreeMap<String, BTreeMap<String, String>>,
     /// Bounded `BlockBehaviour.Properties` chains, keyed the same way.
     block_property_builders: BTreeMap<String, BTreeMap<String, String>>,
+    /// Property builders / blocks created from `ofFullCopy` / `ofLegacyCopy` / `copy` whose
+    /// source block's `hasCollision` is unknown (cleared if `.noCollision()` is called).
+    block_copied_properties: BTreeSet<String>,
     /// Properties captured from each mod block's virtual state-definition hook.
     block_state_properties: BTreeMap<String, BTreeMap<String, StatePropertyInfo>>,
     state_definition_builders: BTreeMap<String, String>,
     block_states: BTreeMap<String, (String, BTreeMap<String, String>)>,
     block_default_states: BTreeMap<String, BTreeMap<String, String>>,
     unknown_block_state_definitions: BTreeSet<String>,
-    next_block_state: usize,
     /// Marker counter for a property builder made by a static factory
     /// (`BlockBehaviour.Properties.of()`), which has no `new` site to name it.
     next_property_builder: usize,
@@ -3908,6 +3943,8 @@ pub struct StdHost {
     cached_collections: BTreeMap<(String, String), String>,
     /// Primitive state for vanilla RangedAttribute handles.
     ranged_attributes: BTreeMap<String, vanilla_values::RangedAttributeState>,
+    /// Modelled Minecraft 26.3 `VoxelShape` values, keyed by their host handle.
+    voxel_shapes: BTreeMap<String, voxel_shape::VoxelShapeData>,
     /// The `Arrays.asList` views and the arrays they mirror (`array_views.rs`).
     array_views: array_views::ArrayViews,
     /// The JDK's own `List.of`/`List.copyOf` lists among the unmodifiable
@@ -4031,6 +4068,12 @@ pub struct StdHost {
     next_unmodifiable_collection: usize,
     next_reversed_view: usize,
     next_ranged_attribute: usize,
+    next_voxel_shape: u64,
+    next_shape_extraction: u64,
+    /// Set when a shape-extraction probe attempts an escaping operation (store,
+    /// non-forwarding call, return, throw, or capture); cleared by GC once no
+    /// live `HostKind::ShapeProbe` handles remain in heap or host roots.
+    retained_shape_probes: bool,
     /// The game event one listener is running for, so the façade markers a
     /// callback receives (server, level, player, NeoForge event object) can
     /// answer from it. `None` outside [`NativeJar::run_game_listener`].
@@ -4150,12 +4193,12 @@ impl StdHost {
             declared_registrations: BTreeSet::new(),
             item_property_builders: BTreeMap::new(),
             block_property_builders: BTreeMap::new(),
+            block_copied_properties: BTreeSet::new(),
             block_state_properties: BTreeMap::new(),
             state_definition_builders: BTreeMap::new(),
             block_states: BTreeMap::new(),
             block_default_states: BTreeMap::new(),
             unknown_block_state_definitions: BTreeSet::new(),
-            next_block_state: 0,
             next_property_builder: 0,
             payload_registrations: Vec::new(),
             outgoing_payloads: Vec::new(),
@@ -4193,6 +4236,7 @@ impl StdHost {
             shared_empties: BTreeMap::new(),
             cached_collections: BTreeMap::new(),
             ranged_attributes: BTreeMap::new(),
+            voxel_shapes: BTreeMap::new(),
             array_views: Default::default(),
             jdk_list_of: std::collections::BTreeSet::new(),
             charset_decoders: BTreeMap::new(),
@@ -4247,6 +4291,9 @@ impl StdHost {
             next_unmodifiable_collection: 0,
             next_reversed_view: 0,
             next_ranged_attribute: 0,
+            next_voxel_shape: 0,
+            next_shape_extraction: 0,
+            retained_shape_probes: false,
             game_event: None,
             client: client_surface::ClientState::default(),
             render_objects: BTreeMap::new(),
@@ -5991,9 +6038,164 @@ impl StdHost {
                         .filter(|value| !value.is_empty())
                         .map(str::to_owned)
                         .collect();
-                    Some(StatePropertyInfo { kind, values })
+                    Some(StatePropertyInfo {
+                        field: field.to_owned(),
+                        kind,
+                        values,
+                    })
                 })?
             })
+    }
+
+    pub(crate) fn has_unknown_block_state_definition(&self, marker: &str) -> bool {
+        self.unknown_block_state_definitions.contains(marker)
+    }
+
+    /// Enumerate every state combination of `block_marker` in `BTreeMap` property-name order.
+    /// Returns `None` if the Cartesian product would exceed `max_states`.
+    pub(crate) fn enumerate_block_state_combinations(
+        &self,
+        block_marker: &str,
+        max_states: usize,
+    ) -> Option<(Vec<String>, Vec<BTreeMap<String, String>>)> {
+        let Some(props) = self.block_state_properties.get(block_marker) else {
+            return Some((Vec::new(), vec![BTreeMap::new()]));
+        };
+        let names: Vec<String> = props.keys().cloned().collect();
+        let mut combos: Vec<BTreeMap<String, String>> = vec![BTreeMap::new()];
+        for (name, info) in props {
+            if info.values.is_empty() {
+                return None;
+            }
+            let next_len = combos.len().checked_mul(info.values.len())?;
+            if next_len > max_states {
+                return None;
+            }
+            let mut next = Vec::with_capacity(next_len);
+            for base in &combos {
+                for val in &info.values {
+                    let mut entry = base.clone();
+                    entry.insert(name.clone(), val.clone());
+                    next.push(entry);
+                }
+            }
+            combos = next;
+        }
+        Some((names, combos))
+    }
+
+    fn canonical_block_state_marker(
+        block_marker: &str,
+        values: &BTreeMap<String, String>,
+    ) -> String {
+        let mut out = format!("blockstate/{block_marker}[");
+        for (i, (k, v)) in values.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            out.push_str(k);
+            out.push('=');
+            out.push_str(v);
+        }
+        out.push(']');
+        out
+    }
+
+    /// Return the canonical `BlockState` marker for `(block_marker, values)`, populating any
+    /// missing captured properties with their default/first value so every state in a block's
+    /// `StateDefinition` maps 1-to-1 to a single canonical object (matching MC 26.3
+    /// `StateHolder.setValueInternal` returning `this.neighbors[propIndex][valIndex]`).
+    ///
+    /// Canonical state markers live exactly as long as their owning `Block` object
+    /// (reachable directly through the block or through any jar reference to a state,
+    /// and dropped when the collector frees the block), keeping metadata and `==` identity
+    /// stable while the block is alive.
+    pub(crate) fn canonical_block_state(
+        &mut self,
+        block_marker: &str,
+        mut values: BTreeMap<String, String>,
+    ) -> Value {
+        if let Some(props) = self.block_state_properties.get(block_marker) {
+            for (name, info) in props {
+                if !values.contains_key(name)
+                    && let Some(val) = self
+                        .block_default_states
+                        .get(block_marker)
+                        .and_then(|d| d.get(name))
+                        .or_else(|| info.values.first())
+                {
+                    values.insert(name.clone(), val.clone());
+                }
+            }
+        }
+        let key = Self::canonical_block_state_marker(block_marker, &values);
+        self.block_states
+            .entry(key.clone())
+            .or_insert_with(|| (block_marker.to_owned(), values));
+        Value::Ref(Some(key))
+    }
+
+    pub(crate) fn mint_block_state(
+        &mut self,
+        block_marker: &str,
+        values: BTreeMap<String, String>,
+    ) -> Value {
+        self.canonical_block_state(block_marker, values)
+    }
+
+    pub(crate) fn next_shape_extraction_id(&mut self) -> u64 {
+        self.next_shape_extraction = self.next_shape_extraction.saturating_add(1);
+        self.next_shape_extraction
+    }
+
+    /// Whether an earlier leaky block-shape extraction may have left a live
+    /// `HostKind::ShapeProbe` in persistent state (so the per-opcode probe check
+    /// stays armed between extractions until GC finds no live probes left).
+    pub fn has_retained_shape_probes(&self) -> bool {
+        self.retained_shape_probes
+    }
+
+    pub(crate) fn block_has_collision_by_marker(&self, block_marker: &str) -> Option<bool> {
+        let props = self.block_property_builders.get(block_marker)?;
+        if props.contains_key("noCollision") {
+            return Some(false);
+        }
+        if self.block_copied_properties.contains(block_marker) {
+            return None;
+        }
+        Some(true)
+    }
+
+    pub(crate) fn block_to_string(&self, block_marker: &str) -> String {
+        if let Some(entry) = self.registrations.iter().find(|entry| {
+            entry.registry == "minecraft:block"
+                && crate::jar_object::object_key(&entry.value) == Some(block_marker)
+        }) {
+            return format!("Block{{{}}}", entry.id);
+        }
+        "Block{[unregistered]}".to_owned()
+    }
+
+    pub(crate) fn set_block_declaration_shapes(
+        &mut self,
+        registration_index: usize,
+        shapes_json: Option<String>,
+        collision_shapes_json: Option<String>,
+    ) {
+        if let Some(entry) = self.registrations.get_mut(registration_index)
+            && let Some(RegistryDeclaration::Block { properties, .. }) = entry.declaration.as_mut()
+        {
+            if let Some(json) = shapes_json {
+                properties.insert("shapes".to_owned(), json);
+            } else {
+                properties.remove("shapes");
+            }
+            if let Some(json) = collision_shapes_json {
+                properties.insert("collision_shapes".to_owned(), json);
+            } else {
+                properties.remove("collision_shapes");
+            }
+        }
     }
 
     /// The declared class of a captured `BlockStateProperties` field (`EnumProperty`,
@@ -6004,17 +6206,6 @@ impl StdHost {
             .find_map(|line| {
                 let mut parts = line.split('|');
                 (parts.next()? == field).then(|| parts.nth(3)).flatten()
-            })
-    }
-
-    fn captured_property_name(field: &str) -> Option<String> {
-        crate::vanilla_block_state_properties::TABLE
-            .lines()
-            .find_map(|line| {
-                let mut parts = line.split('|');
-                (parts.next()? == field)
-                    .then(|| parts.next().map(str::to_owned))
-                    .flatten()
             })
     }
 
@@ -6732,46 +6923,394 @@ impl StdHost {
             && r.descriptor.ends_with("BlockState;")
             && r.owner.starts_with("net/minecraft/world/level/block/")
         {
-            let state = format!("blockstate/{}/{}", marker, self.next_block_state);
-            self.next_block_state = self.next_block_state.saturating_add(1);
-            self.block_states
-                .insert(state.clone(), (marker.to_owned(), BTreeMap::new()));
-            return Ok(Some(Value::Ref(Some(state))));
+            let mut values = BTreeMap::new();
+            if let Some(props) = self.block_state_properties.get(marker) {
+                for (name, info) in props {
+                    if let Some(first) = info.values.first() {
+                        values.insert(name.clone(), first.clone());
+                    }
+                }
+            }
+            if let Some(defaults) = self.block_default_states.get(marker) {
+                for (name, value) in defaults {
+                    values.insert(name.clone(), value.clone());
+                }
+            }
+            return Ok(Some(self.canonical_block_state(marker, values)));
         }
-        if r.name == "setValue" && marker.starts_with("blockstate/") {
+        if marker.starts_with("blockstate/") {
             let Some((block, values)) = self.block_states.get(marker).cloned() else {
                 return Ok(None);
             };
-            let Some(property) = args.first().and_then(expect_ref) else {
-                return Ok(None);
-            };
-            let Some(name) = property
-                .strip_prefix("property/BlockStateProperties.")
-                .and_then(Self::captured_property_name)
-            else {
-                return Ok(None);
-            };
-            let value = match args.get(1) {
-                Some(Value::Int(value)) => (*value != 0)
-                    .then_some("true".to_owned())
-                    .or_else(|| Some("false".to_owned())),
-                Some(Value::Boxed(Boxed::Boolean(value))) => Some(value.to_string()),
-                Some(Value::Boxed(Boxed::Integer(value))) => Some(value.to_string()),
-                Some(Value::Ref(Some(value))) => value
-                    .rsplit('/')
-                    .next()
-                    .map(|value| value.to_ascii_lowercase()),
-                _ => None,
-            };
-            let Some(value) = value else {
-                return Ok(None);
-            };
-            let state = format!("blockstate/{}/{}", block, self.next_block_state);
-            self.next_block_state = self.next_block_state.saturating_add(1);
-            let mut values = values;
-            values.insert(name, value);
-            self.block_states.insert(state.clone(), (block, values));
-            return Ok(Some(Value::Ref(Some(state))));
+            match (r.name.as_str(), r.descriptor.as_str()) {
+                ("getBlock", "()Lnet/minecraft/world/level/block/Block;") => {
+                    return Ok(Some(jar_object::stored_value(&block)));
+                }
+                ("is", "(Lnet/minecraft/world/level/block/Block;)Z") => {
+                    if let Some(other) = args.first().and_then(jar_object::object_key) {
+                        return Ok(Some(Value::Int(i32::from(other == block))));
+                    }
+                    return Ok(None);
+                }
+                (
+                    "hasProperty",
+                    "(Lnet/minecraft/world/level/block/state/properties/Property;)Z",
+                ) => {
+                    if self.unknown_block_state_definitions.contains(&block) {
+                        return Ok(None);
+                    }
+                    if matches!(args.first(), None | Some(Value::Ref(None))) {
+                        return Ok(Some(Value::Int(0)));
+                    }
+                    let Some(field) = args
+                        .first()
+                        .and_then(expect_ref)
+                        .and_then(|p| p.strip_prefix("property/BlockStateProperties."))
+                    else {
+                        return Ok(None);
+                    };
+                    let has = self
+                        .block_state_properties
+                        .get(&block)
+                        .is_some_and(|props| props.values().any(|info| info.field == field));
+                    return Ok(Some(Value::Int(i32::from(has))));
+                }
+                (
+                    "getValue",
+                    "(Lnet/minecraft/world/level/block/state/properties/Property;)Ljava/lang/Comparable;",
+                ) => {
+                    if self.unknown_block_state_definitions.contains(&block) {
+                        return Ok(None);
+                    }
+                    if matches!(args.first(), None | Some(Value::Ref(None))) {
+                        let owner_str = self.block_to_string(&block);
+                        return Err(NativeError::UncaughtException {
+                            class: "java/lang/IllegalArgumentException".into(),
+                            message: Some(format!(
+                                "Cannot get property null as it does not exist in {owner_str}"
+                            )),
+                            frame: None,
+                        });
+                    }
+                    let Some(field) = args
+                        .first()
+                        .and_then(expect_ref)
+                        .and_then(|p| p.strip_prefix("property/BlockStateProperties."))
+                    else {
+                        return Ok(None);
+                    };
+                    let Some((prop_name, info)) = self
+                        .block_state_properties
+                        .get(&block)
+                        .and_then(|props| props.iter().find(|(_, info)| info.field == field))
+                    else {
+                        let Some(prop_str) =
+                            vanilla_block_state_properties::property_to_string(field)
+                        else {
+                            return Ok(None);
+                        };
+                        let owner_str = self.block_to_string(&block);
+                        return Err(NativeError::UncaughtException {
+                            class: "java/lang/IllegalArgumentException".into(),
+                            message: Some(format!(
+                                "Cannot get property {prop_str} as it does not exist in {owner_str}"
+                            )),
+                            frame: None,
+                        });
+                    };
+                    let Some(serialized) = values
+                        .get(prop_name)
+                        .or_else(|| {
+                            self.block_default_states
+                                .get(&block)
+                                .and_then(|d| d.get(prop_name))
+                        })
+                        .or_else(|| info.values.first())
+                    else {
+                        return Ok(None);
+                    };
+                    return Ok(vanilla_block_state_properties::property_value(
+                        field, &info.kind, serialized,
+                    ));
+                }
+                (
+                    "getOptionalValue",
+                    "(Lnet/minecraft/world/level/block/state/properties/Property;)Ljava/util/Optional;",
+                ) => {
+                    if self.unknown_block_state_definitions.contains(&block) {
+                        return Ok(None);
+                    }
+                    if matches!(args.first(), None | Some(Value::Ref(None))) {
+                        return Ok(Some(empty_optional()));
+                    }
+                    let Some(field) = args
+                        .first()
+                        .and_then(expect_ref)
+                        .and_then(|p| p.strip_prefix("property/BlockStateProperties."))
+                    else {
+                        return Ok(None);
+                    };
+                    let Some((prop_name, info)) = self
+                        .block_state_properties
+                        .get(&block)
+                        .and_then(|props| props.iter().find(|(_, info)| info.field == field))
+                    else {
+                        return Ok(Some(empty_optional()));
+                    };
+                    let Some(serialized) = values
+                        .get(prop_name)
+                        .or_else(|| {
+                            self.block_default_states
+                                .get(&block)
+                                .and_then(|d| d.get(prop_name))
+                        })
+                        .or_else(|| info.values.first())
+                    else {
+                        return Ok(None);
+                    };
+                    let Some(val) = vanilla_block_state_properties::property_value(
+                        field, &info.kind, serialized,
+                    ) else {
+                        return Ok(None);
+                    };
+                    return Ok(Some(optional_wrap(val)));
+                }
+                (
+                    "getValueOrElse",
+                    "(Lnet/minecraft/world/level/block/state/properties/Property;Ljava/lang/Comparable;)Ljava/lang/Comparable;",
+                ) => {
+                    if self.unknown_block_state_definitions.contains(&block) {
+                        return Ok(None);
+                    }
+                    let Some(field) = args
+                        .first()
+                        .and_then(expect_ref)
+                        .and_then(|p| p.strip_prefix("property/BlockStateProperties."))
+                    else {
+                        return Ok(None);
+                    };
+                    let Some((prop_name, info)) = self
+                        .block_state_properties
+                        .get(&block)
+                        .and_then(|props| props.iter().find(|(_, info)| info.field == field))
+                    else {
+                        return Ok(args.get(1).cloned());
+                    };
+                    let Some(serialized) = values
+                        .get(prop_name)
+                        .or_else(|| {
+                            self.block_default_states
+                                .get(&block)
+                                .and_then(|d| d.get(prop_name))
+                        })
+                        .or_else(|| info.values.first())
+                    else {
+                        return Ok(None);
+                    };
+                    return Ok(vanilla_block_state_properties::property_value(
+                        field, &info.kind, serialized,
+                    ));
+                }
+                ("setValue" | "trySetValue", _) => {
+                    if self.unknown_block_state_definitions.contains(&block) {
+                        return Ok(None);
+                    }
+                    if matches!(args.first(), None | Some(Value::Ref(None))) {
+                        if r.name == "trySetValue" {
+                            return Ok(Some(receiver.clone()));
+                        }
+                        let owner_str = self.block_to_string(&block);
+                        return Err(NativeError::UncaughtException {
+                            class: "java/lang/IllegalArgumentException".into(),
+                            message: Some(format!(
+                                "Cannot set property null as it does not exist in {owner_str}"
+                            )),
+                            frame: None,
+                        });
+                    }
+                    let Some(field) = args
+                        .first()
+                        .and_then(expect_ref)
+                        .and_then(|p| p.strip_prefix("property/BlockStateProperties."))
+                    else {
+                        return Ok(None);
+                    };
+                    let Some(prop_str) = vanilla_block_state_properties::property_to_string(field)
+                    else {
+                        return Ok(None);
+                    };
+                    let Some((prop_name, info)) = self
+                        .block_state_properties
+                        .get(&block)
+                        .and_then(|props| props.iter().find(|(_, info)| info.field == field))
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                    else {
+                        if r.name == "trySetValue" {
+                            return Ok(Some(receiver.clone()));
+                        }
+                        let owner_str = self.block_to_string(&block);
+                        return Err(NativeError::UncaughtException {
+                            class: "java/lang/IllegalArgumentException".into(),
+                            message: Some(format!(
+                                "Cannot set property {prop_str} as it does not exist in {owner_str}"
+                            )),
+                            frame: None,
+                        });
+                    };
+                    // Exact MC 26.3 `StateHolder.setValueInternal` -> `Property.getInternalIndex(Comparable)`
+                    // bridge-method order: checkcast first (`ClassCastException` on wrong type), then
+                    // unbox / `Enum.ordinal()` (`NullPointerException` on null), then range/membership
+                    // check (`IllegalArgumentException` for real out-of-range values).
+                    let runtime_class_for_cast = |v: &Value| -> Option<String> {
+                        if let Value::Ref(Some(text)) = v
+                            && value_class::is_plain_string(text)
+                        {
+                            return Some("java/lang/String".to_owned());
+                        }
+                        class_of_value(v)
+                    };
+                    let arg = args.get(1);
+                    let value = match info.kind.as_str() {
+                        "boolean" => match arg {
+                            None | Some(Value::Ref(None)) => {
+                                return Err(NativeError::UncaughtException {
+                                    class: "java/lang/NullPointerException".into(),
+                                    message: Some(
+                                        "Cannot invoke \"java.lang.Boolean.booleanValue()\" because \"value\" is null"
+                                            .into(),
+                                    ),
+                                    frame: None,
+                                });
+                            }
+                            Some(Value::Boxed(Boxed::Boolean(b))) => b.to_string(),
+                            Some(other) => {
+                                let Some(cls) = runtime_class_for_cast(other) else {
+                                    return Ok(None);
+                                };
+                                return Err(checkcast::class_cast_exception(
+                                    &cls,
+                                    "java/lang/Boolean",
+                                ));
+                            }
+                        },
+                        "integer" => match arg {
+                            None | Some(Value::Ref(None)) => {
+                                return Err(NativeError::UncaughtException {
+                                    class: "java/lang/NullPointerException".into(),
+                                    message: Some(
+                                        "Cannot invoke \"java.lang.Integer.intValue()\" because \"value\" is null"
+                                            .into(),
+                                    ),
+                                    frame: None,
+                                });
+                            }
+                            Some(Value::Boxed(Boxed::Integer(n)) | Value::Int(n)) => {
+                                let s = n.to_string();
+                                if !info.values.iter().any(|allowed| allowed == &s) {
+                                    let owner_str = self.block_to_string(&block);
+                                    return Err(NativeError::UncaughtException {
+                                        class: "java/lang/IllegalArgumentException".into(),
+                                        message: Some(format!(
+                                            "Cannot set property {prop_str} to {s} on {owner_str}, it is not an allowed value"
+                                        )),
+                                        frame: None,
+                                    });
+                                }
+                                s
+                            }
+                            Some(other) => {
+                                let Some(cls) = runtime_class_for_cast(other) else {
+                                    return Ok(None);
+                                };
+                                return Err(checkcast::class_cast_exception(
+                                    &cls,
+                                    "java/lang/Integer",
+                                ));
+                            }
+                        },
+                        "enum" => match arg {
+                            None | Some(Value::Ref(None)) => {
+                                return Err(NativeError::UncaughtException {
+                                    class: "java/lang/NullPointerException".into(),
+                                    message: Some(
+                                        "Cannot invoke \"java.lang.Enum.ordinal()\" because \"value\" is null"
+                                            .into(),
+                                    ),
+                                    frame: None,
+                                });
+                            }
+                            Some(Value::Ref(Some(enum_marker)))
+                                if enum_marker.starts_with("enum/")
+                                    && !enum_marker
+                                        .starts_with("enum/java/lang/StackWalker$Option/") =>
+                            {
+                                let Some((enum_cls, _)) = enum_marker
+                                    .strip_prefix("enum/")
+                                    .and_then(|rest| rest.rsplit_once('/'))
+                                else {
+                                    return Ok(None);
+                                };
+                                if vanilla_block_state_properties::enum_property_class(field)
+                                    != Some(enum_cls)
+                                {
+                                    // Cross-enum raw call indexes `ordinalToIndex[value.ordinal()]`;
+                                    // leave counted rather than guessing across unrelated enums.
+                                    return Ok(None);
+                                }
+                                match vanilla_block_state_properties::enum_serialized_name(
+                                    field,
+                                    enum_marker,
+                                )
+                                .filter(|s| info.values.iter().any(|allowed| allowed == s))
+                                {
+                                    Some(s) => s,
+                                    None => {
+                                        let val_str =
+                                            vanilla_block_state_properties::enum_value_to_string(
+                                                enum_marker,
+                                            )
+                                            .unwrap_or_else(|| enum_marker.clone());
+                                        let owner_str = self.block_to_string(&block);
+                                        return Err(NativeError::UncaughtException {
+                                            class: "java/lang/IllegalArgumentException".into(),
+                                            message: Some(format!(
+                                                "Cannot set property {prop_str} to {val_str} on {owner_str}, it is not an allowed value"
+                                            )),
+                                            frame: None,
+                                        });
+                                    }
+                                }
+                            }
+                            // A jar object or enum host handle could be a `java.lang.Enum`
+                            // subclass (which passes `checkcast java/lang/Enum`). Count it.
+                            Some(Value::Host(h))
+                                if matches!(
+                                    h.kind(),
+                                    HostKind::JarObject
+                                        | HostKind::MobEffectCategory
+                                        | HostKind::MixinSide
+                                ) =>
+                            {
+                                return Ok(None);
+                            }
+                            Some(other) => {
+                                let Some(cls) = runtime_class_for_cast(other) else {
+                                    return Ok(None);
+                                };
+                                return Err(checkcast::class_cast_exception(
+                                    &cls,
+                                    "java/lang/Enum",
+                                ));
+                            }
+                        },
+                        _ => return Ok(None),
+                    };
+                    let mut values = values;
+                    values.insert(prop_name, value);
+                    return Ok(Some(self.canonical_block_state(&block, values)));
+                }
+                _ => {}
+            }
         }
         if r.name == "registerDefaultState"
             && r.descriptor.contains("BlockState")
@@ -6840,6 +7379,9 @@ impl StdHost {
                 for (key, value) in settings {
                     record_inferred_property(builders, marker, key, Some(value));
                 }
+                if !item && r.name == "noCollision" {
+                    self.block_copied_properties.remove(marker);
+                }
                 let returns_self = if item {
                     ITEM_PROPERTIES_DESC
                 } else {
@@ -6862,6 +7404,8 @@ impl StdHost {
                 else {
                     return Ok(None);
                 };
+                let copied = self.block_copied_properties.contains(builder)
+                    && !properties.contains_key("noCollision");
                 // Only a vanilla `CraftingTableBlock` itself behaves as the crafting table (its
                 // `useWithoutItem` opens the 3x3 grid). This constructor is also the super call of
                 // a jar's subclass (Runes' altar), whose own `useWithoutItem` opens its own menu:
@@ -6877,6 +7421,11 @@ impl StdHost {
                 {
                     self.block_property_builders
                         .insert(marker.to_owned(), properties);
+                    if copied {
+                        self.block_copied_properties.insert(marker.to_owned());
+                    } else {
+                        self.block_copied_properties.remove(marker);
+                    }
                 }
                 Ok(Some(Value::Void))
             }
@@ -6922,18 +7471,29 @@ impl StdHost {
                     self.item_required_features
                         .insert(marker.to_owned(), features);
                 }
-                let builders = if r.owner == ITEM_CLASS {
-                    &mut self.item_property_builders
-                } else {
+                let is_block = r.owner == BLOCK_CLASS;
+                let builders = if is_block {
                     &mut self.block_property_builders
+                } else {
+                    &mut self.item_property_builders
                 };
                 let Some(properties) = builders.get(builder).cloned() else {
                     return Ok(None);
                 };
+                let copied = is_block
+                    && self.block_copied_properties.contains(builder)
+                    && !properties.contains_key("noCollision");
                 // Hand the finished chain to the value the mod registers, so
                 // the registration's marker names it.
                 if builders.contains_key(marker) || builders.len() < MAX_PROPERTY_BUILDERS {
                     builders.insert(marker.to_owned(), properties);
+                    if is_block {
+                        if copied {
+                            self.block_copied_properties.insert(marker.to_owned());
+                        } else {
+                            self.block_copied_properties.remove(marker);
+                        }
+                    }
                 }
                 Ok(Some(Value::Void))
             }
@@ -7198,6 +7758,38 @@ impl Host for StdHost {
             .or_default() += 1;
     }
 
+    fn voxel_shape_or_array(
+        &mut self,
+        r: &MethodRef,
+        first: &Value,
+        others: &[Value],
+    ) -> Result<Value, NativeError> {
+        voxel_shape::or_array_call(self, r, first, others)
+    }
+
+    fn block_state_block(&self, state: &Value) -> Option<Value> {
+        let marker = expect_ref(state)?;
+        let (block_marker, _) = self.block_states.get(marker)?;
+        Some(jar_object::stored(block_marker))
+    }
+
+    fn block_has_collision(&self, block: &Value) -> Option<bool> {
+        let marker = jar_object::object_key(block)?;
+        self.block_has_collision_by_marker(marker)
+    }
+
+    fn has_retained_shape_probes(&self) -> bool {
+        self.retained_shape_probes
+    }
+
+    fn note_retained_shape_probe(&mut self) {
+        self.retained_shape_probes = true;
+    }
+
+    fn voxel_shape_to_string(&self, key: &str) -> Option<String> {
+        self.voxel_shapes.get(key).map(|s| s.to_java_string())
+    }
+
     fn begin_block_state_definition(&mut self, block: &Value, builder: &Value) {
         if let (Some(block), Some(builder)) = (expect_ref(block), expect_ref(builder)) {
             self.state_definition_builders
@@ -7433,6 +8025,9 @@ impl Host for StdHost {
             return Ok(crate::game_object::client_value("client/player".into()));
         }
         if let Some(value) = vec2::get_field(&self.vec2, receiver, r) {
+            return value;
+        }
+        if let Some(value) = voxel_shape::get_field(receiver, r) {
             return value;
         }
         // A façade object's own field (`facade_server.rs`).
@@ -8306,6 +8901,15 @@ impl Host for StdHost {
         if let Some(value) = vanilla_values::static_field(r) {
             return Ok(value);
         }
+        if let Some(value) = voxel_shape::static_field(self, r) {
+            return value;
+        }
+        if r.owner == "net/minecraft/core/BlockPos"
+            && r.name == "ZERO"
+            && r.descriptor == "Lnet/minecraft/core/BlockPos;"
+        {
+            return Ok(game_object::server_value("block-pos/0,0,0".into()));
+        }
         if let Some(value) = block_entity_types::static_field(r) {
             return Ok(value);
         }
@@ -8717,6 +9321,12 @@ impl Host for StdHost {
         }
         self.record(r, None, args);
         if let Some(result) = vanilla_values::static_call(self, r, args) {
+            return result;
+        }
+        if let Some(result) = voxel_shape::static_call(self, r, args) {
+            return result;
+        }
+        if let Some(result) = voxel_shape::direction_static_call(r, args) {
             return result;
         }
         if let Some(result) = self.random_static(r, args) {
@@ -9562,13 +10172,21 @@ impl Host for StdHost {
                     None => Value::Ref(None),
                 })
             }
-            ("java/util/Objects", "equals", "(Ljava/lang/Object;Ljava/lang/Object;)Z") => Ok(
-                Value::Int((Self::argument(r, args, 0)? == Self::argument(r, args, 1)?) as i32),
-            ),
+            ("java/util/Objects", "equals", "(Ljava/lang/Object;Ljava/lang/Object;)Z") => {
+                let left = Self::argument(r, args, 0)?;
+                let right = Self::argument(r, args, 1)?;
+                if matches!(left, Value::Host(h) if h.kind() == HostKind::ShapeProbe)
+                    || matches!(right, Value::Host(h) if h.kind() == HostKind::ShapeProbe)
+                {
+                    return self.unknown_host_call(r);
+                }
+                Ok(Value::Int((left == right) as i32))
+            }
             ("java/util/Objects", "hashCode", "(Ljava/lang/Object;)I") => {
                 let value = Self::argument(r, args, 0)?;
-                if expect_ref(value)
-                    .is_some_and(|marker| crate::stream_pipeline::is_stream_marker(marker))
+                if matches!(value, Value::Host(h) if h.kind() == HostKind::ShapeProbe)
+                    || expect_ref(value)
+                        .is_some_and(|marker| crate::stream_pipeline::is_stream_marker(marker))
                 {
                     return self.unknown_host_call(r);
                 }
@@ -10050,9 +10668,23 @@ impl Host for StdHost {
             (BLOCK_PROPERTIES_CLASS, "of" | "ofFullCopy" | "copy" | "ofLegacyCopy", descriptor)
                 if descriptor.ends_with(BLOCK_PROPERTIES_DESC) =>
             {
+                // MC 26.3 `ofFullCopy` calls `ofLegacyCopy` (offset 1), which reads
+                // `block.properties` (offset 8), throwing a helpful NPE on `null`.
+                if r.name != "of" && matches!(args.first(), None | Some(Value::Ref(None))) {
+                    return Err(NativeError::UncaughtException {
+                        class: "java/lang/NullPointerException".into(),
+                        message: Some(
+                            "Cannot read field \"properties\" because \"block\" is null".into(),
+                        ),
+                        frame: None,
+                    });
+                }
                 let marker = format!("block/properties/{}", self.next_property_builder);
                 self.next_property_builder = self.next_property_builder.saturating_add(1);
                 open_inferred_builder(&mut self.block_property_builders, &marker);
+                if r.name != "of" {
+                    self.block_copied_properties.insert(marker.clone());
+                }
                 Ok(Value::Ref(Some(marker)))
             }
             // `Duration` factories: configs and timeouts read across the
@@ -10207,6 +10839,34 @@ impl Host for StdHost {
         }
         if let Some(result) = vanilla_values::instance_call(self, r, receiver, args) {
             return result;
+        }
+        if let Some(result) = voxel_shape::instance_call(self, r, receiver, args) {
+            return result;
+        }
+        if let Some(result) = voxel_shape::direction_instance_call(r, receiver) {
+            return result;
+        }
+        if let Value::Host(handle) = receiver
+            && handle.kind() == host_ref::HostKind::GameValue
+            && let Some([x, y, z]) = server_values::block_pos(handle.key())
+            && matches!(
+                r.owner.as_str(),
+                "net/minecraft/core/BlockPos" | "net/minecraft/core/Vec3i"
+            )
+        {
+            match (r.name.as_str(), r.descriptor.as_str()) {
+                ("getX", "()I") => return Ok(Value::Int(x)),
+                ("getY", "()I") => return Ok(Value::Int(y)),
+                ("getZ", "()I") => return Ok(Value::Int(z)),
+                _ => {}
+            }
+        }
+        if r.name == "getShape"
+            && r.descriptor == voxel_shape::GET_SHAPE_DESC
+            && vanilla_block_shapes::inherits_block_behaviour_get_shape(&r.owner)
+            && jar_object::object_class(receiver).is_some()
+        {
+            return Ok(voxel_shape::block_shape());
         }
         if let Some(result) = self.random_instance(r, receiver, args) {
             return result;
@@ -10510,6 +11170,8 @@ impl Host for StdHost {
             let Some(mut properties) = self.block_property_builders.get(builder).cloned() else {
                 return Ok(Value::Void);
             };
+            let copied = self.block_copied_properties.contains(builder)
+                && !properties.contains_key("noCollision");
             let marker = jar_object::instance_key(receiver).unwrap_or_default();
             if jar_object::key_class(marker)
                 == Some("net/minecraft/world/level/block/CraftingTableBlock")
@@ -10521,6 +11183,11 @@ impl Host for StdHost {
             {
                 self.block_property_builders
                     .insert(marker.to_owned(), properties);
+                if copied {
+                    self.block_copied_properties.insert(marker.to_owned());
+                } else {
+                    self.block_copied_properties.remove(marker);
+                }
             }
             return Ok(Value::Void);
         }
@@ -14797,6 +15464,9 @@ fn class_of_value(value: &Value) -> Option<String> {
 /// [`class_of_value`] of a reference's text, without building a `Value` (it
 /// runs inside `is_plain_string`, on every array store of a string).
 fn class_of_text(marker: &str) -> Option<String> {
+    if marker.starts_with("blockstate/") {
+        return Some("net/minecraft/world/level/block/state/BlockState".into());
+    }
     // A text spelling an object's key (a host-made collection's included,
     // P14c) is a `String` (`jar_object.rs`).
     if jar_object::spells_key_text(marker) {
@@ -15557,6 +16227,12 @@ fn block_builder_settings(
         "jumpFactor" => push("jumpFactor", number(first)),
         "randomTicks" => push("randomTicks", Some("true".to_owned())),
         "noOcclusion" => push("noOcclusion", Some("true".to_owned())),
+        // MC 26.3 `BlockBehaviour$Properties.noCollision()` sets both `hasCollision = false` and
+        // `canOcclude = false` (offsets 0..10).
+        "noCollision" => {
+            push("noCollision", Some("true".to_owned()));
+            push("noOcclusion", Some("true".to_owned()));
+        }
         "requiresCorrectToolForDrops" => {
             push("requiresCorrectToolForDrops", Some("true".to_owned()))
         }
@@ -15660,6 +16336,130 @@ pub(crate) fn game_enum_class(class: &str) -> bool {
 fn game_enum_constants(owner: &str) -> Option<&'static [&'static str]> {
     Some(match owner {
         "net/minecraft/core/Direction" => &["DOWN", "UP", "NORTH", "SOUTH", "WEST", "EAST"],
+        "net/minecraft/world/level/EmptyBlockGetter" => &["INSTANCE"],
+        "net/minecraft/core/FrontAndTop" => &[
+            "DOWN_EAST",
+            "DOWN_NORTH",
+            "DOWN_SOUTH",
+            "DOWN_WEST",
+            "UP_EAST",
+            "UP_NORTH",
+            "UP_SOUTH",
+            "UP_WEST",
+            "WEST_UP",
+            "EAST_UP",
+            "NORTH_UP",
+            "SOUTH_UP",
+        ],
+        "net/minecraft/world/level/block/CopperGolemStatueBlock$Pose" => {
+            &["STANDING", "SITTING", "RUNNING", "STAR"]
+        }
+        "net/minecraft/world/level/block/entity/trialspawner/TrialSpawnerState" => &[
+            "INACTIVE",
+            "WAITING_FOR_PLAYERS",
+            "ACTIVE",
+            "WAITING_FOR_REWARD_EJECTION",
+            "EJECTING_REWARD",
+            "COOLDOWN",
+        ],
+        "net/minecraft/world/level/block/entity/vault/VaultState" => {
+            &["INACTIVE", "ACTIVE", "UNLOCKING", "EJECTING"]
+        }
+        "net/minecraft/world/level/block/state/properties/AttachFace" => {
+            &["FLOOR", "WALL", "CEILING"]
+        }
+        "net/minecraft/world/level/block/state/properties/BambooLeaves" => {
+            &["NONE", "SMALL", "LARGE"]
+        }
+        "net/minecraft/world/level/block/state/properties/BedPart" => &["HEAD", "FOOT"],
+        "net/minecraft/world/level/block/state/properties/BellAttachType" => {
+            &["FLOOR", "CEILING", "SINGLE_WALL", "DOUBLE_WALL"]
+        }
+        "net/minecraft/world/level/block/state/properties/ChestType" => {
+            &["SINGLE", "LEFT", "RIGHT"]
+        }
+        "net/minecraft/world/level/block/state/properties/ComparatorMode" => {
+            &["COMPARE", "SUBTRACT"]
+        }
+        "net/minecraft/world/level/block/state/properties/CreakingHeartState" => {
+            &["UPROOTED", "DORMANT", "AWAKE"]
+        }
+        "net/minecraft/world/level/block/state/properties/DoorHingeSide" => &["LEFT", "RIGHT"],
+        "net/minecraft/world/level/block/state/properties/DoubleBlockHalf" => &["UPPER", "LOWER"],
+        "net/minecraft/world/level/block/state/properties/Half" => &["TOP", "BOTTOM"],
+        "net/minecraft/world/level/block/state/properties/NoteBlockInstrument" => &[
+            "HARP",
+            "BASEDRUM",
+            "SNARE",
+            "HAT",
+            "BASS",
+            "FLUTE",
+            "BELL",
+            "GUITAR",
+            "CHIME",
+            "XYLOPHONE",
+            "IRON_XYLOPHONE",
+            "COW_BELL",
+            "DIDGERIDOO",
+            "BIT",
+            "BANJO",
+            "PLING",
+            "TRUMPET",
+            "TRUMPET_EXPOSED",
+            "TRUMPET_OXIDIZED",
+            "TRUMPET_WEATHERED",
+            "ZOMBIE",
+            "SKELETON",
+            "CREEPER",
+            "DRAGON",
+            "WITHER_SKELETON",
+            "PIGLIN",
+            "CUSTOM_HEAD",
+        ],
+        "net/minecraft/world/level/block/state/properties/PistonType" => &["DEFAULT", "STICKY"],
+        "net/minecraft/world/level/block/state/properties/PotentSulfurState" => {
+            &["DRY", "WET", "DORMANT", "ERUPTING", "CONTINUOUS"]
+        }
+        "net/minecraft/world/level/block/state/properties/RailShape" => &[
+            "NORTH_SOUTH",
+            "EAST_WEST",
+            "ASCENDING_EAST",
+            "ASCENDING_WEST",
+            "ASCENDING_NORTH",
+            "ASCENDING_SOUTH",
+            "SOUTH_EAST",
+            "SOUTH_WEST",
+            "NORTH_WEST",
+            "NORTH_EAST",
+        ],
+        "net/minecraft/world/level/block/state/properties/RedstoneSide" => &["UP", "SIDE", "NONE"],
+        "net/minecraft/world/level/block/state/properties/SculkSensorPhase" => {
+            &["INACTIVE", "ACTIVE", "COOLDOWN"]
+        }
+        "net/minecraft/world/level/block/state/properties/SideChainPart" => {
+            &["UNCONNECTED", "RIGHT", "CENTER", "LEFT"]
+        }
+        "net/minecraft/world/level/block/state/properties/SlabType" => &["TOP", "BOTTOM", "DOUBLE"],
+        "net/minecraft/world/level/block/state/properties/SpeleothemThickness" => {
+            &["TIP_MERGE", "TIP", "FRUSTUM", "MIDDLE", "BASE"]
+        }
+        "net/minecraft/world/level/block/state/properties/StairsShape" => &[
+            "STRAIGHT",
+            "INNER_LEFT",
+            "INNER_RIGHT",
+            "OUTER_LEFT",
+            "OUTER_RIGHT",
+        ],
+        "net/minecraft/world/level/block/state/properties/StructureMode" => {
+            &["SAVE", "LOAD", "CORNER", "DATA"]
+        }
+        "net/minecraft/world/level/block/state/properties/TestBlockMode" => {
+            &["START", "LOG", "FAIL", "ACCEPT"]
+        }
+        "net/minecraft/world/level/block/state/properties/Tilt" => {
+            &["NONE", "UNSTABLE", "PARTIAL", "FULL"]
+        }
+        "net/minecraft/world/level/block/state/properties/WallSide" => &["NONE", "LOW", "TALL"],
         "net/minecraft/world/phys/HitResult$Type" => &["MISS", "BLOCK", "ENTITY"],
         "net/minecraft/client/ParticleStatus" => &["ALL", "DECREASED", "MINIMAL"],
         "net/minecraft/core/Direction$Axis" => &["X", "Y", "Z"],
@@ -16046,6 +16846,14 @@ impl host_ref::Nested for HostNested<'_> {
     fn component_json(&mut self, value: &Value) -> Option<serde_json::Value> {
         let host = self.0.as_deref()?;
         facade_text::json_now(value, Some(&host.component_states))
+    }
+
+    fn voxel_shape_to_string(&mut self, key: &str) -> Option<String> {
+        self.0
+            .as_deref()?
+            .voxel_shapes
+            .get(key)
+            .map(|s| s.to_java_string())
     }
 
     fn uuid_bits(&mut self, value: &Value) -> Option<(i64, i64)> {
@@ -22469,6 +23277,8 @@ impl NativeJar {
             store_verdict: Default::default(),
             depth: 0,
             next_frame_id: 0,
+            shape_extraction: None,
+            check_shape_probes: false,
             budget,
         };
         if !runtime.classes.contains_key(&class_name) {
@@ -22642,9 +23452,34 @@ impl NativeJar {
         host: &mut H,
         budget: &ExecutionBudget,
     ) -> Result<Value, NativeError> {
+        self.invoke_persistent_inner(target, receiver, args, host, budget, None)
+    }
+
+    pub(crate) fn invoke_persistent_shape_extraction<H: Host>(
+        &self,
+        target: &MethodRef,
+        receiver: Option<Value>,
+        args: &[Value],
+        host: &mut H,
+        budget: &ExecutionBudget,
+        extraction_id: u64,
+    ) -> Result<Value, NativeError> {
+        self.invoke_persistent_inner(target, receiver, args, host, budget, Some(extraction_id))
+    }
+
+    fn invoke_persistent_inner<H: Host>(
+        &self,
+        target: &MethodRef,
+        receiver: Option<Value>,
+        args: &[Value],
+        host: &mut H,
+        budget: &ExecutionBudget,
+        shape_extraction: Option<u64>,
+    ) -> Result<Value, NativeError> {
         let (static_fields, initialized_classes) = host.persistent_class_state();
         let (io_paths, io_files, io_file_bytes, io_dirs) = host.persistent_io_state();
         let mut callback_infos = CallbackInfos::new();
+        let check_shape_probes = shape_extraction.is_some() || host.has_retained_shape_probes();
         let mut runtime = Runtime {
             classes: &self.classes,
             mixin_index: std::cell::OnceCell::new(),
@@ -22698,6 +23533,8 @@ impl NativeJar {
             store_verdict: Default::default(),
             depth: 0,
             next_frame_id: 0,
+            shape_extraction,
+            check_shape_probes,
             budget,
         };
         // The callback sees the objects its entrypoint built, and the next
@@ -22705,8 +23542,15 @@ impl NativeJar {
         let resident = runtime.adopt_resident_heap();
         // What the embedder handed over, and below what it gets back: it may
         // hold either until this call's store ends (`StdHost::retain` for
-        // longer).
-        let mut crossing: Vec<Value> = receiver.iter().chain(args).cloned().collect();
+        // longer). Extraction probes are dropped as soon as `evaluate_jar_shape_states`
+        // finishes and are not collectable jar objects, so omit them from `crossing`
+        // during shape extraction to avoid keeping `retained_shape_probes` armed.
+        let mut crossing: Vec<Value> = receiver
+            .iter()
+            .chain(args.iter())
+            .filter(|v| shape_extraction.is_none() || !is_shape_probe(v))
+            .cloned()
+            .collect();
         let result = runtime.invoke(
             &target.owner,
             &target.name,
@@ -22718,7 +23562,11 @@ impl NativeJar {
         let persistence = runtime.persist_class_state();
         let io_persistence = runtime.persist_io_state();
         if resident {
-            crossing.extend(result.as_ref().ok().cloned());
+            if let Ok(value) = result.as_ref()
+                && (shape_extraction.is_none() || !is_shape_probe(value))
+            {
+                crossing.push(value.clone());
+            }
             runtime.persist_resident_heap_crossing(&crossing)?;
         }
         persistence?;
@@ -22791,6 +23639,8 @@ impl NativeJar {
             store_verdict: Default::default(),
             depth: 0,
             next_frame_id: 0,
+            shape_extraction: None,
+            check_shape_probes: false,
             budget: &ExecutionBudget::UNBOUNDED,
         };
         let resident = runtime.adopt_resident_heap();
@@ -22964,6 +23814,8 @@ impl NativeJar {
             store_verdict: Default::default(),
             depth: 0,
             next_frame_id: 0,
+            shape_extraction: None,
+            check_shape_probes: false,
             budget: &ExecutionBudget::UNBOUNDED,
         };
         let resident = runtime.adopt_resident_heap();
@@ -25267,6 +26119,16 @@ struct Runtime<'a, H> {
     /// A depth is insufficient because two sequential calls at the same depth
     /// must still get distinct allocation provenance.
     next_frame_id: u64,
+    /// Extraction id of the active `Block.getShape` / `getCollisionShape` call,
+    /// if any. Free forwarding in [`Self::is_allowed_shape_probe_invoke`] is
+    /// granted only to `HostKind::ShapeProbe` handles tagged with this exact id
+    /// in their original slots.
+    shape_extraction: Option<u64>,
+    /// True whenever a `HostKind::ShapeProbe` may be reachable during this
+    /// execution (inside shape extraction, after an earlier extraction on this
+    /// host, or when a probe was passed directly); enables
+    /// [`Self::check_shape_probe_opcode`] in [`Runtime::invoke_frame`].
+    check_shape_probes: bool,
     /// The wall-clock budget this execution honours, checked with
     /// [`BUDGET_CHECK_INSTRUCTIONS`] and in [`Runtime::invoke`].
     budget: &'a ExecutionBudget,
@@ -25280,6 +26142,11 @@ enum Assignable {
     Counted,
     /// A name the runtime does not know: the host's nominal answer.
     Host,
+}
+
+/// Whether `value` is an opaque shape-extraction probe (`HostKind::ShapeProbe`).
+fn is_shape_probe(value: &Value) -> bool {
+    matches!(value, Value::Host(h) if h.kind() == HostKind::ShapeProbe)
 }
 
 /// Whether `file` itself declares `field` (name and descriptor).
@@ -28112,6 +28979,11 @@ impl<H: Host> Runtime<'_, H> {
         {
             let receiver = receiver.unwrap_or(&Value::Ref(None));
             let other = StdHost::argument(r, args, 0)?;
+            if matches!(receiver, Value::Host(h) if h.kind() == HostKind::ShapeProbe)
+                || matches!(other, Value::Host(h) if h.kind() == HostKind::ShapeProbe)
+            {
+                return self.host.unknown_operand_call(r).map(Some);
+            }
             return Ok(Some(Value::Int(
                 (value_marker(receiver) == value_marker(other)) as i32,
             )));
@@ -29333,6 +30205,130 @@ impl<H: Host> Runtime<'_, H> {
         // the same way.
         if let Some(value) = self.content_builder_call(r, receiver, args)? {
             return Ok(Some(value));
+        }
+        // `Shapes.or(VoxelShape, VoxelShape...)`: needs the runtime-owned varargs array.
+        if r.owner == voxel_shape::SHAPES
+            && r.name == "or"
+            && r.descriptor
+                == "(Lnet/minecraft/world/phys/shapes/VoxelShape;[Lnet/minecraft/world/phys/shapes/VoxelShape;)Lnet/minecraft/world/phys/shapes/VoxelShape;"
+        {
+            let first = args.first().unwrap_or(&Value::Ref(None));
+            let rest_arg = args.get(1).unwrap_or(&Value::Ref(None));
+            if *rest_arg == Value::Ref(None) {
+                return Err(NativeError::UncaughtException {
+                    class: "java/lang/NullPointerException".into(),
+                    message: None,
+                    frame: None,
+                });
+            }
+            if let Some(others) = self.owned_array(rest_arg).map(|v| v.into_owned()) {
+                return self.host.voxel_shape_or_array(r, first, &others).map(Some);
+            }
+        }
+        // `BlockStateBase.getShape(BlockGetter, BlockPos[, CollisionContext])`: dispatches to the
+        // block's `getShape` (MC 26.3 `BlockBehaviour$BlockStateBase.getShape`).
+        if matches!(
+            r.owner.as_str(),
+            "net/minecraft/world/level/block/state/BlockState"
+                | "net/minecraft/world/level/block/state/BlockBehaviour$BlockStateBase"
+        ) && r.name == "getShape"
+            && (r.descriptor == voxel_shape::BLOCK_STATE_GET_SHAPE_2_DESC
+                || r.descriptor == voxel_shape::BLOCK_STATE_GET_SHAPE_3_DESC)
+            && let Some(state_val) = receiver
+            && let Some(block_val) = self.host.block_state_block(state_val)
+            && let Some(block_class) = jar_object::object_class(&block_val)
+        {
+            let level = args.first().cloned().unwrap_or(Value::Ref(None));
+            let pos = args.get(1).cloned().unwrap_or(Value::Ref(None));
+            let ctx = if r.descriptor == voxel_shape::BLOCK_STATE_GET_SHAPE_3_DESC {
+                args.get(2).cloned().unwrap_or(Value::Ref(None))
+            } else {
+                voxel_shape::empty_collision_context()
+            };
+            let mut cur = block_class.to_owned();
+            let mut found = None;
+            for _ in 0..64 {
+                let Some(file) = self.class(&cur) else {
+                    break;
+                };
+                if file
+                    .method("getShape", voxel_shape::GET_SHAPE_DESC)
+                    .is_some()
+                {
+                    found = Some(cur.clone());
+                    break;
+                }
+                if file.super_name.is_empty() {
+                    break;
+                }
+                cur = file.super_name.clone();
+            }
+            if let Some(owner) = found {
+                return self
+                    .invoke(
+                        &owner,
+                        "getShape",
+                        voxel_shape::GET_SHAPE_DESC,
+                        Some(block_val),
+                        &[state_val.clone(), level, pos, ctx],
+                    )
+                    .map(Some);
+            }
+            if vanilla_block_shapes::inherits_block_behaviour_get_shape(&cur) {
+                return Ok(Some(voxel_shape::block_shape()));
+            }
+        }
+        // `super.getCollisionShape` on a vanilla class inheriting `BlockBehaviour.getCollisionShape`:
+        // `return this.hasCollision ? state.getShape(level, pos) : Shapes.empty();`
+        if r.name == "getCollisionShape"
+            && r.descriptor == voxel_shape::GET_SHAPE_DESC
+            && vanilla_block_shapes::inherits_block_behaviour_get_collision_shape(&r.owner)
+            && let Some(block_val) = receiver
+            && let Some(has_collision) = self.host.block_has_collision(block_val)
+        {
+            if !has_collision {
+                return Ok(Some(voxel_shape::empty_shape()));
+            }
+            let state_val = args.first().cloned().unwrap_or(Value::Ref(None));
+            if let Some(state_block) = self.host.block_state_block(&state_val)
+                && let Some(block_class) = jar_object::object_class(&state_block)
+            {
+                let level = args.get(1).cloned().unwrap_or(Value::Ref(None));
+                let pos = args.get(2).cloned().unwrap_or(Value::Ref(None));
+                let ctx = voxel_shape::empty_collision_context();
+                let mut cur = block_class.to_owned();
+                let mut found = None;
+                for _ in 0..64 {
+                    let Some(file) = self.class(&cur) else {
+                        break;
+                    };
+                    if file
+                        .method("getShape", voxel_shape::GET_SHAPE_DESC)
+                        .is_some()
+                    {
+                        found = Some(cur.clone());
+                        break;
+                    }
+                    if file.super_name.is_empty() {
+                        break;
+                    }
+                    cur = file.super_name.clone();
+                }
+                if let Some(owner) = found {
+                    return self
+                        .invoke(
+                            &owner,
+                            "getShape",
+                            voxel_shape::GET_SHAPE_DESC,
+                            Some(state_block),
+                            &[state_val, level, pos, ctx],
+                        )
+                        .map(Some);
+                }
+                if vanilla_block_shapes::inherits_block_behaviour_get_shape(&cur) {
+                    return Ok(Some(voxel_shape::block_shape()));
+                }
+            }
         }
         // `BlockPos.betweenClosedStream` is the game's own bounding-box stream.
         // A mod filters and maps it for a shape offset table; the bounded host
@@ -34028,9 +35024,18 @@ impl<H: Host> Runtime<'_, H> {
         let frame_id = self.next_frame_id;
         self.next_frame_id = self.next_frame_id.wrapping_add(1);
         self.depth += 1;
+        let prev_check_shape_probes = self.check_shape_probes;
+        if self.shape_extraction.is_some()
+            || self.host.has_retained_shape_probes()
+            || receiver.as_ref().is_some_and(is_shape_probe)
+            || args.iter().any(is_shape_probe)
+        {
+            self.check_shape_probes = true;
+        }
         stack_walk::enter(class, method);
         let result = self.invoke_frame(class, method, desc, receiver, args, frame_id);
         stack_walk::leave();
+        self.check_shape_probes = prev_check_shape_probes;
         self.depth -= 1;
         // An execution's end: a host walk's refusal no jar frame saw (the entrypoint's own
         // host call, or one that left uncaught) is counted too.
@@ -34049,6 +35054,241 @@ impl<H: Host> Runtime<'_, H> {
             instructions: self.instructions,
             instruction_limit: self.budget.instruction_limit(),
         }
+    }
+
+    /// Whether `value` is a `HostKind::ShapeProbe` that does NOT belong to the
+    /// currently active extraction (`self.shape_extraction`).
+    fn is_stale_shape_probe(&self, value: &Value) -> bool {
+        let Value::Host(handle) = value else {
+            return false;
+        };
+        if handle.kind() != HostKind::ShapeProbe {
+            return false;
+        }
+        match (
+            self.shape_extraction,
+            voxel_shape::parse_shape_probe_key(handle.key()),
+        ) {
+            (Some(current_id), Some((probe_id, _))) => probe_id != current_id,
+            _ => true,
+        }
+    }
+
+    fn count_shape_probe_use(&mut self, op: u8) -> Result<(), NativeError> {
+        let can_escape = !matches!(
+            op,
+            0x3a | 0x4b..=0x4e | 0x57..=0x5f | 0xb1 | 0xb4 | 0xc2 | 0xc3 | 0xc6 | 0xc7
+        );
+        if can_escape {
+            self.host.note_retained_shape_probe();
+        }
+        let name = match op {
+            0x3a | 0x4b..=0x4e => "<astore>",
+            0x4f..=0x56 => "<aastore>",
+            0x57..=0x5f => "<stack_op>",
+            0xac..=0xb0 => "<areturn>",
+            0xb1 => "<return>",
+            0xb3 => "<putstatic>",
+            0xb4 => "<getfield>",
+            0xb5 => "<putfield>",
+            0xba => "<invokedynamic>",
+            0xbf => "<athrow>",
+            0xc2 => "<monitorenter>",
+            0xc3 => "<monitorexit>",
+            0xc6 => "<ifnull>",
+            0xc7 => "<ifnonnull>",
+            _ => "<shape_probe>",
+        };
+        self.host
+            .unknown_operand_call(&MethodRef {
+                owner: "java/lang/Object".into(),
+                name: name.into(),
+                descriptor: "()V".into(),
+            })
+            .map(|_| ())
+    }
+
+    /// Structural allow-list enforced on every bytecode instruction while
+    /// `self.check_shape_probes` is active: a `HostKind::ShapeProbe` from the
+    /// CURRENT extraction (`self.shape_extraction`) may only move between locals
+    /// and the operand stack (loads/stores/dup/pop/swap) or be forwarded in its
+    /// exact original slot to the targets in [`Self::is_allowed_shape_probe_invoke`].
+    /// Any other use — and any stack manipulation or forwarding of a probe from
+    /// another extraction — counts as unknown.
+    fn check_shape_probe_opcode(
+        &mut self,
+        op: u8,
+        code: &[u8],
+        pc: usize,
+        stack: &[Value],
+    ) -> Result<(), NativeError> {
+        match op {
+            // (a1) Opcodes that pop nothing from the operand stack.
+            0x00..=0x2d | 0x84 | 0xa7 | 0xb2 | 0xbb | 0xc8 => return Ok(()),
+            // (a2) Local stores and stack shuffles: allowed only for probes of the
+            // CURRENT extraction; a probe from any other extraction counts.
+            0x3a | 0x4b..=0x4e | 0x57..=0x5f => {
+                let read_slots = match op {
+                    0x58 | 0x5a | 0x5c | 0x5f => 2,
+                    0x5b | 0x5d => 3,
+                    0x5e => 4,
+                    _ => 1,
+                };
+                let tail_start = stack.len().saturating_sub(read_slots);
+                if stack[tail_start..]
+                    .iter()
+                    .any(|v| self.is_stale_shape_probe(v))
+                {
+                    self.count_shape_probe_use(op)?;
+                }
+                return Ok(());
+            }
+            0xb1 => {
+                if stack.iter().any(|v| self.is_stale_shape_probe(v)) {
+                    self.count_shape_probe_use(op)?;
+                }
+                return Ok(());
+            }
+            0xac..=0xb0 => {
+                if stack.last().is_some_and(is_shape_probe)
+                    || stack.iter().any(|v| self.is_stale_shape_probe(v))
+                {
+                    self.count_shape_probe_use(op)?;
+                }
+                return Ok(());
+            }
+            0xc4 => {
+                if let Some(&wide_op) = code.get(pc) {
+                    if matches!(wide_op, 0x15..=0x19 | 0x84) {
+                        return Ok(());
+                    }
+                    if wide_op == 0x3a {
+                        if stack.last().is_some_and(|v| self.is_stale_shape_probe(v)) {
+                            self.count_shape_probe_use(wide_op)?;
+                        }
+                        return Ok(());
+                    }
+                }
+            }
+            // Checked in `0xb6..=0xb9` (`is_allowed_shape_probe_invoke`), `0xba` (captured args),
+            // and in `same_reference` / `checkcast` / `instanceof` (exact target-named counts).
+            0xa5 | 0xa6 | 0xb6..=0xba | 0xc0 | 0xc1 => return Ok(()),
+            _ => {}
+        }
+        let read_slots = match op {
+            0x4f..=0x56 => 3,
+            0x2e..=0x35 | 0x60..=0x73 | 0x78..=0x83 | 0x94..=0x98 | 0x9f..=0xa4 | 0xb5 => 2,
+            0xc5 => code.get(pc + 2).copied().map_or(stack.len(), usize::from),
+            _ => 1,
+        };
+        let tail_start = stack.len().saturating_sub(read_slots);
+        if stack[tail_start..].iter().any(is_shape_probe) {
+            self.count_shape_probe_use(op)?;
+        }
+        Ok(())
+    }
+
+    /// Walk `start_class` up the jar/linked hierarchy looking for `(name, GET_SHAPE_DESC)`.
+    /// Returns `(true, _)` if a jar class defines it (so it executes under the same allow-list),
+    /// or `(false, external_super)` at the first external superclass.
+    fn resolve_shape_method_chain(&self, start_class: &str, name: &str) -> (bool, String) {
+        let mut cur = start_class.to_owned();
+        for _ in 0..64 {
+            let Some(file) = self.class(&cur) else {
+                return (false, cur);
+            };
+            if file.method(name, voxel_shape::GET_SHAPE_DESC).is_some() {
+                return (true, cur);
+            }
+            if file.super_name.is_empty() {
+                return (false, cur);
+            }
+            cur = file.super_name.clone();
+        }
+        (false, cur)
+    }
+
+    /// Exact allow-list of method invocations that may receive `HostKind::ShapeProbe` arguments
+    /// during shape extraction without being immediately counted as unknown. Only probes tagged
+    /// with the CURRENT extraction id (`self.shape_extraction`) in their original slots are
+    /// granted free forwarding.
+    fn is_allowed_shape_probe_invoke(
+        &self,
+        op: u8,
+        r: &MethodRef,
+        receiver: Option<&Value>,
+        args: &[Value],
+    ) -> bool {
+        let Some(current_id) = self.shape_extraction else {
+            return false;
+        };
+        let Some(receiver) = receiver else {
+            return false;
+        };
+        if is_shape_probe(receiver) {
+            return false;
+        }
+        let probe_in_slot = |value: &Value, expected_role: &str| {
+            !is_shape_probe(value)
+                || matches!(
+                    value,
+                    Value::Host(h)
+                        if h.kind() == HostKind::ShapeProbe
+                            && voxel_shape::parse_shape_probe_key(h.key())
+                                == Some((current_id, expected_role))
+                )
+        };
+        // (b1) `state.getShape(level, pos[, ctx])` on a tracked jar BlockState with probes of
+        // the current extraction in their original argument positions.
+        if matches!(
+            r.owner.as_str(),
+            "net/minecraft/world/level/block/state/BlockState"
+                | "net/minecraft/world/level/block/state/BlockBehaviour$BlockStateBase"
+        ) && r.name == "getShape"
+            && ((r.descriptor == voxel_shape::BLOCK_STATE_GET_SHAPE_2_DESC
+                && args.len() == 2
+                && probe_in_slot(&args[0], "block-getter")
+                && probe_in_slot(&args[1], "block-pos"))
+                || (r.descriptor == voxel_shape::BLOCK_STATE_GET_SHAPE_3_DESC
+                    && args.len() == 3
+                    && probe_in_slot(&args[0], "block-getter")
+                    && probe_in_slot(&args[1], "block-pos")
+                    && probe_in_slot(&args[2], "collision-context")))
+            && let Some(state_block) = self.host.block_state_block(receiver)
+            && let Some(block_class) = jar_object::object_class(&state_block)
+        {
+            let (in_jar, external) = self.resolve_shape_method_chain(block_class, "getShape");
+            return in_jar || vanilla_block_shapes::inherits_block_behaviour_get_shape(&external);
+        }
+        // (b2) `super.getShape` / `this.getShape` / `super.getCollisionShape` /
+        // `this.getCollisionShape` with probes of the current extraction in their original
+        // positions (1=block-getter, 2=block-pos, 3=collision-context).
+        if matches!(op, 0xb6 | 0xb7)
+            && matches!(r.name.as_str(), "getShape" | "getCollisionShape")
+            && r.descriptor == voxel_shape::GET_SHAPE_DESC
+            && args.len() == 4
+            && !is_shape_probe(&args[0])
+            && probe_in_slot(&args[1], "block-getter")
+            && probe_in_slot(&args[2], "block-pos")
+            && probe_in_slot(&args[3], "collision-context")
+            && let Some(recv_class) = jar_object::object_class(receiver)
+        {
+            let start = if op == 0xb7 {
+                r.owner.as_str()
+            } else {
+                recv_class
+            };
+            let (in_jar, external) = self.resolve_shape_method_chain(start, &r.name);
+            if in_jar {
+                return true;
+            }
+            if r.name == "getShape" {
+                return vanilla_block_shapes::inherits_block_behaviour_get_shape(&external);
+            }
+            return vanilla_block_shapes::inherits_block_behaviour_get_collision_shape(&external)
+                && self.host.block_has_collision(receiver).is_some();
+        }
+        false
     }
 
     fn invoke_bigdecimal_static(
@@ -34888,6 +36128,9 @@ impl<H: Host> Runtime<'_, H> {
             let at = pc;
             let op = code[pc];
             pc += 1;
+            if self.check_shape_probes {
+                invoke_or_catch!(at, self.check_shape_probe_opcode(op, code, pc, &stack));
+            }
             match op {
                 0x00 => {}
                 0x01 => stack.push(Value::Ref(None)),
@@ -36127,6 +37370,18 @@ impl<H: Host> Runtime<'_, H> {
                         && r.descriptor == "(Ljava/lang/Object;)Ljava/lang/String;"
                     {
                         frame_modified_identity = true;
+                    }
+                    if self.check_shape_probes
+                        && (receiver.as_ref().is_some_and(is_shape_probe)
+                            || args.iter().any(is_shape_probe))
+                        && !self.is_allowed_shape_probe_invoke(op, &r, receiver.as_ref(), &args)
+                    {
+                        self.host.note_retained_shape_probe();
+                        let value = invoke_or_catch!(at, self.host.unknown_operand_call(&r));
+                        if value != Value::Void {
+                            stack.push(value);
+                        }
+                        continue;
                     }
                     // A cancelled `new` left a null reference behind; its
                     // matching `<init>` is skipped so the construction has no
@@ -37575,6 +38830,9 @@ impl<H: Host> Runtime<'_, H> {
                         .map(|_| pop(&mut stack, class, method, at))
                         .collect::<Result<Vec<_>, _>>()?;
                     captured.reverse();
+                    if self.check_shape_probes && captured.iter().any(is_shape_probe) {
+                        invoke_or_catch!(at, self.count_shape_probe_use(op));
+                    }
                     // A pattern-matching `switch` site answers the matching
                     // label's index (`type_switch`).
                     if let Some(labels) = file.type_switch_labels(index)
@@ -42318,6 +43576,8 @@ mod tests {
             store_verdict: Default::default(),
             depth: 0,
             next_frame_id: 0,
+            shape_extraction: None,
+            check_shape_probes: false,
             budget: &ExecutionBudget::UNBOUNDED,
         };
         let method = MethodRef {
@@ -42404,6 +43664,8 @@ mod tests {
             store_verdict: Default::default(),
             depth: 0,
             next_frame_id: 0,
+            shape_extraction: None,
+            check_shape_probes: false,
             budget: &ExecutionBudget::UNBOUNDED,
         };
         let method = MethodRef {
@@ -49570,6 +50832,8 @@ mandatory = true
             store_verdict: Default::default(),
             depth: 0,
             next_frame_id: 0,
+            shape_extraction: None,
+            check_shape_probes: false,
             budget: &ExecutionBudget::UNBOUNDED,
         };
         let first = runtime.new_object("demo/Fields");
@@ -49798,6 +51062,8 @@ mandatory = true
             store_verdict: Default::default(),
             depth: 0,
             next_frame_id: 0,
+            shape_extraction: None,
+            check_shape_probes: false,
             budget: &ExecutionBudget::UNBOUNDED,
         };
         let new_instance = MethodRef {
@@ -50001,6 +51267,8 @@ mandatory = true
             store_verdict: Default::default(),
             depth: 0,
             next_frame_id: 0,
+            shape_extraction: None,
+            check_shape_probes: false,
             budget: &ExecutionBudget::UNBOUNDED,
         };
         // A stream takes one stage or terminal (`linkedOrConsumed`): each
@@ -50380,6 +51648,8 @@ mandatory = true
             store_verdict: Default::default(),
             depth: 0,
             next_frame_id: 0,
+            shape_extraction: None,
+            check_shape_probes: false,
             budget: &ExecutionBudget::UNBOUNDED,
         };
         let lookup = MethodRef {
@@ -50703,6 +51973,8 @@ mandatory = true
             store_verdict: Default::default(),
             depth: 0,
             next_frame_id: 0,
+            shape_extraction: None,
+            check_shape_probes: false,
             budget: &ExecutionBudget::UNBOUNDED,
         };
         let class = host_class::class_value("demo/ReflectiveFields");
@@ -55984,6 +57256,8 @@ mandatory = true
             store_verdict: Default::default(),
             depth: 0,
             next_frame_id: 0,
+            shape_extraction: None,
+            check_shape_probes: false,
             budget: &ExecutionBudget::UNBOUNDED,
         };
         let grid = runtime.new_multidim_array("[[I", &[2, 3]).unwrap();
@@ -56057,6 +57331,8 @@ mandatory = true
             store_verdict: Default::default(),
             depth: 0,
             next_frame_id: 0,
+            shape_extraction: None,
+            check_shape_probes: false,
             budget: &ExecutionBudget::UNBOUNDED,
         };
         let error = runtime
