@@ -52,7 +52,63 @@ The pin is `0a875da91d` (Nightly 2026-11-20), the newest build with a published 
 when this was written. At that pin `cargo check --all-targets`, clippy with `-D warnings` and
 `cargo test --lib` pass.
 
+## Embedded data as Rust
+
+The official Horizon's native package takes only `.rs` and `.toml` files under `src/`
+(horizon-rust/horizon `docs/modding/src/how-to/native-mods/03-data-files.md`), and the launcher's
+staging leaves every other file out, so the build fails on the first `include_str!` of a `.txt`.
+`vendor.py --mod` therefore writes each embedded data file of another kind into a folder with
+`horizon-mod.toml` as `<name>.rs`, one raw string literal of the same text, and turns the vendored
+`include_str!("<name>")` into `include!("<name>.rs")`. The constant holds the same bytes;
+`tests/test_vendor_mod.py` checks the literal against the source file. `mod/` keeps the plain copy.
+
+## In-game proof (official launcher 0.2.95, Nightly 2026-11-20 at the pin)
+
+Run in a scratch tree with fresh `HORIZON_*`/`XDG_*` homes, as Horizon's
+`docs/mod-api/developer-acceptance-workflow.md` describes:
+
+```sh
+horizon-launcher install nightly-2026-11-20-0a875da
+horizon-launcher prepare --version nightly-2026-11-20-0a875da --minecraft <your Minecraft folder>
+python3 tools/vendor.py --mod mod-horizon     # then copy mod-horizon/ without .horizon/ to MOD
+horizon-launcher native-build MOD --server-output ENGINE --version nightly-2026-11-20-0a875da --trust-native-code
+horizon-server --dir SERVER init --eula --world proof --port 25599 --no-whitelist --offline --yes
+horizon-server --dir SERVER config set engine.path=ENGINE/horizon-engine server.bind=127.0.0.1
+# jars from tools/java_mod_fixture.py in SERVER/config/horizon_java/java-mods, then
+horizon-server --dir SERVER start; horizon-server --dir SERVER cmd ...; horizon-server --dir SERVER stop
+```
+
+The launcher prints `Prebuilt game: only the mods compile (optimized)`: the game is the signed SDK's
+prebuilt server engine, and only this mod's crate and its 20 registry crates compile (211 s here).
+
+- **M0**: with an empty `java-mods/`, `config/horizon_java/java-runtime.json` is written through
+  the config service with `"schema": 1, "jars": []`.
+- **M1**: eight fixture jars are `ran-clean` with no unknown host calls (`m0_fixture`: 11 host
+  calls). A file that is not a jar is `refused` with `not a readable jar: Zip("invalid Zip archive:
+  Could not find EOCD")`.
+- **M2a**: `m2a_fixture`'s `SERVER_STARTED` and `SERVER_STOPPING` listeners ran: `callbacks.ran`
+  is 2, with 0 failed.
+- **M2b**: `javahello Viola` on the console answers `Hello, Viola!`, `javahello` answers
+  `Hello, world!`, and `help javahello` shows `/javahello [<name>]`. The row has 3 usages translated
+  and 2 runs.
+- **M2c**: `m2c_fixture`'s tick listeners ran 825 callbacks, 0 failed.
+- **M3**: `own_content_fixture` declares `horizon_java:proof_item` and `horizon_java:proof_block`.
+  - `setblock … horizon_java:proof_block` works, and `execute if block` finds it.
+  - `item replace … with horizon_java:proof_item` puts the item in a chest.
+  - `horizon_java:proof_block` is `Unknown item`: it has no block item, as in Java.
+  - `m3_fixture:*` is unknown: that namespace is not the mod's, so it is in the row's
+    `content.skipped`.
+
 ## What is not done yet
 
-- **No in-game proof.** The next step is the M0–M3b proof of [mod-plan.md](mod-plan.md) with the
-  official launcher's `native-build mod-horizon --server-output …` at this pin.
+- **The mod's log lines don't reach the game's log.** The mod compiles its own copy of the `log`
+  crate, and no logger is installed in that copy. The game's `log` is in the SDK's
+  `libmod_vocab.so`. So the `Horizon Java …` lines and the jars' `System.out` lines are lost on
+  this build, and the proof above reads the report and the console instead. horizon-rust/horizon#17983
+  proposes `Host::log` for this.
+- **M2d and the player-driven parts of M2c** (entity interaction, block break cancel) need a
+  player on the server. They have not been run on this build.
+- **M3b**: `tools/bake.py` writes Sunrise packages (`.smod` in `sunrise-mods/`). A bake for the
+  official Horizon (`.hmod` in `horizon-mods/`, its own manifest name) does not exist yet.
+- An item the jar declares shows `block.horizon_java.proof_item` as its name key, where Java uses
+  `item.horizon_java.proof_item`. Not looked into yet.
