@@ -129,6 +129,17 @@ pub(crate) fn component(json: &Json) -> Value {
     ))
 }
 
+/// 26.3 `Inventory.DEFAULT_NAME = Component.translatable("container.inventory")`
+/// (`Inventory.<clinit>` offsets 93-99): one canonical `static final` `MutableComponent`
+/// handle so `inv.getDisplayName() == inv.getName()` holds by reference equality and
+/// its non-numeric marker never collides with `Runtime::new_object` ids in `heap::collect`.
+pub(crate) fn inventory_default_name() -> Value {
+    Value::Host(HostRef::new(
+        HostKind::Component,
+        format!("{MUTABLE}#inventory-default:{{\"translate\":\"container.inventory\"}}"),
+    ))
+}
+
 /// The handle of `value` when it is a component.
 fn handle_of(value: &Value) -> Option<&HostRef> {
     match value {

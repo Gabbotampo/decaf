@@ -651,6 +651,10 @@ pub enum HostKind {
     /// (`TooltipFlag.NORMAL`, `TooltipFlag.ADVANCED`, `asCreative()`,
     /// `client_surface.rs`).
     TooltipFlagDefault,
+    /// A host-synthesized menu model object (`menu_models.rs`): key `<class>#menu<n>`,
+    /// kept out of `jar_object::parse_key` / `freed_objects` numeric ranges while
+    /// remaining a canonical non-`String` object handle.
+    MenuObject,
     /// An `ItemStack` value constructed by the host (e.g. `CreativeModeTab$Output.accept(ItemLike)`).
     ItemStack,
     /// Vanilla `FeatureFlag` singletons (`FeatureFlags.*`).
@@ -2892,6 +2896,14 @@ const KINDS: &[KindInfo] = &[
         class: ClassRule::FromKey(crate::runtime::client_surface::tooltip_flag_default_class),
         canonical: crate::runtime::client_surface::tooltip_flag_default_canonical,
         methods: &crate::runtime::client_surface::TOOLTIP_FLAG_DEFAULT_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::MenuObject,
+        tag: "menu",
+        class: ClassRule::FromKey(crate::runtime::jar_object::menu_object_class),
+        // Monotonic `#menu<n>` serial per host-synthesized menu object: one key, one object.
+        canonical: always_canonical,
+        methods: &crate::runtime::jar_object::MENU_OBJECT,
     },
     KindInfo {
         kind: HostKind::ItemStack,

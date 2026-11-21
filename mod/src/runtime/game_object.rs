@@ -103,8 +103,8 @@ fn client_kind(rest: &str) -> HostKind {
     match family {
         "player" if key.is_empty() => HostKind::GameEntity,
         "level" if key.is_empty() => HostKind::GameLevel,
-        // `OptionInstance`s and vanilla `KeyMapping`s: one per name.
-        "option" | "vanilla-key" => HostKind::GameSingleton,
+        // `OptionInstance`s, vanilla `KeyMapping`s, and `RenderPipelines` constants: one per name.
+        "option" | "vanilla-key" | "render-pipeline" => HostKind::GameSingleton,
         name if key.is_empty() && CLIENT_SINGLETONS.contains(&name) => HostKind::GameSingleton,
         "item" | "block" | "block-entity-type" | "mob-effect" | "effect-holder" | "attribute"
         | "particle-type" => HostKind::GameRegistryObject,
@@ -417,6 +417,12 @@ pub(crate) fn declared_types(key: &str) -> &'static [&'static str] {
         (true, "options") => &["net/minecraft/client/Options"],
         (true, "font") => &["net/minecraft/client/gui/Font"],
         (true, "gui") => &["net/minecraft/client/gui/Gui"],
+        (true, "render-pipeline") => &["com/mojang/renderpearl/api/pipeline/RenderPipeline"],
+        (true, "inventory") => &[
+            "net/minecraft/world/entity/player/Inventory",
+            "net/minecraft/world/Container",
+            "net/minecraft/world/Nameable",
+        ],
         // A family whose class P16b–e reads from its snapshot: only `Object`
         // is sure until then.
         _ => &[],

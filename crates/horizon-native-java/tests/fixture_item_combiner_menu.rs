@@ -136,9 +136,9 @@ public abstract class ItemCombinerMenu extends AbstractContainerMenu {
 public class RecipeManager { public RecipeManager() { } public Object getRecipeFor() { return null; } }
 "#,
         "demo/TwoInputMenu.java" => r#"package demo;
-import net.minecraft.world.inventory.*; import net.minecraft.world.item.ItemStack; import net.minecraft.world.level.block.state.BlockState; import net.minecraft.world.entity.player.Player;
+import net.minecraft.world.inventory.*; import net.minecraft.world.item.ItemStack; import net.minecraft.world.level.block.state.BlockState; import net.minecraft.world.entity.player.Inventory; import net.minecraft.world.entity.player.Player;
 public final class TwoInputMenu extends ItemCombinerMenu {
-  public TwoInputMenu() { super(null, 17, null, ContainerLevelAccess.NULL, createDefinition()); }
+  public TwoInputMenu() { super(null, 17, new Inventory(null, null), ContainerLevelAccess.NULL, createDefinition()); }
   private static ItemCombinerMenuSlotDefinition createDefinition() {
     return ItemCombinerMenuSlotDefinition.create().withSlot(0, 17, 29, stack -> stack != ItemStack.EMPTY).withSlot(1, 73, 29, stack -> true).withResultSlot(2, 121, 29).build();
   }
