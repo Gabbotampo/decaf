@@ -37,7 +37,7 @@
 
 use serde_json::{Map, Value as Json, json};
 
-use crate::runtime::host_component::{CODEC_STYLE_KEYS, ComponentState, MAX_JSON_BYTES, States};
+use crate::runtime::host_component::{CODEC_STYLE_KEYS, CodecJson, ComponentState, MAX_JSON_BYTES, States};
 use crate::runtime::{Boxed, Host, MethodRef, NativeError, Runtime, Value, expect_ref};
 
 const COMPONENT: &str = "net/minecraft/network/chat/Component";
@@ -52,10 +52,13 @@ pub(crate) fn json_now(value: &Value, states: Option<&States>) -> Option<Json> {
     crate::runtime::host_component::json_in(value, states, &argument)
 }
 
-/// Vanilla's `ComponentSerialization.CODEC` + `JsonOps.INSTANCE` JSON for
-/// `value` (plain literals collapsed to strings; fields in codec order).
-pub(crate) fn codec_json_now(value: &Value, states: Option<&States>) -> Option<Json> {
-    crate::runtime::host_component::codec_json_in(value, states, &argument)
+/// Vanilla's `ComponentSerialization.CODEC` + `JsonOps.INSTANCE` JSON string
+/// for `value` (plain literals collapsed to strings; fields in codec order;
+/// non-finite `Float`/`Double` arguments emitted as Gson's `NaN`, `Infinity`,
+/// `-Infinity`).
+pub(crate) fn codec_json_now(value: &Value, states: Option<&States>) -> Option<String> {
+    crate::runtime::host_component::codec_json_in(value, states, &codec_argument)
+        .map(|json| json.to_json_string())
 }
 
 /// A new component of `json`.
@@ -129,11 +132,14 @@ fn is_allowed_primitive_argument(value: &Value) -> bool {
     }
 }
 
-/// One translation argument that is not a component, matching Minecraft 26.3's
-/// `TranslatableContents.isAllowedPrimitiveArgument`: only `Number`, `Boolean`,
-/// and `String` are allowed. Anything vanilla's codec rejects (`null`,
-/// `Character`, arbitrary objects, non-finite floats) returns `None` so callers
-/// refuse or count it at serialization time rather than stringifying it.
+/// One translation argument encoded for strict RFC 8259 `serde_json::Value`
+/// consumers (`json_now`, `CommandText`, `ClientText::Json`): matches
+/// Minecraft 26.3's `TranslatableContents.isAllowedPrimitiveArgument`
+/// (`Number`, `Boolean`, `String`), returning `None` for disallowed objects
+/// (`null`, `Character`, arbitrary objects) and for non-finite floats that
+/// `serde_json::Number` cannot represent (callers count those rather than
+/// dropping or stringifying them; [`codec_argument`] handles non-finite floats
+/// verbatim for Gson-compatible codec output).
 pub(crate) fn argument(value: &Value) -> Option<Json> {
     match value {
         Value::Int(v) => Some(json!(v)),
@@ -148,6 +154,38 @@ pub(crate) fn argument(value: &Value) -> Option<Json> {
         Value::Boxed(Boxed::Integer(v)) => Some(json!(v)),
         Value::Ref(Some(text)) if is_plain_string_arg(text) => Some(json!(text)),
         Value::Ref(_) | Value::Boxed(Boxed::Character(_)) | Value::Host(_) | Value::Void => None,
+    }
+}
+
+fn float_codec_json(v: f64) -> CodecJson {
+    if v.is_nan() {
+        CodecJson::RawNumber("NaN")
+    } else if v.is_infinite() {
+        CodecJson::RawNumber(if v.is_sign_negative() {
+            "-Infinity"
+        } else {
+            "Infinity"
+        })
+    } else {
+        match serde_json::Number::from_f64(v) {
+            Some(number) => CodecJson::Json(Json::Number(number)),
+            None => CodecJson::RawNumber("NaN"),
+        }
+    }
+}
+
+/// One translation argument encoded for vanilla's `ComponentSerialization.CODEC`
+/// with `JsonOps.INSTANCE` and Gson output (`StdHost::component_json`): matches
+/// `TranslatableContents.isAllowedPrimitiveArgument`, emitting Gson's literal
+/// `NaN`, `Infinity`, and `-Infinity` tokens for non-finite `Float`/`Double`
+/// values.
+pub(crate) fn codec_argument(value: &Value) -> Option<CodecJson> {
+    match value {
+        Value::Float(v) => Some(float_codec_json(*v)),
+        Value::Boxed(Boxed::Float(bits)) => {
+            Some(float_codec_json(f64::from(f32::from_bits(*bits))))
+        }
+        other => argument(other).map(CodecJson::Json),
     }
 }
 
@@ -584,6 +622,30 @@ mod tests {
             None
         );
         assert_eq!(argument(&Value::Float(f64::NAN)), None);
+        assert_eq!(
+            codec_argument(&Value::Float(f64::NAN)),
+            Some(CodecJson::RawNumber("NaN"))
+        );
+        assert_eq!(
+            codec_argument(&Value::Float(f64::INFINITY)),
+            Some(CodecJson::RawNumber("Infinity"))
+        );
+        assert_eq!(
+            codec_argument(&Value::Float(f64::NEG_INFINITY)),
+            Some(CodecJson::RawNumber("-Infinity"))
+        );
+        assert_eq!(
+            codec_argument(&Value::Boxed(Boxed::Float(f32::NAN.to_bits()))),
+            Some(CodecJson::RawNumber("NaN"))
+        );
+        assert_eq!(
+            codec_argument(&Value::Boxed(Boxed::Float(f32::INFINITY.to_bits()))),
+            Some(CodecJson::RawNumber("Infinity"))
+        );
+        assert_eq!(
+            codec_argument(&Value::Boxed(Boxed::Float(f32::NEG_INFINITY.to_bits()))),
+            Some(CodecJson::RawNumber("-Infinity"))
+        );
         assert_eq!(
             plain(&json!({"text": "a", "extra": ["b", {"translate": "k"}]})),
             "abk"

@@ -4037,7 +4037,6 @@ impl StdHost {
     /// `JsonOps.INSTANCE` JSON representation of a component value.
     pub fn component_json(&self, value: &Value) -> Option<String> {
         crate::runtime::facade_text::codec_json_now(value, Some(&self.component_states))
-            .map(|json| json.to_string())
     }
 
     pub fn unknown_host_call_count(&self) -> usize {

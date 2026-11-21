@@ -2402,9 +2402,11 @@ impl StdHost {
                     .and_then(|()| state.fill([x + w - 1, y + 1, x + w, y + h - 1], c))
             }
             ("text", descriptor) if descriptor.starts_with("(Lnet/minecraft/client/gui/Font;") => {
-                // A null string draws nothing (`text` returns early).
-                let Some(text) = text_arg(args.get(1)?, &self.component_states) else {
-                    return Some(Value::Void);
+                // A null string draws nothing (`text` returns early); an
+                // unresolvable component refuses rather than drawing nothing.
+                let arg = args.get(1)?;
+                let Some(text) = text_arg(arg, &self.component_states) else {
+                    return (*arg == Value::Ref(None)).then_some(Value::Void);
                 };
                 let v = ints(2, 3)?;
                 // The five-argument overloads draw with a shadow.
@@ -2448,14 +2450,19 @@ impl StdHost {
             {
                 let slot = self.client_stack_slot(args.get(1)?)?;
                 let v = ints(2, 2)?;
-                let count = args.get(4).map(|text| {
-                    text_arg(text, &self.component_states).map(|t| match t {
-                        ClientText::Literal(s) | ClientText::Translatable(s) => s,
-                        ClientText::Json(json) => serde_json::from_str(&json)
-                            .map(|json| crate::facade_text::plain(&json))
-                            .unwrap_or_default(),
-                    })
-                });
+                let count = match args.get(4) {
+                    Some(arg) => match text_arg(arg, &self.component_states) {
+                        Some(t) => Some(Some(match t {
+                            ClientText::Literal(s) | ClientText::Translatable(s) => s,
+                            ClientText::Json(json) => serde_json::from_str(&json)
+                                .map(|json| crate::facade_text::plain(&json))
+                                .unwrap_or_default(),
+                        })),
+                        None if *arg == Value::Ref(None) => Some(None),
+                        None => return None,
+                    },
+                    None => None,
+                };
                 return self
                     .client_item_draw(frame, slot, [v[0], v[1]], false, Some(count.flatten()))
                     .map(|()| Value::Void);
@@ -2489,8 +2496,9 @@ impl StdHost {
             ("centeredText", descriptor)
                 if descriptor.starts_with("(Lnet/minecraft/client/gui/Font;") =>
             {
-                let Some(text) = text_arg(args.get(1)?, &self.component_states) else {
-                    return Some(Value::Void);
+                let arg = args.get(1)?;
+                let Some(text) = text_arg(arg, &self.component_states) else {
+                    return (*arg == Value::Ref(None)).then_some(Value::Void);
                 };
                 let v = ints(2, 3)?;
                 // `x - font.width(text) / 2`, Java's integer division.
@@ -3487,5 +3495,84 @@ mod tests {
                 clicks: 0
             }]
         );
+    }
+
+    #[test]
+    fn graphics_text_refuses_unresolvable_component_instead_of_drawing_nothing() {
+        let mut host = StdHost::new();
+        let bad = crate::host_component::translatable("k");
+        let bad_arg = crate::jar_object::handle("java/lang/Object#0".into());
+        crate::host_component::change(
+            &mut host.component_states,
+            &bad,
+            &crate::facade_text::argument,
+            |state| state.args = Some(vec![bad_arg]),
+        )
+        .unwrap();
+        host.begin_client_frame(snapshot(), &[]);
+        let gfx = marker(GRAPHICS);
+        let font = marker(FONT);
+        for name in ["text", "centeredText"] {
+            let r = method(
+                "net/minecraft/client/gui/GuiGraphicsExtractor",
+                name,
+                "(Lnet/minecraft/client/gui/Font;Lnet/minecraft/network/chat/Component;III)V",
+            );
+            // Null draws nothing; an unresolvable component must refuse.
+            assert_eq!(
+                host.client_call(
+                    &r,
+                    &gfx,
+                    &[
+                        font.clone(),
+                        Value::Ref(None),
+                        Value::Int(0),
+                        Value::Int(0),
+                        Value::Int(0),
+                    ],
+                )
+                .unwrap()
+                .unwrap(),
+                Value::Void,
+                "{name}(null)"
+            );
+            assert!(
+                matches!(
+                    host.client_call(
+                        &r,
+                        &gfx,
+                        &[
+                            font.clone(),
+                            bad.clone(),
+                            Value::Int(0),
+                            Value::Int(0),
+                            Value::Int(0),
+                        ],
+                    ),
+                    Some(Err(NativeError::UnknownHostCall(_)))
+                ),
+                "{name}(unresolvable)"
+            );
+        }
+        let dec = method(
+            "net/minecraft/client/gui/GuiGraphicsExtractor",
+            "itemDecorations",
+            "(Lnet/minecraft/client/gui/Font;Lnet/minecraft/world/item/ItemStack;IILjava/lang/String;)V",
+        );
+        assert!(matches!(
+            host.client_call(
+                &dec,
+                &gfx,
+                &[
+                    font,
+                    marker(format!("{}main-hand", items::STACK)),
+                    Value::Int(0),
+                    Value::Int(0),
+                    bad,
+                ],
+            ),
+            Some(Err(NativeError::UnknownHostCall(_)))
+        ));
+        host.end_client_frame();
     }
 }

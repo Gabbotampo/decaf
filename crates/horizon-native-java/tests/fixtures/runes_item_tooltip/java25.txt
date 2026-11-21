@@ -27,6 +27,13 @@ escape_list={"translate":"demo.esc","with":["[a, b]"]}
 escape_formatting={"translate":"demo.esc","with":["§c"]}
 escape_component={"translate":"demo.esc","with":[{"text":"lit","color":"gold"}]}
 escape_tooltip_flag={"translate":"demo.esc","with":["Default[advanced=false, creative=false]"]}
+translatable_double_nan={"translate":"demo.nan","with":[NaN]}
+translatable_double_pos_inf={"translate":"demo.inf","with":[Infinity]}
+translatable_double_neg_inf={"translate":"demo.ninf","with":[-Infinity]}
+translatable_float_nan={"translate":"demo.fnan","with":[NaN]}
+translatable_float_pos_inf={"translate":"demo.finf","with":[Infinity]}
+translatable_float_neg_inf={"translate":"demo.fninf","with":[-Infinity]}
+escape_nonfinite={"translate":"demo.esc_nf","with":[NaN,Infinity,-Infinity]}
 flag_default_strings=Default[advanced=false, creative=false]|Default[advanced=true, creative=false]|Default[advanced=false, creative=true]|Default[advanced=true, creative=true]
 flag_default_hashes=39584,39398,39578,39392
 flag_default_accessors=false,false,false,false|true,true,true,true

@@ -381,19 +381,230 @@ pub(crate) fn json_in(
     resolve_component(value, states, argument, false, 0, &mut budget)
 }
 
+/// One JSON node produced by vanilla's `ComponentSerialization.CODEC` +
+/// `JsonOps.INSTANCE`, including Gson's lenient non-finite number literals
+/// (`NaN`, `Infinity`, `-Infinity`) that `serde_json::Number` cannot hold.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum CodecJson {
+    Json(Json),
+    RawNumber(&'static str),
+    Array(Vec<CodecJson>),
+    Object(Vec<(String, CodecJson)>),
+}
+
+impl CodecJson {
+    fn from_normalized_json(json: Json) -> Self {
+        match normalize_codec_json(json) {
+            Json::Array(items) => {
+                Self::Array(items.into_iter().map(Self::from_normalized_json).collect())
+            }
+            Json::Object(map) => Self::Object(
+                map.into_iter()
+                    .map(|(key, value)| (key, Self::from_normalized_json(value)))
+                    .collect(),
+            ),
+            other => Self::Json(other),
+        }
+    }
+
+    fn estimated_len(&self) -> usize {
+        match self {
+            Self::Json(value) => value.to_string().len(),
+            Self::RawNumber(token) => token.len(),
+            Self::Array(items) => items.iter().map(|i| i.estimated_len() + 1).sum::<usize>() + 2,
+            Self::Object(fields) => {
+                fields
+                    .iter()
+                    .map(|(key, value)| key.len() + value.estimated_len() + 4)
+                    .sum::<usize>()
+                    + 2
+            }
+        }
+    }
+
+    fn write_to(&self, out: &mut String) {
+        match self {
+            Self::Json(value) => out.push_str(&value.to_string()),
+            Self::RawNumber(token) => out.push_str(token),
+            Self::Array(items) => {
+                out.push('[');
+                for (index, item) in items.iter().enumerate() {
+                    if index > 0 {
+                        out.push(',');
+                    }
+                    item.write_to(out);
+                }
+                out.push(']');
+            }
+            Self::Object(fields) => {
+                out.push('{');
+                for (index, (key, value)) in fields.iter().enumerate() {
+                    if index > 0 {
+                        out.push(',');
+                    }
+                    out.push_str(&Json::String(key.clone()).to_string());
+                    out.push(':');
+                    value.write_to(out);
+                }
+                out.push('}');
+            }
+        }
+    }
+
+    pub(crate) fn to_json_string(&self) -> String {
+        let mut out = String::new();
+        self.write_to(&mut out);
+        out
+    }
+}
+
+fn order_codec_entries(
+    mut base: Map<String, Json>,
+    with: Option<Vec<CodecJson>>,
+    extra: Option<Vec<CodecJson>>,
+) -> Vec<(String, CodecJson)> {
+    let mut ordered = Vec::new();
+    if let Some(text) = base.remove("text") {
+        ordered.push(("text".into(), CodecJson::Json(text)));
+    }
+    if let Some(translate) = base.remove("translate") {
+        ordered.push(("translate".into(), CodecJson::Json(translate)));
+    }
+    if let Some(fallback) = base.remove("fallback") {
+        ordered.push(("fallback".into(), CodecJson::Json(fallback)));
+    }
+    let existing_with = base.remove("with");
+    if let Some(with) = with {
+        if !with.is_empty() {
+            ordered.push(("with".into(), CodecJson::Array(with)));
+        }
+    } else if let Some(Json::Array(with)) = existing_with
+        && !with.is_empty()
+    {
+        ordered.push((
+            "with".into(),
+            CodecJson::Array(
+                with.into_iter()
+                    .map(CodecJson::from_normalized_json)
+                    .collect(),
+            ),
+        ));
+    }
+    base.remove("extra");
+    let mut style = Vec::new();
+    for key in CODEC_STYLE_KEYS {
+        if let Some(value) = base.remove(key) {
+            style.push((key, CodecJson::Json(value)));
+        }
+    }
+    for (key, value) in base {
+        ordered.push((key, CodecJson::Json(value)));
+    }
+    if let Some(extra) = extra
+        && !extra.is_empty()
+    {
+        ordered.push(("extra".into(), CodecJson::Array(extra)));
+    }
+    for (key, value) in style {
+        ordered.push((key.into(), value));
+    }
+    ordered
+}
+
+fn resolve_codec_component(
+    value: &Value,
+    states: Option<&States>,
+    argument: &dyn Fn(&Value) -> Option<CodecJson>,
+    depth: usize,
+    budget: &mut usize,
+) -> Option<CodecJson> {
+    if depth > MAX_DEPTH {
+        return None;
+    }
+    let state = state_of(value, states)?;
+    let own: usize = state
+        .base
+        .iter()
+        .filter(|(key, _)| !matches!(key.as_str(), "extra" | "with"))
+        .map(|(key, value)| key.len() + value.to_string().len() + 4)
+        .sum();
+    *budget = budget.checked_sub(own + 2)?;
+    let mut base = state.base;
+    let with = if let Some(args) = &state.args {
+        if args.is_empty() {
+            None
+        } else {
+            let mut with = Vec::with_capacity(args.len());
+            for arg in args {
+                with.push(if is_component(arg) {
+                    resolve_codec_component(arg, states, argument, depth + 1, budget)?
+                } else {
+                    let arg = argument(arg)?;
+                    *budget = budget.checked_sub(arg.estimated_len() + 1)?;
+                    arg
+                });
+            }
+            Some(with)
+        }
+    } else if let Some(existing) = base.get("with") {
+        *budget = budget.checked_sub(existing.to_string().len())?;
+        if let Some(Json::Array(items)) = base.remove("with") {
+            Some(
+                items
+                    .into_iter()
+                    .map(CodecJson::from_normalized_json)
+                    .collect(),
+            )
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    if let Some(extra) = base.get("extra") {
+        *budget = budget.checked_sub(extra.to_string().len())?;
+    }
+    let mut extra: Vec<CodecJson> = match base.remove("extra") {
+        Some(Json::Array(existing)) => existing
+            .into_iter()
+            .map(CodecJson::from_normalized_json)
+            .collect(),
+        _ => Vec::new(),
+    };
+    for sibling in &state.siblings {
+        extra.push(resolve_codec_component(
+            sibling,
+            states,
+            argument,
+            depth + 1,
+            budget,
+        )?);
+    }
+    let extra = (!extra.is_empty()).then_some(extra);
+    let ordered = order_codec_entries(base, with, extra);
+    if ordered.len() == 1
+        && let Some((key, CodecJson::Json(Json::String(text)))) = ordered.first()
+        && key == "text"
+    {
+        return Some(CodecJson::Json(Json::String(text.clone())));
+    }
+    Some(CodecJson::Object(ordered))
+}
+
 /// The vanilla `ComponentSerialization.CODEC` + `JsonOps.INSTANCE` JSON `value`
 /// encodes to now: plain literal components (no style, no siblings) collapse to
-/// JSON strings at every level (`Component.tryCollapseToString`), and object
+/// JSON strings at every level (`Component.tryCollapseToString`), object
 /// members follow vanilla's codec order (content fields, then `extra`, then
-/// `Style$Serializer` fields). `None` for non-components, unsupported
-/// translation arguments, or trees past the resolution bounds.
+/// `Style$Serializer` fields), and non-finite `Float`/`Double` arguments emit
+/// Gson's literal `NaN` / `Infinity` / `-Infinity`. `None` for non-components,
+/// unsupported translation arguments, or trees past the resolution bounds.
 pub(crate) fn codec_json_in(
     value: &Value,
     states: Option<&States>,
-    argument: &dyn Fn(&Value) -> Option<Json>,
-) -> Option<Json> {
+    argument: &dyn Fn(&Value) -> Option<CodecJson>,
+) -> Option<CodecJson> {
     let mut budget = MAX_JSON_BYTES;
-    resolve_component(value, states, argument, true, 0, &mut budget)
+    resolve_codec_component(value, states, argument, 0, &mut budget)
 }
 
 /// Change the component `receiver` in place: `change` its state, then keep it in `states`. The

@@ -190,6 +190,13 @@ public final class TooltipProbe {
       out.accept(Component.translatableEscape("demo.esc", ChatFormatting.RED));
       out.accept(Component.translatableEscape("demo.esc", Component.literal("lit").withStyle(ChatFormatting.GOLD)));
       out.accept(Component.translatableEscape("demo.esc", TooltipFlag.NORMAL));
+      out.accept(Component.translatable("demo.nan", Double.NaN));
+      out.accept(Component.translatable("demo.inf", Double.POSITIVE_INFINITY));
+      out.accept(Component.translatable("demo.ninf", Double.NEGATIVE_INFINITY));
+      out.accept(Component.translatable("demo.fnan", Float.NaN));
+      out.accept(Component.translatable("demo.finf", Float.POSITIVE_INFINITY));
+      out.accept(Component.translatable("demo.fninf", Float.NEGATIVE_INFINITY));
+      out.accept(Component.translatableEscape("demo.esc_nf", Double.NaN, Float.POSITIVE_INFINITY, Float.NEGATIVE_INFINITY));
     }
   }
 
