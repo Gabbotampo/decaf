@@ -111,4 +111,7 @@ prebuilt server engine, and only this mod's crate and its 20 registry crates com
 - **M3b**: `tools/bake.py` writes Sunrise packages (`.smod` in `sunrise-mods/`). A bake for the
   official Horizon (`.hmod` in `horizon-mods/`, its own manifest name) does not exist yet.
 - An item the jar declares shows `block.horizon_java.proof_item` as its name key, where Java uses
-  `item.horizon_java.proof_item`. Not looked into yet.
+  `item.horizon_java.proof_item`. The game picks the key, not this bridge: Horizon's command
+  feedback (`crates/horizon-client/src/game/administration/commands/mod.rs` at the pin) uses
+  `item.<id>` only when the language pack holds that key, and `block.<id>` otherwise. An item with
+  no name in any language pack therefore prints the block form.
