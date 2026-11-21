@@ -156,6 +156,7 @@ impl StdHost {
         self.fabric_entrypoint_containers
             .retain(|entry| entry.provider != id);
         self.fabric_origins.retain(|key, _| key != id);
+        Arc::make_mut(&mut self.linked_classes).remove_fabric_data_layer(id);
     }
 
     /// Record a Fabric jar's metadata, refusing a duplicate id or alias.

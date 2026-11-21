@@ -320,6 +320,14 @@ impl<H: Host> Runtime<'_, H> {
         {
             return self.guava_table_hash(value);
         }
+        if let Value::Host(handle) = value
+            && crate::recipe_models::is_recipe_object_kind(handle.kind())
+        {
+            return Ok(self
+                .host
+                .as_std_host()
+                .and_then(|host| crate::recipe_models::object_hash_code(host, handle)));
+        }
         // One level of a nested `hashCode` (#250): a list holding itself recurses on the JVM
         // too, and ends in a `StackOverflowError` the jar can catch.
         let _level = crate::host_recursion::enter()?;
@@ -522,6 +530,21 @@ impl<H: Host> Runtime<'_, H> {
         if matches!(a, Value::Host(handle) if matches!(handle.kind(), crate::host_ref::HostKind::GuavaTable | crate::host_ref::HostKind::GuavaCell))
         {
             return match self.guava_table_equals(a, b)? {
+                Some(equal) => Ok(equal),
+                None => {
+                    self.host.unknown_operand_call(&MethodRef {
+                        owner: "java/lang/Object".into(),
+                        name: "equals".into(),
+                        descriptor: EQUALS.into(),
+                    })?;
+                    Ok(false)
+                }
+            };
+        }
+        if let Value::Host(handle) = a
+            && crate::recipe_models::is_recipe_object_kind(handle.kind())
+        {
+            return match crate::recipe_models::runtime_object_equals(self, handle, b)? {
                 Some(equal) => Ok(equal),
                 None => {
                     self.host.unknown_operand_call(&MethodRef {
@@ -1146,6 +1169,49 @@ impl<H: Host> Runtime<'_, H> {
                 _ => Ok(None),
             };
         }
+        if handle.kind() == crate::host_ref::HostKind::ItemStack {
+            let stack = Value::Host(handle.clone());
+            let answer = match (r.name.as_str(), r.descriptor.as_str(), args) {
+                ("toString", "()Ljava/lang/String;", []) => self
+                    .item_stack_to_string_opt(&stack, class, method)?
+                    .map(|text| Value::Ref(Some(text))),
+                ("hashCode", HASH_CODE, []) => None,
+                ("equals", EQUALS, [other]) => match other {
+                    Value::Host(other) => handle
+                        .same_object(other)
+                        .map(|equal| Value::Int(i32::from(equal))),
+                    _ => Some(Value::Int(0)),
+                },
+                _ => return Ok(None),
+            };
+            return match answer {
+                Some(answer) => Ok(Some(answer)),
+                None => self.host.unknown_operand_call(r).map(Some),
+            };
+        }
+        if crate::recipe_models::is_recipe_object_kind(handle.kind()) {
+            let answer = match (r.name.as_str(), r.descriptor.as_str(), args) {
+                ("toString", "()Ljava/lang/String;", []) => self
+                    .host
+                    .as_std_host()
+                    .and_then(|host| crate::recipe_models::object_to_string(host, handle))
+                    .map(|text| Value::Ref(Some(text))),
+                ("hashCode", HASH_CODE, []) => self
+                    .host
+                    .as_std_host()
+                    .and_then(|host| crate::recipe_models::object_hash_code(host, handle))
+                    .map(Value::Int),
+                ("equals", EQUALS, [other]) => {
+                    crate::recipe_models::runtime_object_equals(self, handle, other)?
+                        .map(|equal| Value::Int(i32::from(equal)))
+                }
+                _ => return Ok(None),
+            };
+            return match answer {
+                Some(answer) => Ok(Some(answer)),
+                None => self.host.unknown_operand_call(r).map(Some),
+            };
+        }
         // An object's methods are its class's: dispatched like any call.
         if !matches!(opcode, 0xb6 | 0xb9) || crate::jar_object::is_object_handle(handle) {
             return Ok(None);
@@ -1255,6 +1321,15 @@ impl<H: Host> Runtime<'_, H> {
             crate::host_ref::HostKind::GuavaTable | crate::host_ref::HostKind::GuavaCell
         ) {
             return self.guava_table_text(&Value::Host(handle.clone()));
+        }
+        if handle.kind() == crate::host_ref::HostKind::ItemStack {
+            return self.item_stack_to_string_opt(&Value::Host(handle.clone()), class, method);
+        }
+        if crate::recipe_models::is_recipe_object_kind(handle.kind()) {
+            return Ok(self
+                .host
+                .as_std_host()
+                .and_then(|host| crate::recipe_models::object_to_string(host, handle)));
         }
         handle.to_string(&mut RuntimeNested {
             runtime: self,

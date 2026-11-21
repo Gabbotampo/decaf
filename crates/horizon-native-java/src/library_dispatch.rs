@@ -396,8 +396,10 @@ impl<H: Host> Runtime<'_, H> {
             && let Some(receiver) = receiver
             && r.owner == "net/minecraft/world/item/ItemStack"
             && r.name == "<init>"
-            && crate::jar_object::object_class(receiver)
-                == Some("net/minecraft/world/item/ItemStack")
+            && matches!(
+                receiver,
+                Value::Host(handle) if handle.kind() == crate::host_ref::HostKind::ItemStack
+            )
         {
             let count = match (r.descriptor.as_str(), args) {
                 ("(Lnet/minecraft/world/level/ItemLike;)V", [_]) => Some(1),
