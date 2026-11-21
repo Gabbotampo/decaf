@@ -245,10 +245,6 @@ pub enum HostKind {
     MobEffectCategory,
     /// A freshly constructed vanilla `RangedAttribute`.
     RangedAttribute,
-    /// Canonical vanilla `FeatureFlag` constants (`FeatureFlags.VANILLA`, …).
-    FeatureFlag,
-    /// Vanilla `FeatureFlagSet` bitmasks (`FeatureFlags.VANILLA_SET`, `FeatureFlagSet.of(...)`).
-    FeatureFlagSet,
     /// `net.minecraft.references.BlockItemId`: key the block and item ids'
     /// [`HostRef::of_values`].
     BlockItemId,
@@ -627,6 +623,8 @@ pub enum HostKind {
     /// Fabric CreativeModeTab builder and built tab handles.
     CreativeModeTabBuilder,
     CreativeModeTab,
+    /// Output collector passed to Fabric creative-tab modify callbacks.
+    CreativeModeTabOutput,
     /// Fabric's `BlockApiLookup`, one per (id, API class, context class) (`fabric_block_api.rs`).
     FabricBlockApiLookup,
     Url,
@@ -641,6 +639,12 @@ pub enum HostKind {
     /// kept out of `jar_object::parse_key` / `freed_objects` numeric ranges while
     /// remaining a canonical non-`String` object handle.
     MenuObject,
+    /// An `ItemStack` value constructed by the host (e.g. `CreativeModeTab$Output.accept(ItemLike)`).
+    ItemStack,
+    /// Vanilla `FeatureFlag` singletons (`FeatureFlags.*`).
+    FeatureFlag,
+    /// Vanilla `FeatureFlagSet` values (`FeatureFlags.VANILLA_SET`, `FeatureFlagSet.of(...)`).
+    FeatureFlagSet,
 }
 
 /// How a kind's Java class follows from its key.
@@ -1375,20 +1379,6 @@ const KINDS: &[KindInfo] = &[
         class: ClassRule::Fixed(crate::runtime::vanilla_values::RANGED_ATTRIBUTE),
         canonical: never_canonical,
         methods: &crate::runtime::vanilla_values::RANGED_ATTRIBUTE_METHODS,
-    },
-    KindInfo {
-        kind: HostKind::FeatureFlag,
-        tag: "fflag",
-        class: ClassRule::Fixed(crate::runtime::vanilla_values::FEATURE_FLAG),
-        canonical: always_canonical,
-        methods: &crate::runtime::vanilla_values::FEATURE_FLAG_METHODS,
-    },
-    KindInfo {
-        kind: HostKind::FeatureFlagSet,
-        tag: "ffset",
-        class: ClassRule::Fixed(crate::runtime::vanilla_values::FEATURE_FLAG_SET),
-        canonical: crate::runtime::vanilla_values::feature_flag_set_canonical,
-        methods: &crate::runtime::vanilla_values::FEATURE_FLAG_SET_METHODS,
     },
     KindInfo {
         kind: HostKind::BlockItemId,
@@ -2783,9 +2773,20 @@ const KINDS: &[KindInfo] = &[
         kind: HostKind::CreativeModeTab,
         tag: "cmt",
         class: ClassRule::Fixed("net/minecraft/world/item/CreativeModeTab"),
-        canonical: never_canonical,
+        // Each `Builder.build()` uses a fresh serial (`t#<n>`) and each vanilla tab a unique id
+        // (`tab:<id>`), so equal keys are the same `CreativeModeTab` object.
+        canonical: always_canonical,
         // No overrides: identity `equals`, counted `hashCode`/`toString`.
         methods: &crate::runtime::host_events::DECLARED_TYPE_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::CreativeModeTabOutput,
+        tag: "ctout",
+        class: ClassRule::Fixed(
+            "net/fabricmc/fabric/api/creativetab/v1/FabricCreativeModeTabOutput",
+        ),
+        canonical: always_canonical,
+        methods: &crate::runtime::host_creative_tab::OUTPUT_METHODS,
     },
     KindInfo {
         kind: HostKind::FabricBlockApiLookup,
@@ -2838,6 +2839,32 @@ const KINDS: &[KindInfo] = &[
         // Monotonic `#menu<n>` serial per host-synthesized menu object: one key, one object.
         canonical: always_canonical,
         methods: &crate::runtime::jar_object::MENU_OBJECT,
+    },
+    KindInfo {
+        kind: HostKind::ItemStack,
+        tag: "istk",
+        // `FromKey` rather than `Fixed`: `ItemStack.EMPTY` (`GameValue`), client-frame stacks
+        // (`GameTransient`), and jar-allocated `new ItemStack(...)` (`JarObject`) are also
+        // `ItemStack` instances.
+        class: ClassRule::FromKey(crate::runtime::host_creative_tab::item_stack_class),
+        canonical: always_canonical,
+        methods: &crate::runtime::host_creative_tab::ITEM_STACK_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::FeatureFlag,
+        tag: "fflg",
+        class: ClassRule::Fixed("net/minecraft/world/flag/FeatureFlag"),
+        canonical: always_canonical,
+        methods: &crate::runtime::host_creative_tab::FEATURE_FLAG_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::FeatureFlagSet,
+        tag: "ffset",
+        class: ClassRule::Fixed("net/minecraft/world/flag/FeatureFlagSet"),
+        // `empty:0` is `EMPTY`, `vanilla:1` is `VANILLA_SET`/`DEFAULT_FLAGS`, and every `of(...)`/
+        // `join`/`subtract` allocation carries its own serial `n:<serial>:<mask>`.
+        canonical: always_canonical,
+        methods: &crate::runtime::host_creative_tab::FEATURE_FLAG_SET_METHODS,
     },
 ];
 

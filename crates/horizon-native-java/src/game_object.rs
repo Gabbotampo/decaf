@@ -545,6 +545,10 @@ pub(crate) const ENTITY_METHODS: Methods = Methods {
 pub(crate) const VALUE_METHODS: Methods = Methods {
     to_string: |handle, _| {
         let key = handle.key();
+        if key == "client/stack/empty" {
+            // `ItemStack.EMPTY.toString()` (`server-26.3.jar` `ItemStack.toString` 0..16).
+            return Ok(Some("0 minecraft:air".to_owned()));
+        }
         if let Some(value) = crate::sound_event::to_string(key) {
             return Ok(Some(value));
         }
