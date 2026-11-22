@@ -3280,6 +3280,12 @@ impl HostRef {
         if self.kind == HostKind::ShapeProbe || other.kind == HostKind::ShapeProbe {
             return None;
         }
+        if self.kind == HostKind::GameRegistryObject
+            && other.kind == HostKind::GameRegistryObject
+            && crate::server_values::same_block_state_unknown(self.key(), other.key())
+        {
+            return None;
+        }
         if self != other {
             return Some(false);
         }
