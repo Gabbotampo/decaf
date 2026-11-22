@@ -28,11 +28,126 @@ use mod_api::{BlocksEvent, ItemsEvent, PackageKind, Registrar, RegistrationConte
 use crate::runtime;
 use crate::{JARS, JarRow, LOG, LoadedJar, State, jar_id, load_jar};
 
+/// Run a registered jar block's vanilla placement override. The game hook
+/// supplies a resolved Sunrise placement snapshot; the runtime owns the
+/// `BlockPlaceContext` façade and returns the canonical Java `BlockState`.
+/// `None` is vanilla's `null` refusal. This helper deliberately does not
+/// inspect a mod name or a block-specific property.
+pub(crate) fn state_for_placement(
+    jar: &mut LoadedJar,
+    block_id: &str,
+    context: runtime::BlockPlaceContextData,
+) -> Result<Option<runtime::Value>, runtime::NativeError> {
+    let block = jar
+        .host
+        .registrations()
+        .iter()
+        .rev()
+        .find(|entry| entry.registry == "minecraft:block" && entry.id == block_id)
+        .map(|entry| entry.value.clone());
+    let Some(block) = block else { return Ok(None) };
+    jar.jar
+        .block_state_for_placement(block, context, &mut jar.host)
+}
+
+pub(crate) enum PlacementContentOutcome {
+    /// Java returned `null` (vanilla placement refusal) with no unknown calls.
+    Refused,
+    /// Java returned a decoded `(block_id, properties)` state with no unknown calls.
+    State(String, BTreeMap<String, String>),
+    /// Java returned a non-null state whose block could not be decoded (e.g. unregistered).
+    UnknownState,
+    /// One or more unmodelled / unknown-placer calls were hit during execution.
+    CountedUnknown(usize),
+}
+
+pub(crate) fn state_for_placement_content(
+    jar: &mut LoadedJar,
+    block_id: &str,
+    context: runtime::BlockPlaceContextData,
+) -> Result<PlacementContentOutcome, runtime::NativeError> {
+    let unknown_before = jar.host.unknown_host_call_count();
+    let result = state_for_placement(jar, block_id, context);
+    let unknown_delta = jar
+        .host
+        .unknown_host_call_count()
+        .saturating_sub(unknown_before);
+    jar.row.callback_unknown_host_calls += unknown_delta;
+    let state = result?;
+    if unknown_delta > 0 {
+        return Ok(PlacementContentOutcome::CountedUnknown(unknown_delta));
+    }
+    let Some(state) = state else {
+        return Ok(PlacementContentOutcome::Refused);
+    };
+    Ok(match jar.host.block_state_content(&state) {
+        Some((id, props)) => PlacementContentOutcome::State(id, props),
+        None => PlacementContentOutcome::UnknownState,
+    })
+}
+
 /// This mod's manifest id (`mod/sunrise-mod.toml`): the package whose namespaces the game's
 /// declaration fence checks.
 pub(crate) const MOD_ID: &str = "horizon_java";
 
+pub(crate) fn register_placement_parts(
+    state: &mut State,
+    context: &RegistrationContext,
+    registrar: &mut dyn mod_api::Registrar,
+    shared: Arc<Mutex<State>>,
+) {
+    state.ensure_loaded(context, registration_game_version(context));
+    let owned = owned_namespaces(context);
+    for jar in &state.jars {
+        for declaration in runtime::content::declarations(jar.host.registrations()) {
+            let runtime::content::ContentDeclaration::Block(block) = declaration else {
+                continue;
+            };
+            if !usable_id(&block.id) || !owns(&owned, &block.id) {
+                continue;
+            }
+            let key = registrar.block_key(&block.id);
+            registrar.block_part(
+                key,
+                crate::JavaPlacementPart {
+                    state: Arc::clone(&shared),
+                },
+            );
+        }
+    }
+}
+
 impl State {
+    pub(crate) fn has_registered_block(&self, block_id: &str) -> bool {
+        self.jars.iter().any(|jar| {
+            jar.host
+                .registrations()
+                .iter()
+                .any(|entry| entry.registry == "minecraft:block" && entry.id == block_id)
+        })
+    }
+
+    /// Placement hook adapter used by the Sunrise `state_for_placement` part.
+    /// The lookup is by the game's registered block id; no block-specific
+    /// behavior is embedded in the native mod.
+    pub(crate) fn state_for_placement_content(
+        &mut self,
+        block_id: &str,
+        context: runtime::BlockPlaceContextData,
+    ) -> Result<Option<PlacementContentOutcome>, runtime::NativeError> {
+        for jar in &mut self.jars {
+            if jar
+                .host
+                .registrations()
+                .iter()
+                .any(|entry| entry.registry == "minecraft:block" && entry.id == block_id)
+            {
+                return state_for_placement_content(jar, block_id, context).map(Some);
+            }
+        }
+        Ok(None)
+    }
+
     /// Runs every jar once, the first time content is asked for, and keeps its runtime for the
     /// server lifecycle hooks. The game asks for blocks before items, so this guard also makes
     /// the two hooks one pass.

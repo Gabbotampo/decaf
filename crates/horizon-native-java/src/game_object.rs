@@ -90,6 +90,7 @@ fn server_kind(rest: &str) -> HostKind {
         "item"
         | "block"
         | "block-state"
+        | "default-block-state"
         | "registry"
         | "entity_type"
         | "data-component-type"
@@ -407,7 +408,9 @@ pub(crate) fn declared_types(key: &str) -> &'static [&'static str] {
             "net/minecraft/world/level/ItemLike",
         ],
         (false, "block") => &["net/minecraft/world/level/block/Block"],
-        (false, "block-state") => &["net/minecraft/world/level/block/state/BlockState"],
+        (false, "block-state" | "default-block-state") => {
+            &["net/minecraft/world/level/block/state/BlockState"]
+        }
         (false, "stack") => &[
             "net/minecraft/world/item/ItemStack",
             "net/minecraft/world/item/ItemInstance",
