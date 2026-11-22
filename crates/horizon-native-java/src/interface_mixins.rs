@@ -231,21 +231,34 @@ impl RuntimeMixinState {
         }
     }
 
-    fn allows_primary(&self, mixin: &str, is_interface: bool) -> bool {
+    /// Whether `mixin` passes the primary jar's Mixin config and physical-side gate.
+    ///
+    /// Returns `true` when config gating is disabled (`unconfigured()` in synthetic unit
+    /// tests) or when the jar has readable Mixin configs that list `mixin` for the active
+    /// side. A jar with no readable Mixin configs never passes this gate.
+    fn allows_config_gated(&self, mixin: &str) -> bool {
         if !self.require_config {
             return true;
         }
-        // A config-less probe jar keeps the existing interface-accessor type scan
-        // (`host_events_tests`), while concrete interface-injection Mixins on host
-        // game objects always require a readable Mixin config entry.
         if self.configs.is_empty() {
-            return is_interface;
+            return false;
         }
         let Some(side) = self.side else {
             return false;
         };
         mixin_config_gate(&self.configs, &self.config_sides, mixin, side).is_ok()
     }
+}
+
+#[derive(Clone, Copy)]
+struct MixinRegistration {
+    /// True for primary-jar classes (preserving the existing jar-local and non-host-game
+    /// `by_target` scan), false for linked-jar classes.
+    is_primary: bool,
+    /// True when the mixin passes config & side gating (or config gating is disabled).
+    config_active: bool,
+    /// True when the primary jar has no readable Mixin config at all.
+    primary_has_no_configs: bool,
 }
 
 /// Outcome of [`Runtime::game_handle_put_field`].
@@ -815,14 +828,22 @@ impl<H: Host> Runtime<'_, H> {
             let mut seen_mixins = BTreeSet::new();
 
             // 1. Primary jar classes.
+            let primary_has_no_configs = self.mixin_index.configs.is_empty();
             for class in self.classes.values() {
                 if !seen_mixins.insert(class.name.clone()) {
                     continue;
                 }
-                let is_interface =
-                    class_access(class).is_some_and(|access| access & ACC_INTERFACE != 0);
-                let active = self.mixin_index.allows_primary(&class.name, is_interface);
-                index.register_class(class, active, |name| self.class(name));
+                let reg = MixinRegistration {
+                    is_primary: true,
+                    config_active: self.mixin_index.allows_config_gated(&class.name),
+                    primary_has_no_configs,
+                };
+                index.register_class(
+                    class,
+                    reg,
+                    |target| self.classes.contains_key(target),
+                    |name| self.class(name),
+                );
             }
 
             // 2. Linked jar classes (gated by each linked jar's own mixin configs).
@@ -835,9 +856,23 @@ impl<H: Host> Runtime<'_, H> {
                         let Some(class) = self.class(class_name) else {
                             continue;
                         };
-                        let active =
-                            mixin_config_gate(configs, config_sides, class_name, side).is_ok();
-                        index.register_class(class, active, |name| self.class(name));
+                        let reg = MixinRegistration {
+                            is_primary: false,
+                            config_active: mixin_config_gate(
+                                configs,
+                                config_sides,
+                                class_name,
+                                side,
+                            )
+                            .is_ok(),
+                            primary_has_no_configs: false,
+                        };
+                        index.register_class(
+                            class,
+                            reg,
+                            |target| self.classes.contains_key(target),
+                            |name| self.class(name),
+                        );
                     }
                 }
             }
@@ -851,8 +886,17 @@ impl<H: Host> Runtime<'_, H> {
                 if mixin_annotations(class).is_empty() {
                     continue;
                 }
-                let active = !self.mixin_index.require_config;
-                index.register_class(class, active, |name| self.class(name));
+                let reg = MixinRegistration {
+                    is_primary: false,
+                    config_active: !self.mixin_index.require_config,
+                    primary_has_no_configs: false,
+                };
+                index.register_class(
+                    class,
+                    reg,
+                    |target| self.classes.contains_key(target),
+                    |name| self.class(name),
+                );
             }
 
             index
@@ -1250,33 +1294,60 @@ impl RuntimeMixinIndex {
     fn register_class<'a>(
         &mut self,
         class: &ClassFile,
-        active: bool,
+        reg: MixinRegistration,
+        is_jar_local: impl Fn(&str) -> bool,
         lookup: impl Fn(&str) -> Option<&'a ClassFile>,
     ) {
         let Some(details) = inspect_mixin_class(class, lookup) else {
             return;
         };
+        let is_interface_injection = !details.is_interface && !details.interfaces.is_empty();
         let mut active_interface_targets = BTreeSet::new();
-        if active && !details.unrunnable_initializer {
-            for target in &details.targets {
+        for target in &details.targets {
+            let is_external_host_game_target =
+                !is_jar_local(target) && is_host_modelled_game_target(target);
+            let (include_in_by_target, include_in_interface_dispatch) = if reg.is_primary {
+                if is_external_host_game_target && is_interface_injection {
+                    // Host-game-object interface-injection Mixins are always strictly
+                    // config-gated and require a runnable no-arg initialiser.
+                    let active = reg.config_active && !details.unrunnable_initializer;
+                    (active, active)
+                } else if is_external_host_game_target {
+                    // Accessor/invoker interfaces on host-modelled game targets keep the
+                    // config-less probe scan when the jar has no Mixin configs, and obey
+                    // the config gate when it does.
+                    (reg.primary_has_no_configs || reg.config_active, false)
+                } else {
+                    // Jar-local woven classes (e.g. `demo/Woven$Target`) and non-host-game
+                    // targets (e.g. `ArrayBackedEvent`) preserve the existing unconditional
+                    // primary-jar `by_target` scan and never enter host-object dispatch.
+                    (true, false)
+                }
+            } else {
+                // Linked-jar Mixins are always config-gated.
+                let active = reg.config_active && !details.unrunnable_initializer;
+                (
+                    active,
+                    active && is_external_host_game_target && is_interface_injection,
+                )
+            };
+
+            if include_in_by_target {
                 let mixins = self.by_target.entry(target.clone()).or_default();
                 if !mixins.contains(&details.mixin) {
                     mixins.push(details.mixin.clone());
                 }
-                if !details.is_interface
-                    && !details.interfaces.is_empty()
-                    && is_host_modelled_game_target(target)
-                {
-                    active_interface_targets.insert(target.clone());
-                    self.interface_by_target
-                        .entry(target.clone())
-                        .or_default()
-                        .push(ActiveInterfaceMixin {
-                            mixin: details.mixin.clone(),
-                            interfaces: details.interfaces.clone(),
-                            added_public_methods: details.added_public_methods.clone(),
-                        });
-                }
+            }
+            if include_in_interface_dispatch {
+                active_interface_targets.insert(target.clone());
+                self.interface_by_target
+                    .entry(target.clone())
+                    .or_default()
+                    .push(ActiveInterfaceMixin {
+                        mixin: details.mixin.clone(),
+                        interfaces: details.interfaces.clone(),
+                        added_public_methods: details.added_public_methods.clone(),
+                    });
             }
         }
         self.meta.insert(

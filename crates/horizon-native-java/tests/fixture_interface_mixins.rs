@@ -1743,3 +1743,102 @@ public final class RunesProbe {
         host.unknown_host_calls()
     );
 }
+
+/// Regression test: in a config-less jar (no `mixins.json`), a jar-local `@Mixin` class
+/// still adds its implemented interface to the jar-local woven class (matching `main`'s
+/// `fixture_class_objects` behaviour), while a `@Mixin(Player.class)` interface-injection
+/// class targeting a host-modelled game object stays strictly config-gated.
+#[test]
+fn configless_jar_preserves_jar_local_woven_interface_but_gates_host_game_object() {
+    let mut sources = mixin_stubs();
+    sources.insert(
+        "demo/LocalDuck.java",
+        "package demo;\npublic interface LocalDuck {}\n",
+    );
+    sources.insert(
+        "demo/HostDuck.java",
+        "package demo;\npublic interface HostDuck { int value(); }\n",
+    );
+    sources.insert(
+        "demo/LocalTarget.java",
+        "package demo;\npublic class LocalTarget {}\n",
+    );
+    sources.insert(
+        "demo/LocalTargetMixin.java",
+        r#"package demo;
+import org.spongepowered.asm.mixin.Mixin;
+
+@Mixin(LocalTarget.class)
+public abstract class LocalTargetMixin implements LocalDuck {}
+"#,
+    );
+    sources.insert(
+        "demo/UnconfiguredPlayerMixin.java",
+        r#"package demo;
+import net.minecraft.world.entity.player.Player;
+import org.spongepowered.asm.mixin.Mixin;
+
+@Mixin(Player.class)
+public class UnconfiguredPlayerMixin implements HostDuck {
+    @Override public int value() { return 55; }
+}
+"#,
+    );
+    sources.insert(
+        "demo/ConfiglessProbe.java",
+        r#"package demo;
+import net.minecraft.world.entity.player.Player;
+
+public final class ConfiglessProbe {
+    public static String checkLocal() {
+        LocalTarget target = new LocalTarget();
+        boolean assignable = LocalDuck.class.isAssignableFrom(LocalTarget.class);
+        boolean isInst = LocalDuck.class.isInstance(target);
+        boolean same = LocalDuck.class.cast(target) == target;
+        boolean inIfaces = java.util.Arrays.asList(LocalTarget.class.getInterfaces())
+            .contains(LocalDuck.class);
+        return assignable + "," + isInst + "," + same + "," + inIfaces;
+    }
+
+    public static boolean checkHost(Player p) {
+        return p instanceof HostDuck;
+    }
+}
+"#,
+    );
+
+    let jar_path = build_jar("configless-local-vs-host", sources, &[], COMPILE_ONLY_STUBS);
+    let jar = NativeJar::from_path(&jar_path).unwrap();
+
+    // Jar-local woven class still gains LocalDuck without any mixins.json.
+    let mut host = StdHost::new().with_environment_type("SERVER");
+    let local = jar
+        .invoke_method(
+            "demo.ConfiglessProbe",
+            "checkLocal",
+            "()Ljava/lang/String;",
+            None,
+            &mut host,
+        )
+        .unwrap();
+    assert_eq!(local, Value::Ref(Some("true,true,true,true".into())));
+    assert_eq!(host.unknown_host_call_count(), 0);
+
+    // Host-modelled Player does NOT receive HostDuck in a config-less jar.
+    let player = server_player(77, "NoCfg", 1, 0, 1);
+    let mut strict = StdHost::new()
+        .with_environment_type("SERVER")
+        .with_strict_unknown_host_calls();
+    let err = jar.invoke_method_with_args(
+        "demo.ConfiglessProbe",
+        "checkHost",
+        "(Lnet/minecraft/world/entity/player/Player;)Z",
+        None,
+        std::slice::from_ref(&player),
+        &mut strict,
+    );
+    assert!(
+        err.is_err(),
+        "config-less jar must not apply interface-injection mixin onto host Player: {err:?}"
+    );
+}

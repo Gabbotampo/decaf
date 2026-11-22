@@ -27017,6 +27017,89 @@ impl<H: Host> Runtime<'_, H> {
         }
     }
 
+    /// Out-of-line `getfield` body kept out of `invoke_frame` so the unoptimised
+    /// interpreter frame stays within `frame_bound`'s stack budget.
+    #[inline(never)]
+    fn read_instance_field(
+        &mut self,
+        receiver: &Value,
+        r: &MethodRef,
+    ) -> Result<Value, NativeError> {
+        if *receiver == Value::Ref(None) {
+            return Err(null_checks::read_field_on_null(r));
+        }
+        self.refuse_collected(receiver, r)?;
+        if let Some(value) = self.host.menu_field(receiver, r) {
+            return Ok(value);
+        }
+        if let Some(value) = self.game_handle_get_field(receiver, r)? {
+            return Ok(value);
+        }
+        match instance_field_key(receiver, r).and_then(|key| self.fields.get(&key).cloned()) {
+            Some(value) => Ok(value),
+            // JVMS §2.3: a jar field nothing wrote yet, unless the heap collected the object.
+            None if self.reads_unwritten_jar_field(r, receiver) => {
+                Ok(Value::default_for(&r.descriptor))
+            }
+            None => self.host.get_field(receiver, r),
+        }
+    }
+
+    /// Out-of-line `putfield` body kept out of `invoke_frame` so the unoptimised
+    /// interpreter frame stays within `frame_bound`'s stack budget.
+    #[inline(never)]
+    fn write_instance_field(
+        &mut self,
+        receiver: &Value,
+        r: &MethodRef,
+        value: Value,
+    ) -> Result<(), NativeError> {
+        if *receiver == Value::Ref(None) {
+            return Err(null_checks::assign_field_on_null(r));
+        }
+        let Some(key) = instance_field_key(receiver, r) else {
+            return Ok(());
+        };
+        if !self.fields.contains_key(&key) {
+            self.refuse_collected(receiver, r)?;
+        }
+        match self.host.menu_field_set(receiver, r, &value) {
+            menu_models::FieldSetResult::Written => Ok(()),
+            menu_models::FieldSetResult::NotOwned => {
+                match self.game_handle_put_field(receiver, r, &value)? {
+                    interface_mixins::GameFieldWrite::Stored
+                    | interface_mixins::GameFieldWrite::Handled => Ok(()),
+                    interface_mixins::GameFieldWrite::Fallthrough => {
+                        self.fields.insert(key, value);
+                        Ok(())
+                    }
+                }
+            }
+            menu_models::FieldSetResult::Counted => self.host.unknown_operand_call(r).map(|_| ()),
+        }
+    }
+
+    /// Out-of-line dispatch shared by game helpers and interface-injection Mixins,
+    /// avoiding an extra `invoke_or_catch!` slot inside `invoke_frame`.
+    #[inline(never)]
+    fn invoke_game_helpers_or_interface_mixin(
+        &mut self,
+        r: &MethodRef,
+        op: u8,
+        receiver: Option<&Value>,
+        args: &[Value],
+        class: &str,
+        method: &str,
+    ) -> Result<Option<(Value, bool)>, NativeError> {
+        if let Some(value) = self.invoke_game_helpers(r, receiver, args, class, method)? {
+            return Ok(Some((value, false)));
+        }
+        if let Some(value) = self.invoke_interface_mixin(r, op, receiver, args)? {
+            return Ok(Some((value, true)));
+        }
+        Ok(None)
+    }
+
     /// Run a combinator's result (`callback_marker::composite`) the way its
     /// JDK default method does: the sides in the combinator's order,
     /// `and`/`or` short-circuiting, `negate` flipping, `identity()` answering
@@ -36621,30 +36704,8 @@ impl<H: Host> Runtime<'_, H> {
                     let outcome =
                         self.dispatch_field_anchor(&r, false, None, class, method, desc, at)?;
                     let value = match outcome {
-                        AnchorOutcome::Normal if receiver == Value::Ref(None) => {
-                            invoke_or_catch!(at, Err(null_checks::read_field_on_null(&r)))
-                        }
                         AnchorOutcome::Normal => {
-                            self.refuse_collected(&receiver, &r)?;
-                            if let Some(value) = self.host.menu_field(&receiver, &r) {
-                                value
-                            } else if let Some(value) =
-                                invoke_or_catch!(at, self.game_handle_get_field(&receiver, &r))
-                            {
-                                value
-                            } else {
-                                match instance_field_key(&receiver, &r)
-                                    .and_then(|key| self.fields.get(&key).cloned())
-                                {
-                                    Some(value) => value,
-                                    // JVMS §2.3: a jar field nothing wrote yet,
-                                    // unless the heap collected the object.
-                                    None if self.reads_unwritten_jar_field(&r, &receiver) => {
-                                        Value::default_for(&r.descriptor)
-                                    }
-                                    None => self.host.get_field(&receiver, &r)?,
-                                }
-                            }
+                            invoke_or_catch!(at, self.read_instance_field(&receiver, &r))
                         }
                         AnchorOutcome::Suppress => Value::default_for(&r.descriptor),
                         AnchorOutcome::Replace(value) => value,
@@ -36673,33 +36734,8 @@ impl<H: Host> Runtime<'_, H> {
                         desc,
                         at,
                     )?;
-                    if outcome == AnchorOutcome::Normal && receiver == Value::Ref(None) {
-                        invoke_or_catch!(at, Err(null_checks::assign_field_on_null(&r)))
-                    }
-                    if outcome == AnchorOutcome::Normal
-                        && let Some(key) = instance_field_key(&receiver, &r)
-                    {
-                        if !self.fields.contains_key(&key) {
-                            self.refuse_collected(&receiver, &r)?;
-                        }
-                        match self.host.menu_field_set(&receiver, &r, &value) {
-                            menu_models::FieldSetResult::Written => {}
-                            menu_models::FieldSetResult::NotOwned => {
-                                match invoke_or_catch!(
-                                    at,
-                                    self.game_handle_put_field(&receiver, &r, &value)
-                                ) {
-                                    interface_mixins::GameFieldWrite::Stored
-                                    | interface_mixins::GameFieldWrite::Handled => {}
-                                    interface_mixins::GameFieldWrite::Fallthrough => {
-                                        self.fields.insert(key, value);
-                                    }
-                                }
-                            }
-                            menu_models::FieldSetResult::Counted => {
-                                invoke_or_catch!(at, self.host.unknown_operand_call(&r));
-                            }
-                        }
+                    if outcome == AnchorOutcome::Normal {
+                        invoke_or_catch!(at, self.write_instance_field(&receiver, &r, value));
                     }
                 }
                 0xb6..=0xb9 => {
@@ -37889,20 +37925,21 @@ impl<H: Host> Runtime<'_, H> {
                         dispatched = Some(value);
                     }
                     if dispatched.is_none()
-                        && let Some(value) = invoke_or_catch!(
+                        && let Some((value, is_jar_body)) = invoke_or_catch!(
                             at,
-                            self.invoke_game_helpers(&r, receiver.as_ref(), &args, class, method)
+                            self.invoke_game_helpers_or_interface_mixin(
+                                &r,
+                                op,
+                                receiver.as_ref(),
+                                &args,
+                                class,
+                                method
+                            )
                         )
                     {
-                        dispatched = Some(value);
-                    }
-                    if dispatched.is_none()
-                        && let Some(value) = invoke_or_catch!(
-                            at,
-                            self.invoke_interface_mixin(&r, op, receiver.as_ref(), &args)
-                        )
-                    {
-                        jar_body = true;
+                        if is_jar_body {
+                            jar_body = true;
+                        }
                         dispatched = Some(value);
                     }
                     if dispatched.is_none()
