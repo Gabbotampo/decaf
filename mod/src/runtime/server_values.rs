@@ -13,6 +13,7 @@ pub(crate) const GAME_RULE: &str = "game-rule/";
 const ITEM: &str = "game/item/";
 const BLOCK: &str = "game/block/";
 const BLOCK_STATE: &str = "game/block-state/";
+const DEFAULT_BLOCK_STATE: &str = "game/default-block-state/";
 
 /// The coordinates of a `block-pos/x,y,z` key.
 pub(crate) fn block_pos(key: &str) -> Option<[i32; 3]> {
@@ -141,6 +142,25 @@ pub(crate) fn canonical(key: &str) -> bool {
 pub(crate) fn registry_canonical(key: &str) -> bool {
     key.strip_prefix(BLOCK_STATE)
         .is_none_or(|state| state.contains('['))
+}
+
+/// Whether two `GameRegistryObject` keys might refer to the same `BlockState`
+/// despite different spellings: `game/default-block-state/<id>` against a
+/// `game/block-state/<id>` or `game/block-state/<id>[...]` of the same block
+/// (we do not store vanilla's default property map to prove equality or
+/// inequality).
+pub(crate) fn same_block_state_unknown(a: &str, b: &str) -> bool {
+    let check = |default_key: &str, state_key: &str| {
+        let Some(default_block) = default_key.strip_prefix(DEFAULT_BLOCK_STATE) else {
+            return false;
+        };
+        let Some(state_rest) = state_key.strip_prefix(BLOCK_STATE) else {
+            return false;
+        };
+        let state_block = state_rest.split_once('[').map_or(state_rest, |(id, _)| id);
+        default_block == state_block
+    };
+    check(a, b) || check(b, a)
 }
 
 #[cfg(test)]

@@ -15,7 +15,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs::File,
     path::Path,
-    sync::Arc,
+    sync::{Arc, OnceLock},
     time::Instant,
 };
 
@@ -2405,6 +2405,12 @@ pub struct EventDispatch {
 /// keeps no such state", which the caller turns into a counted path of its own (#246's review:
 /// a silent `null` from `unknown_operand_call` printed a hook-tier player as `null`).
 pub trait Host {
+    /// Materialize a host-owned array returned by a modelled game object into
+    /// the active interpreter invocation as `(array_descriptor, elements)`.
+    /// `None` means the value is not one.
+    fn host_array_values(&self, _value: &Value) -> Option<(&'static str, Vec<Value>)> {
+        None
+    }
     /// Structural vanilla menu/container call. `None` leaves the call on the
     /// ordinary host path; a returned error is a counted refusal.
     fn menu_instance_call(
@@ -3779,6 +3785,11 @@ pub struct StdHost {
     resource_generation: u64,
     /// Per-call container stack clamp resolved virtually for `SimpleContainer.setItem`.
     pending_container_clamp: Option<menu_models::ContainerClamp>,
+    /// Host-owned snapshots handed to a jar's `BlockPlaceContext` override.
+    /// The context is deliberately a value object: it has no guessed world
+    /// state and every accessor is answered from the placement snapshot.
+    placement_contexts: BTreeMap<String, BlockPlaceContextData>,
+    placement_arrays: BTreeMap<String, Vec<Value>>,
     resource_streams: BTreeMap<String, (Vec<u8>, usize)>,
     resource_marks: BTreeMap<String, usize>,
     /// Explicitly seeded class names exposed through `ClassLoader.loadClass`.
@@ -4148,6 +4159,58 @@ pub struct StdHost {
     freed_menu_objects: heap::FreedObjects,
 }
 
+/// Who placed the block for a [`BlockPlaceContextData`] snapshot.
+#[derive(Clone, Debug)]
+pub enum Placer {
+    /// A live player (`BlockPlaceContext` with non-null `getPlayer()`).
+    Player {
+        player: Value,
+        yaw: f32,
+        pitch: f32,
+        secondary_use: bool,
+    },
+    /// No player placed the block (`getPlayer() == null`).
+    ///
+    /// - `direction: Some(dir)` models vanilla `DirectionalPlaceContext`
+    ///   (e.g. a dispenser facing `dir`).
+    /// - `direction: None` models a plain `BlockPlaceContext` constructed with
+    ///   a `null` player.
+    None { direction: Option<Value> },
+    /// The host adapter did not tell the runtime whether a player placed the
+    /// block. Every player- or rotation-dependent accessor is counted as an
+    /// unknown host call rather than guessed.
+    Unknown,
+}
+
+/// The exact inputs exposed by vanilla's `BlockPlaceContext`/`UseOnContext`/
+/// `DirectionalPlaceContext`. Game adapters build this from their resolved
+/// placement snapshot; the runtime never derives a value from a mod or from a
+/// baked block state.
+#[derive(Clone, Debug)]
+pub struct BlockPlaceContextData {
+    pub clicked_pos: [i32; 3],
+    pub clicked_face: Value,
+    pub click_location: [f64; 3],
+    pub inside: bool,
+    pub replacing_clicked_on_block: bool,
+    pub can_place: bool,
+    pub placer: Placer,
+    pub item_in_hand: Value,
+    pub level: Value,
+}
+
+fn opposite(direction: &str) -> &'static str {
+    match direction {
+        "DOWN" => "UP",
+        "UP" => "DOWN",
+        "NORTH" => "SOUTH",
+        "SOUTH" => "NORTH",
+        "WEST" => "EAST",
+        "EAST" => "WEST",
+        _ => "NORTH",
+    }
+}
+
 impl Default for StdHost {
     fn default() -> Self {
         Self::new()
@@ -4192,6 +4255,8 @@ impl StdHost {
             data_pack_layers: Vec::new(),
             resource_generation: 0,
             pending_container_clamp: None,
+            placement_contexts: BTreeMap::new(),
+            placement_arrays: BTreeMap::new(),
             resource_streams: BTreeMap::new(),
             resource_marks: BTreeMap::new(),
             classes: BTreeMap::new(),
@@ -5652,6 +5717,274 @@ impl StdHost {
         &self.calls
     }
 
+    /// Register a vanilla-shaped `BlockPlaceContext` snapshot for a virtual
+    /// block call. The returned handle is rooted by the caller for the
+    /// duration of the invocation and may be reused by nested calls.
+    pub fn new_block_place_context(&mut self, data: BlockPlaceContextData) -> Value {
+        let key = format!("placement-context#{}", self.placement_contexts.len());
+        self.placement_contexts.insert(key.clone(), data);
+        Value::Host(HostRef::new(HostKind::GameTransient, key))
+    }
+
+    /// The canonical empty `ItemStack` used by vanilla contexts with no hand item.
+    pub fn empty_item_stack() -> Value {
+        menu_models::empty_stack()
+    }
+
+    fn placement_context(&self, value: &Value) -> Option<&BlockPlaceContextData> {
+        let Value::Host(handle) = value else {
+            return None;
+        };
+        (handle.kind() == HostKind::GameTransient)
+            .then(|| self.placement_contexts.get(handle.key()))
+            .flatten()
+    }
+
+    fn placement_direction(name: &str) -> Value {
+        Value::Ref(Some(format!("enum/net/minecraft/core/Direction/{name}")))
+    }
+
+    fn direction_name(value: &Value) -> Option<&str> {
+        let name = crate::runtime::expect_ref(value)?.strip_prefix("enum/net/minecraft/core/Direction/")?;
+        matches!(name, "DOWN" | "UP" | "NORTH" | "SOUTH" | "WEST" | "EAST").then_some(name)
+    }
+
+    fn direction_data_2d(direction: &str) -> Option<i32> {
+        match direction {
+            "DOWN" | "UP" => Some(-1),
+            "SOUTH" => Some(0),
+            "WEST" => Some(1),
+            "NORTH" => Some(2),
+            "EAST" => Some(3),
+            _ => None,
+        }
+    }
+
+    fn directional_nearest_looking_directions(direction: &str) -> Option<[&'static str; 6]> {
+        match direction {
+            "DOWN" => Some(["DOWN", "NORTH", "EAST", "SOUTH", "WEST", "UP"]),
+            "UP" => Some(["DOWN", "UP", "NORTH", "EAST", "SOUTH", "WEST"]),
+            "NORTH" => Some(["DOWN", "NORTH", "EAST", "WEST", "UP", "SOUTH"]),
+            "SOUTH" => Some(["DOWN", "SOUTH", "EAST", "WEST", "UP", "NORTH"]),
+            "WEST" => Some(["DOWN", "WEST", "SOUTH", "UP", "NORTH", "EAST"]),
+            "EAST" => Some(["DOWN", "EAST", "SOUTH", "UP", "NORTH", "WEST"]),
+            _ => None,
+        }
+    }
+
+    fn null_entity_view_xrot_npe() -> NativeError {
+        NativeError::UncaughtException {
+            class: "java/lang/NullPointerException".into(),
+            message: Some(
+                "Cannot invoke \"net.minecraft.world.entity.Entity.getViewXRot(float)\" because \"entity\" is null"
+                    .into(),
+            ),
+            frame: None,
+        }
+    }
+
+    fn placement_yaw_direction(yaw: f32) -> &'static str {
+        const HORIZONTAL: [&str; 4] = ["SOUTH", "WEST", "NORTH", "EAST"];
+        let scaled = f64::from(yaw) / 90.0 + 0.5;
+        let i = scaled as i32;
+        let floored = if scaled < f64::from(i) {
+            i.wrapping_sub(1)
+        } else {
+            i
+        };
+        HORIZONTAL[(floored & 3) as usize]
+    }
+
+    fn mth_sin_table() -> &'static [f32] {
+        static SIN: OnceLock<Box<[f32]>> = OnceLock::new();
+        SIN.get_or_init(|| {
+            (0..65_536)
+                .map(|i| (f64::from(i) / 10_430.378_350_470_453).sin() as f32)
+                .collect::<Vec<_>>()
+                .into_boxed_slice()
+        })
+    }
+
+    fn mth_sin(angle: f64) -> f32 {
+        Self::mth_sin_table()[((angle * 10_430.378_350_470_453) as i64 & 65_535) as usize]
+    }
+
+    fn mth_cos(angle: f64) -> f32 {
+        Self::mth_sin_table()
+            [((angle * 10_430.378_350_470_453 + 16_384.0) as i64 & 65_535) as usize]
+    }
+
+    fn placement_ordered_directions(yaw: f32, pitch: f32) -> [&'static str; 6] {
+        let pitch = pitch * 0.017453292f32;
+        let yaw = -yaw * 0.017453292f32;
+        let pitch_sin = Self::mth_sin(f64::from(pitch));
+        let pitch_cos = Self::mth_cos(f64::from(pitch));
+        let yaw_sin = Self::mth_sin(f64::from(yaw));
+        let yaw_cos = Self::mth_cos(f64::from(yaw));
+        let x_pos = yaw_sin > 0.0;
+        let y_pos = pitch_sin < 0.0;
+        let z_pos = yaw_cos > 0.0;
+        let x_yaw = if x_pos { yaw_sin } else { -yaw_sin };
+        let y_mag = if y_pos { -pitch_sin } else { pitch_sin };
+        let z_yaw = if z_pos { yaw_cos } else { -yaw_cos };
+        let x_mag = x_yaw * pitch_cos;
+        let z_mag = z_yaw * pitch_cos;
+        let ax = if x_pos { "EAST" } else { "WEST" };
+        let ay = if y_pos { "UP" } else { "DOWN" };
+        let az = if z_pos { "SOUTH" } else { "NORTH" };
+        let make = |a, b, c| [a, b, c, opposite(c), opposite(b), opposite(a)];
+        if x_yaw > z_yaw {
+            if y_mag > x_mag {
+                make(ay, ax, az)
+            } else if z_mag > y_mag {
+                make(ax, az, ay)
+            } else {
+                make(ax, ay, az)
+            }
+        } else if y_mag > z_mag {
+            make(ay, az, ax)
+        } else if x_mag > y_mag {
+            make(az, ax, ay)
+        } else {
+            make(az, ay, ax)
+        }
+    }
+
+    fn store_placement_direction_array(&mut self, names: [&'static str; 6]) -> Value {
+        let values = names
+            .into_iter()
+            .map(Self::placement_direction)
+            .collect::<Vec<_>>();
+        let key = format!("placement-array/{}", self.placement_arrays.len());
+        self.placement_arrays.insert(key.clone(), values);
+        Value::Host(HostRef::new(HostKind::GameTransient, key))
+    }
+
+    fn placement_context_call(
+        &mut self,
+        r: &MethodRef,
+        receiver: &Value,
+    ) -> Option<Result<Value, NativeError>> {
+        let context = self.placement_context(receiver)?.clone();
+        let direction = |name| Ok(Self::placement_direction(name));
+        let pos = || {
+            Ok(crate::runtime::game_object::server_value(format!(
+                "block-pos/{},{},{}",
+                context.clicked_pos[0], context.clicked_pos[1], context.clicked_pos[2]
+            )))
+        };
+        let result = match (r.name.as_str(), r.descriptor.as_str()) {
+            ("getClickedPos", "()Lnet/minecraft/core/BlockPos;") => pos(),
+            ("getClickedFace", "()Lnet/minecraft/core/Direction;") => Ok(context.clicked_face),
+            ("getClickLocation", "()Lnet/minecraft/world/phys/Vec3;") => {
+                Ok(crate::runtime::game_object::client_value(format!(
+                    "client/vec3/{},{},{}",
+                    context.click_location[0], context.click_location[1], context.click_location[2]
+                )))
+            }
+            ("isInside", "()Z") => Ok(Value::Int(i32::from(context.inside))),
+            ("getItemInHand", "()Lnet/minecraft/world/item/ItemStack;") => Ok(context.item_in_hand),
+            ("getLevel", "()Lnet/minecraft/world/level/Level;") => Ok(context.level),
+            ("canPlace", "()Z") => Ok(Value::Int(i32::from(context.can_place))),
+            ("replacingClickedOnBlock", "()Z") => match context.placer {
+                Placer::None { direction: Some(_) } => Ok(Value::Int(i32::from(context.can_place))),
+                Placer::Player { .. } | Placer::None { direction: None } | Placer::Unknown => {
+                    Ok(Value::Int(i32::from(context.replacing_clicked_on_block)))
+                }
+            },
+            ("getPlayer", "()Lnet/minecraft/world/entity/player/Player;") => match context.placer {
+                Placer::Player { player, .. } => Ok(player),
+                Placer::None { .. } => Ok(Value::Ref(None)),
+                Placer::Unknown => self.unknown_host_call(r),
+            },
+            ("getHorizontalDirection", "()Lnet/minecraft/core/Direction;") => {
+                match context.placer {
+                    Placer::Player { yaw, .. } => direction(Self::placement_yaw_direction(yaw)),
+                    Placer::None { direction: None } => direction("NORTH"),
+                    Placer::None {
+                        direction: Some(ref dir),
+                    } => match Self::direction_name(dir) {
+                        Some("DOWN" | "UP") => direction("NORTH"),
+                        Some(name) => direction(name),
+                        None => self.unknown_host_call(r),
+                    },
+                    Placer::Unknown => self.unknown_host_call(r),
+                }
+            }
+            ("isSecondaryUseActive", "()Z") => match context.placer {
+                Placer::Player { secondary_use, .. } => Ok(Value::Int(i32::from(secondary_use))),
+                Placer::None { .. } => Ok(Value::Int(0)),
+                Placer::Unknown => self.unknown_host_call(r),
+            },
+            ("getRotation", "()F") => match context.placer {
+                Placer::Player { yaw, .. } => Ok(Value::Float(f64::from(yaw))),
+                Placer::None { direction: None } => Ok(Value::Float(0.0)),
+                Placer::None {
+                    direction: Some(ref dir),
+                } => match Self::direction_name(dir).and_then(Self::direction_data_2d) {
+                    Some(data_2d) => Ok(Value::Float(f64::from((data_2d * 90) as f32))),
+                    None => self.unknown_host_call(r),
+                },
+                Placer::Unknown => self.unknown_host_call(r),
+            },
+            ("getNearestLookingDirection", "()Lnet/minecraft/core/Direction;") => {
+                match context.placer {
+                    Placer::Player { yaw, pitch, .. } => {
+                        direction(Self::placement_ordered_directions(yaw, pitch)[0])
+                    }
+                    Placer::None { direction: Some(_) } => direction("DOWN"),
+                    Placer::None { direction: None } => Err(Self::null_entity_view_xrot_npe()),
+                    Placer::Unknown => self.unknown_host_call(r),
+                }
+            }
+            ("getNearestLookingVerticalDirection", "()Lnet/minecraft/core/Direction;") => {
+                match context.placer {
+                    Placer::Player { pitch, .. } => {
+                        direction(if pitch < 0.0 { "UP" } else { "DOWN" })
+                    }
+                    Placer::None { .. } => Err(Self::null_entity_view_xrot_npe()),
+                    Placer::Unknown => self.unknown_host_call(r),
+                }
+            }
+            ("getNearestLookingDirections", "()[Lnet/minecraft/core/Direction;") => {
+                match context.placer {
+                    Placer::Player { yaw, pitch, .. } => {
+                        let mut names = Self::placement_ordered_directions(yaw, pitch);
+                        if !context.replacing_clicked_on_block {
+                            let Some(clicked) = Self::direction_name(&context.clicked_face) else {
+                                return Some(self.unknown_host_call(r));
+                            };
+                            let clicked_opp = opposite(clicked);
+                            if let Some(index) = names.iter().position(|name| *name == clicked_opp)
+                                && index > 0
+                            {
+                                for i in (0..index).rev() {
+                                    names[i + 1] = names[i];
+                                }
+                                names[0] = clicked_opp;
+                            }
+                        }
+                        Ok(self.store_placement_direction_array(names))
+                    }
+                    Placer::None {
+                        direction: Some(ref dir),
+                    } => {
+                        let Some(names) = Self::direction_name(dir)
+                            .and_then(Self::directional_nearest_looking_directions)
+                        else {
+                            return Some(self.unknown_host_call(r));
+                        };
+                        Ok(self.store_placement_direction_array(names))
+                    }
+                    Placer::None { direction: None } => Err(Self::null_entity_view_xrot_npe()),
+                    Placer::Unknown => self.unknown_host_call(r),
+                }
+            }
+            _ => return None,
+        };
+        Some(result)
+    }
+
     pub fn invocations(&self) -> &[HostInvocation] {
         &self.invocations
     }
@@ -6156,6 +6489,34 @@ impl StdHost {
     /// (`destroyTime`, `explosionResistance`, `friction`, ...).
     pub fn block_properties(&self, marker: &str) -> Option<&BTreeMap<String, String>> {
         self.block_property_builders.get(marker)
+    }
+
+    /// Decode a canonical Java `BlockState` into the registered block id and
+    /// serialized property values for a game adapter.
+    pub fn block_state_content(&self, state: &Value) -> Option<(String, BTreeMap<String, String>)> {
+        // Canonical default state of a vanilla `Blocks.<FIELD>` handle
+        // (`Value::Host(HostKind::GameRegistryObject, "game/default-block-state/<id>")`).
+        // A bare `game/block-state/<id>` handle from world reads has unknown
+        // properties and is intentionally not decoded here, and forged Strings
+        // never match because only real host handles are accepted.
+        if let Value::Host(handle) = state
+            && handle.kind() == HostKind::GameRegistryObject
+            && let Some(id) = handle.key().strip_prefix("game/default-block-state/")
+        {
+            return Some((id.to_owned(), BTreeMap::new()));
+        }
+        let marker = expect_ref(state)?;
+        let (block, values) = self.block_states.get(marker)?;
+        let id = self
+            .registrations
+            .iter()
+            .rev()
+            .find(|entry| {
+                entry.registry == "minecraft:block"
+                    && jar_object::object_key(&entry.value) == Some(block.as_str())
+            })
+            .map(|entry| entry.id.clone())?;
+        Some((id, values.clone()))
     }
 
     fn captured_property(field: &str) -> Option<StatePropertyInfo> {
@@ -7707,6 +8068,20 @@ impl menu_models::StackOps for StdHost {
 }
 
 impl Host for StdHost {
+    fn host_array_values(&self, value: &Value) -> Option<(&'static str, Vec<Value>)> {
+        let Value::Host(handle) = value else {
+            return None;
+        };
+        (handle.kind() == HostKind::GameTransient)
+            .then(|| {
+                self.placement_arrays
+                    .get(handle.key())
+                    .cloned()
+                    .map(|values| ("[Lnet/minecraft/core/Direction;", values))
+            })
+            .flatten()
+    }
+
     fn menu_instance_call(
         &mut self,
         r: &MethodRef,
@@ -10925,6 +11300,9 @@ impl Host for StdHost {
         receiver: &Value,
         args: &[Value],
     ) -> Result<Value, NativeError> {
+        if let Some(value) = self.placement_context_call(r, receiver) {
+            return value;
+        }
         if let Some(value) = self.menu_instance_call(r, receiver, args) {
             return value;
         }
@@ -20689,6 +21067,29 @@ fn mixin_accessor_label(kind: MixinAccessorKind) -> &'static str {
 }
 
 impl NativeJar {
+    /// Run a block's `getStateForPlacement(BlockPlaceContext)` override with
+    /// the supplied vanilla context. A `null` answer is vanilla's refusal.
+    pub fn block_state_for_placement<H: Host>(
+        &self,
+        block: Value,
+        context: BlockPlaceContextData,
+        host: &mut H,
+    ) -> Result<Option<Value>, NativeError> {
+        let context_value = host
+            .as_std_host_mut()
+            .ok_or_else(|| NativeError::Metadata("placement requires a standard host".into()))?
+            .new_block_place_context(context);
+        let value = self.invoke_virtual_with_args(
+            "net/minecraft/world/level/block/Block",
+            "getStateForPlacement",
+            "(Lnet/minecraft/world/item/context/BlockPlaceContext;)Lnet/minecraft/world/level/block/state/BlockState;",
+            block,
+            &[context_value],
+            host,
+        )?;
+        Ok((value != Value::Ref(None)).then_some(value))
+    }
+
     pub fn from_classes(classes: impl IntoIterator<Item = ClassFile>) -> Self {
         let classes = classes.into_iter().collect::<Vec<_>>();
         let neoforge_entrypoints = classes
@@ -23625,6 +24026,34 @@ impl NativeJar {
             host,
             &mut CallbackInfos::new(),
         )
+    }
+
+    /// Invoke a virtual member through the interpreter's JVM dispatch path.
+    /// This is the game bridge entry point for callbacks on host-owned
+    /// objects: a jar override is selected by `Runtime::call_virtual`, while
+    /// inherited game methods remain on the host model.
+    pub fn invoke_virtual_with_args<H: Host>(
+        &self,
+        owner: &str,
+        method: &str,
+        descriptor: &str,
+        receiver: Value,
+        args: &[Value],
+        host: &mut H,
+    ) -> Result<Value, NativeError> {
+        let mut roots = Vec::with_capacity(args.len() + 1);
+        roots.push(receiver.clone());
+        roots.extend_from_slice(args);
+        self.with_persistent_runtime(host, &roots, |runtime| {
+            runtime.call_virtual(
+                jdk_call::Site::Virtual,
+                owner,
+                method,
+                descriptor,
+                &receiver,
+                args,
+            )
+        })
     }
 
     /// Invoke one jar method the way a later firing of a registered callback
@@ -27388,7 +27817,7 @@ impl<H: Host> Runtime<'_, H> {
                         .map(Some);
                 }
                 self.note_string_intern(&target, Some(receiver));
-                self.host.invoke_instance(&target, receiver, args).map(Some)
+                self.invoke_host_instance(&target, receiver, args).map(Some)
             }
         }
     }
@@ -27808,9 +28237,7 @@ impl<H: Host> Runtime<'_, H> {
                 return Ok(Some(answer));
             }
             self.note_string_intern(&callback.target, Some(&receiver));
-            let value = self
-                .host
-                .invoke_instance(&callback.target, &receiver, &rest)?;
+            let value = self.invoke_host_instance(&callback.target, &receiver, &rest)?;
             if let Some(token) = token {
                 self.mod_count_after(token, &value)?;
             }
@@ -28092,19 +28519,6 @@ impl<H: Host> Runtime<'_, H> {
                 },
             );
         }
-        let placement = MethodRef {
-            owner: class.to_owned(),
-            name: "getStateForPlacement".into(),
-            descriptor: "(Lnet/minecraft/world/item/context/BlockPlaceContext;)Lnet/minecraft/world/level/block/state/BlockState;".into(),
-        };
-        if self
-            .class(&placement.owner)
-            .and_then(|file| file.method(&placement.name, &placement.descriptor))
-            .is_some()
-        {
-            self.host.block_placement_unknown();
-        }
-
         Ok(())
     }
 
@@ -33934,6 +34348,38 @@ impl<H: Host> Runtime<'_, H> {
             .ok_or_else(|| NativeError::Metadata("array is not owned by this invocation".into()))
     }
 
+    #[inline(never)]
+    fn materialize_host_array(&mut self, value: Value) -> Value {
+        let Some((descriptor, values)) = self.host.host_array_values(&value) else {
+            return value;
+        };
+        self.new_array_value(descriptor, values)
+    }
+
+    #[inline(never)]
+    fn invoke_host_instance(
+        &mut self,
+        r: &MethodRef,
+        receiver: &Value,
+        args: &[Value],
+    ) -> Result<Value, NativeError> {
+        let value = self.host.invoke_instance(r, receiver, args)?;
+        Ok(self.materialize_host_array(value))
+    }
+
+    #[inline(never)]
+    fn invoke_host_or_client_reload_instance(
+        &mut self,
+        r: &MethodRef,
+        receiver: &Value,
+        args: &[Value],
+    ) -> Result<Value, NativeError> {
+        if let Some(value) = client_reload::runtime_instance_call(self, r, receiver, args) {
+            return value;
+        }
+        self.invoke_host_instance(r, receiver, args)
+    }
+
     /// Whether `value` is a stream this runtime made. Stream identity hashes
     /// stay unknown even when a collection asks through a nested path.
     fn is_live_stream_value(&self, value: &Value) -> bool {
@@ -36307,7 +36753,7 @@ impl<H: Host> Runtime<'_, H> {
                 return match receiver.as_ref() {
                     Some(receiver) => {
                         self.note_string_intern(&r, Some(receiver));
-                        self.host.invoke_instance(&r, receiver, args)
+                        self.invoke_host_instance(&r, receiver, args)
                     }
                     None => self.host.invoke(&r, args),
                 };
@@ -36333,7 +36779,7 @@ impl<H: Host> Runtime<'_, H> {
                 JarCallRedirect::Host(r) => match receiver.as_ref() {
                     Some(receiver) => {
                         self.note_string_intern(&r, Some(receiver));
-                        self.host.invoke_instance(&r, receiver, args)
+                        self.invoke_host_instance(&r, receiver, args)
                     }
                     None => {
                         if r.owner == "net/minecraft/network/syncher/SynchedEntityData"
@@ -36398,7 +36844,7 @@ impl<H: Host> Runtime<'_, H> {
                     name: method.to_owned(),
                     descriptor: desc.to_owned(),
                 };
-                return self.host.invoke_instance(&r, receiver, args);
+                return self.invoke_host_instance(&r, receiver, args);
             }
             // Nothing in the jar implements the call: a `native` method (the
             // JVM's `UnsatisfiedLinkError` without its library) or an abstract
@@ -36420,7 +36866,7 @@ impl<H: Host> Runtime<'_, H> {
             return match receiver.as_ref() {
                 Some(receiver) => {
                     self.note_string_intern(&r, Some(receiver));
-                    self.host.invoke_instance(&r, receiver, args)
+                    self.invoke_host_instance(&r, receiver, args)
                 }
                 None => {
                     if r.owner == "net/minecraft/network/syncher/SynchedEntityData"
@@ -38960,16 +39406,9 @@ impl<H: Host> Runtime<'_, H> {
                                         } else {
                                             invoke_or_catch!(
                                                 at,
-                                                if let Some(value) =
-                                                    client_reload::runtime_instance_call(
-                                                        self, &resolved, receiver, &args
-                                                    )
-                                                {
-                                                    value
-                                                } else {
-                                                    self.host
-                                                        .invoke_instance(&resolved, receiver, &args)
-                                                }
+                                                self.invoke_host_or_client_reload_instance(
+                                                    &resolved, receiver, &args
+                                                )
                                             )
                                         }
                                     } else {
@@ -39009,31 +39448,17 @@ impl<H: Host> Runtime<'_, H> {
                                             ),
                                             None => invoke_or_catch!(
                                                 at,
-                                                if let Some(value) =
-                                                    client_reload::runtime_instance_call(
-                                                        self, &resolved, receiver, &args
-                                                    )
-                                                {
-                                                    value
-                                                } else {
-                                                    self.host
-                                                        .invoke_instance(&resolved, receiver, &args)
-                                                }
+                                                self.invoke_host_or_client_reload_instance(
+                                                    &resolved, receiver, &args
+                                                )
                                             ),
                                         }
                                     } else {
                                         invoke_or_catch!(
                                             at,
-                                            if let Some(value) =
-                                                client_reload::runtime_instance_call(
-                                                    self, &resolved, receiver, &args
-                                                )
-                                            {
-                                                value
-                                            } else {
-                                                self.host
-                                                    .invoke_instance(&resolved, receiver, &args)
-                                            }
+                                            self.invoke_host_or_client_reload_instance(
+                                                &resolved, receiver, &args
+                                            )
                                         )
                                     }
                                 } else {
