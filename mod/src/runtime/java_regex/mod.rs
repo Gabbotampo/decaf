@@ -438,6 +438,12 @@ pub(crate) fn matches(pattern: &str, input: &str) -> R<bool> {
         .is_some())
 }
 
+/// Whether the engine compiles `pattern` (flags 0): false for a pattern Java
+/// rejects and for one outside the modelled subset, which are not told apart.
+pub(crate) fn compiles(pattern: &str) -> bool {
+    Regex::compile(pattern, 0).is_ok()
+}
+
 /// `Matcher.find()` on a fresh matcher: does the pattern occur anywhere in
 /// the input? This is what `Pattern.asPredicate()`'s `test(Object)` uses.
 pub(crate) fn find(pattern: &str, input: &str) -> R<bool> {

@@ -2851,7 +2851,13 @@ const KINDS: &[KindInfo] = &[
     KindInfo {
         kind: HostKind::RegexPredicate,
         tag: "rxp",
-        class: ClassRule::Fixed("java/util/function/Predicate"),
+        // The JDK's object is a hidden lambda class (`Pattern$$Lambda/0x...`),
+        // not the interface: its class is not modelled, so `getClass()` and
+        // what follows from it are counted; `instanceof` is exact
+        // (`PREDICATE_METHODS`).
+        class: ClassRule::Unknown {
+            declared: crate::host_jdk_constant::predicate_types,
+        },
         // A serial per `asPredicate` call.
         canonical: always_canonical,
         methods: &crate::host_jdk_constant::PREDICATE_METHODS,

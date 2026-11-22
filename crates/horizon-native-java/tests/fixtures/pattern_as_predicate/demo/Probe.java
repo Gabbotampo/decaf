@@ -1,7 +1,16 @@
 package demo;
 
+import java.io.File;
+import java.math.BigInteger;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.LinkedList;
 import java.util.List;
+import java.util.Random;
+import java.util.StringJoiner;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Predicate;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
@@ -96,6 +105,13 @@ public final class Probe {
         Object asObject = first;
         row(b, "instanceof-Predicate", asObject instanceof Predicate);
         row(b, "instanceof-Runnable", asObject instanceof Runnable);
+        row(b, "instanceof-Object", asObject instanceof Object);
+        row(b, "instanceof-Serializable", asObject instanceof java.io.Serializable);
+        row(b, "instanceof-Comparable", asObject instanceof Comparable);
+        row(b, "instanceof-Function", asObject instanceof java.util.function.Function);
+        row(b, "instanceof-CharSequence", asObject instanceof CharSequence);
+        row(b, "instanceof-Pattern", asObject instanceof Pattern);
+        row(b, "instanceof-String", asObject instanceof String);
 
         // Reached through a helper that takes any Predicate<String>: a predicate
         // the pattern made, a lambda, a method reference and a jar class all take
@@ -187,12 +203,145 @@ public final class Probe {
         return b.toString();
     }
 
+    /** A jar object that is not a String and does not implement Predicate. */
+    private static final class Thing {}
+
+    /**
+     * `test` on an object that is not a String, through the raw `Predicate`: the JDK throws a
+     * ClassCastException whatever the pattern says. The runtime counts these calls; a row prints
+     * what the JDK does. Each row runs on a fresh host in the test.
+     */
+    @SuppressWarnings({"unchecked", "rawtypes"})
+    public static String objectArgument(String which) {
+        Predicate matchA = Pattern.compile("a").asPredicate();
+        Predicate matchNone = Pattern.compile("^zzz").asPredicate();
+        Predicate matchOne = Pattern.compile("1").asPredicate();
+        Predicate matchKeyText = Pattern.compile("^java/lang/Object#").asPredicate();
+        String out;
+        try {
+            switch (which) {
+                case "object" -> out = String.valueOf(matchA.test(new Object()));
+                case "object-nomatch" -> out = String.valueOf(matchNone.test(new Object()));
+                case "object-keytext" -> out = String.valueOf(matchKeyText.test(new Object()));
+                case "jar-object" -> out = String.valueOf(matchA.test(new Thing()));
+                case "arraylist" -> out = String.valueOf(matchA.test(new ArrayList<String>()));
+                case "hashmap" -> out = String.valueOf(matchA.test(new HashMap<String, String>()));
+                case "hashset" -> out = String.valueOf(matchA.test(new HashSet<String>()));
+                case "list-of" -> out = String.valueOf(matchA.test(List.of()));
+                case "linkedlist" -> out = String.valueOf(matchA.test(new LinkedList<String>()));
+                case "file" -> out = String.valueOf(matchA.test(new File("a")));
+                case "atomic-integer" -> out = String.valueOf(matchOne.test(new AtomicInteger(1)));
+                case "biginteger" -> out = String.valueOf(matchOne.test(new BigInteger("1")));
+                case "runtime-exception" -> out = String.valueOf(matchA.test(new RuntimeException("a")));
+                case "random" -> out = String.valueOf(matchA.test(new Random(1)));
+                case "string-joiner" -> out = String.valueOf(matchA.test(new StringJoiner(",")));
+                case "removeIf-object" -> {
+                    List<Object> list = new ArrayList<>(Arrays.asList(new Object(), "b"));
+                    boolean changed = list.removeIf(matchA);
+                    out = changed + " " + list.size();
+                }
+                case "filter-object" ->
+                    out = String.valueOf(Stream.<Object>of(new Object()).filter(matchA).count());
+                case "filter-object-nomatch" ->
+                    out = String.valueOf(Stream.<Object>of(new Object()).filter(matchNone).count());
+                case "anyMatch-object" ->
+                    out = String.valueOf(Stream.<Object>of(new Object()).anyMatch(matchA));
+                // A String whose text spells an object's key is still a String on the JDK; the
+                // runtime cannot tell it from the object and counts it.
+                case "string-key-text" -> out = String.valueOf(matchKeyText.test("java/lang/Object#1"));
+                default -> out = "unknown row " + which;
+            }
+        } catch (ClassCastException e) {
+            out = "ClassCastException";
+        }
+        return which + " = " + out + "\n";
+    }
+
+    static final String[] OBJECT_ARGUMENT_ROWS = {
+        "object", "object-nomatch", "object-keytext", "jar-object", "arraylist", "hashmap",
+        "hashset", "list-of", "linkedlist", "file", "atomic-integer", "biginteger",
+        "runtime-exception", "random", "string-joiner", "removeIf-object", "filter-object",
+        "filter-object-nomatch", "anyMatch-object", "string-key-text",
+    };
+
+    /**
+     * Reflection on the predicate: its class is a hidden lambda class, not the interface. Only
+     * stable facts are printed (the class name has an address in it). Counted by the runtime.
+     */
+    @SuppressWarnings({"unchecked", "rawtypes"})
+    public static String reflection(String which) {
+        Predicate p = Pattern.compile("a").asPredicate();
+        Class<?> c = p.getClass();
+        String out = switch (which) {
+            case "name-is-Predicate" -> String.valueOf(c.getName().equals("java.util.function.Predicate"));
+            case "isInterface" -> String.valueOf(c.isInterface());
+            case "class-eq-Predicate" -> String.valueOf(c == Predicate.class);
+            case "simpleName-is-Predicate" -> String.valueOf(c.getSimpleName().equals("Predicate"));
+            case "packageName" -> c.getPackageName();
+            case "modifiers" -> String.valueOf(c.getModifiers());
+            case "name-starts-with-Pattern-Lambda" ->
+                String.valueOf(c.getName().startsWith("java.util.regex.Pattern$$Lambda"));
+            case "toString-starts-with-class-Pattern-Lambda" ->
+                String.valueOf(c.toString().startsWith("class java.util.regex.Pattern$$Lambda"));
+            case "isHidden" -> String.valueOf(c.isHidden());
+            case "superclass" -> c.getSuperclass().getName();
+            case "interfaces" -> Arrays.toString(c.getInterfaces());
+            default -> "unknown row " + which;
+        };
+        return which + " = " + out + "\n";
+    }
+
+    static final String[] REFLECTION_ROWS = {
+        "name-is-Predicate", "isInterface", "class-eq-Predicate", "simpleName-is-Predicate",
+        "packageName", "modifiers", "name-starts-with-Pattern-Lambda",
+        "toString-starts-with-class-Pattern-Lambda", "isHidden", "superclass", "interfaces",
+    };
+
+    /**
+     * A pattern the JDK rejects (or null): the JDK throws at `compile`, so `asPredicate` is never
+     * reached. The runtime counts these. Each row runs on a fresh host in the test.
+     */
+    public static String badPattern(String which) {
+        String out;
+        try {
+            Pattern p = switch (which) {
+                case "unclosed-group" -> Pattern.compile("(");
+                case "unclosed-class" -> Pattern.compile("[");
+                case "dangling-star" -> Pattern.compile("*");
+                case "bad-repeat" -> Pattern.compile("a{2,1}");
+                case "trailing-backslash" -> Pattern.compile("\\");
+                case "null" -> Pattern.compile(null);
+                default -> throw new IllegalArgumentException(which);
+            };
+            out = String.valueOf(p.asPredicate().test("a"));
+        } catch (java.util.regex.PatternSyntaxException e) {
+            out = "PatternSyntaxException";
+        } catch (NullPointerException e) {
+            out = "NullPointerException";
+        }
+        return which + " = " + out + "\n";
+    }
+
+    static final String[] BAD_PATTERN_ROWS = {
+        "unclosed-group", "unclosed-class", "dangling-star", "bad-repeat", "trailing-backslash",
+        "null",
+    };
+
     /** `java demo.Probe` prints the oracle rows; `java demo.Probe counted` the cases the runtime counts. */
     public static void main(String[] args) {
         if (args.length > 0 && args[0].equals("counted")) {
             System.out.println(flagged());
             System.out.print(supplementary());
             System.out.print(nonString());
+            for (String row : OBJECT_ARGUMENT_ROWS) {
+                System.out.print(objectArgument(row));
+            }
+            for (String row : REFLECTION_ROWS) {
+                System.out.print(reflection(row));
+            }
+            for (String row : BAD_PATTERN_ROWS) {
+                System.out.print(badPattern(row));
+            }
         } else {
             System.out.print(rows());
         }

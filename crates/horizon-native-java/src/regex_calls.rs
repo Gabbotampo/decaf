@@ -119,12 +119,21 @@ impl<H: Host> Runtime<'_, H> {
             // receiver, and the only handle `Pattern.compile(String)` makes
             // has flags 0 (`compile(String, int)` is not modelled, so a
             // `Pattern` with flags never reaches here and stays counted); a
-            // pattern the engine cannot run exactly is counted when `test` runs.
+            // pattern the engine cannot compile is counted here, and an input
+            // it cannot run exactly when `test` runs.
             ("java/util/regex/Pattern", "asPredicate", "()Ljava/util/function/Predicate;") => {
                 let Some(pattern) = receiver.and_then(crate::host_jdk_constant::pattern_text)
                 else {
                     return Ok(None);
                 };
+                // `Pattern.compile(String)` does not check its text (a
+                // documented departure), so a pattern the JDK rejects with a
+                // `PatternSyntaxException` reaches here. The engine refuses it
+                // as it refuses one outside its subset, and the two cannot be
+                // told apart: both are counted, never a predicate.
+                if !java_regex::compiles(&pattern) {
+                    return Ok(None);
+                }
                 Ok(Some(crate::host_jdk_constant::predicate(&pattern)))
             }
             ("java/util/regex/Matcher", "matches", "()Z") => {
@@ -141,19 +150,29 @@ impl<H: Host> Runtime<'_, H> {
             // a `Pattern.asPredicate()` it knows. The JDK's predicate is a
             // `Predicate<String>`: `test(Object)` casts its argument to `String`
             // (a `ClassCastException` for anything else) and runs
-            // `matcher(s).find()` on a fresh matcher. Only a plain `String`
-            // argument is answered; null, a `StringBuilder`/`StringBuffer`, a jar
-            // object or a runtime marker stays counted; so does an input the
-            // engine refuses (a supplementary character). Any other receiver (a jar's own
-            // `Predicate`, a lambda) is not this arm's: the call goes on down
-            // the dispatch chain.
+            // `matcher(s).find()` on a fresh matcher. Only a `Value::Ref` text
+            // that is a plain `String` is answered. A host handle (a jar
+            // object, a collection, a `File`, a `BigInteger`, ...) is never a
+            // `String`, though `expect_ref` reads its key text, so it is not
+            // taken through that; null, a `StringBuilder`/`StringBuffer`, a
+            // runtime marker, and a text that spells an object's key (which
+            // cannot be told from the object) stay counted, and so does an
+            // input the engine refuses (a supplementary character). Any other
+            // receiver (a jar's own `Predicate`, a lambda) is not this arm's:
+            // the call goes on down the dispatch chain.
             ("java/util/function/Predicate", "test", "(Ljava/lang/Object;)Z") => {
                 let (Some(pattern), Some(input)) = (
                     receiver.and_then(crate::host_jdk_constant::predicate_text),
                     args.first()
                         .filter(|value| self.builder_text(value).is_none())
-                        .and_then(expect_ref)
-                        .filter(|text| crate::value_class::is_plain_string(text)),
+                        .and_then(|value| match value {
+                            Value::Ref(Some(text)) => Some(text),
+                            _ => None,
+                        })
+                        .filter(|text| {
+                            crate::value_class::is_plain_string(text)
+                                && !crate::jar_object::spells_key_text(text)
+                        }),
                 ) else {
                     return Ok(None);
                 };

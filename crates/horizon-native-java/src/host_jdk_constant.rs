@@ -22,8 +22,9 @@
 //! * **`Pattern`** (`final`): key `[serial, text]`, a serial per `compile`: one key one object.
 //!   `toString`/`pattern()` is the text, `equals` identity, `hashCode` identity (counted).
 //! * **`Predicate` from `Pattern.asPredicate()`**: key `[serial, text]`, a serial per call (the
-//!   JDK builds a new lambda each time). Only `test(String)` is answered (`regex_calls.rs`); `toString`
-//!   and `hashCode` are counted, `equals` is identity.
+//!   JDK builds a new lambda each time). Only `test(String)` is answered (`regex_calls.rs`); `toString`,
+//!   `hashCode` and the class are counted (the JDK's is a hidden lambda class, `ClassRule::Unknown`),
+//!   `instanceof` is `Object`/`Predicate` only, `equals` is identity.
 //! * **`ArtifactVersion`** (NeoForge's `DefaultArtifactVersion`, Maven's `ComparableVersion`
 //!   behind it): key its text, class unknown (`ArtifactVersion`, `Comparable` declared).
 //!   `toString` is the text; `equals` is `compareTo == 0`: `true` for one text, counted for two
@@ -423,11 +424,34 @@ pub(crate) const PATTERN_METHODS: Methods = Methods {
     ..CONSTANT_METHODS
 };
 
-/// A `Predicate` from `Pattern.asPredicate()`: `toString`/`hashCode` are not
-/// modelled (counted); `equals` is identity.
+/// The types a `Pattern.asPredicate()` object surely is: its hidden lambda
+/// class implements `Predicate` and nothing else.
+pub(crate) fn predicate_types(_: &str) -> &'static [&'static str] {
+    &["java/util/function/Predicate"]
+}
+
+/// `instanceof`/casts on a `Pattern.asPredicate()` object. The JDK 25 object is
+/// a final hidden lambda class whose superclass is `Object` and whose only
+/// interface is `Predicate` (`getInterfaces()` has the one entry), so it is an
+/// `Object` and a `Predicate` and nothing else; its name and modifiers are not
+/// modelled (`getClass()` is counted).
+fn predicate_instance_of(
+    _: &HostRef,
+    wanted: &str,
+    _: &dyn crate::host_ref::ClassHierarchy,
+) -> Option<bool> {
+    Some(matches!(
+        wanted,
+        "java/lang/Object" | "java/util/function/Predicate"
+    ))
+}
+
+/// A `Predicate` from `Pattern.asPredicate()`: `toString`/`hashCode` and the
+/// class are not modelled (counted); `equals` is identity.
 pub(crate) const PREDICATE_METHODS: Methods = Methods {
     to_string: |_, _| Ok(None),
     hash_code: |_, _| Ok(None),
+    instance_of: predicate_instance_of,
     ..CONSTANT_METHODS
 };
 

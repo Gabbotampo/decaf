@@ -7,7 +7,8 @@
 //! is `matcher(s).find()` on a fresh matcher through the `java_regex` engine.
 //! A jar's own `Predicate` (a lambda, a method reference, an anonymous or a
 //! named class) runs as it always did. Everything else stays counted, never
-//! guessed: a `Pattern` with flags, and a `test` argument that is not a
+//! guessed: a `Pattern` with flags, a pattern the engine does not compile, the class of the
+//! predicate, and a `test` argument that is not a
 //! `String`.
 
 #[path = "support/javac_fixture.rs"]
@@ -93,5 +94,172 @@ fn a_test_argument_that_is_not_a_string_is_counted() {
             3
         )],
         "answered {outcome:?}"
+    );
+}
+
+/// Run `demo.Probe.<method>(row)` on a fresh host; the outcome text and the calls the runtime counted.
+fn row_on_fresh_host(fixture: &Fixture, method: &str, row: &str) -> (String, Vec<(String, usize)>) {
+    let mut host = fixture.jar.seed_host(StdHost::new());
+    let outcome = fixture
+        .jar
+        .invoke_method_with_args(
+            "demo/Probe",
+            method,
+            "(Ljava/lang/String;)Ljava/lang/String;",
+            None,
+            &[horizon_native_java::Value::Ref(Some(row.to_owned()))],
+            &mut host,
+        )
+        .map(|value| format!("{value:?}"))
+        .unwrap_or_else(|error| format!("error: {error}"));
+    (outcome, host.unknown_host_calls())
+}
+
+fn oracle_rows(names: &[&str]) -> Vec<String> {
+    let counted = include_str!("fixtures/pattern_as_predicate/java25_counted.txt");
+    names
+        .iter()
+        .map(|name| {
+            counted
+                .lines()
+                .find(|line| line.starts_with(&format!("{name} = ")))
+                .unwrap_or_else(|| panic!("no JDK row for {name}"))
+                .to_owned()
+        })
+        .collect()
+}
+
+/// `test` on an object that is not a `String` (a jar object, `new Object()`, a collection, a
+/// `File`, a `BigInteger`, ...): the JDK throws `ClassCastException` whatever the pattern says
+/// (`java25_counted.txt`), so the runtime counts every one of them, through the direct call and
+/// through `removeIf`, `Stream.filter` and `anyMatch`. A host handle's key text is never read as
+/// the `String` it is not.
+#[test]
+fn a_test_argument_that_is_an_object_is_counted() {
+    let fixture = Fixture::build(
+        "pattern-as-predicate-objects",
+        &[("demo/Probe.java", PROBE)],
+    );
+    let rows = [
+        "object",
+        "object-nomatch",
+        "object-keytext",
+        "jar-object",
+        "arraylist",
+        "hashmap",
+        "hashset",
+        "list-of",
+        "linkedlist",
+        "file",
+        "atomic-integer",
+        "biginteger",
+        "runtime-exception",
+        "random",
+        "string-joiner",
+        "removeIf-object",
+        "filter-object",
+        "filter-object-nomatch",
+        "anyMatch-object",
+        // A real String that spells an object's key: counted as well, since the runtime cannot
+        // tell it from the object (the JDK answers `true`).
+        "string-key-text",
+    ];
+    for row in rows {
+        let (outcome, unknown) = row_on_fresh_host(&fixture, "objectArgument", row);
+        assert!(
+            unknown
+                .iter()
+                .any(|(call, _)| call == "java/util/function/Predicate#test(Ljava/lang/Object;)Z"),
+            "{row}: answered {outcome}, counted {unknown:?}"
+        );
+    }
+    assert_eq!(
+        oracle_rows(&["object", "file", "removeIf-object", "string-key-text"]),
+        [
+            "object = ClassCastException",
+            "file = ClassCastException",
+            "removeIf-object = ClassCastException",
+            "string-key-text = true",
+        ]
+    );
+}
+
+/// The JDK's predicate is a hidden lambda class (`Pattern$$Lambda/0x...`), not
+/// `java.util.function.Predicate`: every reflective question about its class is counted, none
+/// answered from the interface.
+#[test]
+fn the_class_of_the_predicate_is_counted() {
+    let fixture = Fixture::build("pattern-as-predicate-class", &[("demo/Probe.java", PROBE)]);
+    for row in [
+        "name-is-Predicate",
+        "isInterface",
+        "class-eq-Predicate",
+        "simpleName-is-Predicate",
+        "packageName",
+        "modifiers",
+        "name-starts-with-Pattern-Lambda",
+        "toString-starts-with-class-Pattern-Lambda",
+        "isHidden",
+        "superclass",
+        "interfaces",
+    ] {
+        let (outcome, unknown) = row_on_fresh_host(&fixture, "reflection", row);
+        assert!(
+            unknown
+                .iter()
+                .any(|(call, _)| call == "java/util/function/Predicate#getClass()Ljava/lang/Class;"),
+            "{row}: answered {outcome}, counted {unknown:?}"
+        );
+    }
+    // What the JDK prints for the rows the runtime does not answer.
+    assert_eq!(
+        oracle_rows(&[
+            "name-is-Predicate",
+            "isInterface",
+            "modifiers",
+            "interfaces"
+        ]),
+        [
+            "name-is-Predicate = false",
+            "isInterface = false",
+            "modifiers = 4112",
+            "interfaces = [interface java.util.function.Predicate]",
+        ]
+    );
+}
+
+/// A pattern the JDK rejects at `compile` (a `PatternSyntaxException`), or a null text (a
+/// `NullPointerException`): `Pattern.compile(String)` does not check its text, so these reach
+/// `asPredicate`, which counts them rather than answer a predicate for a call that never returns.
+#[test]
+fn a_pattern_the_jdk_rejects_is_counted() {
+    let fixture = Fixture::build("pattern-as-predicate-bad", &[("demo/Probe.java", PROBE)]);
+    for row in [
+        "unclosed-group",
+        "unclosed-class",
+        "dangling-star",
+        "bad-repeat",
+        "trailing-backslash",
+        "null",
+    ] {
+        let (outcome, unknown) = row_on_fresh_host(&fixture, "badPattern", row);
+        assert!(
+            unknown.iter().any(
+                |(call, _)| call.starts_with("java/util/regex/Pattern#asPredicate")
+                    || call.starts_with("java/util/regex/Pattern#compile")
+            ),
+            "{row}: answered {outcome}, counted {unknown:?}"
+        );
+        assert!(
+            !outcome.contains("= true") && !outcome.contains("= false"),
+            "{row}: answered {outcome}"
+        );
+    }
+    assert_eq!(
+        oracle_rows(&["unclosed-group", "null"]),
+        [
+            "unclosed-group = PatternSyntaxException",
+            "null = NullPointerException"
+        ]
     );
 }
