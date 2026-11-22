@@ -55,6 +55,10 @@ pub(crate) struct LiveStack {
     pub(crate) item_id: Option<String>,
     pub(crate) count: i32,
     pub(crate) patch: ComponentPatch,
+    /// True when the stack came from the host game with custom/damage components that this
+    /// model does not materialize: `ItemStack.isSameItemSameComponents` counts when comparing
+    /// two stacks of the same item instead of falsely treating the patch as empty.
+    pub(crate) opaque_components: bool,
 }
 
 impl LiveStack {
@@ -64,6 +68,22 @@ impl LiveStack {
             item_id: Some(item_id),
             count,
             patch,
+            opaque_components: false,
+        }
+    }
+
+    pub(crate) fn from_host_item_id(
+        host: &StdHost,
+        item_id: &str,
+        count: i32,
+        opaque_components: bool,
+    ) -> Self {
+        Self {
+            item_value: Some(item_value_for_id(host, item_id)),
+            item_id: Some(item_id.to_owned()),
+            count,
+            patch: ComponentPatch::default(),
+            opaque_components,
         }
     }
 
@@ -74,6 +94,7 @@ impl LiveStack {
             item_id,
             count,
             patch: ComponentPatch::default(),
+            opaque_components: false,
         }
     }
 
@@ -1650,6 +1671,7 @@ fn live_stack_instance_call(
                         item_id,
                         count,
                         patch: ComponentPatch::default(),
+                        opaque_components: false,
                     },
                 );
                 return Some(Ok(Value::Void));

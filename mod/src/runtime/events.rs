@@ -1050,6 +1050,12 @@ pub struct CreativeTabBuildContext {
     /// Explicit `CreativeModeTab` instance passed to `MODIFY_OUTPUT_ALL`
     /// (`None` resolves the tab registered under `tab_key`, or a canonical handle).
     pub tab: Option<Value>,
+    /// Existing `displayItems` already in the tab before Fabric listeners run
+    /// (`CreativeModeTabMixin.getStacks` offsets 64..75).
+    pub initial_display_stacks: Vec<Value>,
+    /// Existing `displayItemsSearchTab` already in the tab before Fabric listeners run
+    /// (`CreativeModeTabMixin.getStacks` offsets 77..88).
+    pub initial_search_tab_stacks: Vec<Value>,
 }
 
 /// Convert Sunrise's enabled feature identifiers to the exact Minecraft 26.3 feature mask this
@@ -1079,6 +1085,8 @@ impl Default for CreativeTabBuildContext {
             has_permissions: false,
             aligned_right: None,
             tab: None,
+            initial_display_stacks: Vec::new(),
+            initial_search_tab_stacks: Vec::new(),
         }
     }
 }
@@ -1343,12 +1351,18 @@ impl NativeJar {
         // `CreativeModeTabMixin.getStacks` offsets 28..43:
         // `if (self.isAlignedRight() && resourceKey != CreativeModeTabs.OP_BLOCKS) return;`
         if aligned_right && tab_id != "minecraft:op_blocks" {
-            return Ok(CreativeTabContents::default());
+            return Ok(CreativeTabContents {
+                display_stacks: context.initial_display_stacks,
+                search_tab_stacks: context.initial_search_tab_stacks,
+            });
         }
         // `CreativeModeTabMixin.getStacks` offsets 104..118:
         // `if (resourceKey != CreativeModeTabs.OP_BLOCKS || context.hasPermissions())`
         if tab_id == "minecraft:op_blocks" && !context.has_permissions {
-            return Ok(CreativeTabContents::default());
+            return Ok(CreativeTabContents {
+                display_stacks: context.initial_display_stacks,
+                search_tab_stacks: context.initial_search_tab_stacks,
+            });
         }
         // Snapshot the per-tab event's phase-sorted listeners BEFORE running any per-tab
         // callback (`CreativeModeTabMixin.getStacks` offsets 119..145; `ArrayBackedEvent.invoker()`
@@ -1359,10 +1373,12 @@ impl NativeJar {
             &CreativeTabEventTarget::Tab(event_key.clone()),
         );
         // One shared collector across every listener of this tab firing (offsets 90..102).
-        let output = host.begin_creative_tab_output_with(
+        let output = host.begin_creative_tab_output_with_initial(
             &event_key,
             context.enabled_features,
             context.has_permissions,
+            context.initial_display_stacks,
+            context.initial_search_tab_stacks,
         );
         for (invocation_index, callback) in per_tab {
             host.mark_creative_tab_registration_fired(invocation_index);

@@ -468,11 +468,7 @@ impl Hooks for HorizonJava {
     /// Run a jar Item's `appendHoverText` before Sunrise's global tooltip listeners.  The
     /// runtime returns structured Components, so translatable text and style cross the native
     /// API boundary without flattening them.
-    fn item_tooltip(
-        &self,
-        host: &dyn ClientHost,
-        event: &mut mod_api::ItemTooltipEvent<'_>,
-    ) {
+    fn item_tooltip(&self, host: &dyn ClientHost, event: &mut mod_api::ItemTooltipEvent<'_>) {
         self.lock_client().append_java_tooltip(host, event);
     }
 
@@ -1533,8 +1529,8 @@ impl Hooks for HorizonJava {
     /// initial client load and before the title screen's first frame. A dedicated server never
     /// fires it. The client owner runs its resident jars here before the native setup notification
     /// returns; this owner hook does not claim to dispatch a second Java setup event.
-    fn client_setup(&self, _host: &mut dyn ClientHost, _event: &mut ClientSetupEvent) {
-        self.on_client_setup();
+    fn client_setup(&self, host: &mut dyn ClientHost, _event: &mut ClientSetupEvent) {
+        self.on_client_setup_with_version(Some(host.game_version()));
     }
 
     /// Sunrise's client level load carries the newly-created level's borrowed dimension and fires
@@ -1603,9 +1599,14 @@ impl HorizonJava {
         }
     }
 
+    #[cfg(test)]
     fn on_client_setup(&self) {
+        self.on_client_setup_with_version(None);
+    }
+
+    fn on_client_setup_with_version(&self, game_version: Option<&str>) {
         let mut client = self.lock_client();
-        client.ensure_loaded();
+        client.ensure_loaded_with_version(game_version);
         let rows = client.report_rows().count();
         log::info!("{LOG}: stored {rows} client report row(s)");
         log::info!("{LOG} {}: client setup complete", env!("CARGO_PKG_VERSION"));

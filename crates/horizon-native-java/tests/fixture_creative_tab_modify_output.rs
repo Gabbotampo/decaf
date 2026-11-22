@@ -289,13 +289,35 @@ public final class FabricCreativeModeTab {
     (
         "net/fabricmc/fabric/api/creativetab/v1/FabricCreativeModeTabOutput.java",
         r#"package net.fabricmc.fabric.api.creativetab.v1;
+import java.util.Collection;
 import net.minecraft.world.flag.FeatureFlagSet;
 import net.minecraft.world.item.CreativeModeTab;
 import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.level.ItemLike;
 public class FabricCreativeModeTabOutput implements CreativeModeTab.Output {
     public FeatureFlagSet getEnabledFeatures() { throw new AssertionError(); }
     public boolean shouldShowOpRestrictedItems() { throw new AssertionError(); }
     @Override public void accept(ItemStack stack, CreativeModeTab.TabVisibility visibility) { throw new AssertionError(); }
+    public void prepend(ItemStack stack) { throw new AssertionError(); }
+    public void prepend(ItemStack stack, CreativeModeTab.TabVisibility visibility) { throw new AssertionError(); }
+    public void prepend(ItemLike item) { throw new AssertionError(); }
+    public void prepend(ItemLike item, CreativeModeTab.TabVisibility visibility) { throw new AssertionError(); }
+    public void insertBefore(ItemLike anchor, ItemStack... stacks) { throw new AssertionError(); }
+    public void insertBefore(ItemStack anchor, ItemStack... stacks) { throw new AssertionError(); }
+    public void insertBefore(ItemLike anchor, ItemLike... items) { throw new AssertionError(); }
+    public void insertBefore(ItemStack anchor, ItemLike... items) { throw new AssertionError(); }
+    public void insertBefore(ItemLike anchor, Collection<ItemStack> stacks) { throw new AssertionError(); }
+    public void insertBefore(ItemStack anchor, Collection<ItemStack> stacks) { throw new AssertionError(); }
+    public void insertBefore(ItemLike anchor, Collection<ItemStack> stacks, CreativeModeTab.TabVisibility visibility) { throw new AssertionError(); }
+    public void insertBefore(ItemStack anchor, Collection<ItemStack> stacks, CreativeModeTab.TabVisibility visibility) { throw new AssertionError(); }
+    public void insertAfter(ItemLike anchor, ItemStack... stacks) { throw new AssertionError(); }
+    public void insertAfter(ItemStack anchor, ItemStack... stacks) { throw new AssertionError(); }
+    public void insertAfter(ItemLike anchor, ItemLike... items) { throw new AssertionError(); }
+    public void insertAfter(ItemStack anchor, ItemLike... items) { throw new AssertionError(); }
+    public void insertAfter(ItemLike anchor, Collection<ItemStack> stacks) { throw new AssertionError(); }
+    public void insertAfter(ItemStack anchor, Collection<ItemStack> stacks) { throw new AssertionError(); }
+    public void insertAfter(ItemLike anchor, Collection<ItemStack> stacks, CreativeModeTab.TabVisibility visibility) { throw new AssertionError(); }
+    public void insertAfter(ItemStack anchor, Collection<ItemStack> stacks, CreativeModeTab.TabVisibility visibility) { throw new AssertionError(); }
 }"#,
     ),
     (
@@ -1095,4 +1117,276 @@ fn run_real_runes_test(jar_path: &Path) {
     let after_build = host.game_listeners(&jar, true);
     assert_eq!(after_build.unsupported.get(functional_source), None);
     assert_eq!(after_build.unsupported.get(combat_source), None);
+}
+
+const PLACEMENT_PROBE: &str = r##"
+package demo;
+
+import java.util.List;
+import net.fabricmc.fabric.api.creativetab.v1.CreativeModeTabEvents;
+import net.minecraft.core.Registry;
+import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.resources.Identifier;
+import net.minecraft.resources.ResourceKey;
+import net.minecraft.core.registries.Registries;
+import net.minecraft.world.flag.FeatureFlags;
+import net.minecraft.world.item.CreativeModeTab;
+import net.minecraft.world.item.Item;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.Items;
+import net.minecraft.world.level.ItemLike;
+
+public final class PlacementProbe {
+    public static String errLog = "";
+
+    private static String catchMsg(Runnable r) {
+        try {
+            r.run();
+            return "NONE";
+        } catch (Throwable t) {
+            return t.getClass().getSimpleName() + ":" + t.getMessage();
+        }
+    }
+
+    public static void setup() {
+        Item a = Registry.register(BuiltInRegistries.ITEM, Identifier.parse("demo:a"), new Item(new Item.Properties()));
+        Item b = Registry.register(BuiltInRegistries.ITEM, Identifier.parse("demo:b"), new Item(new Item.Properties()));
+        Item c = Registry.register(BuiltInRegistries.ITEM, Identifier.parse("demo:c"), new Item(new Item.Properties()));
+        Item d = Registry.register(BuiltInRegistries.ITEM, Identifier.parse("demo:d"), new Item(new Item.Properties()));
+        Item e = Registry.register(BuiltInRegistries.ITEM, Identifier.parse("demo:e"), new Item(new Item.Properties()));
+        Item disabled = Registry.register(
+            BuiltInRegistries.ITEM,
+            Identifier.parse("demo:disabled"),
+            new Item(new Item.Properties().requiredFeatures(FeatureFlags.TRADE_REBALANCE))
+        );
+
+        ResourceKey<CreativeModeTab> mainTab = ResourceKey.create(Registries.CREATIVE_MODE_TAB, Identifier.parse("demo:placement"));
+        CreativeModeTabEvents.modifyOutputEvent(mainTab).register(entries -> {
+            entries.insertBefore(Items.DIRT, List.of(new ItemStack(a)), CreativeModeTab.TabVisibility.PARENT_TAB_ONLY);
+            entries.insertAfter(Items.STONE, List.of(new ItemStack(b)), CreativeModeTab.TabVisibility.SEARCH_TAB_ONLY);
+            entries.insertAfter(a, c, disabled);
+            entries.insertBefore(Items.GOLD_INGOT, d);
+            entries.prepend(e, CreativeModeTab.TabVisibility.PARENT_AND_SEARCH_TABS);
+        });
+
+        ResourceKey<CreativeModeTab> dupTab = ResourceKey.create(Registries.CREATIVE_MODE_TAB, Identifier.parse("demo:dup"));
+        CreativeModeTabEvents.modifyOutputEvent(dupTab).register(entries -> {
+            entries.insertBefore(Items.STONE, a);
+            entries.insertAfter(Items.STONE, b);
+        });
+
+        ResourceKey<CreativeModeTab> errTab = ResourceKey.create(Registries.CREATIVE_MODE_TAB, Identifier.parse("demo:errors"));
+        CreativeModeTabEvents.modifyOutputEvent(errTab).register(entries -> {
+            StringBuilder sb = new StringBuilder();
+            sb.append("null_vis_disabled=").append(catchMsg(() ->
+                entries.insertBefore(Items.STONE, List.of(new ItemStack(disabled)), null)
+            )).append('\n');
+            sb.append("null_anchor_disabled=").append(catchMsg(() ->
+                entries.insertBefore((ItemLike) null, List.of(new ItemStack(disabled)))
+            )).append('\n');
+            sb.append("null_item_anchor=").append(catchMsg(() ->
+                entries.insertBefore((ItemLike) null, List.of(new ItemStack(a)))
+            )).append('\n');
+            sb.append("null_stack_anchor=").append(catchMsg(() ->
+                entries.insertBefore((ItemStack) null, List.of(new ItemStack(a)))
+            )).append('\n');
+            sb.append("null_collection=").append(catchMsg(() ->
+                entries.insertBefore(Items.STONE, (List<ItemStack>) null)
+            )).append('\n');
+            sb.append("null_vis=").append(catchMsg(() ->
+                entries.insertBefore(Items.STONE, List.of(new ItemStack(a)), null)
+            )).append('\n');
+            sb.append("empty_stack=").append(catchMsg(() ->
+                entries.insertBefore(Items.STONE, ItemStack.EMPTY)
+            )).append('\n');
+            sb.append("count2=").append(catchMsg(() ->
+                entries.insertBefore(Items.STONE, new ItemStack(a, 2))
+            ));
+            errLog = sb.toString();
+        });
+
+        ResourceKey<CreativeModeTab> stackAnchorTab = ResourceKey.create(Registries.CREATIVE_MODE_TAB, Identifier.parse("demo:stack_anchor"));
+        CreativeModeTabEvents.modifyOutputEvent(stackAnchorTab).register(entries -> {
+            entries.insertAfter(new ItemStack(Items.STONE), new ItemStack(a));
+        });
+    }
+
+    public static String errors() {
+        return errLog;
+    }
+}
+"##;
+
+#[test]
+fn anchor_placement_and_prepend_match_java25_fabric_api_oracle() {
+    let mut sources = vec![
+        ("demo/PlacementProbe.java", PLACEMENT_PROBE),
+        (
+            "net/minecraft/world/item/Items.java",
+            "package net.minecraft.world.item; public final class Items { public static final Item STONE = null; public static final Item DIRT = null; public static final Item GOLD_INGOT = null; }",
+        ),
+    ];
+    sources.extend_from_slice(STUBS);
+    let fixture = javac_fixture::Fixture::build("creative-tab-placement-oracle", &sources);
+    let mut host = fixture.jar.seed_host(StdHost::new());
+
+    fixture
+        .jar
+        .invoke_method("demo/PlacementProbe", "setup", "()V", None, &mut host)
+        .unwrap();
+
+    let ids = |host: &StdHost, stacks: &[Value]| -> Vec<String> {
+        stacks
+            .iter()
+            .map(|s| host.item_stack_item_id(s).expect("stack item id"))
+            .collect()
+    };
+
+    // Case 1: Initial `[stone, dirt]` — exact Java 25 + Fabric API 5.0.21 oracle output.
+    let s_stone = host.make_item_stack_for_id("minecraft:stone", 1, false);
+    let s_dirt = host.make_item_stack_for_id("minecraft:dirt", 1, false);
+    let placed = fixture
+        .jar
+        .creative_tab_contents_with(
+            &mut host,
+            "demo:placement",
+            CreativeTabBuildContext {
+                initial_display_stacks: vec![s_stone.clone(), s_dirt.clone()],
+                initial_search_tab_stacks: vec![s_stone.clone(), s_dirt.clone()],
+                ..CreativeTabBuildContext::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        ids(&host, &placed.display_stacks),
+        vec![
+            "demo:e",
+            "minecraft:stone",
+            "demo:a",
+            "demo:c",
+            "minecraft:dirt",
+            "demo:d",
+        ]
+    );
+    assert_eq!(
+        ids(&host, &placed.search_tab_stacks),
+        vec![
+            "demo:e",
+            "minecraft:stone",
+            "demo:b",
+            "minecraft:dirt",
+            "demo:c",
+            "demo:d",
+        ]
+    );
+
+    // Case 2: Duplicate anchor `[stone, dirt, stone]` — `insertBefore` uses FIRST match,
+    // `insertAfter` uses LAST match.
+    let s_stone2 = host.make_item_stack_for_id("minecraft:stone", 1, false);
+    let dup = fixture
+        .jar
+        .creative_tab_contents_with(
+            &mut host,
+            "demo:dup",
+            CreativeTabBuildContext {
+                initial_display_stacks: vec![s_stone.clone(), s_dirt.clone(), s_stone2.clone()],
+                initial_search_tab_stacks: vec![s_stone.clone(), s_dirt.clone(), s_stone2],
+                ..CreativeTabBuildContext::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        ids(&host, &dup.display_stacks),
+        vec![
+            "demo:a",
+            "minecraft:stone",
+            "minecraft:dirt",
+            "minecraft:stone",
+            "demo:b",
+        ]
+    );
+
+    // Case 3: Exact Java 25 / Fabric API 5.0.21 exception messages and evaluation order.
+    let _ = fixture
+        .jar
+        .creative_tab_contents_with(
+            &mut host,
+            "demo:errors",
+            CreativeTabBuildContext {
+                initial_display_stacks: vec![s_stone.clone(), s_dirt.clone()],
+                initial_search_tab_stacks: vec![s_stone.clone(), s_dirt],
+                ..CreativeTabBuildContext::default()
+            },
+        )
+        .unwrap();
+    let err_text = match fixture
+        .jar
+        .invoke_method(
+            "demo/PlacementProbe",
+            "errors",
+            "()Ljava/lang/String;",
+            None,
+            &mut host,
+        )
+        .unwrap()
+    {
+        Value::Ref(Some(text)) => text,
+        other => panic!("unexpected errors result: {other:?}"),
+    };
+    let rows: BTreeMap<&str, &str> = err_text
+        .lines()
+        .map(|l| l.split_once('=').unwrap())
+        .collect();
+    assert_eq!(rows["null_vis_disabled"], "NONE");
+    assert_eq!(rows["null_anchor_disabled"], "NONE");
+    assert_eq!(
+        rows["null_item_anchor"],
+        "NullPointerException:Cannot invoke \"net.minecraft.world.level.ItemLike.asItem()\" because \"anchor\" is null"
+    );
+    assert_eq!(
+        rows["null_stack_anchor"],
+        "NullPointerException:Cannot invoke \"net.minecraft.world.item.ItemStack.is(Object)\" because \"a\" is null"
+    );
+    assert_eq!(
+        rows["null_collection"],
+        "NullPointerException:Cannot invoke \"java.util.Collection.stream()\" because \"newStacks\" is null"
+    );
+    assert_eq!(
+        rows["null_vis"],
+        "NullPointerException:Cannot invoke \"net.minecraft.world.item.CreativeModeTab$TabVisibility.ordinal()\" because \"visibility\" is null"
+    );
+    assert_eq!(
+        rows["empty_stack"],
+        "IllegalArgumentException:Cannot add empty stack"
+    );
+    assert_eq!(
+        rows["count2"],
+        "IllegalArgumentException:Stack size must be exactly 1 for stack: 2 demo:a"
+    );
+    assert_eq!(
+        host.unknown_host_calls(),
+        Vec::<(String, usize)>::new(),
+        "placement oracle must have zero unknown host calls"
+    );
+
+    // Case 4: `ItemStack` anchor against a seeded stack with opaque custom components MUST be
+    // counted as unknown rather than falsely equating components.
+    let opaque_stone = host.make_item_stack_for_id("minecraft:stone", 1, true);
+    let before_unknown = host.unknown_host_call_count();
+    let _ = fixture
+        .jar
+        .creative_tab_contents_with(
+            &mut host,
+            "demo:stack_anchor",
+            CreativeTabBuildContext {
+                initial_display_stacks: vec![opaque_stone.clone()],
+                initial_search_tab_stacks: vec![opaque_stone],
+                ..CreativeTabBuildContext::default()
+            },
+        )
+        .unwrap();
+    assert!(
+        host.unknown_host_call_count() > before_unknown,
+        "ItemStack anchor matching an opaque-component stack must be counted"
+    );
 }

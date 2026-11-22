@@ -1,9 +1,8 @@
-//! Client-side resident jar loading and registration inventory.
+//! Client-side resident jar loading, registration inventory, and creative-tab / tooltip dispatch.
 //!
 //! This phase owns one interpreter host per jar on the client. It runs client entrypoints and
-//! NeoForge's client loading stages, then records registrations and listeners for later G1 hooks.
-//! It deliberately does not draw or dispatch Java client callbacks yet; the owner hooks only keep
-//! the per-jar hosts and the report inventory alive across the client lifecycle.
+//! NeoForge's client loading stages, records registrations and listeners, and dispatches
+//! Sunrise's build-scoped creative-tab and item-tooltip hooks into each resident jar's runtime.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -104,7 +103,7 @@ impl State {
     }
 
     /// Load the client role once, on the client setup thread, and retain every host for later G1 dispatch.
-    pub(crate) fn ensure_loaded(&mut self) {
+    pub(crate) fn ensure_loaded_with_version(&mut self, game_version: Option<&str>) {
         if self.loaded {
             return;
         }
@@ -161,7 +160,7 @@ impl State {
                     (name.clone(), Arc::clone(jar))
                 })
                 .collect();
-            match load_jar(file, jar, &links, &imc) {
+            match load_jar(file, jar, &links, &imc, game_version) {
                 Ok(jar) => self.jars.push(jar),
                 Err(row) => self.refused.push(row),
             }
@@ -216,14 +215,19 @@ impl State {
         self.world_loaded = false;
     }
 
-    /// Dispatch Java Fabric creative-tab output into the build-scoped Sunrise edit.  The
-    /// interpreter owns Fabric's phase order, visibility and feature checks; this adapter only
-    /// converts the resulting, already-validated stacks to Sunrise values.
+    /// Dispatch Java Fabric creative-tab output into the build-scoped Sunrise edit.  Each jar's
+    /// collector is seeded with the tab's current Sunrise parent/search stacks so `insertBefore`,
+    /// `insertAfter`, and `prepend` see real vanilla and earlier-mod anchors; the interpreter owns
+    /// Fabric's phase order, visibility and feature checks, and this adapter reconciles the
+    /// resulting lists back onto `event.edit`.
     pub(crate) fn build_creative_tab(
         &mut self,
         host: &mut dyn mod_api::ClientHost,
         event: &mut mod_api::BuildCreativeModeTabContentsEvent<'_>,
     ) {
+        if self.jars.is_empty() {
+            return;
+        }
         let tab = event.tab.to_owned();
         let permissions = event.permissions == mod_api::CreativeTabPermissions::Operator;
         let Some(enabled_features) = runtime::creative_feature_mask(&event.features) else {
@@ -231,32 +235,52 @@ impl State {
                 loaded
                     .host
                     .note_unknown_game_hook("creative tab feature flag");
+                loaded.row.unknown_host_calls = loaded.host.unknown_host_call_count();
             }
             return;
         };
         for loaded in &mut self.jars {
+            let (Ok(parent_entries), Ok(search_entries)) = (
+                event.edit.entries(host, mod_api::CreativeTabList::Parent),
+                event.edit.entries(host, mod_api::CreativeTabList::Search),
+            ) else {
+                loaded.host.note_unknown_game_hook("creative tab entries");
+                loaded.row.unknown_host_calls = loaded.host.unknown_host_call_count();
+                continue;
+            };
+            let seeded_parent = seed_creative_stacks(host, &mut loaded.host, &parent_entries);
+            let seeded_search = seed_creative_stacks(host, &mut loaded.host, &search_entries);
             let context = runtime::CreativeTabBuildContext {
                 enabled_features,
                 has_permissions: permissions,
+                initial_display_stacks: seeded_parent.iter().map(|(v, _)| v.clone()).collect(),
+                initial_search_tab_stacks: seeded_search.iter().map(|(v, _)| v.clone()).collect(),
                 ..Default::default()
             };
-            let contents = match loaded.jar.creative_tab_contents_with(
+            let contents =
+                match loaded
+                    .jar
+                    .creative_tab_contents_with(&mut loaded.host, &tab, context)
+                {
+                    Ok(contents) => contents,
+                    Err(error) => {
+                        loaded.row.unknown_host_calls = loaded.host.unknown_host_call_count();
+                        log::warn!(
+                            "{LOG}: client {} creative tab {} failed: {error}",
+                            loaded.row.id,
+                            tab
+                        );
+                        continue;
+                    }
+                };
+            apply_creative_contents(
+                host,
+                event,
                 &mut loaded.host,
-                &tab,
-                context,
-            ) {
-                Ok(contents) => contents,
-                Err(error) => {
-                    loaded.row.unknown_host_calls = loaded.host.unknown_host_call_count();
-                    log::warn!(
-                        "{LOG}: client {} creative tab {} failed: {error}",
-                        loaded.row.id,
-                        tab
-                    );
-                    continue;
-                }
-            };
-            apply_creative_contents(host, event, &loaded.host, &contents);
+                &contents,
+                &seeded_parent,
+                &seeded_search,
+            );
             // Creative registrations are initially reported as unfired. Re-read the inventory
             // after this tab's hook so the JSON row reflects the actual registration state.
             let registered = loaded.host.game_listeners(&loaded.jar, false);
@@ -273,13 +297,14 @@ impl State {
         host: &dyn mod_api::ClientHost,
         event: &mut mod_api::ItemTooltipEvent<'_>,
     ) {
-        let Some(id) = mod_api::__private::item_key_id(event.stack.item()) else {
+        if self.jars.is_empty() || !event.display.name_visible(event.creative) {
             return;
-        };
+        }
+        let id = event.stack.item().id(host);
         let count = event.stack.count().min(i32::MAX as u32) as i32;
         let mut additions = Vec::new();
         for loaded in &mut self.jars {
-            let Some(entry) = loaded.host.observed_registry_entry("minecraft:item", id) else {
+            let Some(entry) = loaded.host.observed_registry_entry("minecraft:item", &id) else {
                 continue;
             };
             let item = entry.value.clone();
@@ -309,7 +334,9 @@ impl State {
             for line in lines {
                 let (converted, refused) = convert_tooltip_component(host, &loaded.host, &line);
                 if refused {
-                    loaded.host.note_unknown_game_hook("tooltip component conversion");
+                    loaded
+                        .host
+                        .note_unknown_game_hook("tooltip component conversion");
                 } else if let Some(text) = converted {
                     additions.push((text, u32::MAX));
                 }
@@ -334,6 +361,24 @@ impl State {
     }
 }
 
+pub(crate) fn seed_creative_stacks(
+    host: &dyn mod_api::Host,
+    runtime_host: &mut StdHost,
+    entries: &[mod_api::ItemStack],
+) -> Vec<(Value, mod_api::ItemStack)> {
+    entries
+        .iter()
+        .map(|stack| {
+            let id = stack.item().id(host);
+            let count = stack.count().min(i32::MAX as u32) as i32;
+            let has_custom_components = stack.damage_component().is_some()
+                || stack.components().is_some_and(|c| !c.as_nbt().is_empty());
+            let value = runtime_host.make_item_stack_for_id(&id, count, has_custom_components);
+            (value, stack.clone())
+        })
+        .collect()
+}
+
 fn api_stack(
     host: &dyn mod_api::Host,
     runtime_host: &StdHost,
@@ -345,32 +390,72 @@ fn api_stack(
     mod_api::ItemStack::new(key, count)
 }
 
+fn apply_creative_list(
+    host: &mut dyn mod_api::ClientHost,
+    event: &mut mod_api::BuildCreativeModeTabContentsEvent<'_>,
+    runtime_host: &mut StdHost,
+    resulting: &[Value],
+    seeded: &[(Value, mod_api::ItemStack)],
+    visibility: mod_api::CreativeTabVisibility,
+) {
+    let mut prev: Option<mod_api::ItemStack> = None;
+    for value in resulting {
+        if let Some((_, original)) = seeded.iter().find(|(seed_value, _)| seed_value == value) {
+            prev = Some(original.clone());
+            continue;
+        }
+        let Some(stack) = api_stack(host, runtime_host, value) else {
+            runtime_host.note_unknown_game_hook("creative tab stack conversion");
+            continue;
+        };
+        let placement = match &prev {
+            Some(anchor) => mod_api::CreativeTabPlacement::After(anchor.clone()),
+            None => mod_api::CreativeTabPlacement::First,
+        };
+        match event
+            .edit
+            .insert(host, placement, stack.clone(), visibility)
+        {
+            Ok(()) => prev = Some(stack),
+            Err(mod_api::CreativeTabEditError::Duplicate(_)) => {
+                // Vanilla's CreativeModeTab backs both displayItems and displayItemsSearchTab with
+                // ItemStackLinkedSet, so duplicate insertions keep the first occurrence in place.
+            }
+            Err(error) => {
+                runtime_host.note_unknown_game_hook("creative tab edit");
+                log::warn!(
+                    "{LOG}: creative tab {} insert refused: {error:?}",
+                    event.tab
+                );
+            }
+        }
+    }
+}
+
 pub(crate) fn apply_creative_contents(
     host: &mut dyn mod_api::ClientHost,
     event: &mut mod_api::BuildCreativeModeTabContentsEvent<'_>,
-    runtime_host: &StdHost,
+    runtime_host: &mut StdHost,
     contents: &runtime::CreativeTabContents,
+    seeded_parent: &[(Value, mod_api::ItemStack)],
+    seeded_search: &[(Value, mod_api::ItemStack)],
 ) {
-    for value in &contents.display_stacks {
-        if let Some(stack) = api_stack(host, runtime_host, value) {
-            let _ = event.edit.insert(
-                host,
-                mod_api::CreativeTabPlacement::Last,
-                stack,
-                mod_api::CreativeTabVisibility::Parent,
-            );
-        }
-    }
-    for value in &contents.search_tab_stacks {
-        if let Some(stack) = api_stack(host, runtime_host, value) {
-            let _ = event.edit.insert(
-                host,
-                mod_api::CreativeTabPlacement::Last,
-                stack,
-                mod_api::CreativeTabVisibility::Search,
-            );
-        }
-    }
+    apply_creative_list(
+        host,
+        event,
+        runtime_host,
+        &contents.display_stacks,
+        seeded_parent,
+        mod_api::CreativeTabVisibility::Parent,
+    );
+    apply_creative_list(
+        host,
+        event,
+        runtime_host,
+        &contents.search_tab_stacks,
+        seeded_search,
+        mod_api::CreativeTabVisibility::Search,
+    );
 }
 
 pub(crate) fn convert_tooltip_component(
@@ -406,13 +491,18 @@ fn load_jar(
     jar: Arc<NativeJar>,
     links: &[(String, Arc<NativeJar>)],
     imc: &runtime::neoforge_imc::ImcBus,
+    game_version: Option<&str>,
 ) -> Result<LoadedJar, Row> {
     let id = jar_id(&jar, &file);
     let entrypoints = jar.role_entrypoints(true);
     if entrypoints.is_empty() {
         return Err(Row::refused(&file, id, "no client entrypoint"));
     }
-    let mut host = match jar.try_seed_host(StdHost::new().with_environment_type("CLIENT")) {
+    let mut seed = StdHost::new().with_environment_type("CLIENT");
+    if let Some(version) = game_version {
+        seed = seed.with_game_version(version);
+    }
+    let mut host = match jar.try_seed_host(seed) {
         Ok(host) => host,
         Err(error) => return Err(Row::refused(&file, id, error)),
     };
