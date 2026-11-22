@@ -1305,18 +1305,27 @@ pub(crate) fn decode_non_air_item_id(host: &StdHost, raw: &str) -> Result<String
     Ok(id)
 }
 
+pub(crate) fn format_json_map(map: &serde_json::Map<String, serde_json::Value>) -> String {
+    serde_json::to_string(&serde_json::Value::Object(map.clone()))
+        .unwrap_or_else(|_| "{}".to_owned())
+}
+
 pub(crate) fn decode_item_stack_template_map(
     host: &mut StdHost,
     map: &serde_json::Map<String, serde_json::Value>,
-) -> Result<Value, DecodeError> {
+) -> crate::runtime::dfu_codec::DfuCodecResult<Value> {
+    use crate::runtime::dfu_codec::DfuCodecResult;
     // Evaluate all three RecordCodecBuilder fields (`id`, `count`, `components`) in field order
-    // and accumulate errors just like DFU's `ItemStackTemplate.MAP_CODEC`.
+    // and accumulate errors just like DFU's `ItemStackTemplate.MAP_CODEC`. `count` and
+    // `components` are `optionalFieldOf` with defaults `1` and `EMPTY`, so they always produce
+    // a partial value even on error; `id` is required, so `ItemStackTemplate` produces a partial
+    // whenever `id` succeeds.
     let mut invalid_errors = Vec::new();
     let mut first_unmodelled: Option<String> = None;
 
     let item_id = match map.get("id").filter(|v| !v.is_null()) {
         None => {
-            invalid_errors.push("No key id in ItemStackTemplate".into());
+            invalid_errors.push(format!("No key id in MapLike[{}]", format_json_map(map)));
             None
         }
         Some(v) => match v.as_str() {
@@ -1334,76 +1343,131 @@ pub(crate) fn decode_item_stack_template_map(
                 }
             },
             None => {
-                invalid_errors.push(format!("Not a string for ItemStackTemplate id: {v}"));
+                invalid_errors.push(format!("Not a string: {v}"));
                 None
             }
         },
     };
 
     // `ExtraCodecs.intRange(1, 99).optionalFieldOf("count", 1)`: JSON `null` = absent/default,
-    // fractional JSON numbers truncate toward zero before range checking.
+    // fractional JSON numbers truncate toward zero before range checking, and decode errors
+    // keep partial value `1`.
     let count = match map.get("count").filter(|v| !v.is_null()) {
-        None => Some(1),
+        None => 1,
         Some(v) => match json_number_to_i64(v).map(|n| n as i32) {
             None => {
-                invalid_errors.push(format!("Not a number for ItemStackTemplate count: {v}"));
-                None
+                invalid_errors.push(format!("Not a number: {v}"));
+                1
             }
             Some(n) if !(1..=99).contains(&n) => {
                 invalid_errors.push(format!("Value must be within range [1;99]: {n}"));
-                None
+                1
             }
-            Some(n) => Some(n),
+            Some(n) => n,
         },
     };
 
     let patch = match map.get("components").filter(|v| !v.is_null()) {
-        None => Some(ComponentPatch::default()),
+        None => ComponentPatch::default(),
         Some(v) => match decode_component_patch_json(host, v) {
-            Ok(p) => Some(p),
+            Ok(p) => p,
             Err(DecodeError::Invalid(msg)) => {
                 invalid_errors.push(msg);
-                None
+                ComponentPatch::default()
             }
             Err(DecodeError::Unmodelled(msg)) => {
                 if first_unmodelled.is_none() {
                     first_unmodelled = Some(msg);
                 }
-                None
+                ComponentPatch::default()
             }
         },
     };
 
     if let Some(msg) = first_unmodelled {
-        return Err(DecodeError::Unmodelled(msg));
+        return DfuCodecResult::Unmodelled(msg);
     }
     if !invalid_errors.is_empty() {
-        return Err(DecodeError::Invalid(invalid_errors.join("; ")));
+        // DFU's `RecordCodecBuilder` (`ap3`) combines error messages in reverse field order.
+        let message = invalid_errors
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>()
+            .join("; ");
+        let partial = item_id.map(|id| {
+            host.recipes.alloc_template(TemplateData {
+                item_id: id,
+                count,
+                patch,
+            })
+        });
+        return DfuCodecResult::Error { message, partial };
     }
-    Ok(host.recipes.alloc_template(TemplateData {
+    DfuCodecResult::Ok(host.recipes.alloc_template(TemplateData {
         item_id: item_id.unwrap(),
-        count: count.unwrap(),
-        patch: patch.unwrap(),
+        count,
+        patch,
     }))
 }
 
 pub(crate) fn decode_item_stack_template_json(
     host: &mut StdHost,
     value: &serde_json::Value,
-) -> Result<Value, DecodeError> {
-    match value {
-        serde_json::Value::String(raw_id) => {
-            let item_id = decode_non_air_item_id(host, raw_id)?;
-            Ok(host.recipes.alloc_template(TemplateData {
+) -> crate::runtime::dfu_codec::DfuCodecResult<Value> {
+    use crate::runtime::dfu_codec::DfuCodecResult;
+    // `ItemStackTemplate.CODEC = Codec.withAlternative(MAP_CODEC.codec(), Item.CODEC, ItemStackTemplate::new)`
+    // (`EitherCodec`): try object form first, then string item-id form; on dual error prefer a
+    // partial from first (then second), else format DFU's combined `EitherCodec` message.
+    let first = match value {
+        serde_json::Value::Object(map) => decode_item_stack_template_map(host, map),
+        _ => DfuCodecResult::Error {
+            message: format!("Not a JSON object: {value}"),
+            partial: None,
+        },
+    };
+    let (first_err, first_partial) = match first {
+        DfuCodecResult::Ok(v) => return DfuCodecResult::Ok(v),
+        DfuCodecResult::Unmodelled(u) => return DfuCodecResult::Unmodelled(u),
+        DfuCodecResult::Error { message, partial } => (message, partial),
+    };
+    let second = match value {
+        serde_json::Value::String(raw_id) => match decode_non_air_item_id(host, raw_id) {
+            Ok(item_id) => DfuCodecResult::Ok(host.recipes.alloc_template(TemplateData {
                 item_id,
                 count: 1,
                 patch: ComponentPatch::default(),
-            }))
-        }
-        serde_json::Value::Object(map) => decode_item_stack_template_map(host, map),
-        _ => Err(DecodeError::Invalid(format!(
-            "Not a valid ItemStackTemplate JSON value: {value}"
-        ))),
+            })),
+            Err(DecodeError::Invalid(message)) => DfuCodecResult::Error {
+                message,
+                partial: None,
+            },
+            Err(DecodeError::Unmodelled(u)) => DfuCodecResult::Unmodelled(u),
+        },
+        _ => DfuCodecResult::Error {
+            message: format!("Not a string: {value}"),
+            partial: None,
+        },
+    };
+    let (second_err, second_partial) = match second {
+        DfuCodecResult::Ok(v) => return DfuCodecResult::Ok(v),
+        DfuCodecResult::Unmodelled(u) => return DfuCodecResult::Unmodelled(u),
+        DfuCodecResult::Error { message, partial } => (message, partial),
+    };
+    if first_partial.is_some() {
+        return DfuCodecResult::Error {
+            message: first_err,
+            partial: first_partial,
+        };
+    }
+    if second_partial.is_some() {
+        return DfuCodecResult::Error {
+            message: second_err,
+            partial: second_partial,
+        };
+    }
+    DfuCodecResult::Error {
+        message: format!("Failed to parse either. First: {first_err}; Second: {second_err}"),
+        partial: None,
     }
 }
 

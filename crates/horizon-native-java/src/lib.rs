@@ -50,6 +50,7 @@ mod collection_base;
 mod collection_callback;
 mod collection_store;
 mod color_collection;
+mod commons_fraction;
 mod commons_io;
 mod commons_lang;
 mod commons_pair;
@@ -58,6 +59,7 @@ pub mod content;
 mod declarations_content;
 pub mod dependencies;
 mod dfu_codec;
+pub use dfu_codec::DfuCodecResult;
 mod dfu_either;
 mod dfu_pair;
 mod dfu_pair_ops;
@@ -205,6 +207,7 @@ mod mod_count;
 mod mod_origin;
 mod model_layers;
 mod modified_utf8;
+mod mutable_container;
 mod native_library;
 mod neoforge_api;
 pub mod neoforge_attachments;
@@ -9051,6 +9054,9 @@ impl Host for StdHost {
             return Ok(value);
         }
         // `CompoundTag.CODEC`, the root of a modelled attachment codec (`attachment_codec.rs`).
+        if let Some(value) = commons_lang::static_field(r) {
+            return Ok(value);
+        }
         if let Some(value) = dfu_codec::static_field(r) {
             return Ok(value);
         }
@@ -23827,6 +23833,79 @@ impl NativeJar {
         result
     }
 
+    /// Decode a JSON value through a modelled DFU `Codec` handle constructed by this jar.
+    pub fn decode_dfu_codec_json<H: Host>(
+        &self,
+        codec: &Value,
+        json: &serde_json::Value,
+        host: &mut H,
+    ) -> Result<DfuCodecResult<Value>, NativeError> {
+        let mut outcome: Option<DfuCodecResult<Value>> = None;
+        self.with_persistent_runtime(host, std::slice::from_ref(codec), |runtime| {
+            let res = dfu_codec::decode_value_json(runtime, codec, json)?;
+            let rooted = match &res {
+                DfuCodecResult::Ok(v)
+                | DfuCodecResult::Error {
+                    partial: Some(v), ..
+                } => v.clone(),
+                _ => Value::Void,
+            };
+            outcome = Some(res);
+            Ok(rooted)
+        })?;
+        Ok(outcome.unwrap_or_else(|| DfuCodecResult::Unmodelled("no decode outcome".into())))
+    }
+
+    /// Encode a runtime value to JSON through a modelled DFU `Codec` handle constructed by this jar.
+    pub fn encode_dfu_codec_json<H: Host>(
+        &self,
+        codec: &Value,
+        value: &Value,
+        host: &mut H,
+    ) -> Result<DfuCodecResult<serde_json::Value>, NativeError> {
+        let mut outcome: Option<DfuCodecResult<serde_json::Value>> = None;
+        let roots = [codec.clone(), value.clone()];
+        self.with_persistent_runtime(host, &roots, |runtime| {
+            outcome = Some(dfu_codec::encode_value_json(runtime, codec, value)?);
+            Ok(Value::Void)
+        })?;
+        Ok(outcome.unwrap_or_else(|| DfuCodecResult::Unmodelled("no encode outcome".into())))
+    }
+
+    /// Encode a runtime value to exact MC 26.3 wire bytes through a modelled `StreamCodec`.
+    pub fn encode_stream_codec_bytes<H: Host>(
+        &self,
+        codec: &Value,
+        value: &Value,
+        host: &mut H,
+    ) -> Result<Option<Vec<u8>>, NativeError> {
+        let mut encoded = None;
+        let roots = [codec.clone(), value.clone()];
+        self.with_persistent_runtime(host, &roots, |runtime| {
+            encoded = stream_codec::encode_bytes(runtime, codec, value)?;
+            Ok(Value::Void)
+        })?;
+        Ok(encoded)
+    }
+
+    /// Decode a runtime value from exact MC 26.3 wire bytes through a modelled `StreamCodec`,
+    /// returning `(value, bytes_consumed)`.
+    pub fn decode_stream_codec_bytes<H: Host>(
+        &self,
+        codec: &Value,
+        bytes: &[u8],
+        host: &mut H,
+    ) -> Result<Option<(Value, usize)>, NativeError> {
+        let mut decoded: Option<(Value, usize)> = None;
+        self.with_persistent_runtime(host, std::slice::from_ref(codec), |runtime| {
+            decoded = stream_codec::decode_bytes(runtime, codec, bytes)?;
+            Ok(decoded
+                .as_ref()
+                .map_or(Value::Void, |(value, _)| value.clone()))
+        })?;
+        Ok(decoded)
+    }
+
     /// Invoke one jar method with the `CallbackInfo` objects of the execution
     /// that owns it, so `ci.cancel()` inside a Mixin callback is visible to the
     /// caller once the call returns.
@@ -26347,6 +26426,11 @@ impl<H: Host> Runtime<'_, H> {
                 {
                     return owner.to_owned();
                 }
+                if let Some(owner) =
+                    mutable_container::field_owner(&current, &field.name, &field.descriptor)
+                {
+                    return owner.to_owned();
+                }
                 // `AbstractList.modCount`, inherited from a JDK skeleton.
                 if let Some(owner) =
                     jdk_skeletons::skeleton_field_owner(&current, &field.name, &field.descriptor)
@@ -27496,6 +27580,11 @@ impl<H: Host> Runtime<'_, H> {
                 )? {
                     return Ok(Some(value));
                 }
+                if let Some(value) =
+                    dfu_codec::runtime_instance_call(self, &callback.target, None, &values)?
+                {
+                    return Ok(Some(value));
+                }
                 let token = self.mod_count_before(&callback.target, 0xb8, None, &values)?;
                 if let Some(answer) = token.as_ref().and_then(|token| token.answer.clone()) {
                     return Ok(Some(answer));
@@ -27689,6 +27778,16 @@ impl<H: Host> Runtime<'_, H> {
                 "callback",
             )? {
                 return Ok(Some(value));
+            }
+            if let Some(value) =
+                dfu_codec::runtime_instance_call(self, &callback.target, Some(&receiver), &rest)?
+            {
+                return Ok(Some(value));
+            }
+            if let Some(value) =
+                stream_codec::runtime_instance_call(self, &callback.target, Some(&receiver), &rest)
+            {
+                return value.map(Some);
             }
             // `list::add` moves the list's `modCount` as the call would.
             let token = self.mod_count_before(&callback.target, 0xb9, Some(&receiver), &rest)?;
@@ -35758,6 +35857,97 @@ impl<H: Host> Runtime<'_, H> {
         self.invoke_hash_collection(r, op, receiver, args)
     }
 
+    /// Out-of-line `putfield` write for instance fields so `invoke_frame` keeps
+    /// only one catch site for the final-field and menu-field write guards.
+    #[inline(never)]
+    fn put_instance_field(
+        &mut self,
+        receiver: &Value,
+        r: &MethodRef,
+        value: Value,
+    ) -> Result<(), NativeError> {
+        let Some(key) = instance_field_key(receiver, r) else {
+            return Ok(());
+        };
+        if !self.fields.contains_key(&key) {
+            self.refuse_collected(receiver, r)?;
+        }
+        if mutable_container::is_final_field(r) {
+            self.host.unknown_operand_call(r)?;
+            return Ok(());
+        }
+        match self.host.menu_field_set(receiver, r, &value) {
+            menu_models::FieldSetResult::Written => {}
+            menu_models::FieldSetResult::NotOwned => {
+                self.fields.insert(key, value);
+            }
+            menu_models::FieldSetResult::Counted => {
+                self.host.unknown_operand_call(r)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Out-of-line stage for JDK skeletons, spliterators, NeoForge IMC, Commons Lang,
+    /// and vanilla mutable-container calls, keeping their dispatch locals out of
+    /// `invoke_frame`.
+    #[inline(never)]
+    fn invoke_jdk_and_runtime_models(
+        &mut self,
+        r: &MethodRef,
+        op: u8,
+        receiver: Option<&Value>,
+        args: &[Value],
+        class: &str,
+        method: &str,
+    ) -> Result<Option<Value>, NativeError> {
+        if let Some(value) = self.invoke_jdk_skeleton(r, op, receiver, args)? {
+            return Ok(Some(value));
+        }
+        if let Some(value) = self.invoke_jdk_spliterator(r, op, receiver, args, class, method)? {
+            return Ok(Some(value));
+        }
+        if let Some(value) = self.invoke_neoforge_imc(r, receiver, args, class, method)? {
+            return Ok(Some(value));
+        }
+        if let Some(value) = commons_lang::runtime_call(self, r, receiver, args)? {
+            return Ok(Some(value));
+        }
+        mutable_container::runtime_call(self, r, op, receiver, args)
+    }
+
+    /// Out-of-line stage for unbuilt `String` constructors, DFU codec, and recipe
+    /// runtime models, keeping their dispatch locals out of `invoke_frame`.
+    #[inline(never)]
+    fn invoke_codec_and_recipe_models(
+        &mut self,
+        r: &MethodRef,
+        receiver: Option<&Value>,
+        args: &[Value],
+    ) -> Result<Option<Value>, NativeError> {
+        if let Some(value) = string_constructors::count(self, r)? {
+            if let Some(marker) = receiver
+                .filter(|value| jar_object::is_object(value))
+                .and_then(jar_object::object_key)
+            {
+                self.counted_strings.insert(marker.to_owned());
+            }
+            return Ok(Some(value));
+        }
+        if let Some(value) = dfu_codec::runtime_instance_call(self, r, receiver, args)? {
+            return Ok(Some(value));
+        }
+        if let Some(value) = recipe_models::runtime_recipe_manager_call(self, r, receiver, args)? {
+            return Ok(Some(value));
+        }
+        if receiver.is_none()
+            && let Some(value) = recipe_models::runtime_static_call(self, r, args)?
+        {
+            return Ok(Some(value));
+        }
+        Ok(None)
+    }
+
     fn prepare_entity_data_hierarchy(&mut self, args: &[Value]) {
         let Some(mut class_name) = args
             .first()
@@ -37483,21 +37673,8 @@ impl<H: Host> Runtime<'_, H> {
                     if outcome == AnchorOutcome::Normal && receiver == Value::Ref(None) {
                         invoke_or_catch!(at, Err(null_checks::assign_field_on_null(&r)))
                     }
-                    if outcome == AnchorOutcome::Normal
-                        && let Some(key) = instance_field_key(&receiver, &r)
-                    {
-                        if !self.fields.contains_key(&key) {
-                            self.refuse_collected(&receiver, &r)?;
-                        }
-                        match self.host.menu_field_set(&receiver, &r, &value) {
-                            menu_models::FieldSetResult::Written => {}
-                            menu_models::FieldSetResult::NotOwned => {
-                                self.fields.insert(key, value);
-                            }
-                            menu_models::FieldSetResult::Counted => {
-                                invoke_or_catch!(at, self.host.unknown_operand_call(&r));
-                            }
-                        }
+                    if outcome == AnchorOutcome::Normal {
+                        invoke_or_catch!(at, self.put_instance_field(&receiver, &r, value));
                     }
                 }
                 0xb6..=0xb9 => {
@@ -38106,24 +38283,7 @@ impl<H: Host> Runtime<'_, H> {
                     if dispatched.is_none()
                         && let Some(value) = invoke_or_catch!(
                             at,
-                            self.invoke_jdk_skeleton(&r, op, receiver.as_ref(), &args)
-                        )
-                    {
-                        dispatched = Some({
-                            // A JDK skeleton's body or a JDK interface default the
-                            // receiver inherits (`jdk_skeletons/`). It never
-                            // claims a call the jar copy above runs: that one
-                            // takes only static/`invokespecial` calls whose member
-                            // a jar class declares, while a skeleton
-                            // `invokespecial` needs the member to resolve to the
-                            // JDK class, as the JVM's resolution does.
-                            value
-                        });
-                    }
-                    if dispatched.is_none()
-                        && let Some(value) = invoke_or_catch!(
-                            at,
-                            self.invoke_jdk_spliterator(
+                            self.invoke_jdk_and_runtime_models(
                                 &r,
                                 op,
                                 receiver.as_ref(),
@@ -38131,29 +38291,6 @@ impl<H: Host> Runtime<'_, H> {
                                 class,
                                 method
                             )
-                        )
-                    {
-                        dispatched = Some({
-                            // The JDK's spliterators and `StreamSupport.stream`
-                            // (`jdk_spliterators.rs`).
-                            value
-                        });
-                    }
-                    if dispatched.is_none()
-                        && let Some(value) = invoke_or_catch!(
-                            at,
-                            self.invoke_neoforge_imc(&r, receiver.as_ref(), &args, class, method)
-                        )
-                    {
-                        dispatched = Some({
-                            // FML's `InterModComms` (`neoforge_imc.rs`).
-                            value
-                        });
-                    }
-                    if dispatched.is_none()
-                        && let Some(value) = invoke_or_catch!(
-                            at,
-                            commons_lang::runtime_call(self, &r, receiver.as_ref(), &args)
                         )
                     {
                         dispatched = Some(value);
@@ -38180,44 +38317,9 @@ impl<H: Host> Runtime<'_, H> {
                         });
                     }
                     if dispatched.is_none()
-                        && let Some(value) =
-                            invoke_or_catch!(at, string_constructors::count(self, &r))
-                    {
-                        if let Some(marker) = receiver
-                            .as_ref()
-                            .filter(|value| jar_object::is_object(value))
-                            .and_then(jar_object::object_key)
-                        {
-                            self.counted_strings.insert(marker.to_owned());
-                        }
-                        dispatched = Some(value);
-                    }
-                    if dispatched.is_none()
                         && let Some(value) = invoke_or_catch!(
                             at,
-                            dfu_codec::runtime_instance_call(self, &r, receiver.as_ref(), &args)
-                        )
-                    {
-                        dispatched = Some(value);
-                    }
-                    if dispatched.is_none()
-                        && let Some(value) = invoke_or_catch!(
-                            at,
-                            recipe_models::runtime_recipe_manager_call(
-                                self,
-                                &r,
-                                receiver.as_ref(),
-                                &args
-                            )
-                        )
-                    {
-                        dispatched = Some(value);
-                    }
-                    if dispatched.is_none()
-                        && receiver.is_none()
-                        && let Some(value) = invoke_or_catch!(
-                            at,
-                            recipe_models::runtime_static_call(self, &r, &args)
+                            self.invoke_codec_and_recipe_models(&r, receiver.as_ref(), &args)
                         )
                     {
                         dispatched = Some(value);

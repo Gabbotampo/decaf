@@ -188,6 +188,18 @@ impl<H: Host> Runtime<'_, H> {
         object
     }
 
+    /// A modelled `DataResult.error(Supplier, partial?)`: stores the error message supplier and
+    /// an optional partial value (absent when `None`).
+    pub(crate) fn data_result_error(&mut self, supplier: Value, partial: Option<Value>) -> Value {
+        let object = self.data_result("error", supplier);
+        if let Some(partial) = partial
+            && let Some(marker) = expect_ref(&object).cloned()
+        {
+            self.fields.insert(result_key(&marker, "p"), partial);
+        }
+        object
+    }
+
     /// `Ok(value)` for a modelled success, `Err(None)` for a modelled error, `Err(Some(why))` for
     /// anything else.
     pub(crate) fn read_data_result(&self, result: &Value) -> Result<Value, Option<String>> {
@@ -204,6 +216,28 @@ impl<H: Host> Runtime<'_, H> {
             _ => Err(Some(format!(
                 "a codec lambda answered a DataResult this runtime does not model ({marker})"
             ))),
+        }
+    }
+
+    /// The `Supplier<String>` stored inside a modelled `DataResult.error(Supplier)`, if any.
+    pub(crate) fn read_data_result_error_supplier(&self, result: &Value) -> Option<Value> {
+        let marker = expect_ref(result)?;
+        match self.fields.get(&result_key(marker, "kind")) {
+            Some(Value::Ref(Some(kind))) if kind == "error" => {
+                self.fields.get(&result_key(marker, "v")).cloned()
+            }
+            _ => None,
+        }
+    }
+
+    /// The partial value stored inside a modelled `DataResult.error(Supplier, partial)`, if any.
+    pub(crate) fn read_data_result_error_partial(&self, result: &Value) -> Option<Value> {
+        let marker = expect_ref(result)?;
+        match self.fields.get(&result_key(marker, "kind")) {
+            Some(Value::Ref(Some(kind))) if kind == "error" => {
+                self.fields.get(&result_key(marker, "p")).cloned()
+            }
+            _ => None,
         }
     }
 

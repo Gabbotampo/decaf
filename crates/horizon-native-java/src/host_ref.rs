@@ -688,6 +688,11 @@ pub enum HostKind {
     /// (`equals`, `hashCode`, `toString`, `instanceof`, `checkcast`, `==`, `getClass`,
     /// or any method call) counts on the host and refuses static shape export.
     ShapeProbe,
+    /// Apache Commons Lang `org.apache.commons.lang3.math.Fraction` (`commons_fraction.rs`).
+    CommonsFraction,
+    /// Vanilla `StreamCodec$CodecOperation` combinator returned by `ByteBufCodecs.list(...)`
+    /// and friends (`stream_codec.rs`).
+    StreamCodecOperation,
 }
 
 /// How a kind's Java class follows from its key.
@@ -971,6 +976,10 @@ const CLASS_SIDES: &[(HostKind, &ClassSide)] = &[
     (
         HostKind::TooltipFlagDefault,
         &crate::client_surface::TOOLTIP_FLAG_DEFAULT_CLASS_SIDE,
+    ),
+    (
+        HostKind::CommonsFraction,
+        &crate::commons_fraction::CLASS_SIDE,
     ),
 ];
 
@@ -3048,6 +3057,22 @@ const KINDS: &[KindInfo] = &[
         class: ClassRule::Unknown { declared: |_| &[] },
         canonical: never_canonical,
         methods: &crate::voxel_shape::SHAPE_PROBE_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::CommonsFraction,
+        tag: "cfrac",
+        class: ClassRule::FromKey(crate::commons_fraction::fraction_class),
+        canonical: always_canonical,
+        methods: &crate::commons_fraction::METHODS,
+    },
+    KindInfo {
+        kind: HostKind::StreamCodecOperation,
+        tag: "scdo",
+        class: ClassRule::Unknown {
+            declared: crate::stream_codec::codec_operation_types,
+        },
+        canonical: never_canonical,
+        methods: &crate::stream_codec::CODEC_OPERATION_METHODS,
     },
 ];
 
