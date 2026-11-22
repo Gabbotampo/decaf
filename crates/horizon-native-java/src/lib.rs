@@ -14513,12 +14513,43 @@ impl Host for StdHost {
                     .trim_matches(|c: char| c <= '\u{0020}')
                     .to_owned(),
             ))),
+            // `strip`, `stripLeading`, `stripTrailing` and `isBlank` use
+            // `Character.isWhitespace` (not U+00A0, U+2007 or U+202F). A
+            // receiver that is a jar-object marker (an unmodelled constructor
+            // left a `String#n` reference) has no text to strip: counted.
+            (
+                "java/lang/String",
+                "strip" | "stripLeading" | "stripTrailing",
+                "()Ljava/lang/String;",
+            )
+            | ("java/lang/String", "isBlank", "()Z")
+                if jar_object::spells_key(receiver) || matches!(receiver, Value::Host(_)) =>
+            {
+                self.unknown_host_call(r)
+            }
             ("java/lang/String", "strip", "()Ljava/lang/String;") => {
-                Ok(Value::Ref(Some(expect_string(receiver).trim().to_owned())))
+                let text = expect_string(receiver);
+                let (start, end) = jdk_character::strip_bounds(text);
+                // All-whitespace text has `start > end`: clamp so the slice is
+                // empty instead of panicking.
+                Ok(Value::Ref(Some(text[start..end.max(start)].to_owned())))
             }
-            ("java/lang/String", "isBlank", "()Z") => {
-                Ok(Value::Int(expect_string(receiver).trim().is_empty() as i32))
+            ("java/lang/String", "stripLeading", "()Ljava/lang/String;") => {
+                let text = expect_string(receiver);
+                let (start, _) = jdk_character::strip_bounds(text);
+                Ok(Value::Ref(Some(text[start..].to_owned())))
             }
+            ("java/lang/String", "stripTrailing", "()Ljava/lang/String;") => {
+                let text = expect_string(receiver);
+                let (_, end) = jdk_character::strip_bounds(text);
+                Ok(Value::Ref(Some(text[..end].to_owned())))
+            }
+            ("java/lang/String", "isBlank", "()Z") => Ok(Value::Int(
+                expect_string(receiver)
+                    .chars()
+                    .all(|ch| jdk_character::is_whitespace(ch as u32 as i32))
+                    as i32,
+            )),
             ("java/lang/String", "substring", "(I)Ljava/lang/String;") => {
                 let start = expect_int(r, Self::argument(r, args, 0)?)?;
                 let value = expect_string(receiver);
