@@ -2398,6 +2398,11 @@ pub struct EventDispatch {
 /// keeps no such state", which the caller turns into a counted path of its own (#246's review:
 /// a silent `null` from `unknown_operand_call` printed a hook-tier player as `null`).
 pub trait Host {
+    /// Materialize a host-owned array returned by a modelled game object into
+    /// the active interpreter invocation. `None` means the value is not one.
+    fn host_array_values(&self, _value: &Value) -> Option<Vec<Value>> {
+        None
+    }
     /// Structural vanilla menu/container call. `None` leaves the call on the
     /// ordinary host path; a returned error is a counted refusal.
     fn menu_instance_call(
@@ -3693,6 +3698,11 @@ pub struct StdHost {
     resource_generation: u64,
     /// Per-call container stack clamp resolved virtually for `SimpleContainer.setItem`.
     pending_container_clamp: Option<menu_models::ContainerClamp>,
+    /// Host-owned snapshots handed to a jar's `BlockPlaceContext` override.
+    /// The context is deliberately a value object: it has no guessed world
+    /// state and every accessor is answered from the placement snapshot.
+    placement_contexts: BTreeMap<String, BlockPlaceContextData>,
+    placement_arrays: BTreeMap<String, Vec<Value>>,
     resource_streams: BTreeMap<String, (Vec<u8>, usize)>,
     resource_marks: BTreeMap<String, usize>,
     /// Explicitly seeded class names exposed through `ClassLoader.loadClass`.
@@ -4060,6 +4070,37 @@ pub struct StdHost {
     freed_menu_objects: heap::FreedObjects,
 }
 
+/// The exact inputs exposed by vanilla's `BlockPlaceContext`/`UseOnContext`.
+/// Game adapters build this from their resolved placement snapshot; the
+/// runtime never derives a value from a mod or from a baked block state.
+#[derive(Clone, Debug)]
+pub struct BlockPlaceContextData {
+    pub clicked_pos: [i32; 3],
+    pub clicked_face: Value,
+    pub click_location: [f64; 3],
+    pub inside: bool,
+    pub yaw: f32,
+    pub pitch: f32,
+    pub secondary_use: bool,
+    pub replacing_clicked_on_block: bool,
+    pub can_place: bool,
+    pub player: Value,
+    pub item_in_hand: Value,
+    pub level: Value,
+}
+
+fn opposite(direction: &str) -> &'static str {
+    match direction {
+        "DOWN" => "UP",
+        "UP" => "DOWN",
+        "NORTH" => "SOUTH",
+        "SOUTH" => "NORTH",
+        "WEST" => "EAST",
+        "EAST" => "WEST",
+        _ => "NORTH",
+    }
+}
+
 impl Default for StdHost {
     fn default() -> Self {
         Self::new()
@@ -4104,6 +4145,8 @@ impl StdHost {
             data_pack_layers: Vec::new(),
             resource_generation: 0,
             pending_container_clamp: None,
+            placement_contexts: BTreeMap::new(),
+            placement_arrays: BTreeMap::new(),
             resource_streams: BTreeMap::new(),
             resource_marks: BTreeMap::new(),
             classes: BTreeMap::new(),
@@ -5562,6 +5605,147 @@ impl StdHost {
         &self.calls
     }
 
+    /// Register a vanilla-shaped `BlockPlaceContext` snapshot for a virtual
+    /// block call. The returned handle is rooted by the caller for the
+    /// duration of the invocation and may be reused by nested calls.
+    pub fn new_block_place_context(&mut self, data: BlockPlaceContextData) -> Value {
+        let key = format!("placement-context#{}", self.placement_contexts.len());
+        self.placement_contexts.insert(key.clone(), data);
+        Value::Host(HostRef::new(HostKind::GameTransient, key))
+    }
+
+    fn placement_context(&self, value: &Value) -> Option<&BlockPlaceContextData> {
+        let Value::Host(handle) = value else {
+            return None;
+        };
+        (handle.kind() == HostKind::GameTransient)
+            .then(|| self.placement_contexts.get(handle.key()))
+            .flatten()
+    }
+
+    fn placement_direction(name: &str) -> Value {
+        Value::Ref(Some(format!("enum/net/minecraft/core/Direction/{name}")))
+    }
+
+    fn placement_yaw_direction(yaw: f32) -> &'static str {
+        const HORIZONTAL: [&str; 4] = ["SOUTH", "WEST", "NORTH", "EAST"];
+        HORIZONTAL[((f64::from(yaw) / 90.0 + 0.5).floor() as i64 & 3) as usize]
+    }
+
+    fn placement_ordered_directions(yaw: f32, pitch: f32) -> [&'static str; 6] {
+        let pitch = f64::from(pitch).to_radians();
+        let yaw = -f64::from(yaw).to_radians();
+        let (pitch_sin, pitch_cos) = pitch.sin_cos();
+        let (yaw_sin, yaw_cos) = yaw.sin_cos();
+        let x_pos = yaw_sin > 0.0;
+        let y_pos = pitch_sin < 0.0;
+        let z_pos = yaw_cos > 0.0;
+        let x_yaw = if x_pos { yaw_sin } else { -yaw_sin };
+        let y_mag = if y_pos { -pitch_sin } else { pitch_sin };
+        let z_yaw = if z_pos { yaw_cos } else { -yaw_cos };
+        let x_mag = x_yaw * pitch_cos;
+        let z_mag = z_yaw * pitch_cos;
+        let ax = if x_pos { "EAST" } else { "WEST" };
+        let ay = if y_pos { "UP" } else { "DOWN" };
+        let az = if z_pos { "SOUTH" } else { "NORTH" };
+        let make = |a, b, c| [a, b, c, opposite(c), opposite(b), opposite(a)];
+        if x_yaw > z_yaw {
+            if y_mag > x_mag {
+                make(ay, ax, az)
+            } else if z_mag > y_mag {
+                make(ax, az, ay)
+            } else {
+                make(ax, ay, az)
+            }
+        } else if y_mag > z_mag {
+            make(ay, az, ax)
+        } else if x_mag > y_mag {
+            make(az, ax, ay)
+        } else {
+            make(az, ay, ax)
+        }
+    }
+
+    fn placement_context_call(
+        &mut self,
+        r: &MethodRef,
+        receiver: &Value,
+    ) -> Option<Result<Value, NativeError>> {
+        let context = self.placement_context(receiver)?.clone();
+        let direction = |name| Ok(Self::placement_direction(name));
+        let pos = || {
+            Ok(crate::runtime::game_object::server_value(format!(
+                "block-pos/{},{},{}",
+                context.clicked_pos[0], context.clicked_pos[1], context.clicked_pos[2]
+            )))
+        };
+        let result = match (r.name.as_str(), r.descriptor.as_str()) {
+            ("getClickedPos", "()Lnet/minecraft/core/BlockPos;") => pos(),
+            ("getClickedFace", "()Lnet/minecraft/core/Direction;") => Ok(context.clicked_face),
+            ("getClickLocation", "()Lnet/minecraft/world/phys/Vec3;") => {
+                Ok(crate::runtime::game_object::client_value(format!(
+                    "client/vec3/{},{},{}",
+                    context.click_location[0], context.click_location[1], context.click_location[2]
+                )))
+            }
+            ("isInside", "()Z") => Ok(Value::Int(i32::from(context.inside))),
+            ("getItemInHand", "()Lnet/minecraft/world/item/ItemStack;") => Ok(context.item_in_hand),
+            ("getPlayer", "()Lnet/minecraft/world/entity/player/Player;") => Ok(context.player),
+            ("getLevel", "()Lnet/minecraft/world/level/Level;") => Ok(context.level),
+            ("getHorizontalDirection", "()Lnet/minecraft/core/Direction;") => {
+                if matches!(context.player, Value::Ref(None)) {
+                    direction("NORTH")
+                } else {
+                    direction(Self::placement_yaw_direction(context.yaw))
+                }
+            }
+            ("isSecondaryUseActive", "()Z") => Ok(Value::Int(i32::from(context.secondary_use))),
+            ("getRotation", "()F") => Ok(Value::Float(
+                if matches!(context.player, Value::Ref(None)) {
+                    0.0
+                } else {
+                    f64::from(context.yaw)
+                },
+            )),
+            ("canPlace", "()Z") => Ok(Value::Int(i32::from(context.can_place))),
+            ("replacingClickedOnBlock", "()Z") => {
+                Ok(Value::Int(i32::from(context.replacing_clicked_on_block)))
+            }
+            ("getNearestLookingDirection", "()Lnet/minecraft/core/Direction;") => {
+                direction(Self::placement_ordered_directions(context.yaw, context.pitch)[0])
+            }
+            ("getNearestLookingVerticalDirection", "()Lnet/minecraft/core/Direction;") => {
+                direction(if context.pitch < 0.0 { "UP" } else { "DOWN" })
+            }
+            ("getNearestLookingDirections", "()[Lnet/minecraft/core/Direction;") => {
+                let mut names = Self::placement_ordered_directions(context.yaw, context.pitch);
+                if !context.replacing_clicked_on_block {
+                    let clicked = crate::runtime::expect_ref(&context.clicked_face)
+                        .and_then(|m| m.rsplit_once('/').map(|(_, n)| n));
+                    if let Some(clicked) = clicked.map(opposite)
+                        && let Some(index) = names.iter().position(|name| *name == clicked)
+                        && index > 0
+                    {
+                        names[1..=index].rotate_right(1);
+                        names[0] = clicked;
+                    }
+                }
+                let values = names
+                    .into_iter()
+                    .map(Self::placement_direction)
+                    .collect::<Vec<_>>();
+                let key = format!(
+                    "placement-array/{}",
+                    self.placement_contexts.len() + self.calls.len()
+                );
+                self.placement_arrays.insert(key.clone(), values);
+                Ok(Value::Host(HostRef::new(HostKind::GameTransient, key)))
+            }
+            _ => return None,
+        };
+        Some(result)
+    }
+
     pub fn invocations(&self) -> &[HostInvocation] {
         &self.invocations
     }
@@ -5971,6 +6155,24 @@ impl StdHost {
     /// (`destroyTime`, `explosionResistance`, `friction`, ...).
     pub fn block_properties(&self, marker: &str) -> Option<&BTreeMap<String, String>> {
         self.block_property_builders.get(marker)
+    }
+
+    /// Decode a canonical Java `BlockState` into the registered block id and
+    /// serialized property values for a game adapter.
+    pub fn block_state_content(&self, state: &Value) -> Option<(String, BTreeMap<String, String>)> {
+        let marker = expect_ref(state)?;
+        let (block, values) = self.block_states.get(marker)?;
+        let id = self
+            .registrations
+            .iter()
+            .rev()
+            .find(|entry| {
+                entry.registry == "minecraft:block"
+                    && jar_object::object_key(&entry.value) == Some(block.as_str())
+            })?
+            .id
+            .clone();
+        Some((id, values.clone()))
     }
 
     fn captured_property(field: &str) -> Option<StatePropertyInfo> {
@@ -7522,6 +7724,15 @@ impl menu_models::StackOps for StdHost {
 }
 
 impl Host for StdHost {
+    fn host_array_values(&self, value: &Value) -> Option<Vec<Value>> {
+        let Value::Host(handle) = value else {
+            return None;
+        };
+        (handle.kind() == HostKind::GameTransient)
+            .then(|| self.placement_arrays.get(handle.key()).cloned())
+            .flatten()
+    }
+
     fn menu_instance_call(
         &mut self,
         r: &MethodRef,
@@ -10628,6 +10839,9 @@ impl Host for StdHost {
         receiver: &Value,
         args: &[Value],
     ) -> Result<Value, NativeError> {
+        if let Some(value) = self.placement_context_call(r, receiver) {
+            return value;
+        }
         if let Some(value) = self.menu_instance_call(r, receiver, args) {
             return value;
         }
@@ -20349,6 +20563,29 @@ fn mixin_accessor_label(kind: MixinAccessorKind) -> &'static str {
 }
 
 impl NativeJar {
+    /// Run a block's `getStateForPlacement(BlockPlaceContext)` override with
+    /// the supplied vanilla context. A `null` answer is vanilla's refusal.
+    pub fn block_state_for_placement<H: Host>(
+        &self,
+        block: Value,
+        context: BlockPlaceContextData,
+        host: &mut H,
+    ) -> Result<Option<Value>, NativeError> {
+        let context_value = host
+            .as_std_host_mut()
+            .ok_or_else(|| NativeError::Metadata("placement requires a standard host".into()))?
+            .new_block_place_context(context);
+        let value = self.invoke_virtual_with_args(
+            "net/minecraft/world/level/block/Block",
+            "getStateForPlacement",
+            "(Lnet/minecraft/world/item/context/BlockPlaceContext;)Lnet/minecraft/world/level/block/state/BlockState;",
+            block,
+            &[context_value],
+            host,
+        )?;
+        Ok((value != Value::Ref(None)).then_some(value))
+    }
+
     pub fn from_classes(classes: impl IntoIterator<Item = ClassFile>) -> Self {
         let classes = classes.into_iter().collect::<Vec<_>>();
         let neoforge_entrypoints = classes
@@ -23279,6 +23516,34 @@ impl NativeJar {
             host,
             &mut CallbackInfos::new(),
         )
+    }
+
+    /// Invoke a virtual member through the interpreter's JVM dispatch path.
+    /// This is the game bridge entry point for callbacks on host-owned
+    /// objects: a jar override is selected by `Runtime::call_virtual`, while
+    /// inherited game methods remain on the host model.
+    pub fn invoke_virtual_with_args<H: Host>(
+        &self,
+        owner: &str,
+        method: &str,
+        descriptor: &str,
+        receiver: Value,
+        args: &[Value],
+        host: &mut H,
+    ) -> Result<Value, NativeError> {
+        let mut roots = Vec::with_capacity(args.len() + 1);
+        roots.push(receiver.clone());
+        roots.extend_from_slice(args);
+        self.with_persistent_runtime(host, &roots, |runtime| {
+            runtime.call_virtual(
+                jdk_call::Site::Virtual,
+                owner,
+                method,
+                descriptor,
+                &receiver,
+                args,
+            )
+        })
     }
 
     /// Invoke one jar method the way a later firing of a registered callback
@@ -27563,19 +27828,6 @@ impl<H: Host> Runtime<'_, H> {
                 },
             );
         }
-        let placement = MethodRef {
-            owner: class.to_owned(),
-            name: "getStateForPlacement".into(),
-            descriptor: "(Lnet/minecraft/world/item/context/BlockPlaceContext;)Lnet/minecraft/world/level/block/state/BlockState;".into(),
-        };
-        if self
-            .class(&placement.owner)
-            .and_then(|file| file.method(&placement.name, &placement.descriptor))
-            .is_some()
-        {
-            self.host.block_placement_unknown();
-        }
-
         Ok(())
     }
 
@@ -33239,6 +33491,13 @@ impl<H: Host> Runtime<'_, H> {
             .ok_or_else(|| NativeError::Metadata("array is not owned by this invocation".into()))
     }
 
+    fn materialize_host_array(&mut self, value: Value) -> Value {
+        let Some(values) = self.host.host_array_values(&value) else {
+            return value;
+        };
+        self.new_array_value("[Lnet/minecraft/core/Direction;", values)
+    }
+
     /// Whether `value` is a stream this runtime made. Stream identity hashes
     /// stay unknown even when a collection asks through a nested path.
     fn is_live_stream_value(&self, value: &Value) -> bool {
@@ -35206,7 +35465,10 @@ impl<H: Host> Runtime<'_, H> {
                     descriptor: desc.to_owned(),
                 };
                 return match receiver.as_ref() {
-                    Some(receiver) => self.host.invoke_instance(&r, receiver, args),
+                    Some(receiver) => self
+                        .host
+                        .invoke_instance(&r, receiver, args)
+                        .map(|value| self.materialize_host_array(value)),
                     None => self.host.invoke(&r, args),
                 };
             }

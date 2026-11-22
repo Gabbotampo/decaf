@@ -22,17 +22,104 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::Mutex;
 
 use mod_api::{BlocksEvent, ItemsEvent, PackageKind, RegistrationContext};
 
 use crate::runtime;
 use crate::{JARS, JarRow, LOG, LoadedJar, State, jar_id, load_jar};
 
+/// Run a registered jar block's vanilla placement override. The game hook
+/// supplies a resolved Sunrise placement snapshot; the runtime owns the
+/// `BlockPlaceContext` façade and returns the canonical Java `BlockState`.
+/// `None` is vanilla's `null` refusal. This helper deliberately does not
+/// inspect a mod name or a block-specific property.
+pub(crate) fn state_for_placement(
+    jar: &mut LoadedJar,
+    block_id: &str,
+    context: runtime::BlockPlaceContextData,
+) -> Result<Option<runtime::Value>, runtime::NativeError> {
+    let block = jar
+        .host
+        .registrations()
+        .iter()
+        .rev()
+        .find(|entry| entry.registry == "minecraft:block" && entry.id == block_id)
+        .map(|entry| entry.value.clone());
+    let Some(block) = block else { return Ok(None) };
+    jar.jar.block_state_for_placement(block, context, &mut jar.host)
+}
+
+pub(crate) fn state_for_placement_content(
+    jar: &mut LoadedJar,
+    block_id: &str,
+    context: runtime::BlockPlaceContextData,
+) -> Result<Option<Option<(String, BTreeMap<String, String>)>>, runtime::NativeError> {
+    let Some(state) = state_for_placement(jar, block_id, context)? else {
+        return Ok(None);
+    };
+    Ok(Some(jar.host.block_state_content(&state)))
+}
+
 /// This mod's manifest id (`mod/sunrise-mod.toml`): the package whose namespaces the game's
 /// declaration fence checks.
 pub(crate) const MOD_ID: &str = "horizon_java";
 
+pub(crate) fn register_placement_parts(
+    state: &mut State,
+    context: &RegistrationContext,
+    registrar: &mut dyn mod_api::Registrar,
+    shared: Arc<Mutex<State>>,
+) {
+    state.ensure_loaded(context, registration_game_version(context));
+    let owned = owned_namespaces(context);
+    for jar in &state.jars {
+        for declaration in runtime::content::declarations(jar.host.registrations()) {
+            let runtime::content::ContentDeclaration::Block(block) = declaration else {
+                continue;
+            };
+            if !usable_id(&block.id) || !owns(&owned, &block.id) {
+                continue;
+            }
+            let key = registrar.block_key(&block.id);
+            registrar.block_part(key, crate::JavaPlacementPart {
+                state: Arc::clone(&shared),
+            });
+        }
+    }
+}
+
 impl State {
+    pub(crate) fn has_registered_block(&self, block_id: &str) -> bool {
+        self.jars.iter().any(|jar| {
+            jar.host
+                .registrations()
+                .iter()
+                .any(|entry| entry.registry == "minecraft:block" && entry.id == block_id)
+        })
+    }
+
+    /// Placement hook adapter used by the Sunrise `state_for_placement` part.
+    /// The lookup is by the game's registered block id; no block-specific
+    /// behavior is embedded in the native mod.
+    pub(crate) fn state_for_placement_content(
+        &mut self,
+        block_id: &str,
+        context: runtime::BlockPlaceContextData,
+    ) -> Result<Option<Option<(String, BTreeMap<String, String>)>>, runtime::NativeError> {
+        for jar in &mut self.jars {
+            if jar
+                .host
+                .registrations()
+                .iter()
+                .any(|entry| entry.registry == "minecraft:block" && entry.id == block_id)
+            {
+                return state_for_placement_content(jar, block_id, context);
+            }
+        }
+        Ok(None)
+    }
+
     /// Runs every jar once, the first time content is asked for, and keeps its runtime for the
     /// server lifecycle hooks. The game asks for blocks before items, so this guard also makes
     /// the two hooks one pass.
