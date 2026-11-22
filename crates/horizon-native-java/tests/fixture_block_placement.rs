@@ -162,6 +162,91 @@ fn sources() -> Vec<(&'static str, &'static str)> {
             "demo/UnregisteredPlacingBlock.java",
             "package demo; import net.minecraft.world.level.block.*; import net.minecraft.world.level.block.state.*; import net.minecraft.world.item.context.*; public class UnregisteredPlacingBlock extends Block { private static final Block UNREGISTERED = new Block(); @Override public BlockState getStateForPlacement(BlockPlaceContext c) { return UNREGISTERED.defaultBlockState(); } }",
         ),
+        // #635: what a placement leaves behind. `KeepingBlock` keeps its
+        // context, the `Direction[]` it answered and its hand item in
+        // statics, as a mod may; `ThrowingBlock` fails mid-placement.
+        // `LifetimeProbe` holds the blocks (so a collection keeps them) and
+        // reads what was kept; `Probe` stays as the oracle tests use it.
+        (
+            "demo/Tag.java",
+            "package demo; public class Tag { public int n; }",
+        ),
+        (
+            "demo/KeepingBlock.java",
+            "package demo; import java.util.ArrayList; import java.util.List; import net.minecraft.core.Direction; import net.minecraft.world.item.context.BlockPlaceContext; import net.minecraft.world.level.block.Block; import net.minecraft.world.level.block.state.BlockState; public class KeepingBlock extends Block { public static BlockPlaceContext KEPT; public static Direction[] KEPT_DIRS; public static Object KEPT_ITEM; public static final List<BlockPlaceContext> SEEN = new ArrayList<>(); @Override public BlockState getStateForPlacement(BlockPlaceContext c) { KEPT = c; SEEN.add(c); KEPT_DIRS = c.getNearestLookingDirections(); KEPT_ITEM = c.getItemInHand(); return defaultBlockState(); } }",
+        ),
+        (
+            "demo/ThrowingBlock.java",
+            "package demo; import net.minecraft.world.item.context.BlockPlaceContext; import net.minecraft.world.level.block.Block; import net.minecraft.world.level.block.state.BlockState; public class ThrowingBlock extends Block { @Override public BlockState getStateForPlacement(BlockPlaceContext c) { c.getNearestLookingDirections(); throw new IllegalStateException(\"refused mid-placement\"); } }",
+        ),
+        (
+            "demo/LifetimeProbe.java",
+            r#"package demo;
+import net.minecraft.core.Direction;
+import net.minecraft.world.item.context.BlockPlaceContext;
+public class LifetimeProbe {
+  public static final KeepingBlock KEEPING = new KeepingBlock();
+  public static final PlacementBlock FACING_BLOCK = new PlacementBlock();
+  public static final ThrowingBlock THROWING = new ThrowingBlock();
+  public static Object block(int which) {
+    return switch (which) {
+      case 0 -> KEEPING;
+      case 1 -> FACING_BLOCK;
+      default -> THROWING;
+    };
+  }
+  public static Object makeTag(int n) {
+    Tag t = new Tag();
+    t.n = n;
+    return t;
+  }
+  public static String readTag(Object o) {
+    return "tag" + ((Tag) o).n;
+  }
+  public static String keptDirs() {
+    Direction[] d = KeepingBlock.KEPT_DIRS;
+    return d[0] + "," + d[1] + "," + d[2] + "," + d[3] + "," + d[4] + "," + d[5];
+  }
+  public static String keptItem() {
+    return readTag(KeepingBlock.KEPT_ITEM);
+  }
+  public static String kept() {
+    return (KeepingBlock.KEPT != null) + "|" + KeepingBlock.SEEN.size();
+  }
+  public static String touchKept(int which) {
+    BlockPlaceContext c = KeepingBlock.KEPT;
+    switch (which) {
+      case 0 -> c.getClickedPos();
+      case 1 -> c.getClickedFace();
+      case 2 -> c.getClickLocation();
+      case 3 -> c.isInside();
+      case 4 -> c.getItemInHand();
+      case 5 -> c.getLevel();
+      case 6 -> c.canPlace();
+      case 7 -> c.replacingClickedOnBlock();
+      case 8 -> c.getPlayer();
+      case 9 -> c.getHorizontalDirection();
+      case 10 -> c.isSecondaryUseActive();
+      case 11 -> c.getRotation();
+      case 12 -> c.getNearestLookingDirection();
+      case 13 -> c.getNearestLookingVerticalDirection();
+      case 14 -> c.getNearestLookingDirections();
+      default -> throw new IllegalArgumentException();
+    }
+    return "ok";
+  }
+  // Past the heap's collection trigger (`heap.rs`: 1,024 new entries past
+  // twice what the last collection kept), so this call's store collects.
+  public static String garbage() {
+    for (int i = 0; i < 3000; i++) {
+      Tag t = new Tag();
+      t.n = i;
+    }
+    return "g";
+  }
+}
+"#,
+        ),
         (
             "demo/Probe.java",
             r#"package demo;
@@ -625,4 +710,272 @@ fn vanilla_blocks_default_state_and_unregistered_block_decode_honestly() {
         ))),
         None
     );
+}
+
+/// `demo.LifetimeProbe.method` with `args`.
+fn lifetime(
+    fixture: &javac_fixture::Fixture,
+    host: &mut StdHost,
+    method: &str,
+    descriptor: &str,
+    args: &[Value],
+) -> Result<Value, horizon_native_java::NativeError> {
+    fixture
+        .jar
+        .invoke_method_with_args("demo/LifetimeProbe", method, descriptor, None, args, host)
+}
+
+/// `demo.LifetimeProbe.method()`'s `String` answer.
+fn lifetime_text(fixture: &javac_fixture::Fixture, host: &mut StdHost, method: &str) -> String {
+    match lifetime(fixture, host, method, "()Ljava/lang/String;", &[]) {
+        Ok(Value::Ref(Some(text))) => text,
+        other => panic!("{method}: {other:?}"),
+    }
+}
+
+/// The block `demo.LifetimeProbe.block(which)` holds (0 keeping, 1 facing,
+/// 2 throwing): made by the jar and kept in a static, so a collection keeps
+/// it, as the game's registry does a registered block.
+fn lifetime_block(fixture: &javac_fixture::Fixture, host: &mut StdHost, which: i32) -> Value {
+    lifetime(
+        fixture,
+        host,
+        "block",
+        "(I)Ljava/lang/Object;",
+        &[Value::Int(which)],
+    )
+    .unwrap()
+}
+
+/// A new `demo.Tag` holding `n`, which the caller does not retain.
+fn make_tag(fixture: &javac_fixture::Fixture, host: &mut StdHost, n: i32) -> Value {
+    lifetime(
+        fixture,
+        host,
+        "makeTag",
+        "(I)Ljava/lang/Object;",
+        &[Value::Int(n)],
+    )
+    .unwrap()
+}
+
+/// The oracle's first `PLAYER` row: yaw, pitch, and what Java 25's
+/// `getNearestLookingDirections()` answered for that look.
+fn first_player_row() -> (f32, f32, &'static str) {
+    let cols: Vec<&str> = ORACLE
+        .lines()
+        .find(|line| line.starts_with("PLAYER|"))
+        .expect("the oracle has PLAYER rows")
+        .split('|')
+        .collect();
+    (parse_f32_hex(cols[1]), parse_f32_hex(cols[2]), cols[7])
+}
+
+/// #635: a placement keeps nothing on the host once it ends. Every one of
+/// 1,989 placements (one per `PLAYER` and `PLACE_DIRS` oracle row) leaves
+/// both the context table and the `Direction[]` table empty, though the jar
+/// keeps the context, the array and the hand item in statics each time. The
+/// kept array is the jar's own: read after its context is gone, it is still
+/// what Java 25 answered for that look (the row's last column).
+#[test]
+fn placements_leave_no_context_or_direction_array_behind() {
+    let fixture = javac_fixture::Fixture::build("block-placement-lifetime", &sources());
+    let mut host = fixture.jar.seed_host(StdHost::new());
+    let keeping = lifetime_block(&fixture, &mut host, 0);
+    let mut placed = 0usize;
+    for (line_no, line) in ORACLE.lines().enumerate() {
+        let cols: Vec<&str> = line.trim().split('|').collect();
+        let (context, expected) = match cols[0] {
+            // `replaceClicked = true`: Java's raw `Direction.orderedByNearest(player)`.
+            "PLAYER" => (
+                player_context(
+                    parse_f32_hex(cols[1]),
+                    parse_f32_hex(cols[2]),
+                    "UP",
+                    true,
+                    true,
+                    false,
+                ),
+                cols[7],
+            ),
+            "PLACE_DIRS" => (
+                player_context(
+                    parse_f32_hex(cols[1]),
+                    parse_f32_hex(cols[2]),
+                    cols[3],
+                    cols[4] == "true",
+                    true,
+                    false,
+                ),
+                cols[5],
+            ),
+            _ => continue,
+        };
+        fixture
+            .jar
+            .block_state_for_placement(keeping.clone(), context, &mut host)
+            .unwrap()
+            .expect("KeepingBlock places its default state");
+        placed += 1;
+        assert_eq!(
+            host.block_place_context_count(),
+            0,
+            "a context outlived the placement at line {}",
+            line_no + 1
+        );
+        assert_eq!(
+            host.placement_array_count(),
+            0,
+            "a direction array outlived the placement at line {}",
+            line_no + 1
+        );
+        assert_eq!(
+            lifetime_text(&fixture, &mut host, "keptDirs"),
+            expected,
+            "the kept array at line {}",
+            line_no + 1
+        );
+    }
+    assert_eq!(placed, 153 + 1836);
+    assert_eq!(
+        lifetime_text(&fixture, &mut host, "kept"),
+        format!("true|{placed}")
+    );
+    assert_eq!(
+        host.unknown_host_call_count(),
+        0,
+        "{:?}",
+        host.unknown_host_calls()
+    );
+}
+
+/// #635: a context the jar keeps past its placement roots nothing, and every
+/// accessor called on it afterwards is counted, never answered from the old
+/// snapshot (most of them read the player or the world as they are now).
+///
+/// One placement's hand item is a `demo.Tag` the jar keeps itself (through
+/// `getItemInHand()`), the other's a `Tag` only its context held. After the
+/// next collection the first still reads (`tag42`), through the jar's own
+/// static, as does the `Direction[]` the jar kept (Java 25's answer for that
+/// look); the second was collected with nothing left to root it, so reading
+/// it fails by name, as reading any collected object does.
+#[test]
+fn a_kept_context_roots_nothing_and_counts_every_accessor() {
+    let fixture = javac_fixture::Fixture::build("block-placement-kept", &sources());
+    let mut host = fixture.jar.seed_host(StdHost::new());
+    let keeping = lifetime_block(&fixture, &mut host, 0);
+    let facing = lifetime_block(&fixture, &mut host, 1);
+    let kept_item = make_tag(&fixture, &mut host, 42);
+    let dropped_item = make_tag(&fixture, &mut host, 41);
+
+    let (yaw, pitch, expected_dirs) = first_player_row();
+    let mut context = player_context(yaw, pitch, "UP", true, true, false);
+    context.item_in_hand = kept_item;
+    fixture
+        .jar
+        .block_state_for_placement(keeping, context, &mut host)
+        .unwrap()
+        .expect("KeepingBlock places its default state");
+    let mut context = player_context(90.0, 0.0, "UP", false, true, false);
+    context.item_in_hand = dropped_item.clone();
+    fixture
+        .jar
+        .block_state_for_placement(facing, context, &mut host)
+        .unwrap()
+        .expect("PlacementBlock places a facing state");
+    assert_eq!(host.block_place_context_count(), 0);
+    assert_eq!(host.placement_array_count(), 0);
+
+    let fields_before = host.resident_heap().instance_fields();
+    assert_eq!(lifetime_text(&fixture, &mut host, "garbage"), "g");
+    assert!(
+        host.resident_heap().instance_fields() < fields_before + 3000,
+        "the garbage call did not collect"
+    );
+    let freed = lifetime(
+        &fixture,
+        &mut host,
+        "readTag",
+        "(Ljava/lang/Object;)Ljava/lang/String;",
+        &[dropped_item],
+    )
+    .expect_err("only the released context held this Tag");
+    assert!(
+        format!("{freed:?}").contains("was collected while still reachable"),
+        "a collected object read as {freed:?}"
+    );
+    assert_eq!(lifetime_text(&fixture, &mut host, "keptItem"), "tag42");
+    assert_eq!(
+        lifetime_text(&fixture, &mut host, "keptDirs"),
+        expected_dirs
+    );
+    assert_eq!(lifetime_text(&fixture, &mut host, "kept"), "true|1");
+
+    let accessors = [
+        "getClickedPos()Lnet/minecraft/core/BlockPos;",
+        "getClickedFace()Lnet/minecraft/core/Direction;",
+        "getClickLocation()Lnet/minecraft/world/phys/Vec3;",
+        "isInside()Z",
+        "getItemInHand()Lnet/minecraft/world/item/ItemStack;",
+        "getLevel()Lnet/minecraft/world/level/Level;",
+        "canPlace()Z",
+        "replacingClickedOnBlock()Z",
+        "getPlayer()Lnet/minecraft/world/entity/player/Player;",
+        "getHorizontalDirection()Lnet/minecraft/core/Direction;",
+        "isSecondaryUseActive()Z",
+        "getRotation()F",
+        "getNearestLookingDirection()Lnet/minecraft/core/Direction;",
+        "getNearestLookingVerticalDirection()Lnet/minecraft/core/Direction;",
+        "getNearestLookingDirections()[Lnet/minecraft/core/Direction;",
+    ];
+    for (which, accessor) in accessors.iter().enumerate() {
+        let before = host.unknown_host_call_count();
+        let answer = lifetime(
+            &fixture,
+            &mut host,
+            "touchKept",
+            "(I)Ljava/lang/String;",
+            &[Value::Int(which as i32)],
+        )
+        .unwrap();
+        assert_eq!(answer, Value::Ref(Some("ok".into())), "{accessor}");
+        assert_eq!(
+            host.unknown_host_call_count(),
+            before + 1,
+            "{accessor} on a released context must be counted once"
+        );
+        let call = format!("net/minecraft/world/item/context/BlockPlaceContext#{accessor}");
+        assert!(
+            host.unknown_host_calls()
+                .iter()
+                .any(|(counted, _)| *counted == call),
+            "expected {call} in {:?}",
+            host.unknown_host_calls()
+        );
+    }
+    assert_eq!(host.block_place_context_count(), 0);
+    assert_eq!(host.placement_array_count(), 0);
+}
+
+/// #635: a placement whose override throws releases its context, and the
+/// `Direction[]` it answered first, on the error path too.
+#[test]
+fn a_placement_that_throws_still_releases_its_context() {
+    let fixture = javac_fixture::Fixture::build("block-placement-throws", &sources());
+    let mut host = fixture.jar.seed_host(StdHost::new());
+    let throwing = lifetime_block(&fixture, &mut host, 2);
+    let error = fixture
+        .jar
+        .block_state_for_placement(
+            throwing,
+            player_context(0.0, 0.0, "UP", false, true, false),
+            &mut host,
+        )
+        .expect_err("the override throws");
+    assert!(
+        format!("{error:?}").contains("IllegalStateException"),
+        "{error:?}"
+    );
+    assert_eq!(host.block_place_context_count(), 0);
+    assert_eq!(host.placement_array_count(), 0);
 }

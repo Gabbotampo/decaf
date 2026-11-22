@@ -4356,5 +4356,11 @@ mod tests {
         assert_eq!(unknown, None);
         assert_eq!(state.jars[0].host.unknown_host_call_count(), 1);
         assert_eq!(state.jars[0].row.callback_unknown_host_calls, 1);
+
+        // 6. Each placement's `BlockPlaceContext` snapshot ended with its call (#635): five
+        //    placements, a refusal and a counted one among them, leave the jar's host holding
+        //    no context and no direction array.
+        assert_eq!(state.jars[0].host.block_place_context_count(), 0);
+        assert_eq!(state.jars[0].host.placement_array_count(), 0);
     }
 }
