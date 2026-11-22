@@ -1539,7 +1539,9 @@ impl StdHost {
             (TOOLTIP_FLAG_CLASS | TOOLTIP_FLAG_DEFAULT_CLASS, "ADVANCED") => {
                 return Some(Ok(tooltip_flag_default_const(true, false)));
             }
-            (TOOLTIP_DISPLAY_CLASS, "DEFAULT") => return Some(Ok(tooltip_display())),
+            (TOOLTIP_DISPLAY_CLASS, "DEFAULT") => {
+                return Some(Ok(crate::runtime::recipe_models::canonical_default_tooltip_display()));
+            }
             (TOOLTIP_CONTEXT_CLASS, "EMPTY") => return Some(Ok(tooltip_context_empty())),
             _ => {}
         }

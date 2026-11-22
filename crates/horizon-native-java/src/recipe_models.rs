@@ -345,7 +345,16 @@ impl RecipeState {
         self.custom_data.get(handle.key())
     }
 
-    pub(crate) fn alloc_tooltip_display(&mut self, data: TooltipDisplayData) -> Value {
+    pub(crate) fn alloc_tooltip_display(&mut self, mut data: TooltipDisplayData) -> Value {
+        // `TooltipDisplay.hiddenComponents` is a `ReferenceLinkedOpenHashSet`: deduplicate while
+        // preserving first-occurrence insertion order.
+        let mut deduped = Vec::with_capacity(data.hidden_components.len());
+        for id in data.hidden_components {
+            if !deduped.iter().any(|existing| existing == &id) {
+                deduped.push(id);
+            }
+        }
+        data.hidden_components = deduped;
         let key = self.next_key("td");
         self.tooltip_displays.insert(key.clone(), data);
         Value::Host(HostRef::new(HostKind::TooltipDisplay, key))
@@ -464,6 +473,7 @@ pub(crate) fn is_recipe_object_kind(kind: HostKind) -> bool {
             | HostKind::RecipeHolder
             | HostKind::CustomData
             | HostKind::Unit
+            | HostKind::TooltipDisplay
     )
 }
 
@@ -876,7 +886,13 @@ pub(crate) fn host_component_values_equal(host: &StdHost, a: &Value, b: &Value) 
                 if !da.hidden_known || !db.hidden_known {
                     return None;
                 }
-                Some(da.hidden_components == db.hidden_components)
+                // `TooltipDisplay.hiddenComponents` is a `SequencedSet` (a `LinkedHashSet`):
+                // record equality uses `AbstractSet.equals`, which ignores order and duplicates.
+                let set_a: BTreeSet<&str> =
+                    da.hidden_components.iter().map(String::as_str).collect();
+                let set_b: BTreeSet<&str> =
+                    db.hidden_components.iter().map(String::as_str).collect();
+                Some(set_a == set_b)
             }
             (HostKind::TooltipDisplay, k) | (k, HostKind::TooltipDisplay)
                 if k != HostKind::JarObject =>
@@ -2694,6 +2710,23 @@ pub(crate) fn host_object_equals(host: &StdHost, handle: &HostRef, other: &Value
             other,
             Value::Host(other) if other.kind() == HostKind::Unit
         )),
+        HostKind::TooltipDisplay => {
+            let self_val = Value::Host(handle.clone());
+            // Keep the legacy opaque `"default"` placeholder counted.
+            host.recipes.tooltip_display_of(&self_val)?;
+            match other {
+                Value::Host(other_h) if other_h.kind() == HostKind::TooltipDisplay => {
+                    host_component_values_equal(host, &self_val, other)
+                }
+                other
+                    if crate::jar_object::object_class(other)
+                        == Some("net/minecraft/world/item/component/TooltipDisplay") =>
+                {
+                    None
+                }
+                _ => Some(false),
+            }
+        }
         _ => None,
     }
 }

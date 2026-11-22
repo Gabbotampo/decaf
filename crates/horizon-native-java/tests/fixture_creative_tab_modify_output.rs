@@ -1575,3 +1575,269 @@ public final class ItemStack {
         "modelled component ItemStack anchor must have zero unknown host calls"
     );
 }
+
+const TOOLTIP_DISPLAY_SET_PROBE: &str = r##"
+package demo;
+
+import net.fabricmc.fabric.api.creativetab.v1.CreativeModeTabEvents;
+import net.minecraft.core.Registry;
+import net.minecraft.core.component.DataComponents;
+import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.core.registries.Registries;
+import net.minecraft.resources.Identifier;
+import net.minecraft.resources.ResourceKey;
+import net.minecraft.world.item.CreativeModeTab;
+import net.minecraft.world.item.Item;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.Items;
+import net.minecraft.world.item.component.TooltipDisplay;
+
+public final class TooltipDisplaySetProbe {
+    public static String checkEquality() {
+        TooltipDisplay a = TooltipDisplay.DEFAULT
+            .withHidden(DataComponents.LORE, true)
+            .withHidden(DataComponents.DAMAGE, true);
+        TooltipDisplay b = TooltipDisplay.DEFAULT
+            .withHidden(DataComponents.DAMAGE, true)
+            .withHidden(DataComponents.LORE, true);
+        ItemStack stackA = new ItemStack(Items.DIAMOND_SWORD);
+        stackA.set(DataComponents.TOOLTIP_DISPLAY, a);
+        ItemStack stackB = new ItemStack(Items.DIAMOND_SWORD);
+        stackB.set(DataComponents.TOOLTIP_DISPLAY, b);
+        ItemStack stackPlain = new ItemStack(Items.DIAMOND_SWORD);
+        return a.equals(b) + "|"
+            + a.equals(TooltipDisplay.DEFAULT) + "|"
+            + ItemStack.isSameItemSameComponents(stackA, stackB) + "|"
+            + ItemStack.isSameItemSameComponents(stackA, stackPlain);
+    }
+
+    public static void setup() {
+        Item marker = Registry.register(
+            BuiltInRegistries.ITEM,
+            Identifier.parse("demo:td_marker"),
+            new Item(new Item.Properties())
+        );
+        ResourceKey<CreativeModeTab> tab = ResourceKey.create(
+            Registries.CREATIVE_MODE_TAB,
+            Identifier.parse("demo:td_set_anchor")
+        );
+        CreativeModeTabEvents.modifyOutputEvent(tab).register(entries -> {
+            TooltipDisplay b = TooltipDisplay.DEFAULT
+                .withHidden(DataComponents.DAMAGE, true)
+                .withHidden(DataComponents.LORE, true);
+            ItemStack anchorB = new ItemStack(Items.DIAMOND_SWORD);
+            anchorB.set(DataComponents.TOOLTIP_DISPLAY, b);
+            entries.insertAfter(anchorB, new ItemStack(marker));
+        });
+    }
+
+    public static int probeHashCode() {
+        return TooltipDisplay.DEFAULT.withHidden(DataComponents.LORE, true).hashCode();
+    }
+}
+"##;
+
+#[test]
+fn tooltip_display_hidden_components_use_set_equality_and_keep_first_occurrence_order() {
+    use horizon_native_java::RuntimeComponentValue;
+
+    let mut sources = vec![
+        (
+            "demo/TooltipDisplaySetProbe.java",
+            TOOLTIP_DISPLAY_SET_PROBE,
+        ),
+        (
+            "net/minecraft/world/item/Items.java",
+            "package net.minecraft.world.item; public final class Items { public static final Item DIAMOND_SWORD = null; }",
+        ),
+        (
+            "net/minecraft/core/component/DataComponentType.java",
+            "package net.minecraft.core.component; public interface DataComponentType<T> {}",
+        ),
+        (
+            "net/minecraft/core/component/DataComponents.java",
+            r#"package net.minecraft.core.component;
+import net.minecraft.world.item.component.TooltipDisplay;
+public final class DataComponents {
+    public static final DataComponentType<Integer> DAMAGE = null;
+    public static final DataComponentType<Object> LORE = null;
+    public static final DataComponentType<TooltipDisplay> TOOLTIP_DISPLAY = null;
+}"#,
+        ),
+        (
+            "net/minecraft/world/item/component/TooltipDisplay.java",
+            r#"package net.minecraft.world.item.component;
+import net.minecraft.core.component.DataComponentType;
+public final class TooltipDisplay {
+    public static final TooltipDisplay DEFAULT = null;
+    public boolean hideTooltip() { throw new AssertionError(); }
+    public boolean shows(DataComponentType<?> type) { throw new AssertionError(); }
+    public TooltipDisplay withHidden(DataComponentType<?> type, boolean hidden) { throw new AssertionError(); }
+}"#,
+        ),
+        (
+            "net/minecraft/world/item/ItemStack.java",
+            r#"package net.minecraft.world.item;
+import net.minecraft.core.component.DataComponentType;
+import net.minecraft.world.flag.FeatureFlagSet;
+import net.minecraft.world.level.ItemLike;
+public final class ItemStack {
+    public static final ItemStack EMPTY = null;
+    public ItemStack(ItemLike item) {}
+    public ItemStack(ItemLike item, int count) {}
+    public static boolean isSameItemSameComponents(ItemStack a, ItemStack b) { throw new AssertionError(); }
+    public <T> T set(DataComponentType<? super T> type, T value) { throw new AssertionError(); }
+    public boolean isEmpty() { throw new AssertionError(); }
+    public int getCount() { throw new AssertionError(); }
+    public Item getItem() { throw new AssertionError(); }
+    public boolean is(Item item) { throw new AssertionError(); }
+    public boolean isItemEnabled(FeatureFlagSet enabledFeatures) { throw new AssertionError(); }
+}"#,
+        ),
+    ];
+    for &(path, src) in STUBS {
+        if path != "net/minecraft/world/item/ItemStack.java" {
+            sources.push((path, src));
+        }
+    }
+    let fixture = javac_fixture::Fixture::build("creative-tab-tooltip-display-set", &sources);
+    let mut host = fixture.jar.seed_host(StdHost::new());
+
+    let eq_summary = match fixture
+        .jar
+        .invoke_method(
+            "demo/TooltipDisplaySetProbe",
+            "checkEquality",
+            "()Ljava/lang/String;",
+            None,
+            &mut host,
+        )
+        .unwrap()
+    {
+        Value::Ref(Some(text)) => text,
+        other => panic!("unexpected checkEquality result: {other:?}"),
+    };
+    assert_eq!(eq_summary, "true|false|true|false");
+
+    fixture
+        .jar
+        .invoke_method(
+            "demo/TooltipDisplaySetProbe",
+            "setup",
+            "()V",
+            None,
+            &mut host,
+        )
+        .unwrap();
+
+    // Seed with duplicate hidden_components: alloc_tooltip_display must dedupe preserving
+    // first-occurrence order (`["minecraft:lore", "minecraft:damage"]`), and anchor `[damage, lore]`
+    // must match it with zero unknown calls.
+    let seeded_dup = host.make_host_item_stack_with_components(
+        None,
+        "minecraft:diamond_sword",
+        1,
+        vec![(
+            "minecraft:tooltip_display".into(),
+            Some(RuntimeComponentValue::TooltipDisplay {
+                hide_tooltip: false,
+                hidden_components: vec![
+                    "minecraft:lore".into(),
+                    "minecraft:damage".into(),
+                    "minecraft:lore".into(),
+                ],
+                hidden_known: true,
+            }),
+        )],
+        false,
+        Vec::new(),
+    );
+    let extracted = host.item_stack_components(&seeded_dup).unwrap();
+    assert_eq!(
+        extracted.patch,
+        vec![(
+            "minecraft:tooltip_display".into(),
+            Some(RuntimeComponentValue::TooltipDisplay {
+                hide_tooltip: false,
+                hidden_components: vec!["minecraft:lore".into(), "minecraft:damage".into()],
+                hidden_known: true,
+            }),
+        )]
+    );
+
+    let plain_sword = host.make_item_stack_for_id("minecraft:diamond_sword", 1, false);
+    let hidden_sword = host.make_host_item_stack_with_components(
+        None,
+        "minecraft:diamond_sword",
+        1,
+        vec![(
+            "minecraft:tooltip_display".into(),
+            Some(RuntimeComponentValue::TooltipDisplay {
+                hide_tooltip: true,
+                hidden_components: vec!["minecraft:lore".into(), "minecraft:damage".into()],
+                hidden_known: true,
+            }),
+        )],
+        false,
+        Vec::new(),
+    );
+    // `hide_tooltip` mismatch must NOT compare equal (`stack_same_with_hide=false` on JDK 25).
+    assert_eq!(
+        host.stacks_same_item_same_components(&seeded_dup, &hidden_sword)
+            .unwrap(),
+        Some(false)
+    );
+
+    let out = fixture
+        .jar
+        .creative_tab_contents_with(
+            &mut host,
+            "demo:td_set_anchor",
+            CreativeTabBuildContext {
+                initial_display_stacks: vec![
+                    plain_sword.clone(),
+                    seeded_dup.clone(),
+                    hidden_sword.clone(),
+                ],
+                initial_search_tab_stacks: vec![plain_sword, seeded_dup, hidden_sword],
+                ..CreativeTabBuildContext::default()
+            },
+        )
+        .unwrap();
+    let ids: Vec<String> = out
+        .display_stacks
+        .iter()
+        .map(|s| host.item_stack_item_id(s).unwrap())
+        .collect();
+    assert_eq!(
+        ids,
+        vec![
+            "minecraft:diamond_sword",
+            "minecraft:diamond_sword",
+            "demo:td_marker",
+            "minecraft:diamond_sword",
+        ]
+    );
+    assert_eq!(
+        host.unknown_host_calls(),
+        Vec::<(String, usize)>::new(),
+        "TooltipDisplay set equality and anchor matching must have zero unknown calls"
+    );
+
+    // `TooltipDisplay.hashCode()` depends on JVM identity hash codes of `DataComponentType`
+    // singletons and must remain counted rather than fabricating an order-dependent value.
+    let _ = fixture
+        .jar
+        .invoke_method(
+            "demo/TooltipDisplaySetProbe",
+            "probeHashCode",
+            "()I",
+            None,
+            &mut host,
+        )
+        .unwrap();
+    assert!(
+        !host.unknown_host_calls().is_empty(),
+        "TooltipDisplay.hashCode must stay counted"
+    );
+}

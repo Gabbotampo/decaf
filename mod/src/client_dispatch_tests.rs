@@ -505,6 +505,7 @@ public final class DataComponents {
         r#"package net.minecraft.world.item.component;
 import net.minecraft.core.component.DataComponentType;
 public final class TooltipDisplay {
+    public static final TooltipDisplay DEFAULT = null;
     public boolean hideTooltip() { throw new AssertionError(); }
     public boolean shows(DataComponentType<?> type) { throw new AssertionError(); }
     public TooltipDisplay withHidden(DataComponentType<?> type, boolean hidden) { throw new AssertionError(); }
@@ -545,6 +546,7 @@ import net.minecraft.core.component.DataComponentType;
 import net.minecraft.world.level.ItemLike;
 public final class ItemStack {
     public ItemStack(ItemLike item) {}
+    public static boolean isSameItemSameComponents(ItemStack a, ItemStack b) { throw new AssertionError(); }
     public <T> T get(DataComponentType<? extends T> type) { throw new AssertionError(); }
     public <T> T set(DataComponentType<? super T> type, T value) { throw new AssertionError(); }
     public <T> T remove(DataComponentType<? extends T> type) { throw new AssertionError(); }
@@ -2144,6 +2146,189 @@ fn creative_tab_duplicate_reordering_matches_java25_fabric_oracle() {
                 0,
                 "duplicate reconciliation must have zero unknown host calls"
             );
+
+            Ok::<_, ()>(())
+        })
+        .unwrap();
+    });
+}
+
+const TOOLTIP_DISPLAY_SET_DEDUPE_MOD: &str = r#"package demo;
+import net.fabricmc.api.ModInitializer;
+import net.fabricmc.fabric.api.creativetab.v1.CreativeModeTabEvents;
+import net.minecraft.core.component.DataComponents;
+import net.minecraft.world.item.CreativeModeTabs;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.Items;
+import net.minecraft.world.item.component.TooltipDisplay;
+
+public final class TooltipDisplaySetDedupeMod implements ModInitializer {
+    @Override
+    public void onInitialize() {
+        CreativeModeTabEvents.modifyOutputEvent(CreativeModeTabs.COMBAT).register(entries -> {
+            TooltipDisplay tdLoreDmg = TooltipDisplay.DEFAULT
+                .withHidden(DataComponents.LORE, true)
+                .withHidden(DataComponents.DAMAGE, true);
+            TooltipDisplay tdDmgLore = TooltipDisplay.DEFAULT
+                .withHidden(DataComponents.DAMAGE, true)
+                .withHidden(DataComponents.LORE, true);
+
+            // JDK 25 / MC 26.3 oracle: TooltipDisplay.hiddenComponents is a SequencedSet
+            // (ReferenceLinkedOpenHashSet), so record equality ignores order and duplicates.
+            if (!tdLoreDmg.equals(tdDmgLore)) {
+                throw new AssertionError("TooltipDisplay.equals must ignore hiddenComponents order");
+            }
+            if (tdLoreDmg.equals(TooltipDisplay.DEFAULT)) {
+                throw new AssertionError("non-empty TooltipDisplay must not equal DEFAULT");
+            }
+
+            ItemStack stackA = new ItemStack(Items.DIAMOND_SWORD);
+            stackA.set(DataComponents.TOOLTIP_DISPLAY, tdLoreDmg);
+            ItemStack stackB = new ItemStack(Items.DIAMOND_SWORD);
+            stackB.set(DataComponents.TOOLTIP_DISPLAY, tdDmgLore);
+            if (!ItemStack.isSameItemSameComponents(stackA, stackB)) {
+                throw new AssertionError("isSameItemSameComponents must ignore TooltipDisplay hidden order");
+            }
+
+            entries.accept(stackA);
+            entries.accept(stackB);
+        });
+
+        CreativeModeTabEvents.modifyOutputEvent(CreativeModeTabs.INGREDIENTS).register(entries -> {
+            TooltipDisplay tdLoreDmg = TooltipDisplay.DEFAULT
+                .withHidden(DataComponents.LORE, true)
+                .withHidden(DataComponents.DAMAGE, true);
+            ItemStack anchor = new ItemStack(Items.DIAMOND_SWORD);
+            anchor.set(DataComponents.TOOLTIP_DISPLAY, tdLoreDmg);
+            // Must match a seeded stack whose NBT had reordered/duplicate/unqualified ids,
+            // AND accepting `anchor` must dedupe against that seeded stack cleanly.
+            entries.insertAfter(anchor, Items.APPLE);
+            entries.accept(anchor);
+        });
+    }
+}
+"#;
+
+#[test]
+fn creative_tab_dedupes_tooltip_display_hidden_components_as_set_matching_jdk25() {
+    let mut sources = CLIENT_DISPATCH_STUBS.to_vec();
+    sources.push((
+        "demo/TooltipDisplaySetDedupeMod.java",
+        TOOLTIP_DISPLAY_SET_DEDUPE_MOD,
+    ));
+    let jar_bytes = build_javac_jar(
+        "client-tooltip-display-set-dedupe",
+        r#"{"schemaVersion":1,"id":"demo","version":"1.0","entrypoints":{"main":["demo.TooltipDisplaySetDedupeMod"]}}"#,
+        &sources,
+    );
+
+    let java = Arc::new(HorizonJava::default());
+    java.lock_client()
+        .set_fixture_files(vec![("demo-td-dedupe.jar".to_owned(), jar_bytes)]);
+
+    let mods = vec![ModEntry::new(
+        "horizon_java",
+        Box::new(SharedHorizonJava(Arc::clone(&java))),
+    )];
+    mod_api::testing::with_mods(mods.into(), || {
+        mod_api::testing::rebuild_parts(|| {
+            let mut host = TestClientHost::new(&[
+                "minecraft:stone",
+                "minecraft:diamond_sword",
+                "minecraft:apple",
+            ]);
+            mod_api::dispatch_client_setup(&mut host);
+            assert_eq!(report_row(&java)["unknown_host_call_count"], 0);
+
+            // 1) Two newly added stacks whose `tooltip_display.hidden_components` differ only in
+            //    order (`[lore, damage]` vs `[damage, lore]`) dedupe to ONE entry keeping the
+            //    first occurrence's insertion order (JDK 25 ItemStackLinkedSet oracle).
+            let edit = host.begin_tab(50, &["minecraft:stone"], &["minecraft:stone"]);
+            mod_api::dispatch_build_creative_mode_tab_contents(
+                HostSide::Client(&mut host),
+                "minecraft:combat",
+                vec!["minecraft:vanilla".to_owned()],
+                CreativeTabPermissions::Normal,
+                edit,
+            );
+            let expected_hidden = Tag::List(vec![
+                Tag::String("minecraft:lore".into()),
+                Tag::String("minecraft:damage".into()),
+            ]);
+            {
+                let editor = host.editor.borrow();
+                for list in [&editor.parent, &editor.search] {
+                    assert_eq!(
+                        list.len(),
+                        2,
+                        "reordered TooltipDisplay stacks must dedupe to one entry: {list:?}"
+                    );
+                    assert_eq!(list[0].item().id(&host), "minecraft:stone");
+                    assert_eq!(list[1].item().id(&host), "minecraft:diamond_sword");
+                    assert_eq!(
+                        list[1]
+                            .components()
+                            .and_then(|c| c.as_nbt().get(&"minecraft:tooltip_display".into()))
+                            .and_then(|t| t.get("hidden_components")),
+                        Some(&expected_hidden)
+                    );
+                }
+            }
+            assert_eq!(report_row(&java)["unknown_host_call_count"], 0);
+
+            // 2) Seeded Sunrise stack with duplicate + unqualified ids (`["damage", "minecraft:lore",
+            //    "minecraft:damage", "minecraft:lore"]`) matches `[lore, damage]` as an ItemStack
+            //    anchor AND dedupes when accepted again — exact JDK 25 CODEC + Set oracle.
+            let mut seeded_dup = host.stack("minecraft:diamond_sword");
+            seeded_dup
+                .set_components(
+                    [(
+                        "minecraft:tooltip_display".into(),
+                        Tag::compound(vec![(
+                            "hidden_components",
+                            Tag::List(vec![
+                                Tag::String("damage".into()),
+                                Tag::String("minecraft:lore".into()),
+                                Tag::String("minecraft:damage".into()),
+                                Tag::String("minecraft:lore".into()),
+                            ]),
+                        )]),
+                    )]
+                    .into(),
+                )
+                .unwrap();
+            let stone = host.stack("minecraft:stone");
+            let edit = mod_api::__private::creative_tab_edit(51);
+            {
+                let mut editor = host.editor.borrow_mut();
+                editor.active = Some(edit);
+                editor.parent = vec![seeded_dup.clone(), stone.clone()];
+                editor.search = vec![seeded_dup, stone];
+            }
+            mod_api::dispatch_build_creative_mode_tab_contents(
+                HostSide::Client(&mut host),
+                "minecraft:ingredients",
+                vec!["minecraft:vanilla".to_owned()],
+                CreativeTabPermissions::Normal,
+                edit,
+            );
+            assert_eq!(
+                host.tab_entries(CreativeTabList::Parent),
+                vec![
+                    ("minecraft:diamond_sword".to_owned(), 1),
+                    ("minecraft:apple".to_owned(), 1),
+                    ("minecraft:stone".to_owned(), 1),
+                ]
+            );
+            assert_eq!(
+                host.tab_entries(CreativeTabList::Search),
+                vec![
+                    ("minecraft:diamond_sword".to_owned(), 1),
+                    ("minecraft:apple".to_owned(), 1),
+                    ("minecraft:stone".to_owned(), 1),
+                ]
+            );
+            assert_eq!(report_row(&java)["unknown_host_call_count"], 0);
 
             Ok::<_, ()>(())
         })

@@ -5725,6 +5725,16 @@ impl StdHost {
         recipe_models::extract_stack_components(self, stack)
     }
 
+    /// Compare two runtime `ItemStack`s using vanilla `ItemStack.isSameItemSameComponents`
+    /// semantics (`Ok(None)` if opaque/unmodelled components prevent a sound answer).
+    pub fn stacks_same_item_same_components(
+        &self,
+        a: &Value,
+        b: &Value,
+    ) -> Result<Option<bool>, NativeError> {
+        recipe_models::stacks_same_item_same_components(self, a, b)
+    }
+
     /// Allocate a modelled `TooltipDisplay` handle reflecting the host's real tooltip visibility.
     pub fn make_tooltip_display(
         &mut self,

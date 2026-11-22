@@ -404,7 +404,11 @@ fn parse_tooltip_display_tag(tag: &mod_api::Tag) -> Option<(bool, Vec<String>)> 
                     let mod_api::Tag::String(raw_id) = item else {
                         return None;
                     };
-                    let id = java_string_utf8(raw_id)?;
+                    let raw = java_string_utf8(raw_id)?;
+                    // Match MC 26.3 `DataComponentType.CODEC` (`Identifier.CODEC` +
+                    // `ReferenceLinkedOpenHashSet`): normalize unqualified ids (`"damage"` ->
+                    // `"minecraft:damage"`) and deduplicate preserving first-occurrence order.
+                    let id = mod_api::Identifier::parse(&raw).ok()?.to_string();
                     if !hidden_components.iter().any(|existing| existing == &id) {
                         hidden_components.push(id);
                     }
@@ -811,7 +815,8 @@ fn apply_creative_list(
     //    never downgrade, and counting/skipping any stack whose components cannot be converted),
     //    then deduplicate in FIRST-occurrence order exactly like Fabric's
     //    `this.displayItems.clear(); this.displayItems.addAll(displayList);` (ItemStackLinkedSet).
-    let mut desired: Vec<(mod_api::ItemStack, Option<usize>)> = Vec::with_capacity(resulting.len());
+    let mut desired: Vec<(Value, mod_api::ItemStack, Option<usize>)> =
+        Vec::with_capacity(resulting.len());
     let mut claimed_seed = vec![false; seeded.len()];
     for value in resulting {
         let (stack, exact_seed) = if let Some((idx, (_, original))) = seeded
@@ -827,10 +832,13 @@ fn apply_creative_list(
             };
             (stack, None)
         };
-        if desired
-            .iter()
-            .any(|(existing, _)| existing.is_stackable_with(&stack))
-        {
+        if desired.iter().any(|(existing_val, existing_stack, _)| {
+            existing_stack.is_stackable_with(&stack)
+                || matches!(
+                    runtime_host.stacks_same_item_same_components(existing_val, value),
+                    Ok(Some(true))
+                )
+        }) {
             continue;
         }
         let seed_idx = exact_seed.filter(|&idx| !claimed_seed[idx]).or_else(|| {
@@ -843,7 +851,7 @@ fn apply_creative_list(
         if let Some(idx) = seed_idx {
             claimed_seed[idx] = true;
         }
-        desired.push((stack, seed_idx));
+        desired.push((value.clone(), stack, seed_idx));
     }
 
     // 2. Keep the longest subsequence of already-present seeded entries that remain in their
@@ -851,7 +859,7 @@ fn apply_creative_list(
     let present_in_desired: Vec<(usize, usize)> = desired
         .iter()
         .enumerate()
-        .filter_map(|(desired_idx, (_, seed_idx))| seed_idx.map(|s| (desired_idx, s)))
+        .filter_map(|(desired_idx, (_, _, seed_idx))| seed_idx.map(|s| (desired_idx, s)))
         .collect();
     let seq: Vec<usize> = present_in_desired.iter().map(|&(_, s)| s).collect();
     let lis_mask = longest_increasing_mask(&seq);
@@ -876,7 +884,7 @@ fn apply_creative_list(
     // 3. Walk `desired` left-to-right, inserting every non-kept entry immediately after `prev`
     //    (or `First` at index 0) and advancing `prev` through every position in `desired`.
     let mut prev: Option<mod_api::ItemStack> = None;
-    for (stack, seed_idx) in desired {
+    for (_, stack, seed_idx) in desired {
         if seed_idx.is_some_and(|idx| kept_seed[idx]) {
             prev = Some(stack);
             continue;
