@@ -1,0 +1,6 @@
+identity=same=true,calls=1,received=true
+resultUnchanged=outSame=true,notReceiver=true
+resultNull=outNull=true
+throws=java.lang.IllegalStateException:boom
+nullOp=java.lang.NullPointerException:Cannot invoke "net.minecraft.network.codec.StreamCodec$CodecOperation.apply(net.minecraft.network.codec.StreamCodec)" because "operation" is null
+geckolibShape=opIsCodec=true
