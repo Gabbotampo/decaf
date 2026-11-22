@@ -126,21 +126,33 @@ fn placement_player() -> runtime::Value {
     ))
 }
 
+/// Sunrise intentionally keeps placement snapshots independent of live entities. Dispenser
+/// `DirectionalPlaceContext` has a distinctive bottom-centre hit and cardinal rotation, so keep
+/// its player absent; ordinary player clicks retain the rotation-backed transient player needed by
+/// vanilla's direction and rotation accessors.
+fn placement_has_player(context: &mod_api::PlacementContext) -> bool {
+    let centered = (context.hit[0] - (f64::from(context.hit_pos.x) + 0.5)).abs() < 1.0e-6
+        && (context.hit[1] - f64::from(context.hit_pos.y)).abs() < 1.0e-6
+        && (context.hit[2] - (f64::from(context.hit_pos.z) + 0.5)).abs() < 1.0e-6;
+    let cardinal = (context.yaw / 90.0).fract().abs() < 1.0e-6
+        || (context.yaw / 90.0).fract().abs() > 1.0 - 1.0e-6;
+    !(centered && !context.inside && !context.sneaking && context.pitch == 0.0 && cardinal)
+}
+
 /// Apply the Java result's block identity before touching the engine-owned state. `None` means
 /// the hook did not claim the answer (a foreign block or a different block selected by Java),
 /// while `Some(None)` is Java's `null` refusal.
 fn placement_conversion(
-    block_id: &str,
+    _block_id: &str,
     owned: bool,
     returned: Option<(String, BTreeMap<String, String>)>,
-) -> Option<Option<BTreeMap<String, String>>> {
+) -> Option<Option<(String, BTreeMap<String, String>)>> {
     if !owned {
         return None;
     }
     match returned {
         None => Some(None),
-        Some((returned_block, properties)) if returned_block == block_id => Some(Some(properties)),
-        Some(_) => None,
+        Some((returned_block, properties)) => Some(Some((returned_block, properties))),
     }
 }
 
@@ -169,16 +181,15 @@ fn answer_state_for_placement(
         secondary_use: context.sneaking,
         replacing_clicked_on_block: context.replace_clicked,
         can_place: true,
-        // The Sunrise snapshot carries the placer's rotation but intentionally does not retain a
-        // live player handle. A typed transient player keeps vanilla's null checks on the Java
-        // façade while allowing getHorizontalDirection/getRotation to use that rotation.
-        player: placement_player(),
+        player: placement_has_player(context)
+            .then(placement_player)
+            .unwrap_or(runtime::Value::Ref(None)),
         item_in_hand: match context.item {
             Some(item) => runtime::Value::Host(runtime::HostRef::new(
                 runtime::HostKind::ItemStack,
                 format!("placement/item/{item:?}"),
             )),
-            None => runtime::Value::Ref(None),
+            None => runtime::StdHost::empty_item_stack(),
         },
         level: runtime::Value::Host(runtime::HostRef::new(
             runtime::HostKind::GameLevel,
@@ -202,11 +213,27 @@ fn answer_state_for_placement(
         log::warn!("{LOG}: {block_id}: placement override returned an unknown state");
         return None;
     };
-    let Some(Some(properties)) = placement_conversion(&block_id, true, Some(returned)) else {
-        log::warn!("{LOG}: {block_id}: placement override selected another block");
+    let Some(Some((returned_block, properties))) =
+        placement_conversion(&block_id, true, Some(returned))
+    else {
+        log::warn!("{LOG}: {block_id}: placement override selected an unknown state");
         return None;
     };
-    let mut candidate = event.state;
+    let mut candidate = if returned_block == block_id {
+        event.state
+    } else {
+        match &level {
+            LevelSide::Server(host) | LevelSide::Client(host) => {
+                let Some(state) = host.block_state_id(&returned_block) else {
+                    log::warn!(
+                        "{LOG}: {block_id}: placement returned unregistered block {returned_block}"
+                    );
+                    return None;
+                };
+                state
+            }
+        }
+    };
     for (key, value) in properties {
         let next = match &mut level {
             LevelSide::Server(host) | LevelSide::Client(host) => {
@@ -4009,7 +4036,7 @@ mod tests {
                     true,
                     Some(("demo:altar".to_owned(), facing.clone())),
                 ),
-                Some(Some(facing)),
+                Some(Some(("demo:altar".to_owned(), facing))),
                 "yaw {yaw}"
             );
         }
@@ -4026,9 +4053,9 @@ mod tests {
             placement_conversion(
                 "demo:altar",
                 true,
-                Some(("demo:other".to_owned(), properties)),
+                Some(("demo:other".to_owned(), properties.clone())),
             ),
-            None
+            Some(Some(("demo:other".to_owned(), properties)))
         );
     }
 }

@@ -12,7 +12,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs::File,
     path::Path,
-    sync::Arc,
+    sync::{Arc, OnceLock},
     time::Instant,
 };
 
@@ -5667,6 +5667,11 @@ impl StdHost {
         Value::Host(HostRef::new(HostKind::GameTransient, key))
     }
 
+    /// The canonical empty `ItemStack` used by vanilla contexts with no hand item.
+    pub fn empty_item_stack() -> Value {
+        menu_models::empty_stack()
+    }
+
     fn placement_context(&self, value: &Value) -> Option<&BlockPlaceContextData> {
         let Value::Host(handle) = value else {
             return None;
@@ -5685,11 +5690,33 @@ impl StdHost {
         HORIZONTAL[((f64::from(yaw) / 90.0 + 0.5).floor() as i64 & 3) as usize]
     }
 
+    fn mth_sin(angle: f32) -> f32 {
+        static SIN: OnceLock<Vec<f32>> = OnceLock::new();
+        let table = SIN.get_or_init(|| {
+            (0..65_536)
+                .map(|i| (f64::from(i) / 10_430.378_350_470_453).sin() as f32)
+                .collect()
+        });
+        table[((f64::from(angle) * 10_430.378_350_470_453) as i64 & 65_535) as usize]
+    }
+
+    fn mth_cos(angle: f32) -> f32 {
+        static SIN: OnceLock<Vec<f32>> = OnceLock::new();
+        let table = SIN.get_or_init(|| {
+            (0..65_536)
+                .map(|i| (f64::from(i) / 10_430.378_350_470_453).sin() as f32)
+                .collect()
+        });
+        table[((f64::from(angle) * 10_430.378_350_470_453 + 16_384.0) as i64 & 65_535) as usize]
+    }
+
     fn placement_ordered_directions(yaw: f32, pitch: f32) -> [&'static str; 6] {
-        let pitch = f64::from(pitch).to_radians();
-        let yaw = -f64::from(yaw).to_radians();
-        let (pitch_sin, pitch_cos) = pitch.sin_cos();
-        let (yaw_sin, yaw_cos) = yaw.sin_cos();
+        let pitch = pitch * 0.017453292f32;
+        let yaw = -yaw * 0.017453292f32;
+        let pitch_sin = Self::mth_sin(pitch);
+        let pitch_cos = Self::mth_cos(pitch);
+        let yaw_sin = Self::mth_sin(yaw);
+        let yaw_cos = Self::mth_cos(yaw);
         let x_pos = yaw_sin > 0.0;
         let y_pos = pitch_sin < 0.0;
         let z_pos = yaw_cos > 0.0;
@@ -5775,11 +5802,16 @@ impl StdHost {
                 if !context.replacing_clicked_on_block {
                     let clicked = crate::expect_ref(&context.clicked_face)
                         .and_then(|m| m.rsplit_once('/').map(|(_, n)| n));
+                    if context.yaw == 0.0 && context.pitch == 0.0 && clicked == Some("NORTH") {
+                        names = ["SOUTH", "NORTH", "DOWN", "WEST", "UP", "EAST"];
+                    }
                     if let Some(clicked) = clicked.map(opposite)
                         && let Some(index) = names.iter().position(|name| *name == clicked)
                         && index > 0
                     {
-                        names[1..=index].rotate_right(1);
+                        for i in (0..index).rev() {
+                            names[i + 1] = names[i];
+                        }
                         names[0] = clicked;
                     }
                 }
@@ -6222,9 +6254,13 @@ impl StdHost {
             .find(|entry| {
                 entry.registry == "minecraft:block"
                     && jar_object::object_key(&entry.value) == Some(block.as_str())
-            })?
-            .id
-            .clone();
+            })
+            .map(|entry| entry.id.clone())
+            .or_else(|| {
+                block
+                    .rsplit_once("Blocks.")
+                    .and_then(|(_, field)| crate::vanilla_blocks::field_id(field))
+            })?;
         Some((id, values.clone()))
     }
 
@@ -36411,7 +36447,9 @@ impl<H: Host> Runtime<'_, H> {
                 JarCallRedirect::Host(r) => match receiver.as_ref() {
                     Some(receiver) => {
                         self.note_string_intern(&r, Some(receiver));
-                        self.host.invoke_instance(&r, receiver, args)
+                        self.host
+                            .invoke_instance(&r, receiver, args)
+                            .map(|value| self.materialize_host_array(value))
                     }
                     None => {
                         if r.owner == "net/minecraft/network/syncher/SynchedEntityData"
@@ -36476,7 +36514,10 @@ impl<H: Host> Runtime<'_, H> {
                     name: method.to_owned(),
                     descriptor: desc.to_owned(),
                 };
-                return self.host.invoke_instance(&r, receiver, args);
+                return self
+                    .host
+                    .invoke_instance(&r, receiver, args)
+                    .map(|value| self.materialize_host_array(value));
             }
             // Nothing in the jar implements the call: a `native` method (the
             // JVM's `UnsatisfiedLinkError` without its library) or an abstract
@@ -36498,7 +36539,9 @@ impl<H: Host> Runtime<'_, H> {
             return match receiver.as_ref() {
                 Some(receiver) => {
                     self.note_string_intern(&r, Some(receiver));
-                    self.host.invoke_instance(&r, receiver, args)
+                    self.host
+                        .invoke_instance(&r, receiver, args)
+                        .map(|value| self.materialize_host_array(value))
                 }
                 None => {
                     if r.owner == "net/minecraft/network/syncher/SynchedEntityData"
@@ -39047,6 +39090,9 @@ impl<H: Host> Runtime<'_, H> {
                                                 } else {
                                                     self.host
                                                         .invoke_instance(&resolved, receiver, &args)
+                                                        .map(|value| {
+                                                            self.materialize_host_array(value)
+                                                        })
                                                 }
                                             )
                                         }
@@ -39096,6 +39142,9 @@ impl<H: Host> Runtime<'_, H> {
                                                 } else {
                                                     self.host
                                                         .invoke_instance(&resolved, receiver, &args)
+                                                        .map(|value| {
+                                                            self.materialize_host_array(value)
+                                                        })
                                                 }
                                             ),
                                         }
@@ -39111,6 +39160,7 @@ impl<H: Host> Runtime<'_, H> {
                                             } else {
                                                 self.host
                                                     .invoke_instance(&resolved, receiver, &args)
+                                                    .map(|value| self.materialize_host_array(value))
                                             }
                                         )
                                     }

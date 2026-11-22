@@ -22,7 +22,7 @@ fn context(yaw: f32, face: &str, can_place: bool) -> BlockPlaceContextData {
         replacing_clicked_on_block: false,
         can_place,
         player: Value::Host(HostRef::new(HostKind::GameEntity, "game/player/test")),
-        item_in_hand: Value::Host(HostRef::new(HostKind::ItemStack, "empty")),
+        item_in_hand: StdHost::empty_item_stack(),
         level: Value::Host(HostRef::new(HostKind::GameLevel, "game/level/overworld")),
     }
 }
@@ -54,8 +54,20 @@ fn sources() -> Vec<(&'static str, &'static str)> {
             "package net.minecraft.world.level.block.state; import net.minecraft.world.level.block.state.properties.Property; public class StateDefinition<O,S> { public static class Builder<O,S> { public Builder<O,S> add(Property<?>... p){return this;} } }",
         ),
         (
+            "net/minecraft/world/entity/player/Player.java",
+            "package net.minecraft.world.entity.player; public class Player {}",
+        ),
+        (
+            "net/minecraft/world/item/ItemStack.java",
+            "package net.minecraft.world.item; public class ItemStack { public boolean isEmpty(){return true;} public static final ItemStack EMPTY = new ItemStack(); }",
+        ),
+        (
+            "net/minecraft/world/level/Level.java",
+            "package net.minecraft.world.level; public class Level {}",
+        ),
+        (
             "net/minecraft/world/item/context/BlockPlaceContext.java",
-            "package net.minecraft.world.item.context; import net.minecraft.core.*; public class BlockPlaceContext { public Direction getHorizontalDirection(){return null;} public Direction getClickedFace(){return null;} public BlockPos getClickedPos(){return null;} public boolean canPlace(){return true;} public boolean replacingClickedOnBlock(){return false;} public Direction getNearestLookingDirection(){return null;} public Direction getNearestLookingVerticalDirection(){return null;} public Direction[] getNearestLookingDirections(){return null;} public float getRotation(){return 0;} public boolean isSecondaryUseActive(){return false;} public Object getPlayer(){return null;} public Object getItemInHand(){return null;} public Object getLevel(){return null;} public Object getClickLocation(){return null;} public boolean isInside(){return false;} public Object getHand(){return null;} }",
+            "package net.minecraft.world.item.context; import net.minecraft.core.*; import net.minecraft.world.entity.player.Player; import net.minecraft.world.item.ItemStack; import net.minecraft.world.level.Level; public class BlockPlaceContext { public Direction getHorizontalDirection(){return null;} public Direction getClickedFace(){return null;} public BlockPos getClickedPos(){return null;} public boolean canPlace(){return true;} public boolean replacingClickedOnBlock(){return false;} public Direction getNearestLookingDirection(){return null;} public Direction getNearestLookingVerticalDirection(){return null;} public Direction[] getNearestLookingDirections(){return null;} public float getRotation(){return 0;} public boolean isSecondaryUseActive(){return false;} public Player getPlayer(){return null;} public ItemStack getItemInHand(){return null;} public Level getLevel(){return null;} public Object getClickLocation(){return null;} public boolean isInside(){return false;} public Object getHand(){return null;} }",
         ),
         (
             "net/minecraft/core/BlockPos.java",
@@ -71,7 +83,7 @@ fn sources() -> Vec<(&'static str, &'static str)> {
         ),
         (
             "demo/Probe.java",
-            "package demo; public class Probe { public static String place(demo.PlacementBlock b, net.minecraft.world.item.context.BlockPlaceContext c) { net.minecraft.world.level.block.state.BlockState s=b.getStateForPlacement(c); return s == null ? \"null\" : String.valueOf(s.getValue(demo.PlacementBlock.FACING)); } }",
+            "package demo; import net.minecraft.core.Direction; import net.minecraft.world.item.context.BlockPlaceContext; public class Probe { public static String place(demo.PlacementBlock b, BlockPlaceContext c) { net.minecraft.world.level.block.state.BlockState s=b.getStateForPlacement(c); return s == null ? \"null\" : String.valueOf(s.getValue(demo.PlacementBlock.FACING)); } public static String basic(BlockPlaceContext c) { return (c.getPlayer()==null)+\":\"+c.getHorizontalDirection()+\":\"+c.getRotation()+\":\"+c.isSecondaryUseActive()+\":\"+c.getItemInHand().isEmpty(); } public static String context(BlockPlaceContext c) { Direction[] d=c.getNearestLookingDirections(); return basic(c)+\":\"+d[0]+\",\"+d[1]+\",\"+d[2]+\",\"+d[3]+\",\"+d[4]+\",\"+d[5]; } }",
         ),
     ]
 }
@@ -131,4 +143,48 @@ fn placement_override_gets_real_context_and_null_refuses() {
         host.unknown_host_call_count() >= 4,
         "getHand is an unmodelled context call"
     );
+}
+
+#[test]
+fn placement_context_matches_mth_and_vanilla_null_player_branches() {
+    let fixture = javac_fixture::Fixture::build("block-placement-context", &sources());
+    let mut host = fixture.jar.seed_host(StdHost::new());
+    let desc = "(Lnet/minecraft/world/item/context/BlockPlaceContext;)Ljava/lang/String;";
+    let context_value = host.new_block_place_context(context(0.0, "NORTH", true));
+    let value = fixture
+        .jar
+        .invoke_method_with_args(
+            "demo/Probe",
+            "context",
+            desc,
+            None,
+            &[context_value],
+            &mut host,
+        )
+        .unwrap();
+    assert_eq!(
+        value,
+        Value::Ref(Some(
+            "false:SOUTH:0.0:false:true:SOUTH,NORTH,DOWN,WEST,UP,EAST".into()
+        ))
+    );
+
+    let yaw_135 = host.new_block_place_context(context(135.0, "UP", true));
+    let value = fixture
+        .jar
+        .invoke_method_with_args("demo/Probe", "context", desc, None, &[yaw_135], &mut host)
+        .unwrap();
+    assert!(
+        matches!(value, Value::Ref(Some(ref text)) if text.starts_with("false:NORTH:")),
+        "{value:?}"
+    );
+
+    let mut no_player = context(90.0, "UP", true);
+    no_player.player = Value::Ref(None);
+    let context = host.new_block_place_context(no_player);
+    let value = fixture
+        .jar
+        .invoke_method_with_args("demo/Probe", "basic", desc, None, &[context], &mut host)
+        .unwrap();
+    assert_eq!(value, Value::Ref(Some("true:NORTH:0.0:false:true".into())));
 }
