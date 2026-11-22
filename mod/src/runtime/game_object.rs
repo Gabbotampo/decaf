@@ -87,9 +87,13 @@ fn server_kind(rest: &str) -> HostKind {
         "level" => HostKind::GameLevel,
         "server" | "player-list" | "commands" | "rules" | "registries" | "saved-data"
         | "world-border" | "recipe-manager" => HostKind::GameSingleton,
-        "item" | "block" | "block-state" | "registry" | "entity_type" | "data-component-type" => {
-            HostKind::GameRegistryObject
-        }
+        "item"
+        | "block"
+        | "block-state"
+        | "default-block-state"
+        | "registry"
+        | "entity_type"
+        | "data-component-type" => HostKind::GameRegistryObject,
         // `damage`, `stack`, `block-hit`, `connection`, `packet-sender`,
         // `unknown`, `<what>/0` placeholders, and any family a model adds
         // before it gets a row: their own objects (never one shared object).
@@ -407,7 +411,9 @@ pub(crate) fn declared_types(key: &str) -> &'static [&'static str] {
             "net/minecraft/world/level/ItemLike",
         ],
         (false, "block") => &["net/minecraft/world/level/block/Block"],
-        (false, "block-state") => &["net/minecraft/world/level/block/state/BlockState"],
+        (false, "block-state" | "default-block-state") => {
+            &["net/minecraft/world/level/block/state/BlockState"]
+        }
         (false, "stack") => &[
             "net/minecraft/world/item/ItemStack",
             "net/minecraft/world/item/ItemInstance",

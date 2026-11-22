@@ -1960,9 +1960,51 @@ impl StdHost {
                 _ => Err(NativeError::UnknownHostCall(r.clone())),
             });
         }
-        // A `Block` value: its `toString`, `equals` and `hashCode` are the
+        // A canonical default `BlockState` (`Blocks.X.defaultBlockState()`):
+        // its block is known; for vanilla (`minecraft:`) blocks `is`/`isAir` are
+        // exact against vanilla `Blocks.*` (`AIR`, `CAVE_AIR`, `VOID_AIR`);
+        // property reads/writes and unknown mod-block comparisons stay counted.
+        if let Some(block) = text.strip_prefix("game/default-block-state/") {
+            return Some(match (r.name.as_str(), r.descriptor.as_str()) {
+                ("getBlock", "()Lnet/minecraft/world/level/block/Block;") => {
+                    Ok(block_marker(block))
+                }
+                ("is", "(Lnet/minecraft/world/level/block/Block;)Z") => match args.first() {
+                    Some(Value::Ref(None)) => Ok(Value::Int(0)),
+                    Some(arg) => {
+                        if let Some(other) = crate::runtime::game_object::text(arg)
+                            .and_then(|value| value.strip_prefix("game/block/"))
+                        {
+                            Ok(Value::Int(i32::from(other == block)))
+                        } else if matches!(arg, Value::Ref(Some(handle)) if handle.starts_with("obj/"))
+                            && block.starts_with("minecraft:")
+                        {
+                            Ok(Value::Int(0))
+                        } else {
+                            Err(NativeError::UnknownHostCall(r.clone()))
+                        }
+                    }
+                    None => Err(NativeError::UnknownHostCall(r.clone())),
+                },
+                ("isAir", "()Z") if block.starts_with("minecraft:") => {
+                    Ok(Value::Int(i32::from(matches!(
+                        block,
+                        "minecraft:air" | "minecraft:cave_air" | "minecraft:void_air"
+                    ))))
+                }
+                _ => Err(NativeError::UnknownHostCall(r.clone())),
+            });
+        }
+        // A `Block` value: `defaultBlockState()` yields its canonical vanilla
+        // default state handle; `toString`, `equals` and `hashCode` are the
         // kind's (`server_values.rs`); no other member is modelled.
-        if text.starts_with("game/block/") {
+        if let Some(block_id) = text.strip_prefix("game/block/") {
+            if r.name == "defaultBlockState"
+                && r.descriptor == "()Lnet/minecraft/world/level/block/state/BlockState;"
+                && r.owner.starts_with("net/minecraft/world/level/block/")
+            {
+                return Some(Ok(marker(format!("game/default-block-state/{block_id}"))));
+            }
             return Some(Err(NativeError::UnknownHostCall(r.clone())));
         }
         // The clone's old player, keyed as its previous life: the original's facts.
