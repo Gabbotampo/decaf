@@ -80,20 +80,20 @@ use std::time::Duration;
 use attachments::Lifecycle;
 use game_hooks::Arg;
 use mod_api::{
-    AttackEntityEvent, Authority, BlocksEvent, BreakBlockEvent, ClientHost, ClientLevelLoadEvent,
-    ClientLevelUnloadEvent, ClientSetupEvent, ClientStoppingEvent, Command, CommandArgumentValue,
-    CommandSource, ConfigFileError, ConfigPath, DamageContainer, DimensionKey, EntityInteractEvent,
-    EntityJoinLevelEvent, EntityLeaveLevelEvent, EntityRef, Flow, GameRuleChangedEvent, Hand,
-    HitHost, Hooks, Host, HostSide, HurtSource, InteractionResult, ItemsEvent, LeftClickBlockEvent,
-    LevelDimension, LevelLoadEvent, LevelRef, LevelTickPostEvent, LevelTickPreEvent,
-    LevelUnloadEvent, LivingDamagePostEvent, LivingDeathEvent, LivingDeathPostEvent,
-    LivingIncomingDamageEvent, PlayerChangedDimensionEvent, PlayerCloneEvent,
-    PlayerDestroyedBlockEvent, PlayerDiedEvent, PlayerLoggedInEvent, PlayerLoggedOutEvent,
-    PlayerRef, PlayerRespawnedEvent, PlayerTickPostEvent, PlayerTickPreEvent,
-    RegisterCommandsEvent, RegistrationContext, RightClickBlockEvent, RightClickItemEvent,
-    RunModCommandEvent, ServerAboutToStartEvent, ServerHost, ServerStartedEvent,
-    ServerStartingEvent, ServerStoppedEvent, ServerStoppingEvent, ServerTickEvent, ServerTickPhase,
-    Text,
+    AttackEntityEvent, Authority, BlockState, BlocksEvent, BreakBlockEvent, ClientHost,
+    ClientLevelLoadEvent, ClientLevelUnloadEvent, ClientSetupEvent, ClientStoppingEvent, Command,
+    CommandArgumentValue, CommandSource, ConfigFileError, ConfigPath, DamageContainer,
+    DimensionKey, EntityInteractEvent, EntityJoinLevelEvent, EntityLeaveLevelEvent, EntityRef,
+    Flow, GameRuleChangedEvent, Hand, HitHost, Hooks, Host, HostSide, HurtSource,
+    InteractionResult, ItemsEvent, LeftClickBlockEvent, LevelDimension, LevelLoadEvent, LevelRef,
+    LevelSide, LevelTickPostEvent, LevelTickPreEvent, LevelUnloadEvent, LivingDamagePostEvent,
+    LivingDeathEvent, LivingDeathPostEvent, LivingIncomingDamageEvent, PlayerChangedDimensionEvent,
+    PlayerCloneEvent, PlayerDestroyedBlockEvent, PlayerDiedEvent, PlayerLoggedInEvent,
+    PlayerLoggedOutEvent, PlayerRef, PlayerRespawnedEvent, PlayerTickPostEvent, PlayerTickPreEvent,
+    RegisterCommandsEvent, Registrar, RegistrationContext, RightClickBlockEvent,
+    RightClickItemEvent, RunModCommandEvent, ServerAboutToStartEvent, ServerHost,
+    ServerStartedEvent, ServerStartingEvent, ServerStoppedEvent, ServerStoppingEvent,
+    ServerTickEvent, ServerTickPhase, StateForPlacementEvent, Text,
 };
 use runtime::brigadier::{
     self, ArgumentKind, CommandInvocation as RuntimeInvocation, CommandMessage, CommandOutcome,
@@ -106,6 +106,161 @@ use runtime::events::{
 };
 use runtime::{ExecutionBudget, GameHookEffect, GameObject, NativeJar, StdHost};
 use serde_json::json;
+
+fn placement_direction(direction: mod_api::Direction) -> runtime::Value {
+    let name = match direction {
+        mod_api::Direction::Down => "DOWN",
+        mod_api::Direction::Up => "UP",
+        mod_api::Direction::North => "NORTH",
+        mod_api::Direction::South => "SOUTH",
+        mod_api::Direction::West => "WEST",
+        mod_api::Direction::East => "EAST",
+    };
+    runtime::Value::Ref(Some(format!("enum/net/minecraft/core/Direction/{name}")))
+}
+
+/// Apply the Java result's block identity before touching the engine-owned state. `None` means
+/// the hook did not claim the answer (a foreign block or a different block selected by Java),
+/// while `Some(None)` is Java's `null` refusal.
+fn placement_conversion(
+    _block_id: &str,
+    owned: bool,
+    returned: Option<(String, BTreeMap<String, String>)>,
+) -> Option<Option<(String, BTreeMap<String, String>)>> {
+    if !owned {
+        return None;
+    }
+    match returned {
+        None => Some(None),
+        Some((returned_block, properties)) => Some(Some((returned_block, properties))),
+    }
+}
+
+fn answer_state_for_placement(
+    state: &mut State,
+    level: LevelSide<'_>,
+    event: &mut StateForPlacementEvent<'_>,
+) -> Option<Option<BlockState>> {
+    answer_state_for_placement_snapshot(state, level, event.state, event.context)
+}
+
+fn answer_state_for_placement_snapshot(
+    state: &mut State,
+    mut level: LevelSide<'_>,
+    current_state: BlockState,
+    context: &mod_api::PlacementContext,
+) -> Option<Option<BlockState>> {
+    let block_id = match &level {
+        LevelSide::Server(host) | LevelSide::Client(host) => {
+            host.state_block(current_state)?.to_owned()
+        }
+    };
+    // Sunrise's pinned `StateForPlacementEvent`/`PlacementContext` (a2dac1ee75) does not yet carry
+    // whether a player or dispenser/non-player placed the block. Until the SDK exposes the placer,
+    // pass `Placer::Unknown` so any player- or rotation-dependent accessor is counted as unknown
+    // rather than guessed.
+    let data = runtime::BlockPlaceContextData {
+        clicked_pos: if context.replace_clicked {
+            [context.hit_pos.x, context.hit_pos.y, context.hit_pos.z]
+        } else {
+            [context.pos.x, context.pos.y, context.pos.z]
+        },
+        clicked_face: placement_direction(context.face),
+        click_location: context.hit,
+        inside: context.inside,
+        replacing_clicked_on_block: context.replace_clicked,
+        can_place: true,
+        placer: runtime::Placer::Unknown,
+        item_in_hand: match context.item {
+            Some(item) => runtime::Value::Host(runtime::HostRef::new(
+                runtime::HostKind::ItemStack,
+                format!("placement/item/{item:?}"),
+            )),
+            None => runtime::StdHost::empty_item_stack(),
+        },
+        level: runtime::Value::Host(runtime::HostRef::new(
+            runtime::HostKind::GameLevel,
+            "placement/level",
+        )),
+    };
+    if !state.has_registered_block(&block_id) {
+        return None;
+    }
+    let outcome = match state.state_for_placement_content(&block_id, data) {
+        Ok(Some(outcome)) => outcome,
+        Ok(None) => return None,
+        Err(error) => {
+            log::warn!("{LOG}: {block_id}: placement override refused: {error:?}");
+            return None;
+        }
+    };
+    let returned = match outcome {
+        content::PlacementContentOutcome::Refused => return Some(None),
+        content::PlacementContentOutcome::State(returned_block, properties) => {
+            (returned_block, properties)
+        }
+        content::PlacementContentOutcome::UnknownState => {
+            log::warn!("{LOG}: {block_id}: placement override returned an unknown state");
+            return None;
+        }
+        content::PlacementContentOutcome::CountedUnknown(count) => {
+            log::warn!(
+                "{LOG}: {block_id}: placement override hit {count} unknown host call(s); leaving placement unclaimed"
+            );
+            return None;
+        }
+    };
+    let Some(Some((returned_block, properties))) =
+        placement_conversion(&block_id, true, Some(returned))
+    else {
+        log::warn!("{LOG}: {block_id}: placement override selected an unknown state");
+        return None;
+    };
+    let mut candidate = if returned_block == block_id {
+        current_state
+    } else {
+        match &level {
+            LevelSide::Server(host) | LevelSide::Client(host) => {
+                let Some(state) = host.block_state_id(&returned_block) else {
+                    log::warn!(
+                        "{LOG}: {block_id}: placement returned unregistered block {returned_block}"
+                    );
+                    return None;
+                };
+                state
+            }
+        }
+    };
+    for (key, value) in properties {
+        let next = match &mut level {
+            LevelSide::Server(host) | LevelSide::Client(host) => {
+                host.state_with_property(candidate, &key, &value)
+            }
+        };
+        let Some(next) = next else {
+            log::warn!("{LOG}: {block_id}: placement property refused: {key}={value}");
+            return None;
+        };
+        candidate = next;
+    }
+    Some(Some(candidate))
+}
+
+pub(crate) struct JavaPlacementPart {
+    state: Arc<Mutex<State>>,
+}
+
+#[mod_api::sunrise_part]
+impl mod_api::BlockPart for JavaPlacementPart {
+    fn state_for_placement(
+        &self,
+        level: LevelSide<'_>,
+        event: &mut StateForPlacementEvent<'_>,
+    ) -> Option<Option<BlockState>> {
+        let mut state = self.state.lock().ok()?;
+        answer_state_for_placement(&mut state, level, event)
+    }
+}
 
 mod attachments;
 mod client;
@@ -134,7 +289,7 @@ const LOG: &str = "Horizon Java";
 /// the per-server state.
 #[derive(Default)]
 pub struct HorizonJava {
-    state: Mutex<State>,
+    state: Arc<Mutex<State>>,
     client: Mutex<client::State>,
     /// Serializes state access with top-level Java dispatches while allowing same-thread access
     /// through the thread-local frame owned by `game_dispatch`.
@@ -432,6 +587,11 @@ fn hyphenated_uuid(uuid: u128) -> String {
 
 #[mod_api::sunrise_mod]
 impl Hooks for HorizonJava {
+    fn register(&self, registrar: &mut dyn Registrar, context: &RegistrationContext) {
+        let mut state = self.lock();
+        content::register_placement_parts(&mut state, context, registrar, Arc::clone(&self.state));
+    }
+
     /// The content root still accepts native block declarations here, at the Registration phase
     /// and before any resource loads (NeoForge's `RegisterEvent` drained from
     /// `DeferredRegister.Blocks`). This is the one moment a jar's registrations can become content
@@ -3863,5 +4023,338 @@ mod tests {
         assert_eq!(context.amount, 0.0);
         assert!(!context.flag);
         assert_eq!(context.damage.as_deref(), Some("minecraft:player_attack"));
+    }
+
+    #[test]
+    fn placement_direction_conversion_matches_minecraft_names() {
+        for (direction, expected) in [
+            (mod_api::Direction::Down, "DOWN"),
+            (mod_api::Direction::Up, "UP"),
+            (mod_api::Direction::North, "NORTH"),
+            (mod_api::Direction::South, "SOUTH"),
+            (mod_api::Direction::West, "WEST"),
+            (mod_api::Direction::East, "EAST"),
+        ] {
+            assert_eq!(
+                placement_direction(direction),
+                runtime::Value::Ref(Some(format!(
+                    "enum/net/minecraft/core/Direction/{expected}"
+                ),))
+            );
+        }
+    }
+
+    #[test]
+    fn placement_result_conversion_refuses_null_and_leaves_foreign_blocks() {
+        let mut properties = std::collections::BTreeMap::new();
+        properties.insert("facing".to_owned(), "north".to_owned());
+        for (yaw, expected) in [
+            (0.0_f32, "north"),
+            (90.0, "east"),
+            (180.0, "south"),
+            (-90.0, "west"),
+        ] {
+            let mut facing = std::collections::BTreeMap::new();
+            facing.insert("facing".to_owned(), expected.to_owned());
+            assert_eq!(
+                placement_conversion(
+                    "demo:altar",
+                    true,
+                    Some(("demo:altar".to_owned(), facing.clone())),
+                ),
+                Some(Some(("demo:altar".to_owned(), facing))),
+                "yaw {yaw}"
+            );
+        }
+        assert_eq!(placement_conversion("demo:altar", true, None), Some(None));
+        assert_eq!(
+            placement_conversion(
+                "minecraft:stone",
+                false,
+                Some(("minecraft:stone".to_owned(), properties.clone())),
+            ),
+            None
+        );
+        assert_eq!(
+            placement_conversion(
+                "demo:altar",
+                true,
+                Some(("demo:other".to_owned(), properties.clone())),
+            ),
+            Some(Some(("demo:other".to_owned(), properties)))
+        );
+        assert_eq!(
+            placement_conversion(
+                "demo:stone_placer",
+                true,
+                Some(("minecraft:stone".to_owned(), BTreeMap::new())),
+            ),
+            Some(Some(("minecraft:stone".to_owned(), BTreeMap::new())))
+        );
+    }
+
+    struct PlacementTestLevel {
+        by_state: std::collections::HashMap<BlockState, String>,
+        by_id: BTreeMap<String, BlockState>,
+    }
+
+    impl PlacementTestLevel {
+        fn new(entries: &[(&str, u32)]) -> Self {
+            let mut by_state = std::collections::HashMap::new();
+            let mut by_id = BTreeMap::new();
+            for &(id, key) in entries {
+                let state = BlockState::from(mod_api::BlockStateRecord::new(
+                    mod_api::__private::parts_installation::block_key(key),
+                    0,
+                ));
+                by_state.insert(state, id.to_owned());
+                by_id.insert(id.to_owned(), state);
+            }
+            Self { by_state, by_id }
+        }
+
+        fn state_of(&self, id: &str) -> BlockState {
+            *self.by_id.get(id).expect("registered test block")
+        }
+    }
+
+    impl mod_api::LevelRandomHost for PlacementTestLevel {}
+
+    impl mod_api::LevelHost for PlacementTestLevel {
+        fn block_entity_data(&self, _: mod_api::BlockEntityRef) -> Option<mod_api::Compound> {
+            None
+        }
+
+        fn state_block(&self, state: BlockState) -> Option<&str> {
+            self.by_state.get(&state).map(String::as_str)
+        }
+
+        fn block_state_id(&self, name: &str) -> Option<BlockState> {
+            self.by_id.get(name).copied()
+        }
+
+        fn state_with_property(
+            &self,
+            state: BlockState,
+            _key: &str,
+            _value: &str,
+        ) -> Option<BlockState> {
+            Some(state)
+        }
+    }
+
+    fn build_placement_test_state() -> State {
+        use std::io::Write;
+        use std::path::PathBuf;
+
+        let sources: &[(&str, &str)] = &[
+            (
+                "net/minecraft/core/Direction.java",
+                "package net.minecraft.core; public enum Direction { DOWN, UP, NORTH, SOUTH, WEST, EAST; public Direction getOpposite() { return switch(this) { case DOWN -> UP; case UP -> DOWN; case NORTH -> SOUTH; case SOUTH -> NORTH; case WEST -> EAST; case EAST -> WEST; }; } }",
+            ),
+            (
+                "net/minecraft/resources/Identifier.java",
+                "package net.minecraft.resources; public final class Identifier { public static Identifier fromNamespaceAndPath(String ns, String p) { return new Identifier(); } }",
+            ),
+            (
+                "net/minecraft/core/Registry.java",
+                "package net.minecraft.core; import net.minecraft.resources.Identifier; public interface Registry<T> { static <V, T extends V> T register(Registry<V> r, Identifier id, T v) { return v; } }",
+            ),
+            (
+                "net/minecraft/core/registries/BuiltInRegistries.java",
+                "package net.minecraft.core.registries; import net.minecraft.core.Registry; import net.minecraft.world.level.block.Block; public final class BuiltInRegistries { public static final Registry<Block> BLOCK = null; }",
+            ),
+            (
+                "net/minecraft/world/level/block/state/BlockState.java",
+                "package net.minecraft.world.level.block.state; public class BlockState {}",
+            ),
+            (
+                "net/minecraft/world/item/context/BlockPlaceContext.java",
+                "package net.minecraft.world.item.context; import net.minecraft.core.Direction; public class BlockPlaceContext { public Direction getHorizontalDirection(){return null;} public Direction getClickedFace(){return null;} public boolean isSecondaryUseActive(){return false;} }",
+            ),
+            (
+                "net/minecraft/world/level/block/Block.java",
+                "package net.minecraft.world.level.block; import net.minecraft.world.level.block.state.BlockState; import net.minecraft.world.item.context.BlockPlaceContext; public class Block { public BlockState defaultBlockState(){return new BlockState();} public BlockState getStateForPlacement(BlockPlaceContext c){return defaultBlockState();} }",
+            ),
+            (
+                "net/minecraft/world/level/block/Blocks.java",
+                "package net.minecraft.world.level.block; public final class Blocks { public static final Block STONE = null; }",
+            ),
+            (
+                "demo/StoneBlock.java",
+                "package demo; import net.minecraft.world.item.context.BlockPlaceContext; import net.minecraft.world.level.block.*; import net.minecraft.world.level.block.state.BlockState; public class StoneBlock extends Block { @Override public BlockState getStateForPlacement(BlockPlaceContext c) { return Blocks.STONE.defaultBlockState(); } }",
+            ),
+            (
+                "demo/UnregisteredBlock.java",
+                "package demo; import net.minecraft.world.item.context.BlockPlaceContext; import net.minecraft.world.level.block.*; import net.minecraft.world.level.block.state.BlockState; public class UnregisteredBlock extends Block { private static final Block UNREGISTERED = new Block(); @Override public BlockState getStateForPlacement(BlockPlaceContext c) { return UNREGISTERED.defaultBlockState(); } }",
+            ),
+            (
+                "demo/MissingEngineBlock.java",
+                "package demo; import net.minecraft.world.item.context.BlockPlaceContext; import net.minecraft.world.level.block.*; import net.minecraft.world.level.block.state.BlockState; public class MissingEngineBlock extends Block { public static final Block TARGET = new Block(); @Override public BlockState getStateForPlacement(BlockPlaceContext c) { return TARGET.defaultBlockState(); } }",
+            ),
+            (
+                "demo/PlayerDependentBlock.java",
+                "package demo; import net.minecraft.world.item.context.BlockPlaceContext; import net.minecraft.world.level.block.*; import net.minecraft.world.level.block.state.BlockState; public class PlayerDependentBlock extends Block { @Override public BlockState getStateForPlacement(BlockPlaceContext c) { if (c.isSecondaryUseActive()) { return Blocks.STONE.defaultBlockState(); } return defaultBlockState(); } }",
+            ),
+            (
+                "demo/RefusingBlock.java",
+                "package demo; import net.minecraft.core.Direction; import net.minecraft.world.item.context.BlockPlaceContext; import net.minecraft.world.level.block.*; import net.minecraft.world.level.block.state.BlockState; public class RefusingBlock extends Block { @Override public BlockState getStateForPlacement(BlockPlaceContext c) { return c.getClickedFace() == Direction.DOWN ? null : defaultBlockState(); } }",
+            ),
+            (
+                "demo/Main.java",
+                "package demo; import net.minecraft.core.Registry; import net.minecraft.core.registries.BuiltInRegistries; import net.minecraft.resources.Identifier; public final class Main { public void onInitialize() { Registry.register(BuiltInRegistries.BLOCK, Identifier.fromNamespaceAndPath(\"demo\", \"stone_placer\"), new StoneBlock()); Registry.register(BuiltInRegistries.BLOCK, Identifier.fromNamespaceAndPath(\"demo\", \"unregistered_placer\"), new UnregisteredBlock()); Registry.register(BuiltInRegistries.BLOCK, Identifier.fromNamespaceAndPath(\"demo\", \"missing_in_engine\"), MissingEngineBlock.TARGET); Registry.register(BuiltInRegistries.BLOCK, Identifier.fromNamespaceAndPath(\"demo\", \"missing_engine_placer\"), new MissingEngineBlock()); Registry.register(BuiltInRegistries.BLOCK, Identifier.fromNamespaceAndPath(\"demo\", \"player_dep\"), new PlayerDependentBlock()); Registry.register(BuiltInRegistries.BLOCK, Identifier.fromNamespaceAndPath(\"demo\", \"refusing\"), new RefusingBlock()); } }",
+            ),
+        ];
+
+        let root = std::env::var_os("CARGO_TARGET_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir)
+            .join(format!("horizon-java-mod-placement-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (src, classes) = (root.join("src"), root.join("classes"));
+        let mut paths = Vec::new();
+        for (path, body) in sources {
+            let file = src.join(path);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(&file, body).unwrap();
+            paths.push(file);
+        }
+        std::fs::create_dir_all(&classes).unwrap();
+        let javac = std::env::var_os("JAVA_HOME")
+            .map(|home| PathBuf::from(home).join("bin/javac"))
+            .unwrap_or_else(|| "javac".into());
+        let status = std::process::Command::new(javac)
+            .args(["--release", "17", "-nowarn", "-d"])
+            .arg(&classes)
+            .args(&paths)
+            .status()
+            .expect("javac runs");
+        assert!(status.success(), "javac failed");
+
+        let mut bytes = Vec::new();
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut bytes));
+        let options = zip::write::SimpleFileOptions::default();
+        zip.start_file("fabric.mod.json", options).unwrap();
+        zip.write_all(br#"{"id":"placedemo","version":"1","entrypoints":{"main":["demo.Main"]}}"#)
+            .unwrap();
+        for name in [
+            "Main",
+            "StoneBlock",
+            "UnregisteredBlock",
+            "MissingEngineBlock",
+            "PlayerDependentBlock",
+            "RefusingBlock",
+        ] {
+            let path = classes.join(format!("demo/{name}.class"));
+            zip.start_file(format!("demo/{name}.class"), options)
+                .unwrap();
+            zip.write_all(&std::fs::read(path).unwrap()).unwrap();
+        }
+        zip.finish().unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+
+        let jar = Arc::new(NativeJar::from_bytes(&bytes).expect("parse jar"));
+        let mut host = jar.seed_host(StdHost::new().with_environment_type("SERVER"));
+        jar.execute("demo.Main", None, "main", &mut host)
+            .expect("run entrypoint");
+        let loaded = LoadedJar {
+            row: JarRow::refused("placedemo.jar", "placedemo".to_owned(), String::new()),
+            jar,
+            host,
+            listeners: Vec::new(),
+            orderings: Vec::new(),
+            commands: Vec::new(),
+            native_commands: Vec::new(),
+            commands_registered: false,
+            stages_ran: 1,
+            failures: Vec::new(),
+            hooks: runtime::GameHookRegistrations::default(),
+            hook_state: runtime::GameHookState::default(),
+        };
+        State {
+            jars: vec![loaded],
+            ..State::default()
+        }
+    }
+
+    #[test]
+    fn answer_state_for_placement_places_vanilla_stone_and_rejects_unregistered_or_unknown() {
+        let mut state = build_placement_test_state();
+        let level = PlacementTestLevel::new(&[
+            ("minecraft:stone", 1),
+            ("demo:stone_placer", 2),
+            ("demo:unregistered_placer", 3),
+            ("demo:missing_engine_placer", 4),
+            ("demo:player_dep", 5),
+            ("demo:refusing", 6),
+        ]);
+        let stone = level.state_of("minecraft:stone");
+        let stone_placer = level.state_of("demo:stone_placer");
+        let unreg_placer = level.state_of("demo:unregistered_placer");
+        let missing_engine_placer = level.state_of("demo:missing_engine_placer");
+        let player_dep = level.state_of("demo:player_dep");
+        let refusing = level.state_of("demo:refusing");
+        let ctx_up = mod_api::PlacementContext::new(
+            mod_api::BlockPos::new(1, 2, 3),
+            mod_api::Direction::Up,
+            None,
+        );
+        let ctx_down = mod_api::PlacementContext::new(
+            mod_api::BlockPos::new(1, 2, 3),
+            mod_api::Direction::Down,
+            None,
+        );
+
+        // 1. Mod block returning `Blocks.STONE.defaultBlockState()` places `minecraft:stone`.
+        let placed = answer_state_for_placement_snapshot(
+            &mut state,
+            LevelSide::Server(&level),
+            stone_placer,
+            &ctx_up,
+        );
+        assert_eq!(placed, Some(Some(stone)));
+        assert_eq!(state.jars[0].host.unknown_host_call_count(), 0);
+
+        // 2. Mod block returning a state of a block unregistered in Java is left unclaimed (`None`).
+        let unreg = answer_state_for_placement_snapshot(
+            &mut state,
+            LevelSide::Server(&level),
+            unreg_placer,
+            &ctx_up,
+        );
+        assert_eq!(unreg, None);
+        assert_eq!(state.jars[0].host.unknown_host_call_count(), 0);
+
+        // 3. Mod block returning a block absent from Sunrise's registry is left unclaimed (`None`).
+        let missing = answer_state_for_placement_snapshot(
+            &mut state,
+            LevelSide::Server(&level),
+            missing_engine_placer,
+            &ctx_up,
+        );
+        assert_eq!(missing, None);
+        assert_eq!(state.jars[0].host.unknown_host_call_count(), 0);
+
+        // 4. Non-player refusal (`null`) returns `Some(None)` cleanly with 0 unknowns.
+        let refused = answer_state_for_placement_snapshot(
+            &mut state,
+            LevelSide::Server(&level),
+            refusing,
+            &ctx_down,
+        );
+        assert_eq!(refused, Some(None));
+        assert_eq!(state.jars[0].host.unknown_host_call_count(), 0);
+
+        // 5. Player-dependent placement (`isSecondaryUseActive`) counts under `Placer::Unknown`
+        //    and refuses to guess a state (`None`).
+        let unknown = answer_state_for_placement_snapshot(
+            &mut state,
+            LevelSide::Server(&level),
+            player_dep,
+            &ctx_up,
+        );
+        assert_eq!(unknown, None);
+        assert_eq!(state.jars[0].host.unknown_host_call_count(), 1);
+        assert_eq!(state.jars[0].row.callback_unknown_host_calls, 1);
     }
 }

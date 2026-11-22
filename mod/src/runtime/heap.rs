@@ -297,6 +297,21 @@ impl StdHost {
         for entry in &self.registrations {
             value(&entry.value, out);
         }
+        for context in self.placement_contexts.values() {
+            value(&context.clicked_face, out);
+            match &context.placer {
+                crate::runtime::Placer::Player { player, .. } => value(player, out),
+                crate::runtime::Placer::None {
+                    direction: Some(direction),
+                } => value(direction, out),
+                crate::runtime::Placer::None { direction: None } | crate::runtime::Placer::Unknown => {}
+            }
+            value(&context.item_in_hand, out);
+            value(&context.level, out);
+        }
+        for values in self.placement_arrays.values() {
+            values.iter().for_each(|item| value(item, out));
+        }
         self.posted_events
             .iter()
             .for_each(|event| value(event, out));
@@ -1927,6 +1942,8 @@ mod tests {
             "menu_states",
             "posted_events",
             "registrations",
+            "placement_contexts",
+            "placement_arrays",
             "content_builders",
             "item_property_builders",
             "block_property_builders",
