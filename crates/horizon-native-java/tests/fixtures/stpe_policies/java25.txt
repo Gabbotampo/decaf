@@ -20,7 +20,6 @@ remove-on-cancel-off false:false
 execute-existing-on true:false
 repeated false:true
 independent false:true/true:false
-jei false:true done 1
+jei false:true
 shutdown true:true:true false:true
 after-shutdown true:false true
-rejected java.util.concurrent.RejectedExecutionException 1

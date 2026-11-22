@@ -25,10 +25,13 @@
 //!   `setExecuteExistingDelayedTasksAfterShutdownPolicy`) and their getters
 //!   (defaults `false` and `true`, the Java 25 oracle's) are kept per pool a jar
 //!   built with `new`. The flags decide whether a cancelled task leaves the queue
-//!   and whether a delayed task outlives `shutdown`; a task scheduled with a
-//!   non-zero delay already ran when it was scheduled, so on a pool whose policy a
-//!   jar set that `schedule` call is counted, not answered. On a pool no setter
-//!   touched, a delayed task still runs at once (the departure above).
+//!   and whether a delayed task outlives `shutdown`, which a runtime that runs a
+//!   task when it is scheduled cannot show. So once a jar called a policy setter
+//!   or getter on a pool, every `execute`, `submit` and `schedule` on it is a
+//!   counted unknown host call (it was the setter that was counted before), and
+//!   so is one on a pool built with a handler once the pool is shut down (the
+//!   pool never calls the handler). A pool no policy call touched keeps the
+//!   older answers, which are the departures above.
 
 use super::*;
 
@@ -52,6 +55,10 @@ const STPE_EXECUTE_EXISTING: &str = "#stpeExecuteExistingDelayedTasksAfterShutdo
 const STPE_REMOVE_ON_CANCEL: &str = "#stpeRemoveOnCancel";
 /// Set once a `new ScheduledThreadPoolExecutor(..)` passed its argument checks.
 const STPE_CONSTRUCTED: &str = "#stpeConstructed";
+/// Set once a jar called a policy setter or getter on the pool.
+const STPE_POLICY_USED: &str = "#stpePolicyUsed";
+/// Set when the pool was built with a `RejectedExecutionHandler` of the jar's.
+const STPE_HANDLER: &str = "#stpeHandler";
 const EXECUTOR_SERVICE: &str = "java/util/concurrent/ExecutorService";
 const SCHEDULED_EXECUTOR_SERVICE: &str = "java/util/concurrent/ScheduledExecutorService";
 const SCHEDULED_FUTURE: &str = "java/util/concurrent/ScheduledFuture";
@@ -276,6 +283,11 @@ fn invoke_executor<H: Host>(
     let Some(marker) = state_marker(rt, receiver, HostKind::Executor)? else {
         return Ok(None);
     };
+    if matches!(r.name.as_str(), "execute" | "submit" | "schedule")
+        && stpe_task_calls_counted(rt, &marker)
+    {
+        return Ok(None);
+    }
     let value = match (r.name.as_str(), r.descriptor.as_str()) {
         ("execute", "(Ljava/lang/Runnable;)V") => {
             reject_after_shutdown(rt, &marker)?;
@@ -313,13 +325,6 @@ fn invoke_executor<H: Host>(
             if descriptor.starts_with("(Ljava/lang/Runnable;J")
                 || descriptor.starts_with("(Ljava/util/concurrent/Callable;J") =>
         {
-            // A policy setter was called on this pool: the jar relies on a delayed
-            // task being pending (cancelled and dropped, or dropped at
-            // `shutdown`), and the task below would already have run. Not shown
-            // exact, so counted; a zero delay runs at once in Java too (oracle).
-            if stpe_policy_touched(rt, &marker) && !matches!(args.get(1), Some(Value::Long(0))) {
-                return Ok(None);
-            }
             reject_after_shutdown(rt, &marker)?;
             let Some(task) = args.first() else {
                 return Err(native_npe());
@@ -407,6 +412,10 @@ fn invoke_scheduled_pool<H: Host>(
                 return Err(concurrent_sync::null_pointer(name));
             }
         }
+        if tail.contains(&"handler") {
+            rt.fields
+                .insert(format!("{key}|{STPE_HANDLER}"), Value::Int(1));
+        }
         rt.fields.insert(constructed, Value::Int(1));
         return Ok(Some(Value::Void));
     }
@@ -419,6 +428,7 @@ fn invoke_scheduled_pool<H: Host>(
         | "getExecuteExistingDelayedTasksAfterShutdownPolicy" => (STPE_EXECUTE_EXISTING, 1),
         _ => return Ok(None),
     };
+    let used = format!("{key}|{STPE_POLICY_USED}");
     let field = format!("{key}|{field}");
     Ok(match r.descriptor.as_str() {
         "(Z)V" if r.name.starts_with("set") => {
@@ -426,25 +436,33 @@ fn invoke_scheduled_pool<H: Host>(
                 return Ok(None);
             };
             rt.fields.insert(field, Value::Int(i32::from(*flag != 0)));
+            rt.fields.insert(used, Value::Int(1));
             Some(Value::Void)
         }
-        "()Z" if r.name.starts_with("get") => Some(
-            rt.fields
-                .get(&field)
-                .cloned()
-                .unwrap_or(Value::Int(default)),
-        ),
+        "()Z" if r.name.starts_with("get") => {
+            rt.fields.insert(used, Value::Int(1));
+            Some(
+                rt.fields
+                    .get(&field)
+                    .cloned()
+                    .unwrap_or(Value::Int(default)),
+            )
+        }
         _ => None,
     })
 }
 
-/// Whether a jar called a policy setter on this pool (`rt.fields` holds a flag
-/// only after one did). Such a pool is one whose answers depend on a pending
-/// delayed task, which this runtime does not have (see `schedule`).
-fn stpe_policy_touched<H: Host>(rt: &Runtime<'_, H>, marker: &str) -> bool {
-    [STPE_REMOVE_ON_CANCEL, STPE_EXECUTE_EXISTING]
-        .iter()
-        .any(|field| rt.fields.contains_key(&format!("{marker}|{field}")))
+/// Whether an `execute`, `submit` or `schedule` on this pool must stay counted.
+/// A jar that called a policy setter or getter on it relies on what the flags
+/// decide (a pending task dropped on cancel or at `shutdown`), and this runtime
+/// runs a task when it is scheduled, in the caller's thread, without the pool's
+/// factory or handler; none of that is shown exact (the Java 25 rows in
+/// `stpe_policies/java25-counted.txt` differ), and upstream counted the setter
+/// call as the marker. A pool built with a jar handler also stays counted once
+/// shut down: Java then calls the handler, which this pool never does.
+fn stpe_task_calls_counted<H: Host>(rt: &Runtime<'_, H>, marker: &str) -> bool {
+    let has = |field: &str| rt.fields.contains_key(&format!("{marker}|{field}"));
+    has(STPE_POLICY_USED) || (has(STPE_HANDLER) && rt.executor_shutdown(marker))
 }
 
 /// `ThreadFactory.newThread(runnable)` hands out an unstarted `Thread` marker.

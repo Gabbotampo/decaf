@@ -72,14 +72,13 @@ public class Probe {
         ScheduledThreadPoolExecutor other = new ScheduledThreadPoolExecutor(1);
         s.append("independent ").append(policies(pool)).append('/').append(policies(other)).append('\n');
 
-        // The JEI delayed executor's pool, then a task that runs at once.
+        // The JEI delayed executor's pool: policies set, then shut down with
+        // nothing queued. (Tasks on such a pool are not answered: Pending.java.)
         ScheduledThreadPoolExecutor jei = new ScheduledThreadPoolExecutor(1, factory);
         jei.setRemoveOnCancelPolicy(true);
         jei.setExecuteExistingDelayedTasksAfterShutdownPolicy(false);
         ScheduledExecutorService service = jei;
-        int[] ran = new int[1];
-        Object result = service.schedule(() -> { ran[0]++; return "done"; }, 0, TimeUnit.NANOSECONDS).get();
-        s.append("jei ").append(policies(jei)).append(' ').append(result).append(' ').append(ran[0]).append('\n');
+        s.append("jei ").append(policies(jei)).append('\n');
 
         // Shutdown with nothing queued: the policies stay readable and settable.
         service.shutdown();
@@ -89,13 +88,6 @@ public class Probe {
         jei.setRemoveOnCancelPolicy(false);
         jei.setExecuteExistingDelayedTasksAfterShutdownPolicy(true);
         s.append("after-shutdown ").append(policies(jei)).append(' ').append(service.isShutdown()).append('\n');
-        try {
-            service.schedule(() -> { ran[0]++; }, 0, TimeUnit.NANOSECONDS);
-            s.append("rejected none");
-        } catch (java.util.concurrent.RejectedExecutionException e) {
-            s.append("rejected ").append(e.getClass().getName()).append(' ').append(ran[0]);
-        }
-        s.append('\n');
         return s.toString();
     }
 

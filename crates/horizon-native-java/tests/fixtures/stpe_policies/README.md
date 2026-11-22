@@ -15,16 +15,34 @@ OpenJDK Runtime Environment (build 25.0.5.1)
 OpenJDK 64-Bit Server VM (build 25.0.5.1, mixed mode, sharing)
 ```
 
-Every row is deterministic on a real JVM: the constructors' refusals are read
-from the exception class and message, and the only task is scheduled with a zero
-delay and read through `Future.get()`, and `shutdown` runs with nothing queued.
-The probe says nothing about a task still pending at `shutdown` or at `cancel`,
-where the flags decide whether it runs or leaves the queue; the runtime runs a
-task when it is scheduled. So a `schedule` with a non-zero delay on a pool whose
-policy a jar set is counted (an unknown host call), not answered: no oracle row
-backs it (`fixture_stpe_policies.rs`, `delayed_schedule_on_a_policy_pool_is_counted`).
-A pool no setter touched keeps the older answer (the task runs at once), which is
-not shown exact either.
+Two probes, both JDK-only (java.util.concurrent), both committed:
+
+```sh
+$J/javac -d classes demo/Probe.java demo/Pending.java
+$J/java -cp classes demo.Probe > java25.txt
+$J/java -cp classes demo.Pending > java25-counted.txt
+```
+
+`java25.txt` (`Probe`) is what the runtime answers, and the test compares the
+runtime's output to it byte for byte with an empty unknown-call list. Every row is
+deterministic on a real JVM: the constructors' refusals are read from the
+exception class and message, the policies from the getters, and `shutdown` runs
+with nothing queued. It holds no task at all.
+
+`java25-counted.txt` (`Pending`) is what the runtime does NOT answer. It records
+Java 25's answers for a task run by a pool whose policy a jar set or read
+(thread factory called, its thread name, a throwing task or factory, a null unit,
+a task still pending at `shutdown`), and for a pool built with a handler after
+`shutdown` (a discarding or CallerRuns handler gives no exception; Java calls the
+handler, the runtime's pool never does). The runtime runs a task when it is
+scheduled, in the caller's thread, and rejects after `shutdown` without a handler,
+so it differs from these rows. Every `execute`, `submit` and `schedule` on a pool a
+jar called a policy setter or getter on, and every one on a handler-built pool after
+`shutdown`, is therefore an unknown host call, as the setter was upstream
+(`fixture_stpe_policies.rs`, `tasks_on_a_policy_or_handler_pool_are_counted`: each
+row must be counted; the runtime's own answer is not compared). A pool no policy
+call touched keeps the older answers (the task runs at once), which are not shown
+exact either.
 
 A pool only answers a setter or getter once its constructor passed the checks
 the oracle shows (`ctor-*` rows: size first, then the factory, then the handler);
