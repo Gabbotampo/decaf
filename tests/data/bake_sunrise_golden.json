@@ -1,0 +1,16 @@
+{
+  "files": {
+    "config/horizon_java/bake-report.json": "83c8fb24e0817c785b7b1f30f9922b54d9d32c57be7938224a2de559d651d3d6",
+    "sunrise-mods.txt": "25b73f1cc83749b895417823da218759639ef17bdceba4a3a283b923936ad5c9",
+    "sunrise-mods/c.smod": "a611d2177719b5584dade718c466ee56f5dfbe6c213eaa6e915a90c69613eccc",
+    "sunrise-mods/horizon.smod": "65c77a74f2bfb7ff307c7a02a4cd0a1ea4170532ba4949d6b461cbece84e02aa",
+    "sunrise-mods/horizon_java.smod": "5fbb8c76d9eec79886eac76027db0689c19c44e4fe15c18bd79ce004ba0df09b",
+    "sunrise-mods/other_ns.smod": "286bc320d1ada0a071e911328ccd0a3f5ef9f59282b956dfa16d0ac7563f0398",
+    "sunrise-mods/ruby_mod.smod": "764a4d9af4193b2ac85d16c13400b4999687fcec831d933cbde5d6cb57a5945a",
+    "sunrise-mods/weird.smod": "2121e144dca8b949b316f0274e1e5d8345690c573d33952685ffb70435277c9a"
+  },
+  "generated_by": "tools/bake.py at 91040874",
+  "status": 1,
+  "stderr": "evil.jar: refused: unsafe entry path: '../x.json'\nruby-dash.jar: refused: namespace 'ruby-dash' is not a content package id ([a-z0-9_], not a device name): a runtime declaration cannot join its assets (docs/mod-plan.md, Fork seams needed)\n",
+  "stdout": "ruby_mod.jar: 5 package(s) [c, horizon, horizon_java, other_ns, ruby_mod], 13 file(s) skipped\nwe\"ird\\name.jar: 1 package(s) [weird], 0 file(s) skipped\nreport: <root>/game/config/horizon_java/bake-report.json\n"
+}
