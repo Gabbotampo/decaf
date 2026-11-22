@@ -248,6 +248,21 @@ impl<H: Host> Runtime<'_, H> {
             name: TEST.1.to_owned(),
             descriptor: TEST.2.to_owned(),
         };
+        // A `Predicate` from `Pattern.asPredicate()` is a host handle, not a
+        // callback: run its `test` (`regex_calls.rs`). One the engine cannot
+        // answer (an input with a supplementary character) goes to the host as
+        // the `test` call it is, so it is counted rather than read as "false".
+        if crate::host_jdk_constant::predicate_text(callback).is_some() {
+            let answer =
+                match self.invoke_regex(&call, Some(callback), std::slice::from_ref(value))? {
+                    Some(answer) => answer,
+                    None => {
+                        self.host
+                            .invoke_instance(&call, callback, std::slice::from_ref(value))?
+                    }
+                };
+            return Ok(matches!(answer, Value::Int(flag) if flag != 0));
+        }
         if let Some((owner, jar_owned)) = self.dispatch_owner(&call, 0xb9, Some(callback))
             && jar_owned
         {

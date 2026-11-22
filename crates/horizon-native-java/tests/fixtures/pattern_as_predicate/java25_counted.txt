@@ -1,0 +1,7 @@
+flagged ABC = true
+one face = true
+two face = false
+removeIf left = 0
+builder = ClassCastException
+null = NullPointerException
+integer = ClassCastException

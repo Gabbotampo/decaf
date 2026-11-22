@@ -114,6 +114,19 @@ impl<H: Host> Runtime<'_, H> {
                 };
                 Ok(Some(crate::runtime::host_jdk_constant::matcher(&pattern, &input)))
             }
+            // `pattern.asPredicate()` makes a `Predicate` whose `test` runs the
+            // pattern against its argument. Only a `Pattern` handle is a
+            // receiver, and the only handle `Pattern.compile(String)` makes
+            // has flags 0 (`compile(String, int)` is not modelled, so a
+            // `Pattern` with flags never reaches here and stays counted); a
+            // pattern the engine cannot run exactly is counted when `test` runs.
+            ("java/util/regex/Pattern", "asPredicate", "()Ljava/util/function/Predicate;") => {
+                let Some(pattern) = receiver.and_then(crate::runtime::host_jdk_constant::pattern_text)
+                else {
+                    return Ok(None);
+                };
+                Ok(Some(crate::runtime::host_jdk_constant::predicate(&pattern)))
+            }
             ("java/util/regex/Matcher", "matches", "()Z") => {
                 let Some((pattern, input)) =
                     receiver.and_then(crate::runtime::host_jdk_constant::matcher_parts)
@@ -121,6 +134,30 @@ impl<H: Host> Runtime<'_, H> {
                     return Ok(None);
                 };
                 Ok(java_regex::matches(&pattern, &input)
+                    .ok()
+                    .map(|matched| Value::Int(i32::from(matched))))
+            }
+            // `predicate.test(object)` on a `Predicate` this runtime made from
+            // a `Pattern.asPredicate()` it knows. The JDK's predicate is a
+            // `Predicate<String>`: `test(Object)` casts its argument to `String`
+            // (a `ClassCastException` for anything else) and runs
+            // `matcher(s).find()` on a fresh matcher. Only a plain `String`
+            // argument is answered; null, a `StringBuilder`/`StringBuffer`, a jar
+            // object or a runtime marker stays counted; so does an input the
+            // engine refuses (a supplementary character). Any other receiver (a jar's own
+            // `Predicate`, a lambda) is not this arm's: the call goes on down
+            // the dispatch chain.
+            ("java/util/function/Predicate", "test", "(Ljava/lang/Object;)Z") => {
+                let (Some(pattern), Some(input)) = (
+                    receiver.and_then(crate::runtime::host_jdk_constant::predicate_text),
+                    args.first()
+                        .filter(|value| self.builder_text(value).is_none())
+                        .and_then(expect_ref)
+                        .filter(|text| crate::runtime::value_class::is_plain_string(text)),
+                ) else {
+                    return Ok(None);
+                };
+                Ok(java_regex::find(&pattern, input)
                     .ok()
                     .map(|matched| Value::Int(i32::from(matched))))
             }

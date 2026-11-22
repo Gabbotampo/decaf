@@ -21,6 +21,9 @@
 //!   needs a per-allocation key.
 //! * **`Pattern`** (`final`): key `[serial, text]`, a serial per `compile`: one key one object.
 //!   `toString`/`pattern()` is the text, `equals` identity, `hashCode` identity (counted).
+//! * **`Predicate` from `Pattern.asPredicate()`**: key `[serial, text]`, a serial per call (the
+//!   JDK builds a new lambda each time). Only `test(String)` is answered (`regex_calls.rs`); `toString`
+//!   and `hashCode` are counted, `equals` is identity.
 //! * **`ArtifactVersion`** (NeoForge's `DefaultArtifactVersion`, Maven's `ComparableVersion`
 //!   behind it): key its text, class unknown (`ArtifactVersion`, `Comparable` declared).
 //!   `toString` is the text; `equals` is `compareTo == 0`: `true` for one text, counted for two
@@ -284,6 +287,35 @@ fn handle_pattern(handle: &HostRef) -> Option<String> {
     }
 }
 
+static NEXT_PREDICATE: AtomicU64 = AtomicU64::new(0);
+
+/// `pattern.asPredicate()`: a new `Predicate` object (a serial per call, as the
+/// JDK allocates a new lambda each time) carrying the pattern's text, so its
+/// `test` can run the same `java_regex` engine `Matcher#matches` uses.
+pub(crate) fn predicate(pattern: &str) -> Value {
+    Value::Host(HostRef::of_values(
+        HostKind::RegexPredicate,
+        &[
+            Value::Long(NEXT_PREDICATE.fetch_add(1, Ordering::Relaxed) as i64),
+            Value::Ref(Some(pattern.to_owned())),
+        ],
+    ))
+}
+
+/// The pattern text of a `Predicate` handle.
+pub(crate) fn predicate_text(value: &Value) -> Option<String> {
+    let Value::Host(handle) = value else {
+        return None;
+    };
+    if handle.kind() != HostKind::RegexPredicate {
+        return None;
+    }
+    match <[Value; 2]>::try_from(handle.values()?) {
+        Ok([_, Value::Ref(Some(text))]) => Some(text),
+        _ => None,
+    }
+}
+
 /// NeoForge's `ArtifactVersion` of `text`.
 pub(crate) fn artifact_version(text: &str) -> Value {
     Value::Host(HostRef::new(HostKind::ArtifactVersion, text))
@@ -388,6 +420,14 @@ pub(crate) const MATCHER_METHODS: Methods = Methods {
 
 pub(crate) const PATTERN_METHODS: Methods = Methods {
     to_string: |handle, _| Ok(handle_pattern(handle)),
+    ..CONSTANT_METHODS
+};
+
+/// A `Predicate` from `Pattern.asPredicate()`: `toString`/`hashCode` are not
+/// modelled (counted); `equals` is identity.
+pub(crate) const PREDICATE_METHODS: Methods = Methods {
+    to_string: |_, _| Ok(None),
+    hash_code: |_, _| Ok(None),
     ..CONSTANT_METHODS
 };
 
