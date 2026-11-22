@@ -57,52 +57,129 @@ fn fastutil_sorted_entry_set_matches_java25() {
     );
 }
 
-/// What stays counted: `fastIterator()` (one reused entry), a map changed under a live iterator,
-/// an entry read after the iterator's `remove`, and the tree maps (natural key order). Each is
-/// counted, never answered with a value the oracle does not show.
+/// What stays counted, each case on a host of its own: it must count at least one call, and the
+/// call named for it. A counted case is never answered with a value the oracle does not show.
 #[test]
 fn fastutil_sorted_entry_set_leaves_the_rest_counted() {
     let Some(fixture) = build() else {
         return;
     };
-    let mut host = fixture.jar.seed_host(horizon_native_java::StdHost::new());
-    let text = fixture.text_on(&mut host, "countedRows");
-    // Every row of the oracle ran (a row's value is the counted call's neutral answer).
-    let names = |text: &str| -> Vec<String> {
-        text.lines()
-            .map(|line| line.split('\t').next().unwrap_or_default().to_owned())
-            .collect()
-    };
-    assert_eq!(names(&text), names(COUNTED_ORACLE));
-    let counted: Vec<String> = host
-        .unknown_host_calls()
-        .into_iter()
-        .map(|(call, _)| call)
-        .collect();
     let objects = "it/unimi/dsi/fastutil/objects/";
-    for expected in [
-        // The tree maps' natural key order.
-        format!(
-            "{objects}Object2BooleanAVLTreeMap#object2BooleanEntrySet()L{objects}ObjectSortedSet;"
-        ),
-        format!(
-            "{objects}Object2BooleanRBTreeMap#object2BooleanEntrySet()L{objects}ObjectSortedSet;"
-        ),
-        format!(
-            "{objects}Object2BooleanSortedMap#object2BooleanEntrySet()L{objects}ObjectSortedSet;"
-        ),
+    let fast_iterator = format!(
+        "{objects}Object2BooleanSortedMap$FastSortedEntrySet#fastIterator()L{objects}ObjectBidirectionalIterator;"
+    );
+    let iterator = format!(
+        "{objects}Object2BooleanSortedMap$FastSortedEntrySet#iterator()L{objects}ObjectBidirectionalIterator;"
+    );
+    let tree = |class: &str| {
+        format!("{objects}{class}#object2BooleanEntrySet()L{objects}ObjectSortedSet;")
+    };
+    let cases: Vec<(&str, &str, Vec<String>)> = vec![
         // One entry object reused by every `next()`.
-        format!(
-            "{objects}Object2BooleanSortedMap$FastSortedEntrySet#fastIterator()L{objects}ObjectBidirectionalIterator;"
+        (
+            "fastIteratorOrder",
+            "LINKED.fastIterator-order",
+            vec![fast_iterator.clone()],
         ),
-        // A map changed under the live iterator, and an entry read after `remove()`.
-        "java/util/Iterator#hasNext()Z".to_owned(),
-        "java/util/Iterator#next()Ljava/lang/Object;".to_owned(),
-        "java/util/Map$Entry#getKey()Ljava/lang/Object;".to_owned(),
-    ] {
+        (
+            "fastIteratorRetained",
+            "LINKED.fastIterator-retained",
+            vec![fast_iterator],
+        ),
+        // A map changed under a live iterator, whatever type the program gives the iterator, and
+        // an entry read after the iterator's `remove()` or a `put`.
+        (
+            "iteratorPutDuring",
+            "LINKED.iterator-put-during",
+            vec!["java/util/Iterator#hasNext()Z".into()],
+        ),
+        (
+            "iteratorRemoveDuring",
+            "LINKED.iterator-remove-during",
+            vec!["java/util/Iterator#hasNext()Z".into()],
+        ),
+        (
+            "iteratorReadAfterRemove",
+            "LINKED.iterator-read-after-remove",
+            vec!["java/util/Map$Entry#getKey()Ljava/lang/Object;".into()],
+        ),
+        (
+            "typedPutDuring",
+            "LINKED.typed-put-during",
+            vec!["java/util/Iterator#hasNext()Z".into()],
+        ),
+        (
+            "typedRemoveThenPut",
+            "LINKED.typed-remove-then-put",
+            vec!["java/util/Iterator#hasNext()Z".into()],
+        ),
+        (
+            "iteratorPutExistingDuring",
+            "LINKED.iterator-put-existing-during",
+            vec![],
+        ),
+        // fastutil's entry prints `key=>value`.
+        ("entryToString", "LINKED.entry-toString", vec![]),
+        // `setValue` and the backward steps of the bidirectional iterator are not modelled.
+        ("entrySetValue", "LINKED.entry-setValue", vec![]),
+        ("iteratorPrevious", "LINKED.iterator-previous", vec![]),
+        // The kept entry set is a live view; the host's is a copy.
+        ("entrySetKept", "LINKED.entry-set-kept", vec![]),
+        // A map the host table does not mirror: a strategy, constructors with arguments, keys the
+        // host compares by identity or boxes.
+        ("customStrategy", "CUSTOM.iterator-strategy", vec![]),
+        ("copyMapCtor", "COPY.map-ctor", vec![iterator.clone()]),
+        (
+            "copyFastutilCtor",
+            "COPY.fastutil-ctor",
+            vec![iterator.clone()],
+        ),
+        ("copyArraysCtor", "COPY.arrays-ctor", vec![iterator.clone()]),
+        ("capacityCtor", "COPY.capacity-ctor", vec![iterator.clone()]),
+        ("jarClassKeys", "KEYS.jar-class", vec![iterator.clone()]),
+        ("boxedKeys", "KEYS.boxed", vec![iterator]),
+        // The tree maps' natural key order.
+        (
+            "avlIteratorOrder",
+            "AVL.iterator-order",
+            vec![tree("Object2BooleanAVLTreeMap")],
+        ),
+        (
+            "rbtIteratorOrder",
+            "RBT.iterator-order",
+            vec![tree("Object2BooleanRBTreeMap")],
+        ),
+        (
+            "sortedIteratorOrder",
+            "AVL.sorted-iterator-order",
+            vec![tree("Object2BooleanSortedMap")],
+        ),
+    ];
+    // The method table is the oracle's: every row of `java25_counted.txt` has a case.
+    let oracle_rows: Vec<&str> = COUNTED_ORACLE
+        .lines()
+        .map(|line| line.split('\t').next().unwrap_or_default())
+        .collect();
+    let case_rows: Vec<&str> = cases.iter().map(|(_, row, _)| *row).collect();
+    assert_eq!(case_rows, oracle_rows);
+    for (method, row, expected) in cases {
+        let mut host = fixture.jar.seed_host(horizon_native_java::StdHost::new());
+        fixture.text_on(&mut host, method);
+        let counted: Vec<String> = host
+            .unknown_host_calls()
+            .into_iter()
+            .map(|(call, _)| call)
+            .collect();
+        eprintln!("{row}: {counted:?}");
         assert!(
-            counted.contains(&expected),
-            "{expected} not counted: {counted:?}"
+            !counted.is_empty(),
+            "{row} ({method}) answered, none counted"
         );
+        for call in expected {
+            assert!(
+                counted.contains(&call),
+                "{row} ({method}): {call} not counted: {counted:?}"
+            );
+        }
     }
 }

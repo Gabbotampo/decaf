@@ -1950,6 +1950,10 @@ impl<H: Host> host_ref::Nested for RuntimeNested<'_, '_, '_, H> {
         self.runtime.host.constructed_uuid(value)
     }
 
+    fn is_fastutil_entry(&mut self, value: &Value) -> bool {
+        self.runtime.host.map_entry_of_fastutil_map(value)
+    }
+
     fn map_entry_parts(&mut self, value: &Value) -> Option<(Value, Value)> {
         if self
             .runtime

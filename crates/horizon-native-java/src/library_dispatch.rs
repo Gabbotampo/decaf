@@ -1160,19 +1160,28 @@ impl<H: Host> Runtime<'_, H> {
             return Ok(Some(iterator));
         }
         // `hasNext`/`next`/`remove` typed as the fastutil iterator are
-        // `Iterator`'s, on the iterator this model made.
+        // `Iterator`'s, on an iterator this model made (a fastutil-guarded one).
         if r.owner == BIDIRECTIONAL
             && matches!(
                 (r.name.as_str(), r.descriptor.as_str()),
                 ("hasNext", "()Z") | ("next", "()Ljava/lang/Object;") | ("remove", "()V")
             )
-            && crate::host_iterator::marker(receiver).is_some()
+            && crate::host_iterator::marker(receiver)
+                .and_then(|marker| self.host.iterator_guard(marker))
+                .is_some_and(|guard| guard.fastutil)
         {
             let iterator = MethodRef {
                 owner: "java/util/Iterator".into(),
                 name: r.name.clone(),
                 descriptor: r.descriptor.clone(),
             };
+            // Through the iteration guard first: a map changed under the iterator is counted
+            // whatever type the program gives the iterator.
+            if let Some(answer) =
+                self.invoke_iteration_guard(&iterator, 0xb9, Some(receiver), args)?
+            {
+                return Ok(Some(answer));
+            }
             return self
                 .host
                 .invoke_instance(&iterator, receiver, args)
@@ -1206,6 +1215,12 @@ impl<H: Host> Runtime<'_, H> {
         if r.name == "<init>" {
             if kind == "map" && crate::expect_ref(&receiver).is_some() {
                 self.host.register_mutable_collection(&receiver, kind);
+                // Only a no-arg constructor leaves the host table equal to the Java map
+                // (the copy constructors fill the Java map, never the host's).
+                self.host.mark_exact_fastutil_map(
+                    &receiver,
+                    r.owner == LINKED_OBJECT2BOOLEAN_MAP && r.descriptor == "()V",
+                );
             }
             return Ok(Some(Value::Void));
         }
@@ -2647,6 +2662,11 @@ fn unbox_primitive(descriptor: &str, value: &Value) -> Value {
         _ => value.clone(),
     }
 }
+
+/// The one fastutil map class whose host table is modelled exactly enough to answer its entry set's
+/// iterator (`invoke_fastutil_entry_iterator`).
+pub(crate) const LINKED_OBJECT2BOOLEAN_MAP: &str =
+    "it/unimi/dsi/fastutil/objects/Object2BooleanLinkedOpenHashMap";
 
 /// The `java.util` collection kind (`map`, `list`, `set`) a fastutil
 /// collection class implements, from its name; a fastutil iterator, function

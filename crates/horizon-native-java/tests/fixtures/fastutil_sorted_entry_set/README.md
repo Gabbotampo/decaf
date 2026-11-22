@@ -4,13 +4,52 @@
 `Object2BooleanSortedMap.FastSortedEntrySet`; this fixture is the oracle for its `iterator()` and
 for the `ObjectBidirectionalIterator` it returns (`hasNext`, `next`, `remove`).
 
-- `java25.txt`: `demo.Probe.rows()`, every case the runtime answers (zero unknown host calls).
-- `java25_counted.txt`: `demo.Probe.countedRows()`, the cases that stay counted and why:
-  `fastIterator()` reuses one entry object (`cherry,cherry,cherry`), fastutil's iterator reads its
-  map live (a key put under it is visited, a map changed under it is never a
-  `ConcurrentModificationException`), an entry returned before `remove()` reads the map as it is
-  afterwards, and the tree maps iterate in natural key order through an unrelated
-  `ObjectSortedSet`.
+## What the runtime answers
+
+Exactly the rows of `java25.txt` (`demo.Probe.rows()`, zero unknown host calls), under these
+conditions, each of which the runtime checks and otherwise counts:
+
+- the map is an `Object2BooleanLinkedOpenHashMap` itself (not a subclass, not the
+  `Object2BooleanLinkedOpenCustomHashMap`, whose `Hash.Strategy` the host does not model) made by
+  the no-arg constructor (`new Object2BooleanLinkedOpenHashMap<>()`, the only one whose Java map
+  the host's table mirrors);
+- every key in it is a `String`;
+- the iterator's `hasNext`/`next`/`remove`, typed as `Iterator` or as
+  `ObjectBidirectionalIterator`, are called while the map's key sequence is the one the iterator
+  last saw (its own `remove` moves that sequence on).
+
+Rows: `iterator()` order (including the empty-string key and a re-put of a present key), typed
+use through `getKey()` and `getBooleanValue()`, independent iterators, entries kept after the
+iteration, the bare `NoSuchElementException` past the end and on an empty map, the bare
+`IllegalStateException` for a `remove` with nothing to remove, and `remove` in the middle, at the
+end and for every entry.
+
+## What stays counted
+
+`java25_counted.txt` (`demo.Probe.countedRows()`), each case its own method so the test runs it
+on a host of its own and checks it counts a call:
+
+- `fastIterator()`: one entry object reused by every `next()` (`cherry,cherry,cherry`);
+- a map changed under a live iterator (a put or remove), untyped or typed as the fastutil
+  iterator: fastutil's iterator reads its map live and never throws
+  `ConcurrentModificationException`;
+- an entry read after the iterator's `remove()` or after a put of its key;
+- `setValue` of an entry and `hasPrevious`/`previous` of the iterator (the host models neither);
+- `toString()` of a fastutil entry: fastutil prints `key=>value`, `java.util` prints `key=value`;
+- an entry set kept across a change of the map (a live view in Java);
+- `Object2BooleanLinkedOpenCustomHashMap`; maps built by a constructor with arguments (copy
+  constructors, arrays, capacity); keys that are not `String`s (a jar class with its own `equals`,
+  boxes);
+- the tree maps (`Object2BooleanAVLTreeMap`, `Object2BooleanRBTreeMap`): their entry set is an
+  unrelated `ObjectSortedSet` in natural key order.
+
+Not run, not claimed: `fastIterator(entry)`, `forEachRemaining` on the iterator, the entry set's
+`size`/`contains`/`remove`, `iterator()` of any other fastutil class.
+
+An independent oracle (`notes/scratch-1122/fanout/slices/E3-fastutil-edges/probe`, raw JDK 25
+output) agrees with the rows here for the order (empty-string key included), the second `remove()`
+(`IllegalStateException`), `next()` past the end, the empty map, the one entry `fastIterator()`
+reuses, and no `ConcurrentModificationException` for a put during iteration.
 
 Both files are the raw output of the probe, never edited by hand.
 

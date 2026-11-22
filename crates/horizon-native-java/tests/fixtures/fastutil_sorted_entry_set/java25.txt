@@ -9,4 +9,6 @@ LINKED.iterator-remove-middle	3|2|banana,cherry|false
 LINKED.iterator-remove-last	bananatrue;applefalse;cherrytrue;|2|banana,apple|false
 LINKED.iterator-remove-all	0|true|
 LINKED.iterator-reput	apple,cherry,banana
+LINKED.iterator-order-empty-key	b,a,c,aa,
+LINKED.iterator-put-existing	bananafalse;applefalse;cherrytrue;|3
 LINKED.iterator-empty	java.util.NoSuchElementException: 

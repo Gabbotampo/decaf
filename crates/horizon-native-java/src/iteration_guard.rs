@@ -64,7 +64,7 @@ pub struct IteratorGuard {
     /// An iterator over a fastutil map, which reads the map live and never
     /// fails fast: `structure` is the map's key sequence it last saw, and a
     /// step after the map changed is counted (`guard_fastutil_iterator`).
-    fastutil: bool,
+    pub(crate) fastutil: bool,
 }
 
 /// How a fail-fast collection iterates.
@@ -368,21 +368,39 @@ impl<H: Host> Runtime<'_, H> {
     }
 
     /// Whether `entry_set` is the entry set of a linked fastutil hash map
-    /// (`FastSortedEntrySet`): the host's `entrySet()` view of such a map.
+    /// (`FastSortedEntrySet`) whose host table is exactly the Java map: the
+    /// host's `entrySet()` view of an `Object2BooleanLinkedOpenHashMap` (its
+    /// own class, not a subclass and not the custom-strategy map, whose
+    /// `Hash.Strategy` the host ignores) made by its no-arg constructor
+    /// (a copy constructor leaves the host table empty), holding only `String`
+    /// keys (the host compares any other object's keys by identity, where
+    /// fastutil runs the key's `equals`).
     pub(crate) fn is_linked_fastutil_entry_set(&self, entry_set: &Value) -> bool {
         let Some(marker) = expect_ref(entry_set) else {
             return false;
         };
-        self.host.view_copy_kind(marker).as_deref() == Some("entrySet")
-            && self.host.view_copy_source(marker).is_some_and(|map| {
-                matches!(
-                    crate::jar_object::marker_class(&map),
-                    Some(
-                        "it/unimi/dsi/fastutil/objects/Object2BooleanLinkedOpenHashMap"
-                            | "it/unimi/dsi/fastutil/objects/Object2BooleanLinkedOpenCustomHashMap"
-                    )
-                )
-            })
+        if self.host.view_copy_kind(marker).as_deref() != Some("entrySet") {
+            return false;
+        }
+        let Some(map) = self.host.view_copy_source(marker) else {
+            return false;
+        };
+        if crate::jar_object::marker_class(&map)
+            != Some(crate::library_dispatch::LINKED_OBJECT2BOOLEAN_MAP)
+        {
+            return false;
+        }
+        let map = crate::jar_object::stored_value(&map);
+        self.host.is_exact_fastutil_map(&map)
+            && self
+                .host
+                .mutable_collection_entries(&map)
+                .is_some_and(|entries| {
+                    entries.chunks(2).all(|pair| {
+                        matches!(pair.first(), Some(Value::Ref(Some(text)))
+                            if crate::value_class::is_plain_string(text))
+                    })
+                })
     }
 
     /// Guard the iterator over the entry set `entry_set` of a fastutil map

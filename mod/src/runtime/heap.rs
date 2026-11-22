@@ -476,6 +476,7 @@ impl StdHost {
             .chain(self.block_property_builders.keys())
             .chain(self.block_state_properties.keys())
             .chain(self.block_copied_properties.iter())
+            .chain(self.exact_fastutil_maps.iter())
             .chain(self.state_definition_builders.keys())
             .chain(self.block_default_states.keys())
             .chain(self.unknown_block_state_definitions.iter())
@@ -511,6 +512,7 @@ impl StdHost {
         self.block_property_builders.retain(|key, _| keep(key));
         self.block_state_properties.retain(|key, _| keep(key));
         self.block_copied_properties.retain(|key| keep(key));
+        self.exact_fastutil_maps.retain(|key| keep(key));
         self.state_definition_builders.retain(|key, _| keep(key));
         self.block_default_states.retain(|key, _| keep(key));
         self.unknown_block_state_definitions.retain(|key| keep(key));
@@ -1929,6 +1931,7 @@ mod tests {
             "item_property_builders",
             "block_property_builders",
             "block_copied_properties",
+            "exact_fastutil_maps",
             "block_state_properties",
             "state_definition_builders",
             "block_states",
