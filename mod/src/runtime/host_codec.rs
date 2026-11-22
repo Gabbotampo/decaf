@@ -235,6 +235,15 @@ pub(crate) fn opaque_codec_type(value: &Value) -> Option<String> {
     }
 }
 
+/// The `(declared, owner, name)` of a canonical static game codec handle, `None` for any other
+/// value (including non-canonical opaque codec results of unmodelled calls).
+pub(crate) fn static_codec_field(value: &Value) -> Option<(String, String, String)> {
+    match value {
+        Value::Host(handle) if handle.kind() == HostKind::OpaqueCodec => static_field(handle.key()),
+        _ => None,
+    }
+}
+
 /// A codec's label in a content declaration (`declarations_content.rs`): what it is.
 pub(crate) fn codec_label(value: &Value) -> Option<String> {
     if let Some(declared) = crate::runtime::stream_codec::codec_type(value) {
