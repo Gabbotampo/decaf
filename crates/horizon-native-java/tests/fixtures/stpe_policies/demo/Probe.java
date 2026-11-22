@@ -11,6 +11,19 @@ public class Probe {
         return pool.getExecuteExistingDelayedTasksAfterShutdownPolicy() + ":" + pool.getRemoveOnCancelPolicy();
     }
 
+    interface Build {
+        Object make() throws Exception;
+    }
+
+    static String built(Build build) {
+        try {
+            build.make();
+            return "ok";
+        } catch (Throwable t) {
+            return t.getClass().getName() + ": " + t.getMessage();
+        }
+    }
+
     static String rows() throws Exception {
         StringBuilder s = new StringBuilder();
         ThreadFactory factory = r -> new Thread(r);
@@ -21,6 +34,23 @@ public class Probe {
         s.append("defaults-factory ").append(policies(new ScheduledThreadPoolExecutor(1, factory))).append('\n');
         s.append("defaults-handler ").append(policies(new ScheduledThreadPoolExecutor(2, handler))).append('\n');
         s.append("defaults-both ").append(policies(new ScheduledThreadPoolExecutor(0, factory, handler))).append('\n');
+
+        // The constructors refuse the arguments ThreadPoolExecutor's refuses: the
+        // size first, then the factory and the handler by name.
+        ThreadFactory noFactory = null;
+        RejectedExecutionHandler noHandler = null;
+        s.append("ctor-neg ").append(built(() -> new ScheduledThreadPoolExecutor(-1))).append('\n');
+        s.append("ctor-min ").append(built(() -> new ScheduledThreadPoolExecutor(Integer.MIN_VALUE))).append('\n');
+        s.append("ctor-neg-factory ").append(built(() -> new ScheduledThreadPoolExecutor(-1, noFactory))).append('\n');
+        s.append("ctor-neg-handler ").append(built(() -> new ScheduledThreadPoolExecutor(-1, noHandler))).append('\n');
+        s.append("ctor-neg-both ").append(built(() -> new ScheduledThreadPoolExecutor(-1, noFactory, noHandler))).append('\n');
+        s.append("ctor-null-factory ").append(built(() -> new ScheduledThreadPoolExecutor(1, noFactory))).append('\n');
+        s.append("ctor-null-handler ").append(built(() -> new ScheduledThreadPoolExecutor(1, noHandler))).append('\n');
+        s.append("ctor-null-factory3 ").append(built(() -> new ScheduledThreadPoolExecutor(1, noFactory, handler))).append('\n');
+        s.append("ctor-null-handler3 ").append(built(() -> new ScheduledThreadPoolExecutor(1, factory, noHandler))).append('\n');
+        s.append("ctor-null-both ").append(built(() -> new ScheduledThreadPoolExecutor(1, noFactory, noHandler))).append('\n');
+        s.append("ctor-zero ").append(built(() -> new ScheduledThreadPoolExecutor(0))).append('\n');
+        s.append("ctor-max ").append(built(() -> new ScheduledThreadPoolExecutor(Integer.MAX_VALUE, factory, handler))).append('\n');
 
         // Each setter changes only its own policy, and the getter answers it.
         ScheduledThreadPoolExecutor pool = new ScheduledThreadPoolExecutor(1, factory);

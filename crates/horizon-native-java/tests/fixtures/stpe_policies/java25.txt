@@ -2,6 +2,18 @@ defaults true:false
 defaults-factory true:false
 defaults-handler true:false
 defaults-both true:false
+ctor-neg java.lang.IllegalArgumentException: corePoolSize must be non-negative
+ctor-min java.lang.IllegalArgumentException: corePoolSize must be non-negative
+ctor-neg-factory java.lang.IllegalArgumentException: corePoolSize must be non-negative
+ctor-neg-handler java.lang.IllegalArgumentException: corePoolSize must be non-negative
+ctor-neg-both java.lang.IllegalArgumentException: corePoolSize must be non-negative
+ctor-null-factory java.lang.NullPointerException: threadFactory
+ctor-null-handler java.lang.NullPointerException: handler
+ctor-null-factory3 java.lang.NullPointerException: threadFactory
+ctor-null-handler3 java.lang.NullPointerException: handler
+ctor-null-both java.lang.NullPointerException: threadFactory
+ctor-zero ok
+ctor-max ok
 remove-on-cancel true:true
 execute-existing-off false:true
 remove-on-cancel-off false:false

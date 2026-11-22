@@ -71,3 +71,60 @@ fn pools_the_oracle_does_not_cover_stay_counted() {
         "{counted}"
     );
 }
+
+/// A pool whose policy a jar set relies on a delayed task being pending (the
+/// JEI delayed executor drops it on cancel or at `shutdown`); the runtime has
+/// run it at schedule time, so a delayed `schedule` on such a pool is counted,
+/// where a zero delay (the oracle's `jei` row) is still answered.
+const DELAYED: &str = r#"package demo;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
+public class Delayed {
+    public static String zero() {
+        ScheduledThreadPoolExecutor pool = new ScheduledThreadPoolExecutor(1);
+        pool.setRemoveOnCancelPolicy(true);
+        ScheduledExecutorService service = pool;
+        service.schedule(() -> { }, 0, TimeUnit.NANOSECONDS);
+        return "zero";
+    }
+    public static String delayed() {
+        ScheduledThreadPoolExecutor pool = new ScheduledThreadPoolExecutor(1);
+        pool.setExecuteExistingDelayedTasksAfterShutdownPolicy(false);
+        ScheduledExecutorService service = pool;
+        service.schedule(() -> { }, 1, TimeUnit.HOURS);
+        return "delayed";
+    }
+    public static String delayedCallable() {
+        ScheduledThreadPoolExecutor pool = new ScheduledThreadPoolExecutor(1);
+        pool.setRemoveOnCancelPolicy(true);
+        ScheduledExecutorService service = pool;
+        service.schedule(() -> "x", 5, TimeUnit.SECONDS);
+        return "delayedCallable";
+    }
+}
+"#;
+
+#[test]
+fn delayed_schedule_on_a_policy_pool_is_counted() {
+    let fixture =
+        javac_fixture::Fixture::build("stpe_policies_delayed", &[("demo/Delayed.java", DELAYED)]);
+    let counted_after = |method: &str| {
+        let mut host = fixture.jar.seed_host(horizon_native_java::StdHost::new());
+        let _ = fixture.jar.invoke_method_with_args(
+            "demo/Delayed",
+            method,
+            "()Ljava/lang/String;",
+            None,
+            &[],
+            &mut host,
+        );
+        format!("{:?}", host.unknown_host_calls())
+    };
+    let zero = counted_after("zero");
+    assert!(!zero.contains("schedule"), "{zero}");
+    for method in ["delayed", "delayedCallable"] {
+        let counted = counted_after(method);
+        assert!(counted.contains("schedule"), "{method}: {counted}");
+    }
+}
