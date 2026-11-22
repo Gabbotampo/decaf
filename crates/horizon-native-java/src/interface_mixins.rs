@@ -36,9 +36,13 @@ use crate::{
 };
 
 const ACC_PRIVATE: u16 = 0x0002;
+const ACC_FINAL: u16 = 0x0010;
 const ACC_INTERFACE: u16 = 0x0200;
 const ACC_ABSTRACT: u16 = 0x0400;
 const ACC_SYNTHETIC: u16 = 0x1000;
+
+const MIXIN_FINAL_DESCRIPTOR: &str = "Lorg/spongepowered/asm/mixin/Final;";
+const MIXIN_MUTABLE_DESCRIPTOR: &str = "Lorg/spongepowered/asm/mixin/Mutable;";
 
 const PLANNED_INJECTOR_ANNOTATIONS: [&str; 5] = [
     "Lorg/spongepowered/asm/mixin/injection/Inject;",
@@ -139,6 +143,28 @@ pub(crate) struct InterfaceWeaveSummary {
     pub(crate) accounted_mixins: BTreeSet<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StaticShadowField {
+    is_final: bool,
+    is_mutable: bool,
+}
+
+/// Resolution of a `getstatic`/`putstatic` on a `@Mixin` class.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum StaticShadowResolution {
+    /// Not a static `@Shadow` (or inherited game static): use the class's own static slot.
+    NotShadow,
+    /// Unambiguous static `@Shadow` resolved to `target` with its Mixin `@Final`/`@Mutable` flags.
+    Resolved {
+        target: MethodRef,
+        is_final: bool,
+        is_mutable: bool,
+    },
+    /// Ambiguous multi-target static `@Shadow`: caller must count or refuse without reading/writing
+    /// a mixin-local slot.
+    Ambiguous,
+}
+
 /// Detailed member breakdown of one `@Mixin` class.
 #[derive(Debug, Clone)]
 struct MixinClassDetails {
@@ -149,6 +175,7 @@ struct MixinClassDetails {
     added_fields: Vec<MethodRef>,
     added_instance_fields: BTreeSet<(String, String)>,
     shadow_fields: BTreeSet<(String, String)>,
+    static_shadow_fields: BTreeMap<(String, String), StaticShadowField>,
     added_methods: Vec<MethodRef>,
     added_public_methods: BTreeSet<(String, String)>,
     shadow_methods: BTreeSet<(String, String)>,
@@ -173,6 +200,7 @@ struct MixinClassMeta {
     active_interface_targets: BTreeSet<String>,
     added_instance_fields: BTreeSet<(String, String)>,
     shadow_fields: BTreeSet<(String, String)>,
+    static_shadow_fields: BTreeMap<(String, String), StaticShadowField>,
     shadow_methods: BTreeSet<(String, String)>,
     has_initializer: bool,
     extends_game_class: bool,
@@ -668,11 +696,26 @@ fn inspect_mixin_class<'a>(
     let mut added_fields = Vec::new();
     let mut added_instance_fields = BTreeSet::new();
     let mut shadow_fields = BTreeSet::new();
+    let mut static_shadow_fields = BTreeMap::new();
     for field in &class.fields {
         let key = format!("{}|{}", field.name, field.descriptor);
-        let is_shadow = has_annotation(field_anns.get(&key), MIXIN_SHADOW_DESCRIPTOR);
+        let anns = field_anns.get(&key);
+        let is_shadow = has_annotation(anns, MIXIN_SHADOW_DESCRIPTOR);
         if is_shadow {
-            shadow_fields.insert((field.name.clone(), field.descriptor.clone()));
+            let member = (field.name.clone(), field.descriptor.clone());
+            shadow_fields.insert(member.clone());
+            if field.is_static() {
+                let is_final =
+                    (field.access & ACC_FINAL != 0) || has_annotation(anns, MIXIN_FINAL_DESCRIPTOR);
+                let is_mutable = has_annotation(anns, MIXIN_MUTABLE_DESCRIPTOR);
+                static_shadow_fields.insert(
+                    member,
+                    StaticShadowField {
+                        is_final,
+                        is_mutable,
+                    },
+                );
+            }
             continue;
         }
         if field.access & ACC_SYNTHETIC != 0 {
@@ -774,6 +817,7 @@ fn inspect_mixin_class<'a>(
         added_fields,
         added_instance_fields,
         shadow_fields,
+        static_shadow_fields,
         added_methods,
         added_public_methods,
         shadow_methods,
@@ -1583,6 +1627,62 @@ impl<H: Host> Runtime<'_, H> {
         }
     }
 
+    /// Resolve a `getstatic`/`putstatic` targeting a `@Mixin` class's static `@Shadow`
+    /// field (or a static field inherited from a game superclass) to its target owner and
+    /// Mixin `@Final`/`@Mutable` modifiers, or report ambiguity for multi-target mixins.
+    #[inline(never)]
+    pub(crate) fn resolve_static_shadow(&self, field: &MethodRef) -> StaticShadowResolution {
+        let lookup = {
+            let index = self.runtime_mixin_index();
+            let Some(meta) = index.meta.get(&field.owner) else {
+                return StaticShadowResolution::NotShadow;
+            };
+            let member = (field.name.clone(), field.descriptor.clone());
+            if let Some(&info) = meta.static_shadow_fields.get(&member) {
+                let target_owner = resolve_shadow_target(&meta.targets, &[]).map(str::to_owned);
+                let target_name = field
+                    .name
+                    .strip_prefix("shadow$")
+                    .unwrap_or(&field.name)
+                    .to_owned();
+                Some((target_owner, target_name, info.is_final, info.is_mutable))
+            } else if meta.extends_game_class && !meta.declared_chain_fields.contains(&member) {
+                let target_owner = resolve_shadow_target(&meta.targets, &[]).map(str::to_owned);
+                Some((target_owner, field.name.clone(), false, false))
+            } else {
+                None
+            }
+        };
+        let Some((target_owner, target_name, shadow_final, is_mutable)) = lookup else {
+            return StaticShadowResolution::NotShadow;
+        };
+        let Some(owner) = target_owner else {
+            return StaticShadowResolution::Ambiguous;
+        };
+        let raw_target = MethodRef {
+            owner,
+            name: target_name,
+            descriptor: field.descriptor.clone(),
+        };
+        let resolved_owner = self.field_owner(&raw_target);
+        let target_decl_final = self
+            .class(&resolved_owner)
+            .and_then(|file| {
+                file.fields
+                    .iter()
+                    .find(|fl| fl.name == raw_target.name && fl.descriptor == raw_target.descriptor)
+            })
+            .is_some_and(|fl| fl.access & ACC_FINAL != 0);
+        StaticShadowResolution::Resolved {
+            target: MethodRef {
+                owner: resolved_owner,
+                ..raw_target
+            },
+            is_final: shadow_final || target_decl_final,
+            is_mutable,
+        }
+    }
+
     /// Handle `getfield` on a game handle for `@Shadow` fields (routing to the host so
     /// unmodelled shadows are counted/refused) and for added fields of active
     /// interface-injection mixins (ensuring `<init>()V` ran and returning Java defaults
@@ -1807,6 +1907,7 @@ impl RuntimeMixinIndex {
                 active_interface_targets,
                 added_instance_fields: details.added_instance_fields,
                 shadow_fields: details.shadow_fields,
+                static_shadow_fields: details.static_shadow_fields,
                 shadow_methods: details.shadow_methods,
                 has_initializer: details.has_initializer,
                 extends_game_class: details.extends_game_class,

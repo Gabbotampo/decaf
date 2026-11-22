@@ -27555,6 +27555,169 @@ impl<H: Host> Runtime<'_, H> {
         }
     }
 
+    /// Out-of-line `getstatic` body kept out of `invoke_frame` so the unoptimised
+    /// interpreter frame stays within `frame_bound`'s stack budget, while routing
+    /// `@Shadow` static fields on `@Mixin` classes to their target (or counting/refusing
+    /// ambiguous multi-target static shadows).
+    #[inline(never)]
+    fn execute_getstatic(
+        &mut self,
+        symbolic: &MethodRef,
+        class: &str,
+        method: &str,
+        desc: &str,
+        at: usize,
+    ) -> Result<(Value, bool), NativeError> {
+        let field = MethodRef {
+            owner: self.field_owner(symbolic),
+            ..symbolic.clone()
+        };
+        let target = match self.resolve_static_shadow(&field) {
+            interface_mixins::StaticShadowResolution::NotShadow => field,
+            interface_mixins::StaticShadowResolution::Resolved { target, .. } => target,
+            interface_mixins::StaticShadowResolution::Ambiguous => {
+                self.host.unknown_operand_call(&field)?;
+                return Ok((Value::default_for(&field.descriptor), false));
+            }
+        };
+        // Reading a static field initializes its declaring class first, exactly as
+        // the JVM does. Without this a jar's `ItemInit.HANGING_POT_ITEM` read from
+        // another class's `<clinit>` sees an unset field and answers null.
+        self.ensure_initialized(&target.owner)?;
+        let outcome = self.dispatch_field_anchor(&target, false, None, class, method, desc, at)?;
+        let modified =
+            outcome != AnchorOutcome::Normal && target.descriptor.starts_with(['L', '[']);
+        let value = match outcome {
+            AnchorOutcome::Normal => {
+                if let Some(value) = gson_model::static_field(&target)
+                    .or_else(|| gson_tree::static_field(&target))
+                    .or_else(|| gson_writer::static_field(&target))
+                {
+                    value
+                } else {
+                    match self.static_fields.get(&Self::static_field_key(&target)) {
+                        Some(value) => value.clone(),
+                        // A field a jar class declares and nothing assigned yet holds the
+                        // JVM default; only a static of a class the jar does not declare is
+                        // the host's to answer. A `ConstantValue` static is its constant.
+                        None if self.class(&target.owner).is_some_and(|file| {
+                            file.fields.iter().any(|declared| {
+                                declared.name == target.name
+                                    && declared.descriptor == target.descriptor
+                            })
+                        }) =>
+                        {
+                            self.static_constant(&target.owner, &target.name, &target.descriptor)?
+                                .unwrap_or_else(|| Value::default_for(&target.descriptor))
+                        }
+                        None => self.host.get_static(&target)?,
+                    }
+                }
+            }
+            AnchorOutcome::Suppress => Value::default_for(&target.descriptor),
+            AnchorOutcome::Replace(value) => value,
+        };
+        let normalized = if value == Value::Ref(None) {
+            Value::default_for(&target.descriptor)
+        } else {
+            value
+        };
+        Ok((normalized, modified))
+    }
+
+    /// Out-of-line `putstatic` body kept out of `invoke_frame` so the unoptimised
+    /// interpreter frame stays within `frame_bound`'s stack budget, while enforcing
+    /// Mixin's `@Shadow` / `@Final` / `@Mutable` rules and target resolution.
+    #[inline(never)]
+    fn execute_putstatic(
+        &mut self,
+        symbolic: &MethodRef,
+        value: Value,
+        class: &str,
+        method: &str,
+        desc: &str,
+        at: usize,
+    ) -> Result<(), NativeError> {
+        let field = MethodRef {
+            owner: self.field_owner(symbolic),
+            ..symbolic.clone()
+        };
+        // Mixin strips `<clinit>` default-value placeholders (`= null` / `= 0`) on
+        // `@Shadow` static fields that `javac` requires for `static final` declarations.
+        let is_mixin_clinit_default = class == field.owner
+            && method == "<clinit>"
+            && value == Value::default_for(&field.descriptor);
+        match self.resolve_static_shadow(&field) {
+            interface_mixins::StaticShadowResolution::NotShadow => {
+                self.ensure_initialized(&field.owner)?;
+                let outcome = self.dispatch_field_anchor(
+                    &field,
+                    true,
+                    Some(&value),
+                    class,
+                    method,
+                    desc,
+                    at,
+                )?;
+                if outcome == AnchorOutcome::Normal {
+                    self.static_fields
+                        .insert(Self::static_field_key(&field), value);
+                }
+                Ok(())
+            }
+            interface_mixins::StaticShadowResolution::Ambiguous => {
+                if is_mixin_clinit_default {
+                    return Ok(());
+                }
+                self.host.unknown_operand_call(&field)?;
+                Ok(())
+            }
+            interface_mixins::StaticShadowResolution::Resolved {
+                target,
+                is_final,
+                is_mutable,
+            } => {
+                if is_mixin_clinit_default {
+                    return Ok(());
+                }
+                if is_final && !is_mutable {
+                    return Err(NativeError::UncaughtException {
+                        class: "java/lang/IllegalAccessError".into(),
+                        message: Some(format!(
+                            "Cannot assign final @Shadow static field {}#{} without @Mutable",
+                            target.owner, target.name
+                        )),
+                        frame: None,
+                    });
+                }
+                self.ensure_initialized(&target.owner)?;
+                let outcome = self.dispatch_field_anchor(
+                    &target,
+                    true,
+                    Some(&value),
+                    class,
+                    method,
+                    desc,
+                    at,
+                )?;
+                if outcome == AnchorOutcome::Normal {
+                    if self.has_class(&target.owner) {
+                        self.static_fields
+                            .insert(Self::static_field_key(&target), value);
+                    } else if self.host.defers_game_field_write_check() {
+                        return Err(NativeError::Metadata(format!(
+                            "game hook callback writes the game's static field {}#{} through @Shadow, which the host does not apply",
+                            target.owner, target.name
+                        )));
+                    } else {
+                        self.host.unknown_operand_call(&target)?;
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
+
     /// Out-of-line `getfield` body kept out of `invoke_frame` so the unoptimised
     /// interpreter frame stays within `frame_bound`'s stack budget.
     #[inline(never)]
@@ -37756,92 +37919,23 @@ impl<H: Host> Runtime<'_, H> {
                 0xb2 => {
                     let i = read_u16(code, &mut pc)?;
                     let symbolic = file.field_ref(i)?;
-                    // An inherited field is declared by a superclass, so the
-                    // read resolves through the chain before it initializes
-                    // or keys anything.
-                    let field = MethodRef {
-                        owner: self.field_owner(&symbolic),
-                        ..symbolic
-                    };
-                    // Reading a static field initializes its declaring class
-                    // first, exactly as the JVM does. Without this a jar's
-                    // `ItemInit.HANGING_POT_ITEM` read from another class's
-                    // `<clinit>` sees an unset field and answers null.
-                    invoke_or_catch!(at, self.ensure_initialized(&field.owner));
-                    let outcome =
-                        self.dispatch_field_anchor(&field, false, None, class, method, desc, at)?;
-                    if outcome != AnchorOutcome::Normal && field.descriptor.starts_with(['L', '['])
-                    {
+                    let (value, modified) = invoke_or_catch!(
+                        at,
+                        self.execute_getstatic(&symbolic, class, method, desc, at)
+                    );
+                    if modified {
                         frame_modified_identity = true;
                     }
-                    let value = match outcome {
-                        AnchorOutcome::Normal => {
-                            if let Some(value) = gson_model::static_field(&field)
-                                .or_else(|| gson_tree::static_field(&field))
-                                .or_else(|| gson_writer::static_field(&field))
-                            {
-                                value
-                            } else {
-                                match self.static_fields.get(&Self::static_field_key(&field)) {
-                                    Some(value) => value.clone(),
-                                    // A field a jar class declares and nothing
-                                    // assigned yet holds the JVM default; only a
-                                    // static of a class the jar does not declare
-                                    // is the host's to answer (a strict host would
-                                    // refuse the read otherwise).
-                                    // A `ConstantValue` static is its constant
-                                    // (never stored, `class_init.rs`).
-                                    None if self.class(&field.owner).is_some_and(|file| {
-                                        file.fields.iter().any(|declared| {
-                                            declared.name == field.name
-                                                && declared.descriptor == field.descriptor
-                                        })
-                                    }) && gson_model::static_field(&field).is_none()
-                                        && gson_tree::static_field(&field).is_none()
-                                        && gson_writer::static_field(&field).is_none() =>
-                                    {
-                                        self.static_constant(
-                                            &field.owner,
-                                            &field.name,
-                                            &field.descriptor,
-                                        )?
-                                        .unwrap_or_else(|| Value::default_for(&field.descriptor))
-                                    }
-                                    None => self.host.get_static(&field)?,
-                                }
-                            }
-                        }
-                        AnchorOutcome::Suppress => Value::default_for(&field.descriptor),
-                        AnchorOutcome::Replace(value) => value,
-                    };
-                    stack.push(if value == Value::Ref(None) {
-                        Value::default_for(&field.descriptor)
-                    } else {
-                        value
-                    });
+                    stack.push(value);
                 }
                 0xb3 => {
                     let i = read_u16(code, &mut pc)?;
                     let symbolic = file.field_ref(i)?;
-                    let field = MethodRef {
-                        owner: self.field_owner(&symbolic),
-                        ..symbolic
-                    };
-                    invoke_or_catch!(at, self.ensure_initialized(&field.owner));
                     let value = pop(&mut stack, class, method, at)?;
-                    let outcome = self.dispatch_field_anchor(
-                        &field,
-                        true,
-                        Some(&value),
-                        class,
-                        method,
-                        desc,
+                    invoke_or_catch!(
                         at,
-                    )?;
-                    if outcome == AnchorOutcome::Normal {
-                        self.static_fields
-                            .insert(Self::static_field_key(&field), value);
-                    }
+                        self.execute_putstatic(&symbolic, value, class, method, desc, at)
+                    );
                 }
                 0xb4 => {
                     let i = read_u16(code, &mut pc)?;

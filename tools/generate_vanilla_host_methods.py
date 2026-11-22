@@ -8,6 +8,33 @@ interface with a `default` method onto a host-modelled vanilla class: any
 method already declared by the target class hierarchy (or a vanilla interface
 default on it) wins over the injected interface's `default` method and routes
 through host dispatch (answering when modelled, or counting/refusing when not).
+
+Reproducing the committed TSV byte-for-byte
+-------------------------------------------
+Pass ONLY the unmodified Mojang vanilla artifacts (not a Loom/Fabric-woven jar
+with injected interfaces like `FabricRenderPipeline`) plus a JDK 25 runtime:
+
+1. Mojang vanilla Minecraft 26.3 client jar (`26.3.jar`, protocol 777,
+   `version.json` id `"26.3"` — Mojang's official unobfuscated client jar,
+   which includes `net/minecraft/*` and `com/mojang/renderpearl/*`).
+2. `com.mojang:authlib:10.0.77` (`authlib-10.0.77.jar` — from Minecraft 26.3's
+   official library manifest, supplying `com/mojang/authlib/GameProfile`).
+3. JDK 25 runtime (`--jdk <JDK_25_HOME>`, e.g. Eclipse Temurin `25.0.5+8`;
+   read via `jrt:/`, supplying `java/lang/AutoCloseable`,
+   `java/lang/Comparable`, `java/lang/Iterable`, `java/lang/Record`, and
+   `java/util/concurrent/Executor`).
+
+Command::
+
+    python3 tools/generate_vanilla_host_methods.py \\
+        --jar <MINECRAFT_DIR>/versions/26.3/26.3.jar \\
+        --jar <MINECRAFT_DIR>/libraries/com/mojang/authlib/10.0.77/authlib-10.0.77.jar \\
+        --jdk <JDK_25_HOME> \\
+        --output crates/horizon-native-java/src/vanilla_host_methods.tsv
+
+Then re-vendor the copy in `mod/src/runtime/`::
+
+    python3 tools/vendor.py && python3 tools/vendor.py --check
 """
 
 from __future__ import annotations
