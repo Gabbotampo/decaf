@@ -20,6 +20,13 @@
 //!   counted unknowns.
 //! * a `ThreadFactory` is modelled only as far as making an unstarted
 //!   `Thread`; the pool never creates one, and `Thread.start` stays counted.
+//! * `ScheduledThreadPoolExecutor`'s two policy flags (`setRemoveOnCancelPolicy`,
+//!   `setExecuteExistingDelayedTasksAfterShutdownPolicy`) are kept per pool a
+//!   jar built with `new` and answered by their getters (defaults `false` and
+//!   `true`, the Java 25 oracle's). Because every task already ran when it was
+//!   scheduled, there is no pending task for either policy to act on, so the
+//!   flags change no other answer here; in Java they decide whether a cancelled
+//!   task leaves the queue and whether a delayed task outlives `shutdown`.
 
 use super::*;
 
@@ -36,6 +43,11 @@ const JDK_EXECUTORS: &[&str] = &[
     "java/util/concurrent/ScheduledThreadPoolExecutor",
     "java/util/concurrent/ForkJoinPool",
 ];
+const SCHEDULED_POOL: &str = "java/util/concurrent/ScheduledThreadPoolExecutor";
+/// The synthetic fields a constructed `ScheduledThreadPoolExecutor` keeps its
+/// two policy flags under; absent means the constructor's default.
+const STPE_EXECUTE_EXISTING: &str = "#stpeExecuteExistingDelayedTasksAfterShutdown";
+const STPE_REMOVE_ON_CANCEL: &str = "#stpeRemoveOnCancel";
 const EXECUTOR_SERVICE: &str = "java/util/concurrent/ExecutorService";
 const SCHEDULED_EXECUTOR_SERVICE: &str = "java/util/concurrent/ScheduledExecutorService";
 const SCHEDULED_FUTURE: &str = "java/util/concurrent/ScheduledFuture";
@@ -67,6 +79,7 @@ pub(super) fn invoke<H: Host>(
         EXECUTOR | EXECUTOR_SERVICE | SCHEDULED_EXECUTOR_SERVICE => {
             invoke_executor(rt, r, receiver, args)
         }
+        SCHEDULED_POOL => Ok(invoke_scheduled_pool(rt, r, receiver, args)),
         FUTURE
         | SCHEDULED_FUTURE
         | COMPLETABLE_FUTURE
@@ -331,6 +344,50 @@ fn invoke_executor<H: Host>(
         _ => return Ok(None),
     };
     Ok(Some(value))
+}
+
+/// `ScheduledThreadPoolExecutor`'s two policy setters and their getters, on a
+/// pool a jar built with `new ScheduledThreadPoolExecutor(..)` (every
+/// constructor leaves `removeOnCancel` `false` and
+/// `executeExistingDelayedTasksAfterShutdown` `true`). A pool of a jar
+/// subclass, a handle `Executors` made, or anything else is not answered:
+/// those calls stay counted. Every other member named on this class stays
+/// counted too (`schedule`, `shutdown`, ... are answered through the
+/// `ScheduledExecutorService` interface).
+fn invoke_scheduled_pool<H: Host>(
+    rt: &mut Runtime<'_, H>,
+    r: &MethodRef,
+    receiver: Option<&Value>,
+    args: &[Value],
+) -> Option<Value> {
+    let receiver = receiver?;
+    if crate::jar_object::object_class(receiver) != Some(SCHEDULED_POOL) {
+        return None;
+    }
+    let key = crate::jar_object::object_key(receiver)?;
+    let (field, default) = match r.name.as_str() {
+        "setRemoveOnCancelPolicy" | "getRemoveOnCancelPolicy" => (STPE_REMOVE_ON_CANCEL, 0),
+        "setExecuteExistingDelayedTasksAfterShutdownPolicy"
+        | "getExecuteExistingDelayedTasksAfterShutdownPolicy" => (STPE_EXECUTE_EXISTING, 1),
+        _ => return None,
+    };
+    let field = format!("{key}|{field}");
+    match r.descriptor.as_str() {
+        "(Z)V" if r.name.starts_with("set") => {
+            let Some(Value::Int(flag)) = args.first() else {
+                return None;
+            };
+            rt.fields.insert(field, Value::Int(i32::from(*flag != 0)));
+            Some(Value::Void)
+        }
+        "()Z" if r.name.starts_with("get") => Some(
+            rt.fields
+                .get(&field)
+                .cloned()
+                .unwrap_or(Value::Int(default)),
+        ),
+        _ => None,
+    }
 }
 
 /// `ThreadFactory.newThread(runnable)` hands out an unstarted `Thread` marker.

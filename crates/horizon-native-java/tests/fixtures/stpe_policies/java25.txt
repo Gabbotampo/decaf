@@ -1,0 +1,14 @@
+defaults true:false
+defaults-factory true:false
+defaults-handler true:false
+defaults-both true:false
+remove-on-cancel true:true
+execute-existing-off false:true
+remove-on-cancel-off false:false
+execute-existing-on true:false
+repeated false:true
+independent false:true/true:false
+jei false:true done 1
+shutdown true:true:true false:true
+after-shutdown true:false true
+rejected java.util.concurrent.RejectedExecutionException 1
