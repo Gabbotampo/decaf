@@ -87,8 +87,8 @@ const COUNTED: &[&str] = &[
     "loneLowSurrogateLower",
     "loneHighSurrogateUpper",
     "loneHighSurrogateLower",
-    // The `Locale` overloads: tailored locales (Turkish here) and every
-    // non-ASCII receiver.
+    // The `Locale` overloads: tailored locales (Turkish here), a null
+    // locale, and every non-ASCII receiver.
     "asciiTrLower",
     "asciiTrUpper",
     "idotRootLower",
@@ -96,6 +96,9 @@ const COUNTED: &[&str] = &[
     "idotlessRootUpper",
     "idotlessTrUpper",
     "sharpRootUpper",
+    // A null `Locale`: Java throws `NullPointerException`.
+    "asciiNullLocaleUpper",
+    "asciiNullLocaleLower",
 ];
 
 /// The `Locale` overload rows among `COUNTED`.
@@ -107,6 +110,8 @@ const COUNTED_LOCALE: &[&str] = &[
     "idotlessRootUpper",
     "idotlessTrUpper",
     "sharpRootUpper",
+    "asciiNullLocaleUpper",
+    "asciiNullLocaleLower",
 ];
 
 fn expected(method: &str) -> &'static str {

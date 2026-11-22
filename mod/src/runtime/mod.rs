@@ -14636,7 +14636,7 @@ impl Host for StdHost {
             // ASCII receiver answers for any locale Java does not tailor.
             // Java tailors Turkish, Azerbaijani and Lithuanian, and its full
             // Unicode mapping is not modelled here: a non-ASCII receiver, a
-            // tailored locale, or a missing locale is counted.
+            // tailored locale, or a null or unknown locale is counted.
             (
                 "java/lang/String",
                 "toLowerCase" | "toUpperCase",
@@ -14645,7 +14645,7 @@ impl Host for StdHost {
                 let text = expect_string(receiver);
                 let locale = args.first();
                 if text.is_ascii()
-                    && matches!(locale, Some(locale) if !self.tailored_case_locale(locale))
+                    && matches!(locale, Some(locale) if self.untailored_case_locale(locale))
                 {
                     Ok(Value::Ref(Some(match r.name.as_str() {
                         "toLowerCase" => text.to_ascii_lowercase(),

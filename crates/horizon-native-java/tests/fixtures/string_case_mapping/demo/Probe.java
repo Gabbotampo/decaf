@@ -222,6 +222,16 @@ public final class Probe {
     return row("\u00DF".toUpperCase(java.util.Locale.ROOT));
   }
 
+  /* A null Locale: Java throws NullPointerException; the runtime must count the call. */
+
+  public static String asciiNullLocaleUpper() {
+    return row("abc".toUpperCase((java.util.Locale) null));
+  }
+
+  public static String asciiNullLocaleLower() {
+    return row("ABC".toLowerCase((java.util.Locale) null));
+  }
+
   /* ================= Character#toUpperCase / toLowerCase (char and int) ================= */
 
   public static String charUpperSharp() {
@@ -350,6 +360,16 @@ public final class Probe {
     System.out.println("idotlessRootUpper=" + idotlessRootUpper());
     System.out.println("idotlessTrUpper=" + idotlessTrUpper());
     System.out.println("sharpRootUpper=" + sharpRootUpper());
+    try {
+      System.out.println("asciiNullLocaleUpper=" + asciiNullLocaleUpper());
+    } catch (NullPointerException e) {
+      System.out.println("asciiNullLocaleUpper=NullPointerException");
+    }
+    try {
+      System.out.println("asciiNullLocaleLower=" + asciiNullLocaleLower());
+    } catch (NullPointerException e) {
+      System.out.println("asciiNullLocaleLower=NullPointerException");
+    }
     System.out.println("charUpperSharp=" + charUpperSharp());
     System.out.println("charLowerSharp=" + charLowerSharp());
     System.out.println("charUpperE=" + charUpperE());

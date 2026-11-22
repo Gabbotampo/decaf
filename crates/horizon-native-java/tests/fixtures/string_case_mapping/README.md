@@ -1,7 +1,7 @@
 # `string_case_mapping` fixture
 
 Oracle probe: `demo/Probe.java` (package `demo`, class `Probe`), compiled with
-`javac --release 21` and run on Java 25 (this machine: Temurin 25.0.4.1).
+`javac --release 21` and run on Java 25 (this machine: OpenJDK 25.0.5.1).
 
 ## Commands
 
@@ -13,12 +13,20 @@ timeout 120 java -Xmx512m -cp classes demo.Probe | head -c 2000000 > java25.txt
 `java -version`:
 
 ```
-openjdk version "25.0.4.1" 2026-08-18 LTS
-OpenJDK Runtime Environment Temurin-25.0.4.1+1 (build 25.0.4.1+1-LTS)
-OpenJDK 64-Bit Server VM Temurin-25.0.4.1+1 (build 25.0.4.1+1-LTS, mixed mode, sharing)
+openjdk version "25.0.5.1" 2026-11-17
+OpenJDK Runtime Environment (build 25.0.5.1)
+OpenJDK 64-Bit Server VM (build 25.0.5.1, mixed mode, sharing)
 ```
 
-Re-run with `openjdk version "25.0.5.1" 2026-11-17`: byte-identical output.
+The first 62 rows were first recorded on Temurin 25.0.4.1 and were
+byte-identical on 25.0.5.1; the two null-`Locale` rows were added on 25.0.5.1.
+
+The no-argument forms use the default locale. The oracle was run with the
+default locale `it_IT`; under a `tr`/`az`/`lt` default, `"I".toLowerCase()` and
+`"i".toUpperCase()` differ (run with `-Duser.language=tr`: `turkishIDotLower`
+changes from `0069 0307` to `0069`). The runtime answers an ASCII receiver on
+the no-argument forms as a non-tailored default locale would, as it did before
+this change; see the PR description.
 
 `java25.txt` is the RAW output of that final probe, one `<row>=<value>` line
 per case. `<value>` is the result's length in UTF-16 units followed by each
@@ -66,6 +74,10 @@ call as an unknown host call and never answers them):
   (counted with all tailored locales).
 - `idotRootLower`, `idotTrLower`, `idotlessRootUpper`, `idotlessTrUpper`,
   `sharpRootUpper` — non-ASCII receivers with `Locale.ROOT` or `tr`.
+- `asciiNullLocaleUpper`, `asciiNullLocaleLower` — a null `Locale`; Java throws
+  `NullPointerException` (the oracle line is `NullPointerException`; `main`
+  catches it so the other rows still print). Only a `Locale` the runtime holds
+  is answered; a null or unknown value is counted.
 
-Every oracle line (62 rows) is covered by one of the two groups above; the
+Every oracle line (64 rows) is covered by one of the two groups above; the
 fixture asserts that.
