@@ -652,6 +652,17 @@ impl<'a> Matcher<'a> {
         }
     }
 
+    /// Java's `Matcher.last` as an earlier search left it: a search that fails
+    /// leaves it as the last sub-pattern end it reached set it.
+    pub(crate) fn seed_last(&mut self, last: usize) {
+        self.last = last;
+    }
+
+    /// `Matcher.last` now.
+    pub(crate) fn last(&self) -> usize {
+        self.last
+    }
+
     /// Stack bytes the deepest recursion so far used.
     #[cfg(test)]
     pub(crate) fn stack_base_minus_low(&self) -> usize {

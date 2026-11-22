@@ -34,12 +34,14 @@
 //! match, never one record per match. The caller turns a counted call into
 //! an unknown host call, never a guessed answer.
 
+mod cursor;
 mod engine;
 pub(crate) mod stack;
 mod syntax;
 #[cfg(test)]
 mod tests;
 
+pub(crate) use cursor::{Cursor, Found};
 use engine::{Limits, Matcher, Program};
 
 /// Why a call is outside the modelled subset; the caller counts it.
