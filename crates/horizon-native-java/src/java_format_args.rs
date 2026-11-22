@@ -67,6 +67,12 @@ impl<H: Host> Runtime<'_, H> {
     /// One element of the `Object[]`, classed as `Object.getClass` would
     /// class it (`class_of_value`).
     fn format_arg(&mut self, value: &Value) -> Result<Arg, NativeError> {
+        if self
+            .uncertain_identity_root(value, &crate::jar_text::object_to_string())
+            .is_some()
+        {
+            return Ok(Arg::Opaque);
+        }
         // Java dispatches %s on Formattable through the jar object's
         // formatTo(Formatter, flags, width, precision), not toString(). The
         // bounded runtime does not yet execute that callback, so refuse the
@@ -99,6 +105,9 @@ impl<H: Host> Runtime<'_, H> {
             Value::Void => return Ok(Arg::Opaque),
             Value::Ref(Some(marker)) => marker,
         };
+        if self.is_counted_string(value) {
+            return Ok(Arg::Opaque);
+        }
         if let Some(text) = self.builder_text(value) {
             return Ok(Arg::Str(text.clone()));
         }
@@ -110,6 +119,7 @@ impl<H: Host> Runtime<'_, H> {
         // refused here and counted by the host.
         if crate::jar_object::packaged_object_class(value).is_some() {
             return match self.jar_to_string(value, "java/util/Formatter", "format") {
+                Ok(Some(result)) if self.is_counted_string(&result) => Ok(Arg::Opaque),
                 Ok(Some(Value::Ref(Some(text)))) => Ok(Arg::Str(text)),
                 Ok(Some(Value::Ref(None))) => Ok(Arg::Null),
                 Ok(Some(_)) => Ok(Arg::Opaque),
