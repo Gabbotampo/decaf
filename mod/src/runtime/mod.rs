@@ -48297,6 +48297,29 @@ mandatory = true
                 .unwrap(),
             Value::Int(1)
         );
+        // A jar-object marker (`String#n`) has no text to strip: every one of
+        // the four methods stays counted, none answers from the marker's text.
+        let marker = Value::Ref(Some("java/lang/String#3".into()));
+        for (name, descriptor) in [
+            ("strip", "()Ljava/lang/String;"),
+            ("stripLeading", "()Ljava/lang/String;"),
+            ("stripTrailing", "()Ljava/lang/String;"),
+            ("isBlank", "()Z"),
+        ] {
+            let call = MethodRef {
+                owner: "java/lang/String".into(),
+                name: name.into(),
+                descriptor: descriptor.into(),
+            };
+            assert!(host.invoke_instance(&call, &marker, &[]).is_ok(), "{name}");
+            assert!(
+                host.unknown_host_calls()
+                    .iter()
+                    .any(|(counted, _)| *counted == format!("java/lang/String#{name}{descriptor}")),
+                "{name}: {:?}",
+                host.unknown_host_calls()
+            );
+        }
     }
 
     #[test]
