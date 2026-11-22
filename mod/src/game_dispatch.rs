@@ -433,7 +433,9 @@ fn dispatch_state(
         let receiver = dispatch
             .receiver
             .clone()
+            .map(|object| crate::sound::enrich_game_object(dispatch.host, object))
             .map(|object| context.insert(object));
+        loaded.host.set_host_deferred_server_sound_seeds(true);
         let result = crate::caught(
             &format!("{} game hook {}", loaded.row.id, target.hook),
             || {
@@ -467,6 +469,7 @@ fn dispatch_state(
                 })
             },
         );
+        loaded.host.set_host_deferred_server_sound_seeds(false);
         let run = match result {
             Ok(Ok(run)) => run,
             Ok(Err(error)) => {
@@ -485,7 +488,7 @@ fn dispatch_state(
             answer.returned = run.returned;
         }
         for effect in context.take_effects() {
-            apply_effect(dispatch.host, effect);
+            apply_effect(dispatch.host, &mut loaded.host, effect);
         }
         if run.cancelled {
             break;
@@ -493,12 +496,21 @@ fn dispatch_state(
     }
     Ok(answer)
 }
-fn apply_effect(host: &mut dyn ServerHost, effect: GameHookEffect) {
+fn apply_effect(
+    host: &mut dyn ServerHost,
+    runtime_host: &mut crate::runtime::StdHost,
+    effect: GameHookEffect,
+) {
     match effect {
         GameHookEffect::SystemMessage { player, text } => {
             if let Some(target) = host.player(player) {
                 let _ = target.tell(host, mod_api::Text::literal(text));
             }
+        }
+        GameHookEffect::PlaySound(effect) => {
+            crate::sound::apply_server_sounds(host, &[effect], |reason| {
+                runtime_host.note_unknown_game_hook(reason);
+            });
         }
     }
 }

@@ -153,6 +153,17 @@ impl StdHost {
         Some(self.random_handle(state))
     }
 
+    pub(crate) fn make_random_handle(&mut self, state: State) -> Value {
+        self.random_handle(state)
+    }
+
+    pub(crate) fn draw_random_handle_long(&mut self, handle: &Value) -> Option<i64> {
+        let (key, mut state) = self.random_state_mut(handle)?;
+        let value = next_long(&mut state);
+        self.save_random(key, state);
+        Some(value)
+    }
+
     fn random_handle(&mut self, state: State) -> Value {
         let key = format!("{}#{}", state.class(), self.random_sources.len());
         self.random_sources.insert(key.clone(), state);
@@ -541,6 +552,16 @@ fn java_random_answers(r: &MethodRef) -> bool {
             | ("nextDouble", "()D")
     )
 }
+pub(crate) fn legacy_state(seed: i64) -> State {
+    State::Legacy {
+        seed: scramble_legacy(seed),
+    }
+}
+
+pub(crate) fn draw_next_long(state: &mut State) -> i64 {
+    next_long(state)
+}
+
 fn scramble_legacy(seed: i64) -> u64 {
     ((seed as u64) ^ 0x5deece66d) & ((1u64 << 48) - 1)
 }

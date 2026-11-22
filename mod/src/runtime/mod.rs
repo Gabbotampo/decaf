@@ -196,6 +196,7 @@ mod jdk_text_oracle;
 mod jvm_dispatch;
 mod kotlin_stdlib;
 mod lambda_boxing;
+pub mod level_sound;
 mod library_dispatch;
 mod linked_resources;
 mod list_equality;
@@ -333,6 +334,10 @@ pub(crate) use host_optional::{
 pub(crate) use host_path::{path_text, path_value, unix_normal};
 pub use host_ref::{HostKind, HostRef};
 pub use java_nbt::{MAX_DEPTH as NBT_MAX_DEPTH, Nbt, NbtCompound};
+pub use level_sound::{
+    EntitySoundFacts, LevelSoundEffect, SoundHolderKind, SoundSeed, SoundSide, SoundSource,
+    SoundTarget,
+};
 pub use mixin_extras::{GameHookShape, MixinExtrasKind, MixinExtrasPlan};
 pub use mixin_plugins::ConfigPluginReport;
 use mixin_plugins::ConfigPlugins;
@@ -3365,6 +3370,41 @@ pub trait Host {
         None
     }
 
+    /// Registry id of a registered `SoundEvent` value (`MappedRegistry.wrapAsHolder`),
+    /// or `None` when unregistered (`Holder.direct`).
+    fn registered_sound_id(&self, _sound: &Value) -> Option<String> {
+        None
+    }
+
+    /// Unwrap a `Holder<SoundEvent>` handle into `(sound_event_value, bound_registry_id)`
+    /// or an `IllegalStateException` if it is an unbound `Holder$Reference`.
+    fn unwrap_sound_holder(
+        &mut self,
+        _value: &Value,
+    ) -> Option<Result<(Value, Option<String>), NativeError>> {
+        None
+    }
+
+    /// Handle for `Level.random` (`Level.getRandom()`) of `level_marker`.
+    fn level_random_handle(&mut self, _level_marker: &str) -> Option<Value> {
+        None
+    }
+
+    /// Draw `Level.soundSeedGenerator.nextLong()` for `level_marker` (or return
+    /// [`level_sound::SoundSeed::HostDeferred`] when a live host owns the seed stream).
+    fn draw_level_sound_seed(
+        &mut self,
+        _level_marker: &str,
+        _server_side: bool,
+    ) -> Option<level_sound::SoundSeed> {
+        None
+    }
+
+    /// Construct a `SoundEvent` record handle from `new SoundEvent(Identifier, Optional<Float>)`.
+    fn construct_sound_event(&mut self, _r: &MethodRef, _args: &[Value]) -> Option<Value> {
+        None
+    }
+
     /// Record the message of a throwable the interpreter caught and is about
     /// to deliver to a Java handler.
     ///
@@ -4146,6 +4186,7 @@ pub struct StdHost {
     menu_states: menu_models::States,
     next_menu_object: u64,
     freed_menu_objects: heap::FreedObjects,
+    pub(crate) level_sound: level_sound::LevelSoundState,
 }
 
 impl Default for StdHost {
@@ -4351,6 +4392,7 @@ impl StdHost {
             menu_states: BTreeMap::new(),
             next_menu_object: 0,
             freed_menu_objects: heap::FreedObjects::default(),
+            level_sound: level_sound::LevelSoundState::default(),
         }
     }
 
@@ -8931,6 +8973,33 @@ impl Host for StdHost {
         self.throwable_messages.get(marker).cloned()
     }
 
+    fn registered_sound_id(&self, sound: &Value) -> Option<String> {
+        self.registered_sound_id_impl(sound)
+    }
+
+    fn unwrap_sound_holder(
+        &mut self,
+        value: &Value,
+    ) -> Option<Result<(Value, Option<String>), NativeError>> {
+        host_registry_holder::unwrap_sound_holder(self, value)
+    }
+
+    fn level_random_handle(&mut self, level_marker: &str) -> Option<Value> {
+        self.level_random_handle_impl(level_marker)
+    }
+
+    fn draw_level_sound_seed(
+        &mut self,
+        level_marker: &str,
+        server_side: bool,
+    ) -> Option<level_sound::SoundSeed> {
+        self.draw_level_sound_seed_impl(level_marker, server_side)
+    }
+
+    fn construct_sound_event(&mut self, r: &MethodRef, args: &[Value]) -> Option<Value> {
+        sound_event::construct_record(self, r, args)
+    }
+
     fn record_throwable(&mut self, marker: &str, message: Option<String>) {
         // A throw the runtime raised carries no cause (its `getCause()` is
         // `null`), except the initializer error that wraps the `<clinit>`
@@ -11326,6 +11395,9 @@ impl Host for StdHost {
         // A client stand-in (`client/...`), a mod's `KeyMapping`, or a client
         // registration event answers the client surface first.
         if let Some(answer) = self.client_call(r, receiver, args) {
+            return answer;
+        }
+        if let Some(answer) = level_sound::standalone_client_sound_call(self, receiver, r, args) {
             return answer;
         }
         // A game-event façade marker (server, level, player, event object)
@@ -36260,6 +36332,47 @@ impl<H: Host> Runtime<'_, H> {
         Ok((return_desc(descriptor) != "V").then_some(Value::Ref(Some(joined))))
     }
 
+    #[inline(never)]
+    fn invoke_sound_event_init(
+        &mut self,
+        r: &MethodRef,
+        receiver: Option<&Value>,
+        args: &[Value],
+        stack: &mut [Value],
+        locals: &mut [Value],
+    ) -> Option<Value> {
+        if r.owner != "net/minecraft/sounds/SoundEvent" || r.name != "<init>" {
+            return None;
+        }
+        let built = self.host.construct_sound_event(r, args)?;
+        if let Some(marker) = receiver.filter(|value| jar_object::is_object(value)) {
+            for slot in stack.iter_mut().chain(locals.iter_mut()) {
+                if slot == marker {
+                    *slot = built.clone();
+                }
+            }
+        }
+        Some(Value::Void)
+    }
+
+    #[inline(never)]
+    fn invoke_host_instance_with_models(
+        &mut self,
+        r: &MethodRef,
+        receiver: &Value,
+        args: &[Value],
+    ) -> Result<Value, NativeError> {
+        if let Some(value) = client_reload::runtime_instance_call(self, r, receiver, args) {
+            return value;
+        }
+        if level_sound::needs_block_pos_resolution(r, args) {
+            let mut resolved_args = args.to_vec();
+            level_sound::resolve_block_pos_arg(self, r, &mut resolved_args);
+            return self.host.invoke_instance(r, receiver, &resolved_args);
+        }
+        self.host.invoke_instance(r, receiver, args)
+    }
+
     fn invoke_frame(
         &mut self,
         class: &str,
@@ -36307,7 +36420,7 @@ impl<H: Host> Runtime<'_, H> {
                 return match receiver.as_ref() {
                     Some(receiver) => {
                         self.note_string_intern(&r, Some(receiver));
-                        self.host.invoke_instance(&r, receiver, args)
+                        self.invoke_host_instance_with_models(&r, receiver, args)
                     }
                     None => self.host.invoke(&r, args),
                 };
@@ -36333,7 +36446,7 @@ impl<H: Host> Runtime<'_, H> {
                 JarCallRedirect::Host(r) => match receiver.as_ref() {
                     Some(receiver) => {
                         self.note_string_intern(&r, Some(receiver));
-                        self.host.invoke_instance(&r, receiver, args)
+                        self.invoke_host_instance_with_models(&r, receiver, args)
                     }
                     None => {
                         if r.owner == "net/minecraft/network/syncher/SynchedEntityData"
@@ -36420,7 +36533,7 @@ impl<H: Host> Runtime<'_, H> {
             return match receiver.as_ref() {
                 Some(receiver) => {
                     self.note_string_intern(&r, Some(receiver));
-                    self.host.invoke_instance(&r, receiver, args)
+                    self.invoke_host_instance_with_models(&r, receiver, args)
                 }
                 None => {
                     if r.owner == "net/minecraft/network/syncher/SynchedEntityData"
@@ -38330,6 +38443,17 @@ impl<H: Host> Runtime<'_, H> {
                         });
                     }
                     if dispatched.is_none()
+                        && let Some(value) = self.invoke_sound_event_init(
+                            &r,
+                            receiver.as_ref(),
+                            &args,
+                            &mut stack,
+                            &mut locals,
+                        )
+                    {
+                        dispatched = Some(value);
+                    }
+                    if dispatched.is_none()
                         && let Some(value) = invoke_or_catch!(
                             at,
                             self.invoke_codec_and_recipe_models(&r, receiver.as_ref(), &args)
@@ -38960,16 +39084,9 @@ impl<H: Host> Runtime<'_, H> {
                                         } else {
                                             invoke_or_catch!(
                                                 at,
-                                                if let Some(value) =
-                                                    client_reload::runtime_instance_call(
-                                                        self, &resolved, receiver, &args
-                                                    )
-                                                {
-                                                    value
-                                                } else {
-                                                    self.host
-                                                        .invoke_instance(&resolved, receiver, &args)
-                                                }
+                                                self.invoke_host_instance_with_models(
+                                                    &resolved, receiver, &args
+                                                )
                                             )
                                         }
                                     } else {
@@ -39009,31 +39126,17 @@ impl<H: Host> Runtime<'_, H> {
                                             ),
                                             None => invoke_or_catch!(
                                                 at,
-                                                if let Some(value) =
-                                                    client_reload::runtime_instance_call(
-                                                        self, &resolved, receiver, &args
-                                                    )
-                                                {
-                                                    value
-                                                } else {
-                                                    self.host
-                                                        .invoke_instance(&resolved, receiver, &args)
-                                                }
+                                                self.invoke_host_instance_with_models(
+                                                    &resolved, receiver, &args
+                                                )
                                             ),
                                         }
                                     } else {
                                         invoke_or_catch!(
                                             at,
-                                            if let Some(value) =
-                                                client_reload::runtime_instance_call(
-                                                    self, &resolved, receiver, &args
-                                                )
-                                            {
-                                                value
-                                            } else {
-                                                self.host
-                                                    .invoke_instance(&resolved, receiver, &args)
-                                            }
+                                            self.invoke_host_instance_with_models(
+                                                &resolved, receiver, &args
+                                            )
                                         )
                                     }
                                 } else {

@@ -118,6 +118,11 @@ pub struct GameObject {
     /// object each. `None` for a player the host does not count, whose key
     /// names no session (comparisons counted).
     pub incarnation: Option<(u32, u32)>,
+    /// `Entity.isSilent()`, when known by the hook (`None` refuses).
+    pub silent: Option<bool>,
+    /// Explicit `Entity.getSoundSource()` override when not uniquely implied
+    /// by `type_id` (e.g. `minecraft:rabbit`).
+    pub sound_source: Option<crate::level_sound::SoundSource>,
 }
 
 impl GameObject {
@@ -141,6 +146,8 @@ impl GameObject {
             main_hand: None,
             off_hand: None,
             incarnation: None,
+            silent: None,
+            sound_source: None,
         }
     }
 
@@ -293,6 +300,14 @@ impl GameObject {
         self.game_mode = Some(mode);
         self
     }
+    pub fn with_silent(mut self, silent: bool) -> Self {
+        self.silent = Some(silent);
+        self
+    }
+    pub fn with_sound_source(mut self, source: crate::level_sound::SoundSource) -> Self {
+        self.sound_source = Some(source);
+        self
+    }
     pub fn with_address(mut self, address: &str) -> Self {
         self.address = Some(address.to_owned());
         self
@@ -384,6 +399,9 @@ pub enum GameHookEffect {
     /// `ServerPlayer#sendSystemMessage(Component)`: a system line in the
     /// player's chat.
     SystemMessage { player: u128, text: String },
+    /// `Level.playSound` / `playSeededSound` / `Entity.playSound`: a sound
+    /// effect requested during the hook firing.
+    PlaySound(crate::level_sound::LevelSoundEffect),
 }
 
 /// The game objects of one firing, and what the callbacks asked of them.
@@ -430,6 +448,10 @@ impl GameHookContext {
 
     pub fn take_effects(&mut self) -> Vec<GameHookEffect> {
         std::mem::take(&mut self.effects)
+    }
+
+    pub(crate) fn push_effect(&mut self, effect: GameHookEffect) {
+        self.effects.push(effect);
     }
 }
 
@@ -730,6 +752,12 @@ fn is_value_constructor(r: &MethodRef) -> bool {
             "net/minecraft/resources/Identifier",
             "fromNamespaceAndPath" | "withDefaultNamespace" | "parse" | "tryParse" | "tryBuild"
         ) | ("net/minecraft/resources/ResourceKey", "create")
+            | (
+                "net/minecraft/sounds/SoundEvent",
+                "createVariableRangeEvent" | "createFixedRangeEvent"
+            )
+            | ("net/minecraft/core/Holder", "direct")
+            | ("net/minecraft/sounds/SoundSource", "valueOf" | "values")
             // A logger: the bootstrap host's slf4j model answers it.
             | ("com/mojang/logging/LogUtils", "getLogger")
     )
@@ -743,6 +771,7 @@ fn is_host_value_class(owner: &str) -> bool {
         owner,
         "net/minecraft/network/protocol/common/custom/CustomPacketPayload$Type"
             | "net/minecraft/world/level/storage/LevelResource"
+            | "net/minecraft/sounds/SoundEvent"
     )
 }
 
@@ -801,6 +830,16 @@ impl<H: Host> GameHookHost<'_, H> {
             return Ok(Value::Void);
         }
         let object = self.object(marker)?;
+        if let Some(answer) = crate::level_sound::game_hook_sound_call(
+            self.inner,
+            self.context,
+            marker,
+            &object,
+            r,
+            args,
+        ) {
+            return answer;
+        }
         let fact = |value: Option<Value>| value.ok_or_else(|| unmodelled(marker, r));
         let entity = matches!(
             object.kind,
@@ -1709,6 +1748,33 @@ impl<H: Host> Host for GameHookHost<'_, H> {
 
     fn throwable_message(&self, marker: &str) -> Option<Option<String>> {
         self.inner.throwable_message(marker)
+    }
+
+    fn registered_sound_id(&self, sound: &Value) -> Option<String> {
+        self.inner.registered_sound_id(sound)
+    }
+
+    fn unwrap_sound_holder(
+        &mut self,
+        value: &Value,
+    ) -> Option<Result<(Value, Option<String>), NativeError>> {
+        self.inner.unwrap_sound_holder(value)
+    }
+
+    fn level_random_handle(&mut self, level_marker: &str) -> Option<Value> {
+        self.inner.level_random_handle(level_marker)
+    }
+
+    fn draw_level_sound_seed(
+        &mut self,
+        level_marker: &str,
+        server_side: bool,
+    ) -> Option<crate::level_sound::SoundSeed> {
+        self.inner.draw_level_sound_seed(level_marker, server_side)
+    }
+
+    fn construct_sound_event(&mut self, r: &MethodRef, args: &[Value]) -> Option<Value> {
+        self.inner.construct_sound_event(r, args)
     }
 
     fn record_throwable(&mut self, marker: &str, message: Option<String>) {
