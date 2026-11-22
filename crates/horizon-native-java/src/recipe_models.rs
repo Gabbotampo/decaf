@@ -27,8 +27,50 @@ pub(crate) const RECIPE_HOLDER: &str = "net/minecraft/world/item/crafting/Recipe
 pub(crate) const RECIPE_MANAGER: &str = "net/minecraft/world/item/crafting/RecipeManager";
 pub(crate) const RECIPE_ACCESS: &str = "net/minecraft/world/item/crafting/RecipeAccess";
 pub(crate) const TRANSMUTE_RECIPE: &str = "net/minecraft/world/item/crafting/TransmuteRecipe";
+pub(crate) const CUSTOM_DATA: &str = "net/minecraft/world/item/component/CustomData";
+pub(crate) const UNIT: &str = "net/minecraft/util/Unit";
 pub(crate) const EMPTY_PATCH_KEY: &str = "empty";
+pub(crate) const EMPTY_CUSTOM_DATA_KEY: &str = "empty";
+pub(crate) const UNIT_INSTANCE_KEY: &str = "INSTANCE";
+pub(crate) const TOOLTIP_DISPLAY_CANONICAL_DEFAULT: &str = "canonical-default";
 pub(crate) const RECIPE_MANAGER_KEY: &str = "game/recipe-manager";
+
+/// State carried by a modelled `net.minecraft.world.item.component.TooltipDisplay` handle.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TooltipDisplayData {
+    pub(crate) hide_tooltip: bool,
+    pub(crate) hidden_components: Vec<String>,
+    /// True when `hidden_components` is complete (so an absent component id is proven shown).
+    /// False when Sunrise's tooltip display carried unrepresentable entries or `hide_tooltip`
+    /// masked `hidden_components` without raw NBT.
+    pub(crate) hidden_known: bool,
+}
+
+/// Typed representation of a modelled `ItemStack` data component crossing the host boundary.
+#[derive(Clone, Debug, PartialEq)]
+pub enum RuntimeComponentValue {
+    Int(i32),
+    Unit,
+    CustomData(crate::NbtCompound),
+    ComponentJson(String),
+    TooltipDisplay {
+        hide_tooltip: bool,
+        hidden_components: Vec<String>,
+        hidden_known: bool,
+    },
+    /// The stack holds a component value this boundary cannot represent accurately; callers must
+    /// count and skip rather than dropping the component.
+    Unsupported,
+}
+
+/// Extracted `ItemStack` data for converting a Java stack across the game boundary.
+#[derive(Clone, Debug, PartialEq)]
+pub struct StackComponents {
+    pub item_id: String,
+    pub count: i32,
+    pub patch: Vec<(String, Option<RuntimeComponentValue>)>,
+    pub opaque_components: bool,
+}
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ComponentPatch {
@@ -55,6 +97,14 @@ pub(crate) struct LiveStack {
     pub(crate) item_id: Option<String>,
     pub(crate) count: i32,
     pub(crate) patch: ComponentPatch,
+    /// True when the stack came from the host game with custom/damage components that this
+    /// model does not materialize: `ItemStack.isSameItemSameComponents` and `getComponentsPatch`
+    /// count instead of falsely treating the patch as complete.
+    pub(crate) opaque_components: bool,
+    /// Specific component ids that came from the host game with unmodelled values (or removals).
+    /// Reading/writing one of these ids counts as unknown, while modelled sibling components on
+    /// the same stack still answer accurately.
+    pub(crate) opaque_keys: BTreeSet<String>,
 }
 
 impl LiveStack {
@@ -64,6 +114,45 @@ impl LiveStack {
             item_id: Some(item_id),
             count,
             patch,
+            opaque_components: false,
+            opaque_keys: BTreeSet::new(),
+        }
+    }
+
+    pub(crate) fn from_host_item_id(
+        host: &StdHost,
+        item_id: &str,
+        count: i32,
+        opaque_components: bool,
+    ) -> Self {
+        Self::from_host_stack(
+            host,
+            None,
+            item_id,
+            count,
+            ComponentPatch::default(),
+            opaque_components,
+            BTreeSet::new(),
+        )
+    }
+
+    pub(crate) fn from_host_stack(
+        host: &StdHost,
+        item_override: Option<Value>,
+        item_id: &str,
+        count: i32,
+        patch: ComponentPatch,
+        opaque_components: bool,
+        opaque_keys: BTreeSet<String>,
+    ) -> Self {
+        let item_value = item_override.unwrap_or_else(|| item_value_for_id(host, item_id));
+        Self {
+            item_value: Some(item_value),
+            item_id: Some(item_id.to_owned()),
+            count,
+            patch,
+            opaque_components: opaque_components || !opaque_keys.is_empty(),
+            opaque_keys,
         }
     }
 
@@ -74,7 +163,18 @@ impl LiveStack {
             item_id,
             count,
             patch: ComponentPatch::default(),
+            opaque_components: false,
+            opaque_keys: BTreeSet::new(),
         }
+    }
+
+    pub(crate) fn has_opaque_components(&self) -> bool {
+        self.opaque_components || !self.opaque_keys.is_empty()
+    }
+
+    pub(crate) fn is_key_opaque(&self, comp_id: &str) -> bool {
+        self.opaque_keys.contains(comp_id)
+            || (self.opaque_components && self.opaque_keys.is_empty())
     }
 
     pub(crate) fn is_empty(&self) -> bool {
@@ -163,6 +263,8 @@ pub(crate) struct RecipeState {
     pub(crate) ingredients: BTreeMap<String, IngredientSpec>,
     pub(crate) holders: BTreeMap<String, HolderData>,
     pub(crate) common_infos: BTreeMap<String, bool>,
+    pub(crate) custom_data: BTreeMap<String, crate::NbtCompound>,
+    pub(crate) tooltip_displays: BTreeMap<String, TooltipDisplayData>,
     pub(crate) extra_item_tags: BTreeMap<String, Vec<String>>,
     pub(crate) loaded: Option<LoadedRecipeCache>,
 }
@@ -218,6 +320,61 @@ impl RecipeState {
         let key = self.next_key("recipe-holder");
         self.holders.insert(key.clone(), HolderData { id, value });
         Value::Host(HostRef::new(HostKind::RecipeHolder, key))
+    }
+
+    pub(crate) fn alloc_custom_data(&mut self, tag: crate::NbtCompound) -> Value {
+        if tag.is_empty() {
+            return empty_custom_data();
+        }
+        let key = self.next_key("custom-data");
+        self.custom_data.insert(key.clone(), tag);
+        Value::Host(HostRef::new(HostKind::CustomData, key))
+    }
+
+    pub(crate) fn custom_data_of(&self, value: &Value) -> Option<&crate::NbtCompound> {
+        let Value::Host(handle) = value else {
+            return None;
+        };
+        if handle.kind() != HostKind::CustomData {
+            return None;
+        }
+        if handle.key() == EMPTY_CUSTOM_DATA_KEY {
+            static EMPTY: std::sync::OnceLock<crate::NbtCompound> = std::sync::OnceLock::new();
+            return Some(EMPTY.get_or_init(crate::NbtCompound::new));
+        }
+        self.custom_data.get(handle.key())
+    }
+
+    pub(crate) fn alloc_tooltip_display(&mut self, mut data: TooltipDisplayData) -> Value {
+        // `TooltipDisplay.hiddenComponents` is a `ReferenceLinkedOpenHashSet`: deduplicate while
+        // preserving first-occurrence insertion order.
+        let mut deduped = Vec::with_capacity(data.hidden_components.len());
+        for id in data.hidden_components {
+            if !deduped.iter().any(|existing| existing == &id) {
+                deduped.push(id);
+            }
+        }
+        data.hidden_components = deduped;
+        let key = self.next_key("td");
+        self.tooltip_displays.insert(key.clone(), data);
+        Value::Host(HostRef::new(HostKind::TooltipDisplay, key))
+    }
+
+    pub(crate) fn tooltip_display_of(&self, value: &Value) -> Option<TooltipDisplayData> {
+        let Value::Host(handle) = value else {
+            return None;
+        };
+        if handle.kind() != HostKind::TooltipDisplay {
+            return None;
+        }
+        if handle.key() == TOOLTIP_DISPLAY_CANONICAL_DEFAULT {
+            return Some(TooltipDisplayData {
+                hide_tooltip: false,
+                hidden_components: Vec::new(),
+                hidden_known: true,
+            });
+        }
+        self.tooltip_displays.get(handle.key()).cloned()
     }
 
     pub(crate) fn patch_of(&self, value: &Value) -> Option<&ComponentPatch> {
@@ -277,11 +434,28 @@ impl RecipeState {
             + self.ingredients.len()
             + self.holders.len()
             + self.common_infos.len()
+            + self.custom_data.len()
+            + self.tooltip_displays.len()
     }
 }
 
 pub(crate) fn empty_patch() -> Value {
     Value::Host(HostRef::new(HostKind::DataComponentPatch, EMPTY_PATCH_KEY))
+}
+
+pub(crate) fn empty_custom_data() -> Value {
+    Value::Host(HostRef::new(HostKind::CustomData, EMPTY_CUSTOM_DATA_KEY))
+}
+
+pub(crate) fn unit_instance() -> Value {
+    Value::Host(HostRef::new(HostKind::Unit, UNIT_INSTANCE_KEY))
+}
+
+pub(crate) fn canonical_default_tooltip_display() -> Value {
+    Value::Host(HostRef::new(
+        HostKind::TooltipDisplay,
+        TOOLTIP_DISPLAY_CANONICAL_DEFAULT,
+    ))
 }
 
 pub(crate) fn is_empty_stack_handle(value: &Value) -> bool {
@@ -297,6 +471,9 @@ pub(crate) fn is_recipe_object_kind(kind: HostKind) -> bool {
             | HostKind::Ingredient
             | HostKind::RecipeCommonInfo
             | HostKind::RecipeHolder
+            | HostKind::CustomData
+            | HostKind::Unit
+            | HostKind::TooltipDisplay
     )
 }
 
@@ -398,6 +575,49 @@ pub(crate) const HOLDER_METHODS: Methods = Methods {
         fixed_instance_of(RECIPE_HOLDER, &["java/lang/Record"], wanted, hierarchy)
     },
     crosses_jars: |_, _| false,
+    compare_to: None,
+};
+
+pub(crate) const CUSTOM_DATA_METHODS: Methods = Methods {
+    to_string: |_, _| Ok(None),
+    hash_code: |_, _| Ok(None),
+    equals: |handle, other, _| {
+        if handle.key() == EMPTY_CUSTOM_DATA_KEY {
+            return Ok(match other {
+                Value::Host(other)
+                    if other.kind() == HostKind::CustomData
+                        && other.key() == EMPTY_CUSTOM_DATA_KEY =>
+                {
+                    Some(true)
+                }
+                Value::Host(other) if other.kind() == HostKind::CustomData => None,
+                _ => Some(false),
+            });
+        }
+        Ok(None)
+    },
+    instance_of: |_, wanted, hierarchy| fixed_instance_of(CUSTOM_DATA, &[], wanted, hierarchy),
+    crosses_jars: |_, _| false,
+    compare_to: None,
+};
+
+pub(crate) const UNIT_METHODS: Methods = Methods {
+    to_string: |_, _| Ok(Some("INSTANCE".to_owned())),
+    hash_code: |_, _| Ok(None),
+    equals: identity_equals,
+    instance_of: |_, wanted, hierarchy| {
+        fixed_instance_of(
+            UNIT,
+            &[
+                "java/lang/Enum",
+                "java/lang/Comparable",
+                "java/io/Serializable",
+            ],
+            wanted,
+            hierarchy,
+        )
+    },
+    crosses_jars: |_, _| true,
     compare_to: None,
 };
 
@@ -610,6 +830,9 @@ pub(crate) fn prototype_component(
         "minecraft:damage" => {
             base_max_damage(host, item_id).map(|opt| opt.map(|_| Value::Boxed(Boxed::Integer(0))))
         }
+        // `DataComponents.COMMON_ITEM_COMPONENTS` sets `TOOLTIP_DISPLAY` to `TooltipDisplay.DEFAULT`
+        // across vanilla 26.3 items.
+        "minecraft:tooltip_display" => Some(Some(canonical_default_tooltip_display())),
         // Verified empty across all 1,658 vanilla 26.3 item prototypes.
         "minecraft:custom_name"
         | "minecraft:custom_data"
@@ -627,20 +850,80 @@ pub(crate) fn prototype_component(
     }
 }
 
-/// Compare a candidate patch value with a known prototype value (`Objects.equals(val, proto)`).
-/// Returns `None` if equality cannot be determined without running custom Java `.equals`.
-fn value_equals_prototype(val: &Option<Value>, proto: &Option<Value>) -> Option<bool> {
-    match (val, proto) {
-        (None, None) => Some(true),
-        (None, Some(_)) | (Some(_), None) => Some(false),
-        (Some(v), Some(Value::Boxed(Boxed::Integer(p)))) => match v {
-            Value::Boxed(Boxed::Integer(n)) | Value::Int(n) => Some(*n == *p),
-            Value::Ref(None) => Some(false),
+/// Compare two modelled component values (`Objects.equals(a, b)`) without running arbitrary Java
+/// `.equals`. Returns `None` if equality cannot be proven cleanly.
+pub(crate) fn host_component_values_equal(host: &StdHost, a: &Value, b: &Value) -> Option<bool> {
+    match (a, b) {
+        (Value::Ref(None), Value::Ref(None)) => Some(true),
+        (Value::Ref(None), _) | (_, Value::Ref(None)) => Some(false),
+        (
+            Value::Boxed(Boxed::Integer(x)) | Value::Int(x),
+            Value::Boxed(Boxed::Integer(y)) | Value::Int(y),
+        ) => Some(*x == *y),
+        (Value::Boxed(Boxed::Integer(_)) | Value::Int(_), other)
+        | (other, Value::Boxed(Boxed::Integer(_)) | Value::Int(_)) => match other {
             Value::Boxed(_) | Value::Long(_) | Value::Float(_) | Value::Ref(Some(_)) => Some(false),
             Value::Host(h) if h.kind() != HostKind::JarObject => Some(false),
             _ => None,
         },
+        (Value::Host(ha), Value::Host(hb)) => match (ha.kind(), hb.kind()) {
+            (HostKind::Unit, HostKind::Unit) => Some(true),
+            (HostKind::Unit, k) | (k, HostKind::Unit) if k != HostKind::JarObject => Some(false),
+            (HostKind::CustomData, HostKind::CustomData) => {
+                let da = host.recipes.custom_data_of(a)?;
+                let db = host.recipes.custom_data_of(b)?;
+                Some(da == db)
+            }
+            (HostKind::CustomData, k) | (k, HostKind::CustomData) if k != HostKind::JarObject => {
+                Some(false)
+            }
+            (HostKind::TooltipDisplay, HostKind::TooltipDisplay) => {
+                let da = host.recipes.tooltip_display_of(a)?;
+                let db = host.recipes.tooltip_display_of(b)?;
+                if da.hide_tooltip != db.hide_tooltip {
+                    return Some(false);
+                }
+                if !da.hidden_known || !db.hidden_known {
+                    return None;
+                }
+                // `TooltipDisplay.hiddenComponents` is a `SequencedSet` (a `LinkedHashSet`):
+                // record equality uses `AbstractSet.equals`, which ignores order and duplicates.
+                let set_a: BTreeSet<&str> =
+                    da.hidden_components.iter().map(String::as_str).collect();
+                let set_b: BTreeSet<&str> =
+                    db.hidden_components.iter().map(String::as_str).collect();
+                Some(set_a == set_b)
+            }
+            (HostKind::TooltipDisplay, k) | (k, HostKind::TooltipDisplay)
+                if k != HostKind::JarObject =>
+            {
+                Some(false)
+            }
+            (HostKind::Component, HostKind::Component) => {
+                let ja = host.component_json(a)?;
+                let jb = host.component_json(b)?;
+                Some(ja == jb)
+            }
+            (HostKind::Component, k) | (k, HostKind::Component) if k != HostKind::JarObject => {
+                Some(false)
+            }
+            _ => None,
+        },
         _ => None,
+    }
+}
+
+/// Compare a candidate patch value with a known prototype value (`Objects.equals(val, proto)`).
+/// Returns `None` if equality cannot be determined without running custom Java `.equals`.
+fn value_equals_prototype(
+    host: &StdHost,
+    val: &Option<Value>,
+    proto: &Option<Value>,
+) -> Option<bool> {
+    match (val, proto) {
+        (None, None) => Some(true),
+        (None, Some(_)) | (Some(_), None) => Some(false),
+        (Some(v), Some(p)) => host_component_values_equal(host, v, p),
     }
 }
 
@@ -654,7 +937,7 @@ pub(crate) fn patched_set(
 ) -> Option<Value> {
     let proto = prototype_component(host, item_id, comp_id)?;
     let new_opt = (!matches!(new_val, Value::Ref(None))).then(|| new_val.clone());
-    let matches_proto = value_equals_prototype(&new_opt, &proto)?;
+    let matches_proto = value_equals_prototype(host, &new_opt, &proto)?;
     let old_entry = if matches_proto {
         patch.entries.remove(comp_id)
     } else {
@@ -703,7 +986,7 @@ pub(crate) fn patched_apply_patch(
         let proto = prototype_component(host, item_id, comp_id)?;
         let action = match entry {
             Some(_) => {
-                if value_equals_prototype(entry, &proto)? {
+                if value_equals_prototype(host, entry, &proto)? {
                     None
                 } else {
                     Some(entry.clone())
@@ -1399,6 +1682,10 @@ pub(crate) fn static_field(r: &MethodRef) -> Option<Value> {
         (DATA_COMPONENT_PATCH, "EMPTY", "Lnet/minecraft/core/component/DataComponentPatch;") => {
             Some(empty_patch())
         }
+        (CUSTOM_DATA, "EMPTY", "Lnet/minecraft/world/item/component/CustomData;") => {
+            Some(empty_custom_data())
+        }
+        (UNIT, "INSTANCE", "Lnet/minecraft/util/Unit;") => Some(unit_instance()),
         (DATA_COMPONENTS, field, "Lnet/minecraft/core/component/DataComponentType;") => {
             vanilla_item_data::data_component_field_id(field).map(|id| {
                 crate::game_object::server_value(format!("game/data-component-type/{id}"))
@@ -1459,6 +1746,20 @@ pub(crate) fn static_call(
     args: &[Value],
 ) -> Option<Result<Value, NativeError>> {
     match (r.owner.as_str(), r.name.as_str(), r.descriptor.as_str()) {
+        (
+            ITEM_STACK,
+            "isSameItemSameComponents",
+            "(Lnet/minecraft/world/item/ItemStack;Lnet/minecraft/world/item/ItemStack;)Z",
+        ) => {
+            let [a, b] = args else {
+                return None;
+            };
+            match stacks_same_item_same_components(host, a, b) {
+                Ok(Some(same)) => Some(Ok(Value::Int(i32::from(same)))),
+                Ok(None) => None,
+                Err(err) => Some(Err(err)),
+            }
+        }
         (
             DATA_COMPONENT_PATCH,
             "builder",
@@ -1614,6 +1915,23 @@ pub(crate) fn instance_call(
         HostKind::Ingredient => ingredient_instance_call(host, handle, r, args),
         HostKind::RecipeCommonInfo => common_info_instance_call(host, handle, r, args),
         HostKind::RecipeHolder => holder_instance_call(host, handle, r, args),
+        HostKind::CustomData => custom_data_instance_call(host, handle, r, args),
+        _ => None,
+    }
+}
+
+fn custom_data_instance_call(
+    host: &mut StdHost,
+    handle: &HostRef,
+    r: &MethodRef,
+    _args: &[Value],
+) -> Option<Result<Value, NativeError>> {
+    if r.owner != CUSTOM_DATA {
+        return None;
+    }
+    let tag = host.recipes.custom_data_of(&Value::Host(handle.clone()))?;
+    match (r.name.as_str(), r.descriptor.as_str()) {
+        ("isEmpty", "()Z") => Some(Ok(Value::Int(i32::from(tag.is_empty())))),
         _ => None,
     }
 }
@@ -1656,6 +1974,12 @@ fn stack_instance_call_empty(
             "get" | "remove",
             "(Lnet/minecraft/core/component/DataComponentType;)Ljava/lang/Object;",
         ) => Some(Ok(Value::Ref(None))),
+        (
+            "getOrDefault",
+            "(Lnet/minecraft/core/component/DataComponentType;Ljava/lang/Object;)Ljava/lang/Object;",
+        ) => Some(Ok(args.get(1)?.clone())),
+        ("getDamageValue" | "getMaxDamage", "()I") => Some(Ok(Value::Int(0))),
+        ("isDamageableItem" | "isDamaged", "()Z") => Some(Ok(Value::Int(0))),
         (
             "set",
             "(Lnet/minecraft/core/component/DataComponentType;Ljava/lang/Object;)Ljava/lang/Object;",
@@ -1714,6 +2038,8 @@ fn live_stack_instance_call(
                         item_id,
                         count,
                         patch: ComponentPatch::default(),
+                        opaque_components: false,
+                        opaque_keys: BTreeSet::new(),
                     },
                 );
                 return Some(Ok(Value::Void));
@@ -1857,7 +2183,11 @@ fn live_stack_instance_call(
             }
         }
         ("getComponentsPatch", "()Lnet/minecraft/core/component/DataComponentPatch;") => {
-            if live.is_empty() || live.patch.is_empty() {
+            if live.is_empty() {
+                Some(Ok(empty_patch()))
+            } else if live.has_opaque_components() {
+                None
+            } else if live.patch.is_empty() {
                 Some(Ok(empty_patch()))
             } else {
                 Some(Ok(host.recipes.alloc_patch(live.patch)))
@@ -1874,6 +2204,9 @@ fn live_stack_instance_call(
             }
             let item_id = live.resolved_item_id(host)?;
             let comp_id = resolve_data_component_type_id(host, type_arg)?;
+            if live.is_key_opaque(&comp_id) {
+                return None;
+            }
             let mut next_patch = live.patch.clone();
             let prev = patched_set(host, &item_id, &mut next_patch, &comp_id, val_arg)?;
             let slot = host.recipes.stacks.get_mut(&key)?;
@@ -1890,7 +2223,34 @@ fn live_stack_instance_call(
                 return Some(Err(npe()));
             }
             let comp_id = resolve_data_component_type_id(host, type_arg)?;
+            if live.is_key_opaque(&comp_id) {
+                return None;
+            }
             stack_component_get(host, &item_id, &live.patch, &comp_id).map(Ok)
+        }
+        (
+            "getOrDefault",
+            "(Lnet/minecraft/core/component/DataComponentType;Ljava/lang/Object;)Ljava/lang/Object;",
+        ) => {
+            let default_arg = args.get(1)?;
+            if live.is_empty() {
+                return Some(Ok(default_arg.clone()));
+            }
+            let item_id = live.resolved_item_id(host)?;
+            let type_arg = args.first()?;
+            if matches!(type_arg, Value::Ref(None)) {
+                return Some(Err(npe()));
+            }
+            let comp_id = resolve_data_component_type_id(host, type_arg)?;
+            if live.is_key_opaque(&comp_id) {
+                return None;
+            }
+            let val = stack_component_get(host, &item_id, &live.patch, &comp_id)?;
+            Some(Ok(if matches!(val, Value::Ref(None)) {
+                default_arg.clone()
+            } else {
+                val
+            }))
         }
         ("remove", "(Lnet/minecraft/core/component/DataComponentType;)Ljava/lang/Object;") => {
             let type_arg = args.first()?;
@@ -1899,6 +2259,9 @@ fn live_stack_instance_call(
             }
             let item_id = live.resolved_item_id(host)?;
             let comp_id = resolve_data_component_type_id(host, type_arg)?;
+            if live.is_key_opaque(&comp_id) {
+                return None;
+            }
             let mut next_patch = live.patch.clone();
             let prev = patched_remove(host, &item_id, &mut next_patch, &comp_id)?;
             let slot = host.recipes.stacks.get_mut(&key)?;
@@ -1915,8 +2278,110 @@ fn live_stack_instance_call(
                 return Some(Err(npe()));
             }
             let comp_id = resolve_data_component_type_id(host, type_arg)?;
+            if live.is_key_opaque(&comp_id) {
+                return None;
+            }
             stack_component_get(host, &item_id, &live.patch, &comp_id)
                 .map(|v| Ok(Value::Int(i32::from(!matches!(v, Value::Ref(None))))))
+        }
+        ("getMaxDamage", "()I") => {
+            if live.is_empty() {
+                return Some(Ok(Value::Int(0)));
+            }
+            if live.is_key_opaque("minecraft:max_damage") {
+                return None;
+            }
+            let item_id = live.resolved_item_id(host)?;
+            let val = stack_component_get(host, &item_id, &live.patch, "minecraft:max_damage")?;
+            let max = match val {
+                Value::Ref(None) => 0,
+                Value::Int(n) | Value::Boxed(Boxed::Integer(n)) => n,
+                _ => return None,
+            };
+            Some(Ok(Value::Int(max)))
+        }
+        ("getDamageValue", "()I") => {
+            if live.is_empty() {
+                return Some(Ok(Value::Int(0)));
+            }
+            if live.is_key_opaque("minecraft:damage") || live.is_key_opaque("minecraft:max_damage")
+            {
+                return None;
+            }
+            let item_id = live.resolved_item_id(host)?;
+            let dmg_val = stack_component_get(host, &item_id, &live.patch, "minecraft:damage")?;
+            let max_val = stack_component_get(host, &item_id, &live.patch, "minecraft:max_damage")?;
+            let dmg = match dmg_val {
+                Value::Ref(None) => 0,
+                Value::Int(n) | Value::Boxed(Boxed::Integer(n)) => n,
+                _ => return None,
+            };
+            let max = match max_val {
+                Value::Ref(None) => 0,
+                Value::Int(n) | Value::Boxed(Boxed::Integer(n)) => n,
+                _ => return None,
+            };
+            // `Mth.clamp(dmg, 0, max)` (`ItemStack.getDamageValue` offsets 0..25).
+            let clamped = if max < 0 { 0 } else { dmg.clamp(0, max) };
+            Some(Ok(Value::Int(clamped)))
+        }
+        ("isDamageableItem", "()Z") => {
+            if live.is_empty() {
+                return Some(Ok(Value::Int(0)));
+            }
+            if live.is_key_opaque("minecraft:max_damage")
+                || live.is_key_opaque("minecraft:unbreakable")
+                || live.is_key_opaque("minecraft:damage")
+            {
+                return None;
+            }
+            let item_id = live.resolved_item_id(host)?;
+            let has_max = !matches!(
+                stack_component_get(host, &item_id, &live.patch, "minecraft:max_damage")?,
+                Value::Ref(None)
+            );
+            let has_unbreakable = !matches!(
+                stack_component_get(host, &item_id, &live.patch, "minecraft:unbreakable")?,
+                Value::Ref(None)
+            );
+            let has_dmg = !matches!(
+                stack_component_get(host, &item_id, &live.patch, "minecraft:damage")?,
+                Value::Ref(None)
+            );
+            Some(Ok(Value::Int(i32::from(
+                has_max && !has_unbreakable && has_dmg,
+            ))))
+        }
+        ("isDamaged", "()Z") => {
+            if live.is_empty() {
+                return Some(Ok(Value::Int(0)));
+            }
+            if live.is_key_opaque("minecraft:max_damage")
+                || live.is_key_opaque("minecraft:unbreakable")
+                || live.is_key_opaque("minecraft:damage")
+            {
+                return None;
+            }
+            let item_id = live.resolved_item_id(host)?;
+            let max_val = stack_component_get(host, &item_id, &live.patch, "minecraft:max_damage")?;
+            let unbreakable =
+                stack_component_get(host, &item_id, &live.patch, "minecraft:unbreakable")?;
+            let dmg_val = stack_component_get(host, &item_id, &live.patch, "minecraft:damage")?;
+            if matches!(max_val, Value::Ref(None))
+                || !matches!(unbreakable, Value::Ref(None))
+                || matches!(dmg_val, Value::Ref(None))
+            {
+                return Some(Ok(Value::Int(0)));
+            }
+            let (
+                Value::Int(dmg) | Value::Boxed(Boxed::Integer(dmg)),
+                Value::Int(max) | Value::Boxed(Boxed::Integer(max)),
+            ) = (dmg_val, max_val)
+            else {
+                return None;
+            };
+            let clamped = if max < 0 { 0 } else { dmg.clamp(0, max) };
+            Some(Ok(Value::Int(i32::from(clamped > 0))))
         }
         ("applyComponents", "(Lnet/minecraft/core/component/DataComponentPatch;)V") => {
             let patch_arg = args.first()?;
@@ -1925,6 +2390,13 @@ fn live_stack_instance_call(
             }
             let item_id = live.resolved_item_id(host)?;
             let overlay = host.recipes.patch_of(patch_arg)?.clone();
+            if overlay
+                .entries
+                .keys()
+                .any(|comp_id| live.is_key_opaque(comp_id))
+            {
+                return None;
+            }
             let mut next_patch = live.patch.clone();
             patched_apply_patch(host, &item_id, &mut next_patch, &overlay)?;
             let slot = host.recipes.stacks.get_mut(&key)?;
@@ -2226,6 +2698,35 @@ pub(crate) fn host_object_equals(host: &StdHost, handle: &HostRef, other: &Value
             }
             _ => Some(false),
         },
+        HostKind::CustomData => match other {
+            Value::Host(other) if other.kind() == HostKind::CustomData => {
+                let a = host.recipes.custom_data_of(&Value::Host(handle.clone()))?;
+                let b = host.recipes.custom_data_of(&Value::Host(other.clone()))?;
+                Some(a == b)
+            }
+            _ => Some(false),
+        },
+        HostKind::Unit => Some(matches!(
+            other,
+            Value::Host(other) if other.kind() == HostKind::Unit
+        )),
+        HostKind::TooltipDisplay => {
+            let self_val = Value::Host(handle.clone());
+            // Keep the legacy opaque `"default"` placeholder counted.
+            host.recipes.tooltip_display_of(&self_val)?;
+            match other {
+                Value::Host(other_h) if other_h.kind() == HostKind::TooltipDisplay => {
+                    host_component_values_equal(host, &self_val, other)
+                }
+                other
+                    if crate::jar_object::object_class(other)
+                        == Some("net/minecraft/world/item/component/TooltipDisplay") =>
+                {
+                    None
+                }
+                _ => Some(false),
+            }
+        }
         _ => None,
     }
 }
@@ -2594,14 +3095,349 @@ pub(crate) fn ensure_recipes_loaded<H: Host>(
     Ok(())
 }
 
-/// Dispatch `RecipeManager` / `RecipeAccess` methods on the real `game/recipe-manager` handle.
-/// A bare `new RecipeManager()` (not `game/recipe-manager`) returns `Ok(None)` so it stays counted.
+/// Exact MC 26.3 `ItemStack.isSameItemSameComponents(ItemStack a, ItemStack b)`:
+/// checks `a.is(b.getItem())`, empty-stack equivalence, and component-patch equality.
+/// Returns `Ok(None)` (caller counts) if either stack carries opaque components or an
+/// incomparable component value.
+pub(crate) fn stacks_same_item_same_components(
+    host: &StdHost,
+    a: &Value,
+    b: &Value,
+) -> Result<Option<bool>, NativeError> {
+    if matches!(a, Value::Ref(None)) {
+        return Err(NativeError::UncaughtException {
+            class: "java/lang/NullPointerException".into(),
+            message: Some(
+                "Cannot invoke \"net.minecraft.world.item.ItemStack.is(Object)\" because \"a\" is null"
+                    .into(),
+            ),
+            frame: None,
+        });
+    }
+    if matches!(b, Value::Ref(None)) {
+        return Err(NativeError::UncaughtException {
+            class: "java/lang/NullPointerException".into(),
+            message: Some(
+                "Cannot invoke \"net.minecraft.world.item.ItemStack.getItem()\" because \"b\" is null"
+                    .into(),
+            ),
+            frame: None,
+        });
+    }
+    let (Some((item_a, _, empty_a)), Some((item_b, _, empty_b))) =
+        (host.read_item_stack_impl(a), host.read_item_stack_impl(b))
+    else {
+        return Ok(None);
+    };
+    let Some(same_item) = same_item_value(host, &item_a, None, &item_b) else {
+        return Ok(None);
+    };
+    if !same_item {
+        return Ok(Some(false));
+    }
+    if empty_a && empty_b {
+        return Ok(Some(true));
+    }
+    if empty_a != empty_b {
+        return Ok(Some(false));
+    }
+    let (Some(live_a), Some(live_b)) = (read_live_stack_opt(host, a), read_live_stack_opt(host, b))
+    else {
+        return Ok(None);
+    };
+    if live_a.has_opaque_components() || live_b.has_opaque_components() {
+        return Ok(None);
+    }
+    if live_a.patch.entries.len() != live_b.patch.entries.len() {
+        return Ok(Some(false));
+    }
+    for (comp_id, val_a) in &live_a.patch.entries {
+        let Some(val_b) = live_b.patch.entries.get(comp_id) else {
+            return Ok(Some(false));
+        };
+        match (val_a, val_b) {
+            (None, None) => {}
+            (Some(va), Some(vb)) => {
+                let Some(eq) = host_component_values_equal(host, va, vb) else {
+                    return Ok(None);
+                };
+                if !eq {
+                    return Ok(Some(false));
+                }
+            }
+            _ => return Ok(Some(false)),
+        }
+    }
+    Ok(Some(true))
+}
+
+fn runtime_value_from_host(host: &StdHost, value: &Value) -> RuntimeComponentValue {
+    match value {
+        Value::Int(n) | Value::Boxed(Boxed::Integer(n)) => RuntimeComponentValue::Int(*n),
+        Value::Host(handle) => match handle.kind() {
+            HostKind::Unit => RuntimeComponentValue::Unit,
+            HostKind::CustomData => match host.recipes.custom_data_of(value) {
+                Some(nbt) => RuntimeComponentValue::CustomData(nbt.clone()),
+                None => RuntimeComponentValue::Unsupported,
+            },
+            HostKind::Component => match host.component_json(value) {
+                Some(json) => RuntimeComponentValue::ComponentJson(json),
+                None => RuntimeComponentValue::Unsupported,
+            },
+            HostKind::TooltipDisplay => match host.recipes.tooltip_display_of(value) {
+                Some(td) => RuntimeComponentValue::TooltipDisplay {
+                    hide_tooltip: td.hide_tooltip,
+                    hidden_components: td.hidden_components,
+                    hidden_known: td.hidden_known,
+                },
+                None => RuntimeComponentValue::Unsupported,
+            },
+            _ => RuntimeComponentValue::Unsupported,
+        },
+        _ => RuntimeComponentValue::Unsupported,
+    }
+}
+
+pub(crate) fn extract_stack_components(host: &StdHost, stack: &Value) -> Option<StackComponents> {
+    if is_empty_stack_handle(stack) {
+        return Some(StackComponents {
+            item_id: "minecraft:air".to_owned(),
+            count: 0,
+            patch: Vec::new(),
+            opaque_components: false,
+        });
+    }
+    let live = read_live_stack_opt(host, stack)?;
+    let item_id = live.resolved_item_id(host)?;
+    let count = live.effective_count();
+    let patch = if live.is_empty() {
+        Vec::new()
+    } else {
+        live.patch
+            .entries
+            .iter()
+            .map(|(k, v)| {
+                (
+                    k.clone(),
+                    v.as_ref().map(|val| runtime_value_from_host(host, val)),
+                )
+            })
+            .collect()
+    };
+    Some(StackComponents {
+        item_id,
+        count,
+        patch,
+        opaque_components: live.has_opaque_components(),
+    })
+}
+
+pub(crate) fn build_host_stack(
+    host: &mut StdHost,
+    item_override: Option<Value>,
+    item_id: &str,
+    count: i32,
+    patch: Vec<(String, Option<RuntimeComponentValue>)>,
+    mut opaque_components: bool,
+    opaque_keys: Vec<String>,
+) -> Value {
+    let mut opaque_set: BTreeSet<String> = opaque_keys.into_iter().collect();
+    let mut built_patch = ComponentPatch::default();
+    for (comp_id, entry) in patch {
+        match entry {
+            None => {
+                built_patch.entries.insert(comp_id, None);
+            }
+            Some(RuntimeComponentValue::Int(n)) => {
+                built_patch
+                    .entries
+                    .insert(comp_id, Some(Value::Boxed(Boxed::Integer(n))));
+            }
+            Some(RuntimeComponentValue::Unit) => {
+                built_patch.entries.insert(comp_id, Some(unit_instance()));
+            }
+            Some(RuntimeComponentValue::CustomData(nbt)) => {
+                let handle = host.recipes.alloc_custom_data(nbt);
+                built_patch.entries.insert(comp_id, Some(handle));
+            }
+            Some(RuntimeComponentValue::ComponentJson(json)) => {
+                match serde_json::from_str::<serde_json::Value>(&json) {
+                    Ok(parsed) => {
+                        let handle = crate::host_component::component(&parsed);
+                        built_patch.entries.insert(comp_id, Some(handle));
+                    }
+                    Err(_) => {
+                        opaque_components = true;
+                        opaque_set.insert(comp_id);
+                    }
+                }
+            }
+            Some(RuntimeComponentValue::TooltipDisplay {
+                hide_tooltip,
+                hidden_components,
+                hidden_known,
+            }) => {
+                let handle = host.recipes.alloc_tooltip_display(TooltipDisplayData {
+                    hide_tooltip,
+                    hidden_components,
+                    hidden_known,
+                });
+                built_patch.entries.insert(comp_id, Some(handle));
+            }
+            Some(RuntimeComponentValue::Unsupported) => {
+                opaque_components = true;
+                opaque_set.insert(comp_id);
+            }
+        }
+    }
+    let live = LiveStack::from_host_stack(
+        host,
+        item_override,
+        item_id,
+        count,
+        built_patch,
+        opaque_components,
+        opaque_set,
+    );
+    host.recipes.alloc_stack(live)
+}
+
+fn runtime_custom_data_call<H: Host>(
+    runtime: &mut Runtime<'_, H>,
+    r: &MethodRef,
+    receiver: Option<&Value>,
+    args: &[Value],
+) -> Result<Option<Value>, NativeError> {
+    match (receiver, r.name.as_str(), r.descriptor.as_str()) {
+        (
+            None,
+            "of",
+            "(Lnet/minecraft/nbt/CompoundTag;)Lnet/minecraft/world/item/component/CustomData;",
+        ) => {
+            let Some(tag_arg) = args.first() else {
+                return Ok(None);
+            };
+            if matches!(tag_arg, Value::Ref(None)) {
+                return Err(NativeError::UncaughtException {
+                    class: "java/lang/NullPointerException".into(),
+                    message: Some(
+                        "Cannot invoke \"net.minecraft.nbt.CompoundTag.copy()\" because \"tag\" is null"
+                            .into(),
+                    ),
+                    frame: None,
+                });
+            }
+            let Some(marker) = crate::jar_object::object_key(tag_arg) else {
+                return Ok(None);
+            };
+            let Ok(crate::Nbt::Compound(nbt)) = runtime.nbt_read(marker) else {
+                return Ok(None);
+            };
+            let Some(std_host) = runtime.host.as_std_host_mut() else {
+                return Ok(None);
+            };
+            Ok(Some(std_host.recipes.alloc_custom_data(nbt)))
+        }
+        (
+            None,
+            "set",
+            "(Lnet/minecraft/core/component/DataComponentType;Lnet/minecraft/world/item/ItemStack;Lnet/minecraft/nbt/CompoundTag;)V",
+        ) => {
+            let [type_arg, stack_arg, tag_arg] = args else {
+                return Ok(None);
+            };
+            if matches!(tag_arg, Value::Ref(None)) {
+                return Err(NativeError::UncaughtException {
+                    class: "java/lang/NullPointerException".into(),
+                    message: Some(
+                        "Cannot invoke \"net.minecraft.nbt.CompoundTag.isEmpty()\" because \"tag\" is null"
+                            .into(),
+                    ),
+                    frame: None,
+                });
+            }
+            if matches!(stack_arg, Value::Ref(None)) {
+                return Err(npe());
+            }
+            if matches!(type_arg, Value::Ref(None)) {
+                return Err(npe());
+            }
+            let Some(marker) = crate::jar_object::object_key(tag_arg) else {
+                return Ok(None);
+            };
+            let Ok(crate::Nbt::Compound(nbt)) = runtime.nbt_read(marker) else {
+                return Ok(None);
+            };
+            let Some(std_host) = runtime.host.as_std_host_mut() else {
+                return Ok(None);
+            };
+            if is_empty_stack_handle(stack_arg) {
+                return Ok(Some(Value::Void));
+            }
+            let Value::Host(handle) = stack_arg else {
+                return Ok(None);
+            };
+            if handle.kind() != HostKind::ItemStack {
+                return Ok(None);
+            }
+            let key = handle.key().to_owned();
+            let Some(live) = read_live_stack_opt(std_host, stack_arg) else {
+                return Ok(None);
+            };
+            let Some(item_id) = live.resolved_item_id(std_host) else {
+                return Ok(None);
+            };
+            let Some(comp_id) = resolve_data_component_type_id(std_host, type_arg) else {
+                return Ok(None);
+            };
+            if live.is_key_opaque(&comp_id) {
+                return Ok(None);
+            }
+            let mut next_patch = live.patch.clone();
+            if nbt.is_empty() {
+                let Some(_) = patched_remove(std_host, &item_id, &mut next_patch, &comp_id) else {
+                    return Ok(None);
+                };
+            } else {
+                let cd = std_host.recipes.alloc_custom_data(nbt);
+                let Some(_) = patched_set(std_host, &item_id, &mut next_patch, &comp_id, &cd)
+                else {
+                    return Ok(None);
+                };
+            }
+            let Some(slot) = std_host.recipes.stacks.get_mut(&key) else {
+                return Ok(None);
+            };
+            slot.patch = next_patch;
+            Ok(Some(Value::Void))
+        }
+        (Some(recv), "copyTag", "()Lnet/minecraft/nbt/CompoundTag;") => {
+            let nbt = {
+                let Some(std_host) = runtime.host.as_std_host() else {
+                    return Ok(None);
+                };
+                let Some(tag) = std_host.recipes.custom_data_of(recv) else {
+                    return Ok(None);
+                };
+                tag.clone()
+            };
+            Ok(Some(runtime.nbt_alloc(&crate::Nbt::Compound(nbt))))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// Dispatch `RecipeManager` / `RecipeAccess` methods on the real `game/recipe-manager` handle,
+/// plus `CustomData` methods that read or allocate heap `CompoundTag` objects.
 pub(crate) fn runtime_recipe_manager_call<H: Host>(
     runtime: &mut Runtime<'_, H>,
     r: &MethodRef,
     receiver: Option<&Value>,
     args: &[Value],
 ) -> Result<Option<Value>, NativeError> {
+    if r.owner == CUSTOM_DATA {
+        return runtime_custom_data_call(runtime, r, receiver, args);
+    }
     let Some(receiver) = receiver else {
         return Ok(None);
     };

@@ -301,7 +301,9 @@ pub mod weaver;
 
 pub use voxel_shape::{BlockShapes, BlockStateShape};
 
-pub use events::{CreativeTabBuildContext, CreativeTabContents, CreativeTabListener};
+pub use events::{
+    CreativeTabBuildContext, CreativeTabContents, CreativeTabListener, creative_feature_mask,
+};
 pub use facade_server::{GameRuleValue, ServerFacts};
 pub use game_hooks::{
     GAME_OBJECT_PREFIX, GameHookContext, GameHookEffect, GameHookState, GameObject, GameObjectKind,
@@ -334,6 +336,8 @@ pub use java_nbt::{MAX_DEPTH as NBT_MAX_DEPTH, Nbt, NbtCompound};
 pub use mixin_extras::{GameHookShape, MixinExtrasKind, MixinExtrasPlan};
 pub use mixin_plugins::ConfigPluginReport;
 use mixin_plugins::ConfigPlugins;
+pub use recipe_models::{RuntimeComponentValue, StackComponents};
+pub use vanilla_item_data::all_vanilla_data_component_ids;
 pub use weaver::{
     ReturnMode, ShiftBy, WovenClasses, callback_info_class, callback_info_returnable_class,
     weave_class, weave_class_with_extras, weave_classes, weave_classes_with_extras, weave_head,
@@ -2681,6 +2685,36 @@ pub trait Host {
         _visibility_ordinal: u8,
     ) -> bool {
         false
+    }
+
+    /// Prepend an already-enabled, checked `ItemStack` to index 0 of an active
+    /// `FabricCreativeModeTabOutput`.
+    fn creative_tab_output_prepend_verified(
+        &mut self,
+        _output: &Value,
+        _stack: Value,
+        _visibility_ordinal: u8,
+    ) -> bool {
+        false
+    }
+
+    /// Insert already-enabled, checked `ItemStack`s before the first matching anchor (`before ==
+    /// true`) or after the last matching anchor (`before == false`) of an active
+    /// `FabricCreativeModeTabOutput`, appending to the end when the anchor is absent.
+    ///
+    /// When `anchor_is_stack` is `false`, `anchor` is the resolved `Item` value (`stack.is(item)`).
+    /// When `anchor_is_stack` is `true`, `anchor` is an `ItemStack` (`isSameItemSameComponents`).
+    /// Returns `Ok(None)` when anchor matching encounters an unknown component state.
+    fn creative_tab_output_insert_relative(
+        &mut self,
+        _output: &Value,
+        _anchor: &Value,
+        _anchor_is_stack: bool,
+        _stacks: Vec<Value>,
+        _visibility_ordinal: u8,
+        _before: bool,
+    ) -> Result<Option<bool>, NativeError> {
+        Ok(Some(false))
     }
 
     fn invoke(&mut self, r: &MethodRef, _: &[Value]) -> Result<Value, NativeError> {
@@ -5843,18 +5877,105 @@ impl StdHost {
         host_creative_tab::begin_output(&mut self.creative_tab, tab)
     }
 
-    pub(crate) fn begin_creative_tab_output_with(
+    pub(crate) fn begin_creative_tab_output_with_initial(
         &mut self,
         tab: &str,
         enabled_features: u64,
         has_permissions: bool,
+        initial_display: Vec<Value>,
+        initial_search: Vec<Value>,
     ) -> Value {
-        host_creative_tab::begin_output_with(
+        host_creative_tab::begin_output_with_initial(
             &mut self.creative_tab,
             tab,
             enabled_features,
             has_permissions,
+            initial_display,
+            initial_search,
         )
+    }
+
+    /// Allocate a host `ItemStack` representing an existing game stack for `item_id` (for
+    /// seeding a creative tab with vanilla/earlier-mod entries before Fabric listeners run).
+    ///
+    /// If `has_custom_components` is true, the stack's components are marked opaque so
+    /// `ItemStack.isSameItemSameComponents` counts comparisons against same-item stacks rather
+    /// than guessing component equality.
+    pub fn make_item_stack_for_id(
+        &mut self,
+        item_id: &str,
+        count: i32,
+        has_custom_components: bool,
+    ) -> Value {
+        let live = recipe_models::LiveStack::from_host_item_id(
+            self,
+            item_id,
+            count,
+            has_custom_components,
+        );
+        self.recipes.alloc_stack(live)
+    }
+
+    /// Allocate a modelled host `ItemStack` carrying converted component overrides/removals and
+    /// tracking any unrepresentable component keys as opaque so Java reads count rather than
+    /// seeing defaults.
+    pub fn make_host_item_stack_with_components(
+        &mut self,
+        item_override: Option<Value>,
+        item_id: &str,
+        count: i32,
+        patch: Vec<(String, Option<RuntimeComponentValue>)>,
+        opaque_components: bool,
+        opaque_keys: Vec<String>,
+    ) -> Value {
+        recipe_models::build_host_stack(
+            self,
+            item_override,
+            item_id,
+            count,
+            patch,
+            opaque_components,
+            opaque_keys,
+        )
+    }
+
+    /// Extract item id, count, and modelled component patch entries from a runtime `ItemStack`.
+    pub fn item_stack_components(&self, stack: &Value) -> Option<StackComponents> {
+        recipe_models::extract_stack_components(self, stack)
+    }
+
+    /// Compare two runtime `ItemStack`s using vanilla `ItemStack.isSameItemSameComponents`
+    /// semantics (`Ok(None)` if opaque/unmodelled components prevent a sound answer).
+    pub fn stacks_same_item_same_components(
+        &self,
+        a: &Value,
+        b: &Value,
+    ) -> Result<Option<bool>, NativeError> {
+        recipe_models::stacks_same_item_same_components(self, a, b)
+    }
+
+    /// Allocate a modelled `TooltipDisplay` handle reflecting the host's real tooltip visibility.
+    pub fn make_tooltip_display(
+        &mut self,
+        hide_tooltip: bool,
+        hidden_components: Vec<String>,
+        hidden_known: bool,
+    ) -> Value {
+        self.recipes
+            .alloc_tooltip_display(recipe_models::TooltipDisplayData {
+                hide_tooltip,
+                hidden_components,
+                hidden_known,
+            })
+    }
+
+    /// Every `minecraft:data_component_type` id registered by loaded jars on this host.
+    pub fn registered_data_component_ids(&self) -> Vec<String> {
+        self.registrations
+            .iter()
+            .filter(|entry| entry.registry == "minecraft:data_component_type")
+            .map(|entry| entry.id.clone())
+            .collect()
     }
 
     /// Finish a creative-tab callback and return the display stacks in their recorded order.
@@ -5918,6 +6039,14 @@ impl StdHost {
             }
         }
         None
+    }
+
+    fn same_item_value(a: &Value, b: &Value) -> Option<bool> {
+        match (a, b) {
+            (Value::Host(a), Value::Host(b)) => a.same_object(b),
+            (_, Value::Ref(None)) | (Value::Ref(None), _) => Some(false),
+            _ => Some(a == b),
+        }
     }
 
     fn registered_item_id_impl(&self, item: &Value) -> Option<String> {
@@ -9534,6 +9663,57 @@ impl Host for StdHost {
             return false;
         };
         host_creative_tab::accept_verified_stack(&mut self.creative_tab, output, stack, visibility)
+    }
+
+    fn creative_tab_output_prepend_verified(
+        &mut self,
+        output: &Value,
+        stack: Value,
+        visibility_ordinal: u8,
+    ) -> bool {
+        let Some(visibility) = host_creative_tab::TabVisibility::from_ordinal(visibility_ordinal)
+        else {
+            return false;
+        };
+        host_creative_tab::prepend_verified_stack(&mut self.creative_tab, output, stack, visibility)
+    }
+
+    fn creative_tab_output_insert_relative(
+        &mut self,
+        output: &Value,
+        anchor: &Value,
+        anchor_is_stack: bool,
+        stacks: Vec<Value>,
+        visibility_ordinal: u8,
+        before: bool,
+    ) -> Result<Option<bool>, NativeError> {
+        let Some(visibility) = host_creative_tab::TabVisibility::from_ordinal(visibility_ordinal)
+        else {
+            return Ok(Some(false));
+        };
+        let mut creative_tab = std::mem::take(&mut self.creative_tab);
+        let result = {
+            let host = &*self;
+            let mut matches = |entry: &Value| -> Result<Option<bool>, NativeError> {
+                if !anchor_is_stack {
+                    let Some((entry_item, _, _)) = host.read_item_stack_impl(entry) else {
+                        return Ok(None);
+                    };
+                    return Ok(Self::same_item_value(&entry_item, anchor));
+                }
+                recipe_models::stacks_same_item_same_components(host, anchor, entry)
+            };
+            host_creative_tab::insert_relative_verified(
+                &mut creative_tab,
+                output,
+                stacks,
+                visibility,
+                before,
+                &mut matches,
+            )
+        };
+        self.creative_tab = creative_tab;
+        result
     }
 
     fn invoke(&mut self, r: &MethodRef, args: &[Value]) -> Result<Value, NativeError> {
