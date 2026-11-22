@@ -14614,31 +14614,46 @@ impl Host for StdHost {
                     })?;
                 Ok(Value::Int(i32::from(unit)))
             }
-            ("java/lang/String", "toLowerCase", "()Ljava/lang/String;") => Ok(Value::Ref(Some(
-                expect_string(receiver).to_ascii_lowercase(),
-            ))),
-            ("java/lang/String", "toUpperCase", "()Ljava/lang/String;") => Ok(Value::Ref(Some(
-                expect_string(receiver).to_ascii_uppercase(),
-            ))),
-            // The `Locale` overloads (`Locale.ROOT` in ids and file names): the
-            // root locale is Unicode's default case mapping, no locale tailoring.
-            // Java tailors Turkish, Azerbaijani and Lithuanian (`"I"` is `"ı"` in
-            // `tr`): those are counted.
+            // `String#toLowerCase`/`toUpperCase` without a `Locale`: Java 25's
+            // answer is the full Unicode mapping (`"ß".toUpperCase()` is
+            // `"SS"`, `"A\u03A3".toLowerCase()` is `"a\u03C2`); this host does
+            // not model it. Answer only when every unit of the receiver is
+            // ASCII, where folding is the identity outside `a`-`z`/`A`-`Z`;
+            // count everything else instead of silently approximating it.
+            ("java/lang/String", "toLowerCase", "()Ljava/lang/String;")
+            | ("java/lang/String", "toUpperCase", "()Ljava/lang/String;") => {
+                let text = expect_string(receiver);
+                if text.is_ascii() {
+                    Ok(Value::Ref(Some(match r.name.as_str() {
+                        "toLowerCase" => text.to_ascii_lowercase(),
+                        _ => text.to_ascii_uppercase(),
+                    })))
+                } else {
+                    self.unknown_host_call(r)
+                }
+            }
+            // The `Locale` overloads: ASCII folding is locale-independent, so an
+            // ASCII receiver answers for any locale Java does not tailor.
+            // Java tailors Turkish, Azerbaijani and Lithuanian, and its full
+            // Unicode mapping is not modelled here: a non-ASCII receiver, a
+            // tailored locale, or a missing locale is counted.
             (
                 "java/lang/String",
                 "toLowerCase" | "toUpperCase",
                 "(Ljava/util/Locale;)Ljava/lang/String;",
-            ) if args
-                .first()
-                .is_some_and(|locale| self.tailored_case_locale(locale)) =>
-            {
-                self.unknown_host_call(r)
-            }
-            ("java/lang/String", "toLowerCase", "(Ljava/util/Locale;)Ljava/lang/String;") => {
-                Ok(Value::Ref(Some(expect_string(receiver).to_lowercase())))
-            }
-            ("java/lang/String", "toUpperCase", "(Ljava/util/Locale;)Ljava/lang/String;") => {
-                Ok(Value::Ref(Some(expect_string(receiver).to_uppercase())))
+            ) => {
+                let text = expect_string(receiver);
+                let locale = args.first();
+                if text.is_ascii()
+                    && matches!(locale, Some(locale) if !self.tailored_case_locale(locale))
+                {
+                    Ok(Value::Ref(Some(match r.name.as_str() {
+                        "toLowerCase" => text.to_ascii_lowercase(),
+                        _ => text.to_ascii_uppercase(),
+                    })))
+                } else {
+                    self.unknown_host_call(r)
+                }
             }
             ("java/lang/String", "equals", "(Ljava/lang/Object;)Z") => {
                 let other = Self::argument(r, args, 0)?;
