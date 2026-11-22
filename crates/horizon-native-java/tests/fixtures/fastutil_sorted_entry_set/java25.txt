@@ -1,0 +1,12 @@
+LINKED.iterator-order	banana,apple,cherry
+LINKED.iterator-typed	banana=true;apple=false;cherry=true;
+LINKED.iterator-independent	banana,apple|banana|true
+LINKED.iterator-retained	banana,apple,cherry|truefalsetrue
+LINKED.iterator-past-end	java.util.NoSuchElementException: 
+LINKED.iterator-remove-before-next	java.lang.IllegalStateException: 
+LINKED.iterator-remove-twice	java.lang.IllegalStateException: 
+LINKED.iterator-remove-middle	3|2|banana,cherry|false
+LINKED.iterator-remove-last	bananatrue;applefalse;cherrytrue;|2|banana,apple|false
+LINKED.iterator-remove-all	0|true|
+LINKED.iterator-reput	apple,cherry,banana
+LINKED.iterator-empty	java.util.NoSuchElementException: 

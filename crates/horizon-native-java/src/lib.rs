@@ -13101,7 +13101,10 @@ impl Host for StdHost {
                     .and_then(|source| source.strip_prefix("map-entry/"))
                     .and_then(|source| self.view_copy_source(source))
                     .or(fallback_map)
-                    && let Some((key, _)) = self.map_entry_now(&last)
+                    && let Some(key) = self
+                        .map_entry_now(&last)
+                        .map(|(key, _)| key)
+                        .or_else(|| self.fastutil_entry_key(&last, &map))
                 {
                     let Some(mut values) = self.mutable_collections.get(&map).cloned() else {
                         return self.unknown_host_call(r);

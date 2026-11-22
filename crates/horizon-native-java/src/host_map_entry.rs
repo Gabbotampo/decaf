@@ -872,6 +872,20 @@ impl StdHost {
             .map(|(_, state)| state)
     }
 
+    /// The key of `entry`, an entry of the fastutil map `map` read before the map last
+    /// changed. The map keeps no row of its entries it can follow, so the entry reads (its
+    /// value) are counted once the map changed; its key never changes, and it is what the
+    /// iterator that returned the entry removes (`Iterator.remove`).
+    pub(crate) fn fastutil_entry_key(&self, entry: &Value, map: &str) -> Option<Value> {
+        let Value::Host(handle) = entry else {
+            return None;
+        };
+        let state = self.entry_state(handle)?;
+        let own = matches!(&state.life, Life::Opaque { map: own, .. } if own == map);
+        (own && class_of_marker(map).starts_with("it/unimi/dsi/fastutil/"))
+            .then(|| state.key.clone())
+    }
+
     /// The entry an unmodifiable view's entry wraps (`Life::Wrapped`'s `inner`): the source map's
     /// own entry, which `UnmodifiableCollection.toArray(IntFunction)` hands out (#221 review 7,
     /// B11). `None` for any other value.

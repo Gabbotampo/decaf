@@ -61,6 +61,10 @@ pub struct IteratorGuard {
     /// An `ArrayDeque` iterator whose layout is known: its `cursor` slot and
     /// `remaining` count (`array_deque.rs`).
     deque_cursor: Option<(usize, usize)>,
+    /// An iterator over a fastutil map, which reads the map live and never
+    /// fails fast: `structure` is the map's key sequence it last saw, and a
+    /// step after the map changed is counted (`guard_fastutil_iterator`).
+    fastutil: bool,
 }
 
 /// How a fail-fast collection iterates.
@@ -201,6 +205,14 @@ impl<H: Host> Runtime<'_, H> {
         else {
             return Ok(None);
         };
+        if matches!(
+            (r.name.as_str(), r.descriptor.as_str()),
+            ("hasNext", "()Z") | ("next", "()Ljava/lang/Object;") | ("remove", "()V")
+        ) && let Some(guard) = self.host.iterator_guard(&marker)
+            && guard.fastutil
+        {
+            return self.fastutil_iterator_step(r, receiver, &marker, guard, args);
+        }
         match (r.name.as_str(), r.descriptor.as_str()) {
             ("iterator", "()Ljava/util/Iterator;") => {
                 let Some((source, how)) = self.fail_fast_source(receiver) else {
@@ -232,6 +244,7 @@ impl<H: Host> Runtime<'_, H> {
                             structure,
                             deque,
                             deque_cursor,
+                            fastutil: false,
                         },
                     );
                 }
@@ -352,6 +365,94 @@ impl<H: Host> Runtime<'_, H> {
             }
             _ => Ok(None),
         }
+    }
+
+    /// Whether `entry_set` is the entry set of a linked fastutil hash map
+    /// (`FastSortedEntrySet`): the host's `entrySet()` view of such a map.
+    pub(crate) fn is_linked_fastutil_entry_set(&self, entry_set: &Value) -> bool {
+        let Some(marker) = expect_ref(entry_set) else {
+            return false;
+        };
+        self.host.view_copy_kind(marker).as_deref() == Some("entrySet")
+            && self.host.view_copy_source(marker).is_some_and(|map| {
+                matches!(
+                    crate::jar_object::marker_class(&map),
+                    Some(
+                        "it/unimi/dsi/fastutil/objects/Object2BooleanLinkedOpenHashMap"
+                            | "it/unimi/dsi/fastutil/objects/Object2BooleanLinkedOpenCustomHashMap"
+                    )
+                )
+            })
+    }
+
+    /// Guard the iterator over the entry set `entry_set` of a fastutil map
+    /// (`iterator`, a host iterator over its snapshot) with the map's key
+    /// sequence now. fastutil's iterators read their map live and never throw
+    /// `ConcurrentModificationException`, so a step after the map changed
+    /// (other than through this iterator's own `remove`) is counted, not
+    /// answered from the snapshot.
+    pub(crate) fn guard_fastutil_iterator(
+        &mut self,
+        iterator: &Value,
+        entry_set: &Value,
+    ) -> Result<(), NativeError> {
+        let (Some(iterator), Some(marker)) = (
+            crate::host_iterator::marker(iterator),
+            expect_ref(entry_set),
+        ) else {
+            return Ok(());
+        };
+        let Some(source) = self.host.view_copy_source(marker) else {
+            return Ok(());
+        };
+        let structure =
+            self.structure_of(&crate::jar_object::stored_value(&source), FailFast::MapKeys)?;
+        self.host.store_iterator_guard(
+            iterator,
+            IteratorGuard {
+                root: source.clone(),
+                source,
+                cursor: None,
+                expected: ModStamp::default(),
+                structure,
+                deque: false,
+                deque_cursor: None,
+                fastutil: true,
+            },
+        );
+        Ok(())
+    }
+
+    /// `hasNext`, `next` and `remove` of an iterator guarded by
+    /// [`Self::guard_fastutil_iterator`]: the host's answer while the map's
+    /// key sequence is the one the iterator last saw, counted after any other
+    /// change. `remove` is the iterator's own change, so the sequence it
+    /// leaves becomes the one the iterator expects.
+    fn fastutil_iterator_step(
+        &mut self,
+        r: &MethodRef,
+        receiver: &Value,
+        marker: &str,
+        guard: IteratorGuard,
+        args: &[Value],
+    ) -> Result<Option<Value>, NativeError> {
+        let source = crate::jar_object::stored_value(&guard.source);
+        if self.structure_of(&source, FailFast::MapKeys)? != guard.structure {
+            return self.host.unknown_operand_call(r).map(|_| None);
+        }
+        if r.name != "remove" {
+            return Ok(None);
+        }
+        let step = MethodRef {
+            owner: "java/util/Iterator".into(),
+            name: r.name.clone(),
+            descriptor: r.descriptor.clone(),
+        };
+        let answer = self.host.invoke_instance(&step, receiver, args)?;
+        let structure = self.structure_of(&source, FailFast::MapKeys)?;
+        self.host
+            .store_iterator_guard(marker, IteratorGuard { structure, ..guard });
+        Ok(Some(answer))
     }
 
     /// `ArrayList.forEach`: `for (i = 0; modCount == expectedModCount && i

@@ -262,6 +262,9 @@ impl<H: Host> Runtime<'_, H> {
         if let Some(value) = self.invoke_class_is_instance(r, receiver, args)? {
             return Ok(Some(value));
         }
+        if let Some(value) = self.invoke_fastutil_entry_iterator(r, receiver, args)? {
+            return Ok(Some(value));
+        }
         if let Some(value) = self.invoke_fastutil_primitive(r, receiver, args)? {
             return Ok(Some(value));
         }
@@ -1106,6 +1109,76 @@ impl<H: Host> Runtime<'_, H> {
             }
             _ => return Ok(None),
         }))
+    }
+
+    /// The iterator of a linked fastutil map's entry set, and its cursor.
+    ///
+    /// `Object2BooleanLinkedOpenHashMap.object2BooleanEntrySet()` is a
+    /// `FastSortedEntrySet` whose `iterator()` walks the entries in insertion
+    /// order, one new entry per `next()`, and whose `hasNext`/`next`/`remove`
+    /// are `Iterator`'s: a bare `NoSuchElementException` past the end, a bare
+    /// `IllegalStateException` for a `remove` with no entry to remove. The
+    /// entry set is the host's `Map.entrySet()` view of the map (the call that
+    /// made it, above), so its iterator is the host's, guarded
+    /// (`iteration_guard.rs`) because fastutil's iterator reads its map live
+    /// and never fails fast: a map changed under it is counted.
+    ///
+    /// Only the linked hash maps return a `FastSortedEntrySet`: the tree maps'
+    /// entry set is an unrelated `ObjectSortedSet` in natural key order, which
+    /// the host's insertion-ordered map table does not model, so their calls
+    /// stay counted. `fastIterator()` stays counted too: it reuses one entry
+    /// object for every `next()`, where the host makes one per element.
+    fn invoke_fastutil_entry_iterator(
+        &mut self,
+        r: &MethodRef,
+        receiver: Option<&Value>,
+        args: &[Value],
+    ) -> Result<Option<Value>, NativeError> {
+        const FAST_SORTED: &str =
+            "it/unimi/dsi/fastutil/objects/Object2BooleanSortedMap$FastSortedEntrySet";
+        const BIDIRECTIONAL: &str = "it/unimi/dsi/fastutil/objects/ObjectBidirectionalIterator";
+        let Some(receiver) = receiver else {
+            return Ok(None);
+        };
+        if r.owner == FAST_SORTED
+            && r.name == "iterator"
+            && r.descriptor == "()Lit/unimi/dsi/fastutil/objects/ObjectBidirectionalIterator;"
+        {
+            if !self.is_linked_fastutil_entry_set(receiver) {
+                return Ok(None);
+            }
+            let iterator = self.host.invoke_instance(
+                &MethodRef {
+                    owner: "java/util/Set".into(),
+                    name: "iterator".into(),
+                    descriptor: "()Ljava/util/Iterator;".into(),
+                },
+                receiver,
+                &[],
+            )?;
+            self.guard_fastutil_iterator(&iterator, receiver)?;
+            return Ok(Some(iterator));
+        }
+        // `hasNext`/`next`/`remove` typed as the fastutil iterator are
+        // `Iterator`'s, on the iterator this model made.
+        if r.owner == BIDIRECTIONAL
+            && matches!(
+                (r.name.as_str(), r.descriptor.as_str()),
+                ("hasNext", "()Z") | ("next", "()Ljava/lang/Object;") | ("remove", "()V")
+            )
+            && crate::runtime::host_iterator::marker(receiver).is_some()
+        {
+            let iterator = MethodRef {
+                owner: "java/util/Iterator".into(),
+                name: r.name.clone(),
+                descriptor: r.descriptor.clone(),
+            };
+            return self
+                .host
+                .invoke_instance(&iterator, receiver, args)
+                .map(Some);
+        }
+        Ok(None)
     }
 
     /// A fastutil collection's primitive overloads, answered through the
