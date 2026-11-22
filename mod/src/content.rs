@@ -47,7 +47,8 @@ pub(crate) fn state_for_placement(
         .find(|entry| entry.registry == "minecraft:block" && entry.id == block_id)
         .map(|entry| entry.value.clone());
     let Some(block) = block else { return Ok(None) };
-    jar.jar.block_state_for_placement(block, context, &mut jar.host)
+    jar.jar
+        .block_state_for_placement(block, context, &mut jar.host)
 }
 
 pub(crate) fn state_for_placement_content(
@@ -82,9 +83,12 @@ pub(crate) fn register_placement_parts(
                 continue;
             }
             let key = registrar.block_key(&block.id);
-            registrar.block_part(key, crate::JavaPlacementPart {
-                state: Arc::clone(&shared),
-            });
+            registrar.block_part(
+                key,
+                crate::JavaPlacementPart {
+                    state: Arc::clone(&shared),
+                },
+            );
         }
     }
 }

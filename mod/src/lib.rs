@@ -80,20 +80,20 @@ use std::time::Duration;
 use attachments::Lifecycle;
 use game_hooks::Arg;
 use mod_api::{
-    AttackEntityEvent, Authority, BlockState, BlocksEvent, BreakBlockEvent, ClientHost, ClientLevelLoadEvent,
-    ClientLevelUnloadEvent, ClientSetupEvent, ClientStoppingEvent, Command, CommandArgumentValue,
-    CommandSource, ConfigFileError, ConfigPath, DamageContainer, DimensionKey, EntityInteractEvent,
-    EntityJoinLevelEvent, EntityLeaveLevelEvent, EntityRef, Flow, GameRuleChangedEvent, Hand,
-    HitHost, Hooks, Host, HostSide, HurtSource, InteractionResult, ItemsEvent, LeftClickBlockEvent,
-    LevelDimension, LevelLoadEvent, LevelRef, LevelSide, LevelTickPostEvent, LevelTickPreEvent,
-    LevelUnloadEvent, LivingDamagePostEvent, LivingDeathEvent, LivingDeathPostEvent,
-    LivingIncomingDamageEvent, PlayerChangedDimensionEvent, PlayerCloneEvent,
-    PlayerDestroyedBlockEvent, PlayerDiedEvent, PlayerLoggedInEvent, PlayerLoggedOutEvent,
-    PlayerRef, PlayerRespawnedEvent, PlayerTickPostEvent, PlayerTickPreEvent,
-    RegisterCommandsEvent, RegistrationContext, RightClickBlockEvent, RightClickItemEvent,
-    Registrar, RunModCommandEvent, ServerAboutToStartEvent, ServerHost, ServerStartedEvent,
-    ServerStartingEvent, ServerStoppedEvent, ServerStoppingEvent, ServerTickEvent, ServerTickPhase,
-    StateForPlacementEvent, Text,
+    AttackEntityEvent, Authority, BlockState, BlocksEvent, BreakBlockEvent, ClientHost,
+    ClientLevelLoadEvent, ClientLevelUnloadEvent, ClientSetupEvent, ClientStoppingEvent, Command,
+    CommandArgumentValue, CommandSource, ConfigFileError, ConfigPath, DamageContainer,
+    DimensionKey, EntityInteractEvent, EntityJoinLevelEvent, EntityLeaveLevelEvent, EntityRef,
+    Flow, GameRuleChangedEvent, Hand, HitHost, Hooks, Host, HostSide, HurtSource,
+    InteractionResult, ItemsEvent, LeftClickBlockEvent, LevelDimension, LevelLoadEvent, LevelRef,
+    LevelSide, LevelTickPostEvent, LevelTickPreEvent, LevelUnloadEvent, LivingDamagePostEvent,
+    LivingDeathEvent, LivingDeathPostEvent, LivingIncomingDamageEvent, PlayerChangedDimensionEvent,
+    PlayerCloneEvent, PlayerDestroyedBlockEvent, PlayerDiedEvent, PlayerLoggedInEvent,
+    PlayerLoggedOutEvent, PlayerRef, PlayerRespawnedEvent, PlayerTickPostEvent, PlayerTickPreEvent,
+    RegisterCommandsEvent, Registrar, RegistrationContext, RightClickBlockEvent,
+    RightClickItemEvent, RunModCommandEvent, ServerAboutToStartEvent, ServerHost,
+    ServerStartedEvent, ServerStartingEvent, ServerStoppedEvent, ServerStoppingEvent,
+    ServerTickEvent, ServerTickPhase, StateForPlacementEvent, Text,
 };
 use runtime::brigadier::{
     self, ArgumentKind, CommandInvocation as RuntimeInvocation, CommandMessage, CommandOutcome,
@@ -214,9 +214,7 @@ fn answer_state_for_placement(
             }
         };
         let Some(next) = next else {
-            log::warn!(
-                "{LOG}: {block_id}: placement property refused: {key}={value}"
-            );
+            log::warn!("{LOG}: {block_id}: placement property refused: {key}={value}");
             return None;
         };
         candidate = next;
@@ -564,12 +562,7 @@ fn hyphenated_uuid(uuid: u128) -> String {
 impl Hooks for HorizonJava {
     fn register(&self, registrar: &mut dyn Registrar, context: &RegistrationContext) {
         let mut state = self.lock();
-        content::register_placement_parts(
-            &mut state,
-            context,
-            registrar,
-            Arc::clone(&self.state),
-        );
+        content::register_placement_parts(&mut state, context, registrar, Arc::clone(&self.state));
     }
 
     /// The content root still accepts native block declarations here, at the Registration phase
@@ -3989,9 +3982,12 @@ mod tests {
             (mod_api::Direction::West, "WEST"),
             (mod_api::Direction::East, "EAST"),
         ] {
-            assert_eq!(placement_direction(direction), runtime::Value::Ref(Some(
-                format!("enum/net/minecraft/core/Direction/{expected}"),
-            )));
+            assert_eq!(
+                placement_direction(direction),
+                runtime::Value::Ref(Some(format!(
+                    "enum/net/minecraft/core/Direction/{expected}"
+                ),))
+            );
         }
     }
 
