@@ -115,6 +115,9 @@ mod game_hooks;
 mod runtime;
 mod server_facts;
 
+#[cfg(test)]
+mod client_dispatch_tests;
+
 /// This mod's report, in its own `config/horizon_java/` folder.
 const REPORT: &str = "horizon_java/java-runtime.json";
 /// The folder every jar to run is dropped in, beside the report.
@@ -451,6 +454,27 @@ impl Hooks for HorizonJava {
         content::declare_items(&mut state, context, event);
         drop(state);
         self.refresh_game_hook_plan_bits();
+    }
+
+    /// Sunrise's build-scoped creative tab hook is the client-side equivalent of Fabric's
+    /// `CreativeModeTabEvents.modifyOutputEvent`.  Resident Java jars fill the edit in Fabric
+    /// order; the client host applies the resulting parent/search stacks to the native tab.
+    fn build_creative_mode_tab_contents(
+        &self,
+        host: HostSide<'_>,
+        event: &mut mod_api::BuildCreativeModeTabContentsEvent<'_>,
+    ) {
+        let HostSide::Client(host) = host else {
+            return;
+        };
+        self.lock_client().build_creative_tab(host, event);
+    }
+
+    /// Run a jar Item's `appendHoverText` before Sunrise's global tooltip listeners.  The
+    /// runtime returns structured Components, so translatable text and style cross the native
+    /// API boundary without flattening them.
+    fn item_tooltip(&self, host: &dyn ClientHost, event: &mut mod_api::ItemTooltipEvent<'_>) {
+        self.lock_client().append_java_tooltip(host, event);
     }
 
     /// The server is about to open its worlds (NeoForge's `ServerAboutToStartEvent`). Nothing of
@@ -1523,8 +1547,8 @@ impl Hooks for HorizonJava {
     /// initial client load and before the title screen's first frame. A dedicated server never
     /// fires it. The client owner runs its resident jars here before the native setup notification
     /// returns; this owner hook does not claim to dispatch a second Java setup event.
-    fn client_setup(&self, _host: &mut dyn ClientHost, _event: &mut ClientSetupEvent) {
-        self.on_client_setup();
+    fn client_setup(&self, host: &mut dyn ClientHost, _event: &mut ClientSetupEvent) {
+        self.on_client_setup_with_version(Some(host.game_version()));
     }
 
     /// Sunrise's client level load carries the newly-created level's borrowed dimension and fires
@@ -1610,9 +1634,14 @@ impl HorizonJava {
         }
     }
 
+    #[cfg(test)]
     fn on_client_setup(&self) {
+        self.on_client_setup_with_version(None);
+    }
+
+    fn on_client_setup_with_version(&self, game_version: Option<&str>) {
         let mut client = self.lock_client();
-        client.ensure_loaded();
+        client.ensure_loaded_with_version(game_version);
         let rows = client.report_rows().count();
         log::info!("{LOG}: stored {rows} client report row(s)");
         log::info!("{LOG} {}: client setup complete", env!("CARGO_PKG_VERSION"));

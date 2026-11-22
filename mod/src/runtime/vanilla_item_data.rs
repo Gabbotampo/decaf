@@ -57,6 +57,11 @@ pub(crate) fn data_component_field_id(field: &str) -> Option<&'static str> {
         .map(|index| DATA_COMPONENT_FIELDS[index].1)
 }
 
+/// Every vanilla 26.3 `DataComponents` registry id (`minecraft:*`).
+pub fn all_vanilla_data_component_ids() -> impl Iterator<Item = &'static str> {
+    DATA_COMPONENT_FIELDS.iter().map(|(_, id)| *id)
+}
+
 #[rustfmt::skip]
 const VANILLA_ITEMS: &[&str] = &[
     "minecraft:abandoned_camp_map",
