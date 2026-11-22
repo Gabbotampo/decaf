@@ -2801,6 +2801,11 @@ pub trait Host {
         None
     }
 
+    /// The backing map marker of a live host `Map.Entry`, if any.
+    fn map_entry_source(&self, _value: &Value) -> Option<String> {
+        None
+    }
+
     /// Whether a host map entry implements a fastutil primitive entry interface.
     fn map_entry_is_instance_of(&self, _value: &Value, _wanted: &str) -> Option<bool> {
         None
@@ -2918,6 +2923,11 @@ pub trait Host {
         None
     }
 
+    /// The collection a `List.reversed()` view reads, by the view's marker.
+    fn reversed_view_source(&self, _marker: &str) -> Option<String> {
+        None
+    }
+
     fn is_unmodifiable_collection(&self, _marker: &str) -> bool {
         false
     }
@@ -2965,6 +2975,27 @@ pub trait Host {
     fn collection_generation(&self, _marker: &str) -> Option<u64> {
         None
     }
+
+    /// Allocate a fresh invocation run id for identity-epoch tracking.
+    fn next_identity_run(&mut self) -> u64 {
+        0
+    }
+
+    /// Clear per-collection identity-epoch entries after an epoch bump.
+    fn clear_identity_known_epochs(&mut self) {}
+
+    /// `(run_id, epoch)` at which `marker`'s identity-collection contents were
+    /// last known, if recorded.
+    fn identity_known_epoch(&self, _marker: &str) -> Option<(u64, u64)> {
+        None
+    }
+
+    /// Record the `(run_id, epoch)` at which `marker` was freshly constructed.
+    fn set_identity_known_epoch(&mut self, _marker: &str, _run_id: u64, _epoch: u64) {}
+
+    /// Record the current length of the runtime's identity-token table for
+    /// bounded-growth diagnostics.
+    fn note_identity_token_table_len(&mut self, _len: usize) {}
 
     /// The list the host keeps for `marker`, borrowed; `None` as for
     /// [`Self::collection_generation`].
@@ -3105,6 +3136,11 @@ pub trait Host {
         None
     }
 
+    /// The collection or iterator handle held by enumeration `marker`.
+    fn enumeration_source(&self, _marker: &str) -> Option<Value> {
+        None
+    }
+
     fn store_enumeration(&mut self, _marker: &str, _over: host_iterator::EnumerationOver) {}
 
     fn new_list_iterator(&mut self, _state: host_list_iterator::ListIter) -> Option<String> {
@@ -3113,6 +3149,11 @@ pub trait Host {
 
     /// A host list iterator's state, by marker.
     fn list_iterator(&self, _marker: &str) -> Option<host_list_iterator::ListIter> {
+        None
+    }
+
+    /// The list handle held by list iterator `marker`.
+    fn list_iterator_source(&self, _marker: &str) -> Option<Value> {
         None
     }
 
@@ -3157,6 +3198,14 @@ pub trait Host {
     }
 
     fn set_host_iterator_source(&mut self, _marker: &str, _source: String) {}
+
+    /// The originating collection or stream root handle for host iterator `marker`.
+    fn host_iterator_origin(&self, _marker: &str) -> Option<Value> {
+        None
+    }
+
+    /// Attach an originating collection or stream root handle to host iterator `marker`.
+    fn set_host_iterator_origin(&mut self, _marker: &str, _origin: Value) {}
 
     /// The provider classes explicitly seeded for one `ServiceLoader` key.
     /// An unseeded service answers an empty list, never a classpath scan.
@@ -3944,7 +3993,9 @@ pub struct StdHost {
     /// The referent of every `java.lang.ref.Reference` a jar built, keyed by
     /// its object marker ([`references`]).
     references: BTreeMap<String, Value>,
-    iterators: BTreeMap<String, (Vec<Value>, usize)>,
+    iterators: BTreeMap<String, HostIterator>,
+    /// Peak length observed for `Runtime::identity_collections.tokens`.
+    peak_identity_tokens: usize,
     /// The last value returned by each generic iterator, for Iterator.remove.
     iterator_last: BTreeMap<String, Value>,
     /// The enumerations `Collections.enumeration`/`Vector.elements()` made, by key
@@ -4209,6 +4260,7 @@ impl StdHost {
             levels: Vec::new(),
             references: BTreeMap::new(),
             iterators: BTreeMap::new(),
+            peak_identity_tokens: 0,
             iterator_last: BTreeMap::new(),
             enumerations: BTreeMap::new(),
             iterator_guards: BTreeMap::new(),
@@ -4913,7 +4965,8 @@ impl StdHost {
             .resource(name)
             .map(|value| vec![Value::Ref(Some(value.to_owned()))])
             .unwrap_or_default();
-        self.iterators.insert(marker.clone(), (values, 0));
+        self.iterators
+            .insert(marker.clone(), HostIterator::new(values, None));
         host_iterator::enumeration(marker)
     }
 
@@ -8169,6 +8222,12 @@ impl Host for StdHost {
         self.unmodifiable_collections.get(marker).cloned().flatten()
     }
 
+    fn reversed_view_source(&self, marker: &str) -> Option<String> {
+        self.reversed_views
+            .get(marker)
+            .map(|(base, _)| base.clone())
+    }
+
     fn mark_unmodifiable_collection(&mut self, marker: &str) {
         self.unmodifiable_collections
             .entry(marker.to_owned())
@@ -8217,6 +8276,27 @@ impl Host for StdHost {
     fn collection_generation(&self, marker: &str) -> Option<u64> {
         let marker = self.direct_collection(marker)?;
         Some(self.mutable_collections.generation(marker))
+    }
+
+    fn next_identity_run(&mut self) -> u64 {
+        self.mutable_collections.next_identity_run()
+    }
+
+    fn clear_identity_known_epochs(&mut self) {
+        self.mutable_collections.clear_identity_epochs();
+    }
+
+    fn identity_known_epoch(&self, marker: &str) -> Option<(u64, u64)> {
+        self.mutable_collections.collection_identity_epoch(marker)
+    }
+
+    fn set_identity_known_epoch(&mut self, marker: &str, run_id: u64, epoch: u64) {
+        self.mutable_collections
+            .set_collection_identity_epoch(marker.to_owned(), run_id, epoch);
+    }
+
+    fn note_identity_token_table_len(&mut self, len: usize) {
+        self.peak_identity_tokens = self.peak_identity_tokens.max(len);
     }
 
     fn collection_slice(&self, marker: &str) -> Option<&[Value]> {
@@ -8361,21 +8441,21 @@ impl Host for StdHost {
     }
 
     fn iterator_cursor(&self, marker: &str) -> Option<usize> {
-        self.iterators.get(marker).map(|(_, index)| *index)
+        self.iterators.get(marker).map(|entry| entry.index)
     }
 
     fn empty_iterator(&mut self) -> Value {
         // A shared singleton: one row, which stays empty.
         self.iterators
             .entry(host_iterator::EMPTY_ITERATOR.to_owned())
-            .or_insert((Vec::new(), 0));
+            .or_insert_with(|| HostIterator::new(Vec::new(), None));
         host_iterator::iterator(host_iterator::EMPTY_ITERATOR.to_owned())
     }
 
     fn empty_enumeration(&mut self) -> Value {
         self.iterators
             .entry(host_iterator::EMPTY_ENUMERATION.to_owned())
-            .or_insert((Vec::new(), 0));
+            .or_insert_with(|| HostIterator::new(Vec::new(), None));
         host_iterator::enumeration(host_iterator::EMPTY_ENUMERATION.to_owned())
     }
 
@@ -8388,6 +8468,12 @@ impl Host for StdHost {
 
     fn enumeration_over(&self, marker: &str) -> Option<host_iterator::EnumerationOver> {
         self.enumerations.get(marker).cloned()
+    }
+
+    fn enumeration_source(&self, marker: &str) -> Option<Value> {
+        self.enumerations
+            .get(marker)
+            .map(|over| over.held().clone())
     }
 
     fn store_enumeration(&mut self, marker: &str, over: host_iterator::EnumerationOver) {
@@ -8405,46 +8491,52 @@ impl Host for StdHost {
         self.list_iterators.get(marker).cloned()
     }
 
+    fn list_iterator_source(&self, marker: &str) -> Option<Value> {
+        self.list_iterators
+            .get(marker)
+            .map(|state| state.source().clone())
+    }
+
     fn store_list_iterator(&mut self, marker: &str, state: host_list_iterator::ListIter) {
         self.list_iterators.insert(marker.to_owned(), state);
     }
 
     fn host_iterator(&self, marker: &str) -> Option<(usize, usize, Option<String>)> {
-        let (values, index) = self.iterators.get(marker)?;
+        let entry = self.iterators.get(marker)?;
         Some((
-            *index,
-            values.len(),
+            entry.index,
+            entry.values.len(),
             self.iterator_sources.get(marker).cloned(),
         ))
     }
 
     fn host_iterator_next(&mut self, marker: &str) -> Result<Value, NativeError> {
-        let (values, index) = self
+        let entry = self
             .iterators
             .get_mut(marker)
             .ok_or_else(|| NativeError::Metadata("unknown java/util/Iterator marker".into()))?;
-        let value = values
-            .get(*index)
-            .cloned()
-            .ok_or_else(|| NativeError::UncaughtException {
+        let value = entry.values.get(entry.index).cloned().ok_or_else(|| {
+            NativeError::UncaughtException {
                 class: "java/util/NoSuchElementException".into(),
                 message: None,
                 frame: None,
-            })?;
-        *index += 1;
+            }
+        })?;
+        entry.index += 1;
         Ok(value)
     }
 
     fn set_host_iterator_cursor(&mut self, marker: &str, cursor: usize) {
-        if let Some((values, index)) = self.iterators.get_mut(marker) {
-            *index = cursor.min(values.len());
+        if let Some(entry) = self.iterators.get_mut(marker) {
+            entry.index = cursor.min(entry.values.len());
         }
     }
 
     fn new_host_iterator(&mut self, values: Vec<Value>, source: Option<String>) -> Option<Value> {
         let marker = format!("iterator/{}", self.next_iterator);
         self.next_iterator = self.next_iterator.saturating_add(1);
-        self.iterators.insert(marker.clone(), (values, 0));
+        self.iterators
+            .insert(marker.clone(), HostIterator::new(values, None));
         if let Some(source) = source {
             self.iterator_sources.insert(marker.clone(), source);
         }
@@ -8452,11 +8544,23 @@ impl Host for StdHost {
     }
 
     fn host_iterator_values(&self, marker: &str) -> Option<Vec<Value>> {
-        self.iterators.get(marker).map(|(values, _)| values.clone())
+        self.iterators.get(marker).map(|entry| entry.values.clone())
     }
 
     fn set_host_iterator_source(&mut self, marker: &str, source: String) {
         self.iterator_sources.insert(marker.to_owned(), source);
+    }
+
+    fn host_iterator_origin(&self, marker: &str) -> Option<Value> {
+        self.iterators
+            .get(marker)
+            .and_then(|entry| entry.origin.clone())
+    }
+
+    fn set_host_iterator_origin(&mut self, marker: &str, origin: Value) {
+        if let Some(entry) = self.iterators.get_mut(marker) {
+            entry.origin = Some(origin);
+        }
     }
 
     fn immutable_collection(&mut self, kind: &str, values: Vec<Value>) -> Option<Value> {
@@ -8644,6 +8748,13 @@ impl Host for StdHost {
 
     fn map_entry_parts(&self, value: &Value) -> Option<(Value, Value)> {
         self.map_entry_now(value)
+    }
+
+    fn map_entry_source(&self, value: &Value) -> Option<String> {
+        let Value::Host(handle) = value else {
+            return None;
+        };
+        self.map_entries.map_of(handle.key()).map(str::to_owned)
     }
 
     fn map_entry_is_instance_of(&self, value: &Value, wanted: &str) -> Option<bool> {
@@ -12641,7 +12752,8 @@ impl Host for StdHost {
                 }
                 let iterator = format!("iterator/{}", self.next_iterator);
                 self.next_iterator = self.next_iterator.saturating_add(1);
-                self.iterators.insert(iterator.clone(), (Vec::new(), 0));
+                self.iterators
+                    .insert(iterator.clone(), HostIterator::new(Vec::new(), None));
                 return Ok(host_iterator::iterator(iterator));
             }
             if r.name == "findFirst"
@@ -12664,8 +12776,10 @@ impl Host for StdHost {
         if r.owner == "java/util/Enumeration"
             && matches!(r.descriptor.as_str(), "()Z" | "()Ljava/lang/Object;")
             && let Some(marker) = receiver_marker.as_deref()
-            && let Some((values, index)) = self.iterators.get_mut(marker)
+            && let Some(entry) = self.iterators.get_mut(marker)
         {
+            let values = &entry.values;
+            let index = &mut entry.index;
             match (r.name.as_str(), r.descriptor.as_str()) {
                 ("hasMoreElements", "()Z") => {
                     return Ok(Value::Int((*index < values.len()) as i32));
@@ -12714,7 +12828,10 @@ impl Host for StdHost {
             let values = host_collection_values(self, receiver)?;
             let marker = format!("iterator/{}", self.next_iterator);
             self.next_iterator = self.next_iterator.saturating_add(1);
-            self.iterators.insert(marker.clone(), (values, 0));
+            self.iterators.insert(
+                marker.clone(),
+                HostIterator::new(values, Some(receiver.clone())),
+            );
             if let Some(source) = expect_ref(receiver).and_then(|source| iterated_kind(source)) {
                 self.iterator_sources.insert(marker.clone(), source);
             }
@@ -12748,11 +12865,11 @@ impl Host for StdHost {
             if r.name == "forEachRemaining" && r.descriptor == "(Ljava/util/function/Consumer;)V" {
                 let callback = Self::argument(r, args, 0)?.clone();
                 let remaining = {
-                    let (values, index) = self.iterators.get_mut(marker).ok_or_else(|| {
+                    let entry = self.iterators.get_mut(marker).ok_or_else(|| {
                         NativeError::Metadata("unknown java/util/Iterator marker".into())
                     })?;
-                    let remaining = values.get(*index..).unwrap_or_default().to_vec();
-                    *index = values.len();
+                    let remaining = entry.values.get(entry.index..).unwrap_or_default().to_vec();
+                    entry.index = entry.values.len();
                     remaining
                 };
                 for value in remaining {
@@ -12768,10 +12885,12 @@ impl Host for StdHost {
                 }
                 return Ok(Value::Void);
             }
-            let (values, index) = self
+            let entry = self
                 .iterators
                 .get_mut(marker)
                 .ok_or_else(|| NativeError::Metadata("unknown java/util/Iterator marker".into()))?;
+            let values = &entry.values;
+            let index = &mut entry.index;
             if r.name == "remove" && r.descriptor == "()V" {
                 let source = self.iterator_sources.get(marker).cloned();
                 if source.as_deref().is_some_and(|source| {
@@ -13890,6 +14009,34 @@ impl Host for StdHost {
                     })?;
                 Ok(Value::Ref(Some(String::from_utf16_lossy(sliced))))
             }
+            ("java/lang/String", "codePointAt", "(I)I") => {
+                let index = usize::try_from(expect_int(r, Self::argument(r, args, 0)?)?)
+                    .map_err(|_| NativeError::Metadata("negative code point index".into()))?;
+                let units = expect_string(receiver).encode_utf16().collect::<Vec<_>>();
+                let first = *units.get(index).ok_or_else(|| {
+                    NativeError::Metadata("code point index out of bounds".into())
+                })?;
+                let code = if (0xD800..=0xDBFF).contains(&first)
+                    && let Some(second) = units.get(index + 1)
+                    && (0xDC00..=0xDFFF).contains(second)
+                {
+                    0x10000 + ((u32::from(first) - 0xD800) << 10) + u32::from(*second) - 0xDC00
+                } else {
+                    u32::from(first)
+                };
+                Ok(Value::Int(code as i32))
+            }
+            ("java/lang/String", "subSequence", "(II)Ljava/lang/CharSequence;") => {
+                let start = usize::try_from(expect_int(r, Self::argument(r, args, 0)?)?)
+                    .map_err(|_| NativeError::Metadata("negative subsequence start".into()))?;
+                let end = usize::try_from(expect_int(r, Self::argument(r, args, 1)?)?)
+                    .map_err(|_| NativeError::Metadata("negative subsequence end".into()))?;
+                let units = expect_string(receiver).encode_utf16().collect::<Vec<_>>();
+                let slice = units.get(start..end).ok_or_else(|| {
+                    NativeError::Metadata("subsequence range out of bounds".into())
+                })?;
+                Ok(Value::Ref(Some(String::from_utf16_lossy(slice))))
+            }
             ("java/lang/String", "charAt", "(I)C") => {
                 let index = expect_int(r, Self::argument(r, args, 0)?)?;
                 let index = usize::try_from(index).map_err(|_| {
@@ -14425,7 +14572,8 @@ impl Host for StdHost {
                 let values = registry_contents::values(self, &id);
                 let marker = format!("iterator/{}", self.next_iterator);
                 self.next_iterator = self.next_iterator.saturating_add(1);
-                self.iterators.insert(marker.clone(), (values, 0));
+                self.iterators
+                    .insert(marker.clone(), HostIterator::new(values, None));
                 Ok(host_iterator::iterator(marker))
             }
             // A `ResourceKey` or `TagKey` handle (`host_ids.rs`); `toString`/
@@ -16914,6 +17062,12 @@ fn format_java_string_call<H: Host>(
     };
     match text {
         Some(text) => Ok(Value::Ref(Some(text))),
+        None if args
+            .iter()
+            .any(|value| runtime.contains_counted_string_deep(value)) =>
+        {
+            runtime.counted_unknown(r)
+        }
         None => runtime.host.invoke(r, args),
     }
 }
@@ -23097,6 +23251,10 @@ impl NativeJar {
             pipelines: Default::default(),
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
+            counted_strings: std::collections::BTreeSet::new(),
+            identity_collections: immutable_collections::IdentityCollections::default(),
+            string_pool: reference_identity::StringPoolState::default(),
+            counted_text_objects: std::collections::BTreeSet::new(),
             gson_writers: BTreeMap::new(),
             string_builder_capacities: BTreeMap::new(),
 
@@ -23111,6 +23269,7 @@ impl NativeJar {
             io_writer_bytes: BTreeMap::new(),
             io_stream_positions: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
+            io_writer_sinks: BTreeMap::new(),
             io_paths,
             io_files,
             io_file_bytes,
@@ -23126,6 +23285,7 @@ impl NativeJar {
             stream_plan: Default::default(),
             store_verdict: Default::default(),
             depth: 0,
+            next_frame_id: 0,
             shape_extraction: None,
             check_shape_probes: false,
             budget,
@@ -23347,6 +23507,10 @@ impl NativeJar {
             pipelines: Default::default(),
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
+            counted_strings: std::collections::BTreeSet::new(),
+            identity_collections: immutable_collections::IdentityCollections::default(),
+            string_pool: reference_identity::StringPoolState::default(),
+            counted_text_objects: std::collections::BTreeSet::new(),
             gson_writers: BTreeMap::new(),
             string_builder_capacities: BTreeMap::new(),
 
@@ -23361,6 +23525,7 @@ impl NativeJar {
             io_writer_bytes: BTreeMap::new(),
             io_stream_positions: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
+            io_writer_sinks: BTreeMap::new(),
             io_paths,
             io_files,
             io_file_bytes,
@@ -23376,6 +23541,7 @@ impl NativeJar {
             stream_plan: Default::default(),
             store_verdict: Default::default(),
             depth: 0,
+            next_frame_id: 0,
             shape_extraction,
             check_shape_probes,
             budget,
@@ -23447,6 +23613,10 @@ impl NativeJar {
             pipelines: Default::default(),
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
+            counted_strings: std::collections::BTreeSet::new(),
+            identity_collections: immutable_collections::IdentityCollections::default(),
+            string_pool: reference_identity::StringPoolState::default(),
+            counted_text_objects: std::collections::BTreeSet::new(),
             gson_writers: BTreeMap::new(),
             string_builder_capacities: BTreeMap::new(),
 
@@ -23461,6 +23631,7 @@ impl NativeJar {
             io_writer_bytes: BTreeMap::new(),
             io_stream_positions: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
+            io_writer_sinks: BTreeMap::new(),
             io_paths,
             io_files,
             io_file_bytes,
@@ -23476,6 +23647,7 @@ impl NativeJar {
             stream_plan: Default::default(),
             store_verdict: Default::default(),
             depth: 0,
+            next_frame_id: 0,
             shape_extraction: None,
             check_shape_probes: false,
             budget: &ExecutionBudget::UNBOUNDED,
@@ -23686,6 +23858,10 @@ impl NativeJar {
             pipelines: Default::default(),
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
+            counted_strings: std::collections::BTreeSet::new(),
+            identity_collections: immutable_collections::IdentityCollections::default(),
+            string_pool: reference_identity::StringPoolState::default(),
+            counted_text_objects: std::collections::BTreeSet::new(),
             gson_writers: BTreeMap::new(),
             string_builder_capacities: BTreeMap::new(),
 
@@ -23700,6 +23876,7 @@ impl NativeJar {
             io_writer_bytes: BTreeMap::new(),
             io_stream_positions: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
+            io_writer_sinks: BTreeMap::new(),
             io_paths,
             io_files,
             io_file_bytes,
@@ -23715,6 +23892,7 @@ impl NativeJar {
             stream_plan: Default::default(),
             store_verdict: Default::default(),
             depth: 0,
+            next_frame_id: 0,
             shape_extraction: None,
             check_shape_probes: false,
             budget: &ExecutionBudget::UNBOUNDED,
@@ -25864,6 +26042,33 @@ fn parse_value_marker(marker: &str) -> Result<Value, NativeError> {
 /// the wild are kilobytes; a crafted one must not grow host memory.
 const MAX_GSON_JSON_BYTES: usize = 1024 * 1024;
 
+/// A host-owned iterator snapshot together with its cursor and originating
+/// collection/stream handle (used for identity-collection invalidation and GC).
+#[derive(Clone, Debug)]
+pub(crate) struct HostIterator {
+    pub(crate) values: Vec<Value>,
+    pub(crate) index: usize,
+    pub(crate) origin: Option<Value>,
+}
+
+impl HostIterator {
+    fn new(values: Vec<Value>, origin: Option<Value>) -> Self {
+        Self {
+            values,
+            index: 0,
+            origin,
+        }
+    }
+}
+
+/// A runtime-owned value-list stream together with its originating collection
+/// handle (recorded when minted so derived-handle lookup needs no side map).
+#[derive(Clone, Debug)]
+pub(crate) struct StreamEntry {
+    pub(crate) values: Vec<Value>,
+    pub(crate) origin: Option<Value>,
+}
+
 struct Runtime<'a, H> {
     classes: &'a BTreeMap<String, ClassFile>,
     /// Each class a jar `@Mixin` targets, with the mixin classes naming it,
@@ -25887,7 +26092,7 @@ struct Runtime<'a, H> {
     arrays: BTreeMap<String, ArrayData>,
     next_array: usize,
     next_object: usize,
-    streams: BTreeMap<String, Vec<Value>>,
+    streams: BTreeMap<String, StreamEntry>,
     next_stream: usize,
     /// Lazy stream stages and builders (`stream_pipeline.rs`).
     pipelines: stream_pipeline::Pipelines,
@@ -25900,6 +26105,16 @@ struct Runtime<'a, H> {
     /// so a later `toString` sees every earlier append — the JDK's contract,
     /// and what a value-chain marker would lose.
     string_builders: BTreeMap<String, String>,
+    /// Allocation keys of constructors whose String text is not modelled exactly.
+    counted_strings: std::collections::BTreeSet<String>,
+    /// Runtime-wide identity epoch and per-collection provenance for
+    /// `IdentityHashMap` / `IdentityHashSet`.
+    identity_collections: immutable_collections::IdentityCollections,
+    /// Runtime-local JVM string-pool observations for `String.intern()`.
+    string_pool: reference_identity::StringPoolState,
+    /// Allocation keys (or I/O sink keys) whose held text was written from a
+    /// counted value. Reads of these objects must remain counted as well.
+    counted_text_objects: std::collections::BTreeSet<String>,
     /// JsonWriter states keyed by their jar object marker.
     gson_writers: BTreeMap<String, gson_writer::State>,
     /// The current backing capacity of each modelled StringBuilder. Its
@@ -25927,6 +26142,9 @@ struct Runtime<'a, H> {
     io_stream_positions: BTreeMap<String, usize>,
     /// Charset selected by each writer sink; UTF-8 is Java 25's default.
     io_writer_charsets: BTreeMap<String, String>,
+    /// Writer wrappers share the sink of the object they wrap (for example a
+    /// PrintWriter over a StringWriter or a PrintStream over a byte array).
+    io_writer_sinks: BTreeMap<String, String>,
     /// Charset-independent bytes committed for each virtual file. Text is
     /// retained separately for the reader model; File.length() uses these
     /// bytes, as the JDK does.
@@ -25976,6 +26194,10 @@ struct Runtime<'a, H> {
     /// thread's stack (`frame_bound.rs`) in [`Runtime::invoke`] before a frame
     /// starts.
     depth: usize,
+    /// Monotonically increasing identity for each interpreter frame invocation.
+    /// A depth is insufficient because two sequential calls at the same depth
+    /// must still get distinct allocation provenance.
+    next_frame_id: u64,
     /// Extraction id of the active `Block.getShape` / `getCollisionShape` call,
     /// if any. Free forwarding in [`Self::is_allowed_shape_probe_invoke`] is
     /// granted only to `HostKind::ShapeProbe` handles tagged with this exact id
@@ -26351,8 +26573,23 @@ impl<H: Host> Runtime<'_, H> {
         }
     }
 
+    /// Record a `String.intern()` call on `receiver`: if its text was not
+    /// already observed in the pool, Java 25 may install a fresh receiver
+    /// itself in the pool, so fresh-vs-interned identity for that text becomes
+    /// ambiguous and must be counted.
+    pub(crate) fn note_string_intern(&mut self, r: &MethodRef, receiver: Option<&Value>) {
+        if r.owner == "java/lang/String"
+            && r.name == "intern"
+            && r.descriptor == "()Ljava/lang/String;"
+            && let Some(Value::Ref(Some(text))) = receiver
+        {
+            self.string_pool.note_intern(text);
+        }
+    }
+
     /// Replace one argument of the invoke about to run, through every
-    /// `@ModifyArg` callback bound to that call site.
+    /// `@ModifyArg` callback bound to that call site. Returns the argument
+    /// indices whose values were passed through a modifier callback.
     ///
     /// Each callback sees the value the previous one produced, matching
     /// Mixin's sequential argument modifiers.
@@ -26364,27 +26601,28 @@ impl<H: Host> Runtime<'_, H> {
         method: &str,
         descriptor: &str,
         pc: usize,
-    ) -> Result<(), NativeError> {
+    ) -> Result<Vec<usize>, NativeError> {
         if self
             .modify_hooks
             .as_deref()
             .is_none_or(|hooks| hooks.dispatching || !hooks.applies(class, method, descriptor))
         {
-            return Ok(());
+            return Ok(Vec::new());
         }
         let entries = match self.modify_hooks.as_deref_mut() {
             Some(hooks) => hooks.arg_candidates(site),
-            None => return Ok(()),
+            None => return Ok(Vec::new()),
         };
         if entries.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
+        let modified: Vec<usize> = entries.iter().map(|entry| entry.index).collect();
         self.set_modify_dispatching(true);
         let outcome = self.run_modify_arg_callbacks(&entries, args);
         self.set_modify_dispatching(false);
         outcome?;
         self.record_modify_arg_site(class, method, pc);
-        Ok(())
+        Ok(modified)
     }
 
     fn run_modify_arg_callbacks(
@@ -26444,7 +26682,8 @@ impl<H: Host> Runtime<'_, H> {
     }
 
     /// Replace the value of one local store or load through the
-    /// `@ModifyVariable` callbacks bound to it.
+    /// `@ModifyVariable` callbacks bound to it. Marks `frame_modified_identity`
+    /// when a modifier callback altered a reference local.
     fn dispatch_modify_variable(
         &mut self,
         anchor: VariableAnchor,
@@ -26455,6 +26694,7 @@ impl<H: Host> Runtime<'_, H> {
         method: &str,
         descriptor: &str,
         pc: usize,
+        frame_modified_identity: &mut bool,
     ) -> Result<Value, NativeError> {
         if self
             .modify_hooks
@@ -26475,6 +26715,9 @@ impl<H: Host> Runtime<'_, H> {
         self.set_modify_dispatching(false);
         let value = outcome?;
         self.record_modify_variable_site(class, method, pc);
+        if instruction_type == "Ljava/lang/Object;" {
+            *frame_modified_identity = true;
+        }
         Ok(value)
     }
 
@@ -26961,6 +27204,7 @@ impl<H: Host> Runtime<'_, H> {
                         )
                         .map(Some);
                 }
+                self.note_string_intern(&target, Some(receiver));
                 self.host.invoke_instance(&target, receiver, args).map(Some)
             }
         }
@@ -27200,13 +27444,18 @@ impl<H: Host> Runtime<'_, H> {
                 let object = self.new_object(&callback.target.owner);
                 // `StringBuilder::new`: the interpreter's own builder, as `new`
                 // and `<init>` make it (`jdk_string_builder.rs`).
-                if self
-                    .invoke_string_builder(&callback.target, Some(&object), &values)?
-                    .is_none()
+                let builder =
+                    self.invoke_string_builder(&callback.target, Some(&object), &values)?;
+                if builder.is_none()
                     && string_constructors::count(self, &callback.target)?.is_none()
                 {
                     self.host
                         .invoke_instance(&callback.target, &object, &values)?;
+                } else if builder.is_none()
+                    && callback.target.owner == "java/lang/String"
+                    && let Some(key) = jar_object::object_key(&object)
+                {
+                    self.counted_strings.insert(key.to_owned());
                 }
                 return Ok(Some(object));
             }
@@ -27360,6 +27609,7 @@ impl<H: Host> Runtime<'_, H> {
             if let Some(answer) = token.as_ref().and_then(|token| token.answer.clone()) {
                 return Ok(Some(answer));
             }
+            self.note_string_intern(&callback.target, Some(&receiver));
             let value = self
                 .host
                 .invoke_instance(&callback.target, &receiver, &rest)?;
@@ -27658,6 +27908,56 @@ impl<H: Host> Runtime<'_, H> {
         }
 
         Ok(())
+    }
+
+    fn is_counted_string(&self, value: &Value) -> bool {
+        jar_object::object_key(value).is_some_and(|key| self.counted_strings.contains(key))
+    }
+
+    /// Record an unknown result whose value was derived from an opaque String.
+    /// The result is opaque too: retaining its allocation key makes every later
+    /// attempt to turn it into text count rather than printing the key.
+    pub(crate) fn counted_unknown(&mut self, r: &MethodRef) -> Result<Value, NativeError> {
+        let mut value = self.host.unknown_operand_call(r)?;
+        // Unknown reference-returning calls use null as the host's neutral
+        // answer. A derived String remains a live opaque object in Java, so
+        // give it a fresh allocation key for subsequent counted uses.
+        if value == Value::Ref(None) && return_desc(&r.descriptor) == "Ljava/lang/String;" {
+            value = self.new_object("java/lang/String");
+        }
+        if let Some(key) = jar_object::object_key(&value) {
+            self.counted_strings.insert(key.to_owned());
+        }
+        Ok(value)
+    }
+
+    pub(crate) fn contains_counted_string_deep(&self, value: &Value) -> bool {
+        fn visit<H: Host>(
+            runtime: &Runtime<'_, H>,
+            value: &Value,
+            seen: &mut std::collections::HashSet<String>,
+        ) -> bool {
+            if runtime.is_counted_string(value) {
+                return true;
+            }
+            let Some(key) = host_array::array_key(value) else {
+                return false;
+            };
+            if !seen.insert(key.to_owned()) {
+                return false;
+            }
+            runtime
+                .owned_array(value)
+                .is_some_and(|values| values.iter().any(|value| visit(runtime, value, seen)))
+        }
+        visit(self, value, &mut std::collections::HashSet::new())
+    }
+
+    fn contains_counted_string(&self, receiver: Option<&Value>, args: &[Value]) -> bool {
+        receiver.is_some_and(|value| self.contains_counted_string_deep(value))
+            || args
+                .iter()
+                .any(|value| self.contains_counted_string_deep(value))
     }
 
     /// A new object of `class`: a [`HostKind::JarObject`] handle keyed by a
@@ -30254,6 +30554,9 @@ impl<H: Host> Runtime<'_, H> {
 
     /// The sink a modelled writer marker appends into.
     fn io_sink_key(&self, marker: &str) -> Option<String> {
+        if let Some(key) = self.io_writer_sinks.get(marker) {
+            return Some(key.clone());
+        }
         if let Some(path) = self.io_paths.get(marker) {
             return Some(format!("file:{path}"));
         }
@@ -30265,6 +30568,23 @@ impl<H: Host> Runtime<'_, H> {
         }
         let key = format!("mem:{marker}");
         self.io_writers.contains_key(&key).then_some(key)
+    }
+
+    fn mark_counted_text_object(&mut self, value: &Value) {
+        if let Some(key) = jar_object::object_key(value) {
+            self.counted_text_objects.insert(key.to_owned());
+        }
+    }
+
+    fn mark_counted_io_sink(&mut self, marker: &str) {
+        if let Some(key) = self.io_sink_key(marker) {
+            self.counted_text_objects.insert(key);
+        }
+    }
+
+    fn counted_io_sink(&self, marker: &str) -> bool {
+        self.io_sink_key(marker)
+            .is_some_and(|key| self.counted_text_objects.contains(&key))
     }
 
     /// Open a writer marker over `path`, or in memory when the writer wraps a
@@ -30342,6 +30662,37 @@ impl<H: Host> Runtime<'_, H> {
             self.watch_writer_opened(path, false);
         }
         Ok(())
+    }
+
+    fn io_bind_writer(&mut self, marker: &str, wrapped: &Value) -> bool {
+        let Some(wrapped) = jar_object::object_key(wrapped) else {
+            return false;
+        };
+        if !matches!(
+            jar_object::key_class(wrapped),
+            Some(
+                "java/io/BufferedWriter"
+                    | "java/io/FileWriter"
+                    | "java/io/OutputStreamWriter"
+                    | "java/io/StringWriter"
+                    | "java/io/PrintWriter"
+                    | "java/io/PrintStream"
+                    | "java/io/OutputStream"
+                    | "java/io/FileOutputStream"
+                    | "java/io/ByteArrayOutputStream"
+            )
+        ) {
+            return false;
+        }
+        let Some(key) = self.io_sink_key(wrapped) else {
+            return false;
+        };
+        if let Some(path) = self.io_paths.get(wrapped).cloned() {
+            self.io_paths.insert(marker.to_owned(), path);
+        }
+        self.io_writer_sinks.insert(marker.to_owned(), key.clone());
+        self.io_writers.entry(key).or_default();
+        true
     }
 
     /// Append text to a modelled writer's sink.
@@ -31256,11 +31607,14 @@ impl<H: Host> Runtime<'_, H> {
                 // `PrintWriter(Writer)` and `PrintWriter(OutputStream)` wrap one
                 // of ours; a `File`/`String` argument is a file the constructor
                 // itself opens.
-                if let Some(wrapped) = args.first().filter(|value| {
-                    expect_ref(value).is_some_and(|marker| self.io_paths.contains_key(marker))
-                }) {
+                if let Some(wrapped) = args
+                    .first()
+                    .filter(|value| self.io_bind_writer(&marker, value))
+                {
                     let path = self.io_path_of(wrapped);
-                    self.io_open_writer(&marker, path, false)?;
+                    if path.is_some() {
+                        self.io_open_writer(&marker, path, false)?;
+                    }
                 } else {
                     let path = args.first().and_then(|value| self.io_path_of(value));
                     self.io_open_writer(&marker, path, !appending)?;
@@ -31272,8 +31626,13 @@ impl<H: Host> Runtime<'_, H> {
                 let Some(marker) = receiver_marker else {
                     return Ok(None);
                 };
-                let path = args.first().and_then(|value| self.io_path_of(value));
-                self.io_open_writer(&marker, path, false)?;
+                if !args
+                    .first()
+                    .is_some_and(|value| self.io_bind_writer(&marker, value))
+                {
+                    let path = args.first().and_then(|value| self.io_path_of(value));
+                    self.io_open_writer(&marker, path, false)?;
+                }
                 self.io_set_writer_charset(&marker, args);
                 Ok(Some(Value::Void))
             }
@@ -31281,8 +31640,13 @@ impl<H: Host> Runtime<'_, H> {
                 let Some(marker) = receiver_marker else {
                     return Ok(None);
                 };
-                let path = args.first().and_then(|value| self.io_path_of(value));
-                self.io_open_writer(&marker, path, false)?;
+                if !args
+                    .first()
+                    .is_some_and(|value| self.io_bind_writer(&marker, value))
+                {
+                    let path = args.first().and_then(|value| self.io_path_of(value));
+                    self.io_open_writer(&marker, path, false)?;
+                }
                 self.io_set_writer_charset(&marker, args);
                 Ok(Some(Value::Void))
             }
@@ -31291,6 +31655,25 @@ impl<H: Host> Runtime<'_, H> {
                     return Ok(None);
                 };
                 self.io_open_writer(&marker, None, true)?;
+                Ok(Some(Value::Void))
+            }
+            "java/io/ByteArrayOutputStream" if r.name == "<init>" => {
+                let Some(marker) = receiver_marker else {
+                    return Ok(None);
+                };
+                self.io_open_writer(&marker, None, true)?;
+                Ok(Some(Value::Void))
+            }
+            "java/io/PrintStream" if r.name == "<init>" => {
+                let Some(marker) = receiver_marker else {
+                    return Ok(None);
+                };
+                if !args
+                    .first()
+                    .is_some_and(|value| self.io_bind_writer(&marker, value))
+                {
+                    return Ok(None);
+                }
                 Ok(Some(Value::Void))
             }
             "java/io/FileOutputStream" | "java/io/FileInputStream" if r.name == "<init>" => {
@@ -31405,7 +31788,8 @@ impl<H: Host> Runtime<'_, H> {
             | "java/io/OutputStreamWriter"
             | "java/io/StringWriter"
             | "java/io/PrintWriter"
-            | "java/io/PrintStream" => {
+            | "java/io/PrintStream"
+            | "java/io/ByteArrayOutputStream" => {
                 let Some(marker) = receiver_marker else {
                     return Ok(None);
                 };
@@ -31606,7 +31990,15 @@ impl<H: Host> Runtime<'_, H> {
                             || descriptor.ends_with(")Ljava/io/StringWriter;") =>
                     {
                         let text = match args.first() {
-                            Some(value) => java_value_text(&mut *self.host, value, descriptor)?,
+                            Some(value) => {
+                                match self.java_text(value, descriptor, class, method)? {
+                                    Some(text) => text,
+                                    None if self.contains_counted_string_deep(value) => {
+                                        return self.counted_unknown(r).map(Some);
+                                    }
+                                    None => return Ok(None),
+                                }
+                            }
                             None => String::new(),
                         };
                         self.io_write(&marker, &text)?;
@@ -31624,7 +32016,13 @@ impl<H: Host> Runtime<'_, H> {
                                     .first()
                                     .cloned()
                                     .unwrap_or_else(|| "Ljava/lang/Object;".into());
-                                java_value_text(&mut *self.host, value, &argument)?
+                                match self.java_text(value, &argument, class, method)? {
+                                    Some(text) => text,
+                                    None if self.contains_counted_string_deep(value) => {
+                                        return self.counted_unknown(r).map(Some);
+                                    }
+                                    None => return Ok(None),
+                                }
                             }
                             None => String::new(),
                         };
@@ -31665,10 +32063,28 @@ impl<H: Host> Runtime<'_, H> {
                     }
                     ("checkError", "()Z") => Value::Int(0),
                     ("toString", "()Ljava/lang/String;") => {
+                        if self.counted_io_sink(&marker) {
+                            return self.counted_unknown(r).map(Some);
+                        }
                         Value::Ref(Some(self.io_sink_text(&marker)))
                     }
                     ("getBuffer", "()Ljava/lang/StringBuffer;") => {
+                        if self.counted_io_sink(&marker) {
+                            return self.counted_unknown(r).map(Some);
+                        }
                         Value::Ref(Some(self.io_sink_text(&marker)))
+                    }
+                    ("toByteArray", "()[B") => {
+                        if self.counted_io_sink(&marker) {
+                            return self.counted_unknown(r).map(Some);
+                        }
+                        self.io_bytes_array(self.io_sink_text(&marker).into_bytes())
+                    }
+                    ("size", "()I") => {
+                        if self.counted_io_sink(&marker) {
+                            return self.counted_unknown(r).map(Some);
+                        }
+                        Value::Int(self.io_sink_text(&marker).len() as i32)
                     }
                     _ => return Ok(None),
                 }))
@@ -33329,7 +33745,13 @@ impl<H: Host> Runtime<'_, H> {
     fn new_stream(&mut self, class: &str, method: &str, values: Vec<Value>) -> Value {
         let marker = stream_pipeline::stream_marker(class, method, self.next_stream);
         self.next_stream += 1;
-        self.streams.insert(marker.clone(), values);
+        self.streams.insert(
+            marker.clone(),
+            StreamEntry {
+                values,
+                origin: None,
+            },
+        );
         Value::Ref(Some(marker))
     }
 
@@ -33597,7 +34019,7 @@ impl<H: Host> Runtime<'_, H> {
                 }
             }
             ("isEmpty", "()Z") => Value::Int(values.is_empty() as i32),
-            _ => return self.more_stream_stages(r, &values),
+            _ => return self.more_stream_stages(r, receiver, &values),
         };
         Ok(Some(result))
     }
@@ -34683,6 +35105,8 @@ impl<H: Host> Runtime<'_, H> {
         if self.depth == 0 {
             jar_throwables::start_execution();
         }
+        let frame_id = self.next_frame_id;
+        self.next_frame_id = self.next_frame_id.wrapping_add(1);
         self.depth += 1;
         let prev_check_shape_probes = self.check_shape_probes;
         if self.shape_extraction.is_some()
@@ -34693,7 +35117,7 @@ impl<H: Host> Runtime<'_, H> {
             self.check_shape_probes = true;
         }
         stack_walk::enter(class, method);
-        let result = self.invoke_frame(class, method, desc, receiver, args);
+        let result = self.invoke_frame(class, method, desc, receiver, args, frame_id);
         stack_walk::leave();
         self.check_shape_probes = prev_check_shape_probes;
         self.depth -= 1;
@@ -35091,6 +35515,11 @@ impl<H: Host> Runtime<'_, H> {
         }
         let receiver = receiver.expect("checked above");
         let other = args.first().unwrap_or(&Value::Ref(None));
+        if self.uncertain_identity_root(receiver, r).is_some()
+            || self.uncertain_identity_root(other, r).is_some()
+        {
+            return None;
+        }
         Some(
             self.abstract_set_equals(receiver, other)
                 .map(|equal| Value::Int(i32::from(equal))),
@@ -35177,6 +35606,29 @@ impl<H: Host> Runtime<'_, H> {
         Some(self.host.unknown_operand_call(r))
     }
 
+    /// Guard uncertain identity collections and any handle derived from them
+    /// ahead of JDK skeletons, spliterators, streams, iterators, and collection
+    /// models, then fall through to `unmodifiable_member`.
+    #[inline(never)]
+    fn invoke_uncertain_identity_or_unmodifiable(
+        &mut self,
+        r: &MethodRef,
+        op: u8,
+        receiver: Option<&Value>,
+        args: &[Value],
+    ) -> Result<Option<Value>, NativeError> {
+        if let Some(value) = self.count_if_uncertain_identity_operand(r, op, receiver, args)? {
+            return Ok(Some(value));
+        }
+        if let Some(marker) = receiver.and_then(expect_ref)
+            && is_collection_owner(&r.owner)
+            && let Some(result) = self.host.unmodifiable_member(r, marker, args)
+        {
+            return result.map(Some);
+        }
+        Ok(None)
+    }
+
     /// Dispatch the collection/library models as one out-of-line stage. Each
     /// model is tried in the same order as the flat dispatcher; propagating an
     /// error lets the caller deliver it through the current jar frame.
@@ -35187,6 +35639,7 @@ impl<H: Host> Runtime<'_, H> {
         op: u8,
         receiver: Option<&Value>,
         args: &mut [Value],
+        identity_args: &[reference_identity::CallIdentity],
         class: &str,
         method: &str,
     ) -> Result<Option<Value>, NativeError> {
@@ -35211,7 +35664,9 @@ impl<H: Host> Runtime<'_, H> {
         if let Some(value) = self.invoke_guava(r, receiver, args)? {
             return Ok(Some(value));
         }
-        if let Some(value) = self.invoke_immutable_collection(r, op, receiver, args)? {
+        if let Some(value) =
+            self.invoke_immutable_collection(r, op, receiver, args, identity_args)?
+        {
             return Ok(Some(value));
         }
         self.invoke_hash_collection(r, op, receiver, args)
@@ -35286,6 +35741,12 @@ impl<H: Host> Runtime<'_, H> {
         args: &[Value],
     ) -> Result<Option<Value>, NativeError> {
         if let Some(value) = string_constructors::count(self, r)? {
+            if let Some(marker) = receiver
+                .filter(|value| jar_object::is_object(value))
+                .and_then(jar_object::object_key)
+            {
+                self.counted_strings.insert(marker.to_owned());
+            }
             return Ok(Some(value));
         }
         if let Some(value) = dfu_codec::runtime_instance_call(self, r, receiver, args)? {
@@ -35328,6 +35789,279 @@ impl<H: Host> Runtime<'_, H> {
         self.host.note_entity_data_hierarchy(&entries);
     }
 
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    fn collect_identity_args(
+        &self,
+        frame_modified_identity: bool,
+        receiver: Option<&Value>,
+        args: &[Value],
+        modified_args: &[usize],
+        file: &ClassFile,
+        class: &str,
+        method: &str,
+        desc: &str,
+        is_static: bool,
+        code: &[u8],
+        frame_id: u64,
+        at: usize,
+    ) -> Vec<reference_identity::CallIdentity> {
+        if frame_modified_identity || !receiver.is_some_and(|recv| self.tracks_identity_args(recv))
+        {
+            return Vec::new();
+        }
+        args.iter()
+            .enumerate()
+            .map(|(index, value)| {
+                if modified_args.contains(&index) {
+                    return None;
+                }
+                reference_identity::call_identity(
+                    file, class, method, desc, is_static, code, frame_id, at, index, value,
+                )
+            })
+            .collect()
+    }
+
+    #[inline(never)]
+    fn dispatch_counted_string_call(
+        &mut self,
+        r: &MethodRef,
+        receiver: Option<&Value>,
+        args: &[Value],
+    ) -> Result<Option<Value>, NativeError> {
+        if !self.contains_counted_string(receiver, args) {
+            return Ok(None);
+        }
+        let counted_write = matches!(
+            (r.owner.as_str(), r.name.as_str()),
+            (
+                "java/io/Writer"
+                    | "java/io/BufferedWriter"
+                    | "java/io/FileWriter"
+                    | "java/io/OutputStreamWriter"
+                    | "java/io/StringWriter"
+                    | "java/io/PrintWriter"
+                    | "java/io/PrintStream"
+                    | "java/io/OutputStream",
+                "append" | "write" | "print" | "println" | "printf" | "format"
+            )
+        );
+        if counted_write
+            && let Some(receiver) = receiver
+            && let Some(marker) = jar_object::object_key(receiver)
+        {
+            self.mark_counted_io_sink(marker);
+        }
+        if r.owner == "java/util/StringJoiner"
+            && matches!(r.name.as_str(), "add" | "merge")
+            && let Some(receiver) = receiver
+        {
+            self.mark_counted_text_object(receiver);
+        }
+        if r.owner == "java/util/Formatter"
+            && r.name == "format"
+            && let Some(receiver) = receiver
+        {
+            self.mark_counted_text_object(receiver);
+        }
+        let counted = self.counted_unknown(r)?;
+        // `append`/`insert` return their builder. The host's
+        // neutral result may be null, but Java still returns
+        // the receiver whose text is now opaque.
+        let builder_result = matches!(
+            (r.owner.as_str(), r.name.as_str()),
+            (
+                "java/lang/StringBuilder" | "java/lang/StringBuffer",
+                "append" | "insert"
+            )
+        );
+        // A text object constructed from a counted String
+        // (`new String(counted)`, `new StringBuilder(counted)`)
+        // has opaque text too. A constructor returns nothing,
+        // so its receiver is what must be tracked.
+        let text_constructor = r.name == "<init>"
+            && matches!(
+                r.owner.as_str(),
+                "java/lang/String" | "java/lang/StringBuilder" | "java/lang/StringBuffer"
+            );
+        if (builder_result || text_constructor)
+            && let Some(key) = receiver.and_then(jar_object::object_key)
+        {
+            self.counted_strings.insert(key.to_owned());
+        }
+        Ok(Some(if builder_result {
+            receiver.cloned().unwrap_or(counted)
+        } else {
+            counted
+        }))
+    }
+
+    #[inline(never)]
+    fn post_dispatch_counted_taint(
+        &mut self,
+        r: &MethodRef,
+        jar_body: bool,
+        taint_receiver: Option<&Value>,
+        args: &[Value],
+    ) {
+        if crate::runtime::guava_multimap::counted_call_may_mutate(r) {
+            crate::runtime::guava_multimap::taint_operands(self, taint_receiver, args);
+        }
+        if !jar_body && !self.counted_call_is_identity_inert(r, taint_receiver, args) {
+            self.bump_identity_epoch();
+        }
+    }
+
+    #[inline(never)]
+    fn count_if_acmp_counted_string(
+        &mut self,
+        lhs: &Value,
+        rhs: &Value,
+    ) -> Result<(), NativeError> {
+        if self.is_counted_string(lhs) || self.is_counted_string(rhs) {
+            self.host.unknown_operand_call(&MethodRef {
+                owner: "java/lang/Object".into(),
+                name: "if_acmp".into(),
+                descriptor: "(Ljava/lang/Object;Ljava/lang/Object;)Z".into(),
+            })?;
+        }
+        Ok(())
+    }
+
+    #[inline(never)]
+    fn invoke_string_or_builder(
+        &mut self,
+        r: &MethodRef,
+        receiver: Option<&Value>,
+        args: &[Value],
+    ) -> Result<Option<Value>, NativeError> {
+        if let Some(value) = self.invoke_string_content_equals(r, receiver, args)? {
+            return Ok(Some(value));
+        }
+        self.invoke_string_builder(r, receiver, args)
+    }
+
+    #[inline(never)]
+    fn dispatch_string_concat_recipe(
+        &mut self,
+        descriptor: &str,
+        recipe: &str,
+        constants: &[String],
+        mut captured: Vec<Value>,
+        class: &str,
+        method: &str,
+    ) -> Result<Option<Value>, NativeError> {
+        // A String from a constructor Decaf counted counts on every
+        // later use (#423); its text is not known, so the whole
+        // concatenation is counted, never joined from its marker.
+        if captured.iter().any(|value| self.is_counted_string(value)) {
+            let counted = self.counted_unknown(&MethodRef {
+                owner: "java/lang/invoke/StringConcatFactory".into(),
+                name: "makeConcatWithConstants".into(),
+                descriptor: descriptor.to_owned(),
+            })?;
+            return Ok(Some(counted));
+        }
+        let mut arguments = descriptor_arguments(descriptor);
+        // A `subList` operand's `toString` checks its list (`mod_count.rs`).
+        if let Some(answer) = self.sync_sub_list_operands(&captured)? {
+            return Ok(Some(answer));
+        }
+        if self.concat_object_texts(&mut captured, &mut arguments, class, method)? {
+            let counted = self.counted_unknown(&MethodRef {
+                owner: "java/lang/invoke/StringConcatFactory".into(),
+                name: "makeConcatWithConstants".into(),
+                descriptor: descriptor.to_owned(),
+            })?;
+            return Ok(Some(counted));
+        }
+        // A `StringBuilder` operand concatenates as its text
+        // (`String.valueOf` calls its `toString`), not as the
+        // builder's object marker.
+        for value in &mut captured {
+            if let Some(text) = self.builder_text(value) {
+                *value = Value::Ref(Some(text.clone()));
+            }
+        }
+        // An object a library model answers `toString` for (a
+        // Guava `TypeToken`, a proxy) concatenates as that text.
+        for value in &mut captured {
+            if let Some(text) = self.library_to_string(value, class, method)? {
+                *value = Value::Ref(Some(text));
+            }
+        }
+        // Every other model object prints its own `toString`
+        // too (`"" + id` is `a:x`, not the id's marker). A
+        // `String` operand is already its text.
+        for (value, argument) in captured.iter_mut().zip(&arguments) {
+            if argument != "Ljava/lang/String;"
+                && let Some(text) = self.host.modelled_to_string_checked(value)?
+            {
+                *value = Value::Ref(Some(text));
+            }
+        }
+        // A `Class` operand naming a class a family kind owns prints
+        // `Class.toString` or is counted (`owned_class.rs`).
+        for (value, argument) in captured.iter_mut().zip(&arguments) {
+            if argument == "Ljava/lang/Class;"
+                && let Some(text) = self.owned_class_text(value)?
+            {
+                *value = Value::Ref(Some(text));
+            }
+        }
+        let mut joined = String::new();
+        let (mut next_arg, mut next_constant) = (0, 0);
+        let mut expand = |placeholder: u8,
+                          joined: &mut String,
+                          next_arg: &mut usize,
+                          next_constant: &mut usize|
+         -> Result<(), NativeError> {
+            match placeholder {
+                1 => {
+                    let value = captured.get(*next_arg).ok_or_else(|| {
+                        NativeError::Metadata(
+                            "concat recipe has more arguments than captures".into(),
+                        )
+                    })?;
+                    let argument = arguments
+                        .get(*next_arg)
+                        .map_or("Ljava/lang/Object;", String::as_str);
+                    joined.push_str(&java_value_text(&mut *self.host, value, argument)?);
+                    *next_arg += 1;
+                }
+                _ => {
+                    let constant = constants.get(*next_constant).ok_or_else(|| {
+                        NativeError::Metadata(
+                            "concat recipe has more constants than the bootstrap".into(),
+                        )
+                    })?;
+                    joined.push_str(constant);
+                    *next_constant += 1;
+                }
+            }
+            Ok(())
+        };
+        if recipe.is_empty() {
+            for (position, value) in captured.iter().enumerate() {
+                let argument = arguments
+                    .get(position)
+                    .map_or("Ljava/lang/Object;", String::as_str);
+                joined.push_str(&java_value_text(&mut *self.host, value, argument)?);
+            }
+        } else {
+            for ch in recipe.chars() {
+                match ch {
+                    '\u{1}' | '\u{2}' => {
+                        expand(ch as u8, &mut joined, &mut next_arg, &mut next_constant)?
+                    }
+                    other => joined.push(other),
+                }
+            }
+        }
+        Ok((return_desc(descriptor) != "V").then_some(Value::Ref(Some(joined))))
+    }
+
     fn invoke_frame(
         &mut self,
         class: &str,
@@ -35335,6 +36069,7 @@ impl<H: Host> Runtime<'_, H> {
         desc: &str,
         receiver: Option<Value>,
         args: &[Value],
+        frame_id: u64,
     ) -> Result<Value, NativeError> {
         // Kotlin stdlib facades and holder methods are registration/runtime
         // surfaces: the native interpreter records their exact bounded result
@@ -35372,7 +36107,10 @@ impl<H: Host> Runtime<'_, H> {
                     descriptor: desc.to_owned(),
                 };
                 return match receiver.as_ref() {
-                    Some(receiver) => self.host.invoke_instance(&r, receiver, args),
+                    Some(receiver) => {
+                        self.note_string_intern(&r, Some(receiver));
+                        self.host.invoke_instance(&r, receiver, args)
+                    }
                     None => self.host.invoke(&r, args),
                 };
             }
@@ -35395,7 +36133,10 @@ impl<H: Host> Runtime<'_, H> {
         {
             return match redirect {
                 JarCallRedirect::Host(r) => match receiver.as_ref() {
-                    Some(receiver) => self.host.invoke_instance(&r, receiver, args),
+                    Some(receiver) => {
+                        self.note_string_intern(&r, Some(receiver));
+                        self.host.invoke_instance(&r, receiver, args)
+                    }
                     None => {
                         if r.owner == "net/minecraft/network/syncher/SynchedEntityData"
                             && r.name == "defineId"
@@ -35479,7 +36220,10 @@ impl<H: Host> Runtime<'_, H> {
                 return value;
             }
             return match receiver.as_ref() {
-                Some(receiver) => self.host.invoke_instance(&r, receiver, args),
+                Some(receiver) => {
+                    self.note_string_intern(&r, Some(receiver));
+                    self.host.invoke_instance(&r, receiver, args)
+                }
                 None => {
                     if r.owner == "net/minecraft/network/syncher/SynchedEntityData"
                         && r.name == "defineId"
@@ -35493,6 +36237,11 @@ impl<H: Host> Runtime<'_, H> {
         // `if_acmp`'s producer analysis, looked up once per frame
         // (`reference_identity.rs`).
         let mut identity = reference_identity::FrameIdentity::default();
+        // Set when a Mixin modifier (`@ModifyVariable` on a reference load or
+        // store, or an anchor hook replacing a reference field/call) alters a
+        // reference in this frame so static bytecode provenance is no longer
+        // relied upon.
+        let mut frame_modified_identity = false;
         let mut locals = vec![Value::Ref(None); target.max_locals.max(1) as usize];
         let mut local = 0;
         if !target.is_static() {
@@ -35594,16 +36343,29 @@ impl<H: Host> Runtime<'_, H> {
                         method,
                         desc,
                         at,
+                        &mut frame_modified_identity,
                     )?);
                 }
                 0x12 => {
                     let i = *code.get(pc).ok_or(NativeError::Truncated)? as u16;
                     pc += 1;
-                    stack.push(constant_value(&file.pool, i)?);
+                    let value = constant_value(&file.pool, i)?;
+                    if let Value::Ref(Some(text)) = &value
+                        && matches!(file.pool.get(i as usize), Some(Cp::String(_)))
+                    {
+                        self.string_pool.note_literal(text);
+                    }
+                    stack.push(value);
                 }
                 0x13 => {
                     let i = read_u16(code, &mut pc)?;
-                    stack.push(constant_value(&file.pool, i)?);
+                    let value = constant_value(&file.pool, i)?;
+                    if let Value::Ref(Some(text)) = &value
+                        && matches!(file.pool.get(i as usize), Some(Cp::String(_)))
+                    {
+                        self.string_pool.note_literal(text);
+                    }
+                    stack.push(value);
                 }
                 0x14 => {
                     let i = read_u16(code, &mut pc)?;
@@ -35627,6 +36389,7 @@ impl<H: Host> Runtime<'_, H> {
                                 method,
                                 desc,
                                 at,
+                                &mut frame_modified_identity,
                             )?);
                         }
                         0x36..=0x3a => {
@@ -35640,6 +36403,7 @@ impl<H: Host> Runtime<'_, H> {
                                 method,
                                 desc,
                                 at,
+                                &mut frame_modified_identity,
                             )?;
                             if let Some(local) = locals.get_mut(index) {
                                 *local = value;
@@ -35921,6 +36685,7 @@ impl<H: Host> Runtime<'_, H> {
                         method,
                         desc,
                         at,
+                        &mut frame_modified_identity,
                     )?);
                 }
                 0x1e..=0x21 => {
@@ -35935,6 +36700,7 @@ impl<H: Host> Runtime<'_, H> {
                         method,
                         desc,
                         at,
+                        &mut frame_modified_identity,
                     )?);
                 }
                 0x22..=0x25 => {
@@ -35949,6 +36715,7 @@ impl<H: Host> Runtime<'_, H> {
                         method,
                         desc,
                         at,
+                        &mut frame_modified_identity,
                     )?);
                 }
                 0x26..=0x29 => {
@@ -35963,6 +36730,7 @@ impl<H: Host> Runtime<'_, H> {
                         method,
                         desc,
                         at,
+                        &mut frame_modified_identity,
                     )?);
                 }
                 0x2a..=0x2d => {
@@ -35977,12 +36745,13 @@ impl<H: Host> Runtime<'_, H> {
                         method,
                         desc,
                         at,
+                        &mut frame_modified_identity,
                     )?);
                 }
                 0x3b..=0x3e => {
                     let index = (op - 0x3b) as usize;
                     let value = pop(&mut stack, class, method, at)?;
-                    let value = self.dispatch_modify_variable(
+                    locals[index] = self.dispatch_modify_variable(
                         VariableAnchor::Store,
                         index,
                         "I",
@@ -35991,13 +36760,13 @@ impl<H: Host> Runtime<'_, H> {
                         method,
                         desc,
                         at,
+                        &mut frame_modified_identity,
                     )?;
-                    locals[index] = value;
                 }
                 0x3f..=0x42 => {
                     let index = (op - 0x3f) as usize;
                     let value = pop(&mut stack, class, method, at)?;
-                    let value = self.dispatch_modify_variable(
+                    locals[index] = self.dispatch_modify_variable(
                         VariableAnchor::Store,
                         index,
                         "J",
@@ -36006,13 +36775,13 @@ impl<H: Host> Runtime<'_, H> {
                         method,
                         desc,
                         at,
+                        &mut frame_modified_identity,
                     )?;
-                    locals[index] = value;
                 }
                 0x43..=0x46 => {
                     let index = (op - 0x43) as usize;
                     let value = pop(&mut stack, class, method, at)?;
-                    let value = self.dispatch_modify_variable(
+                    locals[index] = self.dispatch_modify_variable(
                         VariableAnchor::Store,
                         index,
                         "F",
@@ -36021,13 +36790,13 @@ impl<H: Host> Runtime<'_, H> {
                         method,
                         desc,
                         at,
+                        &mut frame_modified_identity,
                     )?;
-                    locals[index] = value;
                 }
                 0x47..=0x4a => {
                     let index = (op - 0x47) as usize;
                     let value = pop(&mut stack, class, method, at)?;
-                    let value = self.dispatch_modify_variable(
+                    locals[index] = self.dispatch_modify_variable(
                         VariableAnchor::Store,
                         index,
                         "D",
@@ -36036,13 +36805,13 @@ impl<H: Host> Runtime<'_, H> {
                         method,
                         desc,
                         at,
+                        &mut frame_modified_identity,
                     )?;
-                    locals[index] = value;
                 }
                 0x4b..=0x4e => {
                     let index = (op - 0x4b) as usize;
                     let value = pop(&mut stack, class, method, at)?;
-                    let value = self.dispatch_modify_variable(
+                    locals[index] = self.dispatch_modify_variable(
                         VariableAnchor::Store,
                         index,
                         "Ljava/lang/Object;",
@@ -36051,8 +36820,8 @@ impl<H: Host> Runtime<'_, H> {
                         method,
                         desc,
                         at,
+                        &mut frame_modified_identity,
                     )?;
-                    locals[index] = value;
                 }
                 0x36..=0x3a => {
                     let index = *code.get(pc).ok_or(NativeError::Truncated)? as usize;
@@ -36067,6 +36836,7 @@ impl<H: Host> Runtime<'_, H> {
                         method,
                         desc,
                         at,
+                        &mut frame_modified_identity,
                     )?;
                     if let Some(local) = locals.get_mut(index) {
                         *local = value;
@@ -36193,6 +36963,10 @@ impl<H: Host> Runtime<'_, H> {
                 0xa5 | 0xa6 => {
                     let rhs = pop(&mut stack, class, method, at)?;
                     let lhs = pop(&mut stack, class, method, at)?;
+                    // A String from a constructor Decaf counted (an unmodelled
+                    // charset, ...) counts on every later use, `==` included
+                    // (#423): record the comparison before answering it.
+                    self.count_if_acmp_counted_string(&lhs, &rhs)?;
                     // Identity, not value equality, for boxes and strings
                     // (`reference_identity.rs`).
                     let same = self.same_reference(
@@ -36205,6 +36979,7 @@ impl<H: Host> Runtime<'_, H> {
                         at,
                         &lhs,
                         &rhs,
+                        frame_modified_identity,
                     )?;
                     let take = if op == 0xa5 { same } else { !same };
                     let offset = read_i16(code, &mut pc)?;
@@ -36575,6 +37350,10 @@ impl<H: Host> Runtime<'_, H> {
                     invoke_or_catch!(at, self.ensure_initialized(&field.owner));
                     let outcome =
                         self.dispatch_field_anchor(&field, false, None, class, method, desc, at)?;
+                    if outcome != AnchorOutcome::Normal && field.descriptor.starts_with(['L', '['])
+                    {
+                        frame_modified_identity = true;
+                    }
                     let value = match outcome {
                         AnchorOutcome::Normal => {
                             if let Some(value) = gson_model::static_field(&field)
@@ -36654,6 +37433,9 @@ impl<H: Host> Runtime<'_, H> {
                     let receiver = pop(&mut stack, class, method, at)?;
                     let outcome =
                         self.dispatch_field_anchor(&r, false, None, class, method, desc, at)?;
+                    if outcome != AnchorOutcome::Normal && r.descriptor.starts_with(['L', '[']) {
+                        frame_modified_identity = true;
+                    }
                     let value = match outcome {
                         AnchorOutcome::Normal if receiver == Value::Ref(None) => {
                             invoke_or_catch!(at, Err(null_checks::read_field_on_null(&r)))
@@ -36742,7 +37524,15 @@ impl<H: Host> Runtime<'_, H> {
                     // `@ModifyArg` replaces one argument before the call runs;
                     // a redirect that replaces the whole call sees (and then
                     // discards) the modified value, deterministically.
-                    self.dispatch_modify_arg(&r, &mut args, class, method, desc, at)?;
+                    let modified_args =
+                        self.dispatch_modify_arg(&r, &mut args, class, method, desc, at)?;
+                    if !modified_args.is_empty()
+                        && r.owner == "java/lang/String"
+                        && r.name == "valueOf"
+                        && r.descriptor == "(Ljava/lang/Object;)Ljava/lang/String;"
+                    {
+                        frame_modified_identity = true;
+                    }
                     if self.check_shape_probes
                         && (receiver.as_ref().is_some_and(is_shape_probe)
                             || args.iter().any(is_shape_probe))
@@ -36801,6 +37591,11 @@ impl<H: Host> Runtime<'_, H> {
                             AnchorOutcome::Suppress => Some(Value::default_for(&r.descriptor)),
                             AnchorOutcome::Normal => None,
                         };
+                    if anchor_replacement.is_some()
+                        && return_desc(&r.descriptor).starts_with(['L', '['])
+                    {
+                        frame_modified_identity = true;
+                    }
                     // A synchronized view runs every call on the collection it
                     // wraps (`synchronized_views.rs`): the collection models
                     // below answer for that collection, in its own order.
@@ -36814,6 +37609,25 @@ impl<H: Host> Runtime<'_, H> {
                         }
                         receiver => receiver,
                     };
+                    // Compute argument identity provenance after `@ModifyArg`
+                    // (and synchronized-view unwrapping) only for identity
+                    // collections and their views. A modified argument or a
+                    // frame whose reference locals were altered drops its
+                    // static token so equal-content identity operations count.
+                    let identity_args = self.collect_identity_args(
+                        frame_modified_identity,
+                        receiver.as_ref(),
+                        &args,
+                        &modified_args,
+                        file,
+                        class,
+                        method,
+                        desc,
+                        target.is_static(),
+                        code,
+                        frame_id,
+                        at,
+                    );
                     // A call that may move a host collection's `modCount`
                     // (`mod_count.rs`), checked and noted around the dispatch.
                     let mod_token = if anchor_replacement.is_none() {
@@ -36861,6 +37675,14 @@ impl<H: Host> Runtime<'_, H> {
                     {
                         dispatched = Some(value);
                     }
+                    if dispatched.is_none()
+                        && let Some(value) = invoke_or_catch!(
+                            at,
+                            self.dispatch_counted_string_call(&r, receiver.as_ref(), &args)
+                        )
+                    {
+                        dispatched = Some(value);
+                    }
                     // `StateDefinition.Builder.add(Property...)` inside a jar block's
                     // `createBlockStateDefinition`: each property is recorded for the block's
                     // declaration (or the duplicate counted), and `add` returns the builder.
@@ -36900,6 +37722,9 @@ impl<H: Host> Runtime<'_, H> {
                             // hook above replaced the call, so it never ran.
                             invoke_or_catch!(at, Err(null_checks::invoke_on_null(&r)))
                         });
+                    }
+                    if dispatched.is_none() {
+                        self.note_string_intern(&r, receiver.as_ref());
                     }
                     if dispatched.is_none()
                         && let Some(value) = r
@@ -37258,14 +38083,17 @@ impl<H: Host> Runtime<'_, H> {
                         dispatched = Some(invoke_or_catch!(at, value));
                     }
                     if dispatched.is_none()
-                        && let Some(value) =
-                            receiver.as_ref().and_then(expect_ref).and_then(|marker| {
-                                is_collection_owner(&r.owner)
-                                    .then(|| self.host.unmodifiable_member(&r, marker, &args))
-                                    .flatten()
-                            })
+                        && let Some(value) = invoke_or_catch!(
+                            at,
+                            self.invoke_uncertain_identity_or_unmodifiable(
+                                &r,
+                                op,
+                                receiver.as_ref(),
+                                &args
+                            )
+                        )
                     {
-                        dispatched = Some(invoke_or_catch!(at, value));
+                        dispatched = Some(value);
                     }
                     if dispatched.is_none()
                         && let Some(value) = invoke_or_catch!(
@@ -37319,6 +38147,7 @@ impl<H: Host> Runtime<'_, H> {
                                 op,
                                 receiver.as_ref(),
                                 &mut args,
+                                &identity_args,
                                 class,
                                 method
                             )
@@ -37476,10 +38305,18 @@ impl<H: Host> Runtime<'_, H> {
                             match invoke_or_catch!(at, self.java_format(None, &format, values)) {
                                 Some(text) => Value::Ref(Some(text)),
                                 None => {
-                                    invoke_or_catch!(
-                                        at,
-                                        self.host.invoke_instance(&r, &format, &args)
-                                    )
+                                    if self.contains_counted_string_deep(&format)
+                                        || args
+                                            .iter()
+                                            .any(|value| self.contains_counted_string_deep(value))
+                                    {
+                                        invoke_or_catch!(at, self.counted_unknown(&r))
+                                    } else {
+                                        invoke_or_catch!(
+                                            at,
+                                            self.host.invoke_instance(&r, &format, &args)
+                                        )
+                                    }
                                 }
                             }
                         });
@@ -37779,13 +38616,10 @@ impl<H: Host> Runtime<'_, H> {
                     if dispatched.is_none()
                         && let Some(value) = invoke_or_catch!(
                             at,
-                            self.invoke_string_builder(&r, receiver.as_ref(), &args)
+                            self.invoke_string_or_builder(&r, receiver.as_ref(), &args)
                         )
                     {
-                        dispatched = Some({
-                            // `jdk_string_builder.rs`: its index checks throw.
-                            value
-                        });
+                        dispatched = Some(value);
                     }
                     if dispatched.is_none()
                         && let Some(value) = invoke_or_catch!(
@@ -38031,10 +38865,13 @@ impl<H: Host> Runtime<'_, H> {
                     // operand.  Read-only JDK operations retain exact later multimap reads.
                     // Nested reach through arrays, collections, fields, or lambda captures is a
                     // known gap tracked separately for every host collection.
-                    if self.host.counted_unknown_calls() > unknown_before
-                        && crate::runtime::guava_multimap::counted_call_may_mutate(&r)
-                    {
-                        crate::runtime::guava_multimap::taint_operands(self, taint_receiver.as_ref(), &args);
+                    if self.host.counted_unknown_calls() > unknown_before {
+                        self.post_dispatch_counted_taint(
+                            &r,
+                            jar_body,
+                            taint_receiver.as_ref(),
+                            &args,
+                        );
                     }
                     let value = self.materialize_host_value(value);
                     // No JDK or library API answers a `null` Optional: a host
@@ -38098,124 +38935,18 @@ impl<H: Host> Runtime<'_, H> {
                     // build keys, ids and exception messages through these
                     // sites, and a marker there is not the string Java returns.
                     if let Some((recipe, constants)) = file.string_concat_recipe(index) {
-                        let mut arguments = descriptor_arguments(&descriptor);
-                        // An object operand concatenates as its own
-                        // `toString` (`jar_text.rs`), then reads as a `String`.
-                        let mut captured = captured;
-                        // A `subList` operand's `toString` checks its list
-                        // (`mod_count.rs`).
-                        if let Some(answer) =
-                            invoke_or_catch!(at, self.sync_sub_list_operands(&captured))
-                        {
-                            stack.push(answer);
-                            continue;
-                        }
-                        invoke_or_catch!(
+                        if let Some(answer) = invoke_or_catch!(
                             at,
-                            self.concat_object_texts(&mut captured, &mut arguments, class, method)
-                        );
-                        // A `StringBuilder` operand concatenates as its text
-                        // (`String.valueOf` calls its `toString`), not as the
-                        // builder's object marker.
-                        let captured = captured
-                            .into_iter()
-                            .map(|value| match self.builder_text(&value) {
-                                Some(text) => Value::Ref(Some(text.clone())),
-                                None => value,
-                            })
-                            .collect::<Vec<_>>();
-                        // An object a library model answers `toString` for (a
-                        // Guava `TypeToken`, a proxy) concatenates as that text.
-                        let mut captured = captured;
-                        for value in &mut captured {
-                            if let Some(text) = self.library_to_string(value, class, method)? {
-                                *value = Value::Ref(Some(text));
-                            }
-                        }
-                        // Every other model object prints its own `toString`
-                        // too (`"" + id` is `a:x`, not the id's marker). A
-                        // `String` operand is already its text.
-                        for (value, argument) in captured.iter_mut().zip(&arguments) {
-                            if argument != "Ljava/lang/String;"
-                                && let Some(text) = self.host.modelled_to_string_checked(value)?
-                            {
-                                *value = Value::Ref(Some(text));
-                            }
-                        }
-                        // A `Class` operand naming a class a family kind owns prints
-                        // `Class.toString` or is counted (`owned_class.rs`).
-                        for (value, argument) in captured.iter_mut().zip(&arguments) {
-                            if argument == "Ljava/lang/Class;"
-                                && let Some(text) =
-                                    invoke_or_catch!(at, self.owned_class_text(value))
-                            {
-                                *value = Value::Ref(Some(text));
-                            }
-                        }
-                        let mut joined = String::new();
-                        let (mut next_arg, mut next_constant) = (0, 0);
-                        let mut expand = |placeholder: u8,
-                                          joined: &mut String,
-                                          next_arg: &mut usize,
-                                          next_constant: &mut usize|
-                         -> Result<(), NativeError> {
-                            match placeholder {
-                                1 => {
-                                    let value = captured.get(*next_arg).ok_or_else(|| {
-                                        NativeError::Metadata(
-                                            "concat recipe has more arguments than captures".into(),
-                                        )
-                                    })?;
-                                    let argument = arguments
-                                        .get(*next_arg)
-                                        .map_or("Ljava/lang/Object;", String::as_str);
-                                    joined.push_str(&java_value_text(
-                                        &mut *self.host,
-                                        value,
-                                        argument,
-                                    )?);
-                                    *next_arg += 1;
-                                }
-                                _ => {
-                                    let constant =
-                                        constants.get(*next_constant).ok_or_else(|| {
-                                            NativeError::Metadata(
-                                            "concat recipe has more constants than the bootstrap"
-                                                .into(),
-                                        )
-                                        })?;
-                                    joined.push_str(constant);
-                                    *next_constant += 1;
-                                }
-                            }
-                            Ok(())
-                        };
-                        if recipe.is_empty() {
-                            for (position, value) in captured.iter().enumerate() {
-                                let argument = arguments
-                                    .get(position)
-                                    .map_or("Ljava/lang/Object;", String::as_str);
-                                joined.push_str(&java_value_text(
-                                    &mut *self.host,
-                                    value,
-                                    argument,
-                                )?);
-                            }
-                        } else {
-                            for ch in recipe.chars() {
-                                match ch {
-                                    '\u{1}' | '\u{2}' => expand(
-                                        ch as u8,
-                                        &mut joined,
-                                        &mut next_arg,
-                                        &mut next_constant,
-                                    )?,
-                                    other => joined.push(other),
-                                }
-                            }
-                        }
-                        if return_desc(&descriptor) != "V" {
-                            stack.push(Value::Ref(Some(joined)));
+                            self.dispatch_string_concat_recipe(
+                                &descriptor,
+                                &recipe,
+                                &constants,
+                                captured,
+                                class,
+                                method,
+                            )
+                        ) {
+                            stack.push(answer);
                         }
                         continue;
                     }
@@ -42897,6 +43628,10 @@ mod tests {
             pipelines: Default::default(),
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
+            counted_strings: std::collections::BTreeSet::new(),
+            identity_collections: immutable_collections::IdentityCollections::default(),
+            string_pool: reference_identity::StringPoolState::default(),
+            counted_text_objects: std::collections::BTreeSet::new(),
             gson_writers: BTreeMap::new(),
             string_builder_capacities: BTreeMap::new(),
 
@@ -42911,6 +43646,7 @@ mod tests {
             io_writer_bytes: BTreeMap::new(),
             io_stream_positions: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
+            io_writer_sinks: BTreeMap::new(),
             io_file_bytes: BTreeMap::new(),
             io_paths: BTreeMap::new(),
             io_files: BTreeMap::new(),
@@ -42926,6 +43662,7 @@ mod tests {
             stream_plan: Default::default(),
             store_verdict: Default::default(),
             depth: 0,
+            next_frame_id: 0,
             shape_extraction: None,
             check_shape_probes: false,
             budget: &ExecutionBudget::UNBOUNDED,
@@ -42979,6 +43716,10 @@ mod tests {
             pipelines: Default::default(),
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
+            counted_strings: std::collections::BTreeSet::new(),
+            identity_collections: immutable_collections::IdentityCollections::default(),
+            string_pool: reference_identity::StringPoolState::default(),
+            counted_text_objects: std::collections::BTreeSet::new(),
             gson_writers: BTreeMap::new(),
             string_builder_capacities: BTreeMap::new(),
 
@@ -42993,6 +43734,7 @@ mod tests {
             io_writer_bytes: BTreeMap::new(),
             io_stream_positions: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
+            io_writer_sinks: BTreeMap::new(),
             io_file_bytes: BTreeMap::new(),
             io_paths: BTreeMap::new(),
             io_files: BTreeMap::new(),
@@ -43008,6 +43750,7 @@ mod tests {
             stream_plan: Default::default(),
             store_verdict: Default::default(),
             depth: 0,
+            next_frame_id: 0,
             shape_extraction: None,
             check_shape_probes: false,
             budget: &ExecutionBudget::UNBOUNDED,
@@ -50141,6 +50884,10 @@ mandatory = true
             pipelines: Default::default(),
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
+            counted_strings: std::collections::BTreeSet::new(),
+            identity_collections: immutable_collections::IdentityCollections::default(),
+            string_pool: reference_identity::StringPoolState::default(),
+            counted_text_objects: std::collections::BTreeSet::new(),
             gson_writers: BTreeMap::new(),
             string_builder_capacities: BTreeMap::new(),
 
@@ -50155,6 +50902,7 @@ mandatory = true
             io_writer_bytes: BTreeMap::new(),
             io_stream_positions: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
+            io_writer_sinks: BTreeMap::new(),
             io_file_bytes: BTreeMap::new(),
             io_paths: BTreeMap::new(),
             io_files: BTreeMap::new(),
@@ -50170,6 +50918,7 @@ mandatory = true
             stream_plan: Default::default(),
             store_verdict: Default::default(),
             depth: 0,
+            next_frame_id: 0,
             shape_extraction: None,
             check_shape_probes: false,
             budget: &ExecutionBudget::UNBOUNDED,
@@ -50365,6 +51114,10 @@ mandatory = true
             pipelines: Default::default(),
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
+            counted_strings: std::collections::BTreeSet::new(),
+            identity_collections: immutable_collections::IdentityCollections::default(),
+            string_pool: reference_identity::StringPoolState::default(),
+            counted_text_objects: std::collections::BTreeSet::new(),
             gson_writers: BTreeMap::new(),
             string_builder_capacities: BTreeMap::new(),
 
@@ -50379,6 +51132,7 @@ mandatory = true
             io_writer_bytes: BTreeMap::new(),
             io_stream_positions: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
+            io_writer_sinks: BTreeMap::new(),
             io_file_bytes: BTreeMap::new(),
             io_paths: BTreeMap::new(),
             io_files: BTreeMap::new(),
@@ -50394,6 +51148,7 @@ mandatory = true
             stream_plan: Default::default(),
             store_verdict: Default::default(),
             depth: 0,
+            next_frame_id: 0,
             shape_extraction: None,
             check_shape_probes: false,
             budget: &ExecutionBudget::UNBOUNDED,
@@ -50564,6 +51319,10 @@ mandatory = true
             pipelines: Default::default(),
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
+            counted_strings: std::collections::BTreeSet::new(),
+            identity_collections: immutable_collections::IdentityCollections::default(),
+            string_pool: reference_identity::StringPoolState::default(),
+            counted_text_objects: std::collections::BTreeSet::new(),
             gson_writers: BTreeMap::new(),
             string_builder_capacities: BTreeMap::new(),
 
@@ -50578,6 +51337,7 @@ mandatory = true
             io_writer_bytes: BTreeMap::new(),
             io_stream_positions: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
+            io_writer_sinks: BTreeMap::new(),
             io_file_bytes: BTreeMap::new(),
             io_paths: BTreeMap::new(),
             io_files: BTreeMap::new(),
@@ -50593,6 +51353,7 @@ mandatory = true
             stream_plan: Default::default(),
             store_verdict: Default::default(),
             depth: 0,
+            next_frame_id: 0,
             shape_extraction: None,
             check_shape_probes: false,
             budget: &ExecutionBudget::UNBOUNDED,
@@ -50939,6 +51700,10 @@ mandatory = true
             pipelines: Default::default(),
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
+            counted_strings: std::collections::BTreeSet::new(),
+            identity_collections: immutable_collections::IdentityCollections::default(),
+            string_pool: reference_identity::StringPoolState::default(),
+            counted_text_objects: std::collections::BTreeSet::new(),
             gson_writers: BTreeMap::new(),
             string_builder_capacities: BTreeMap::new(),
 
@@ -50953,6 +51718,7 @@ mandatory = true
             io_writer_bytes: BTreeMap::new(),
             io_stream_positions: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
+            io_writer_sinks: BTreeMap::new(),
             io_file_bytes: BTreeMap::new(),
             io_paths: BTreeMap::new(),
             io_files: BTreeMap::new(),
@@ -50968,6 +51734,7 @@ mandatory = true
             stream_plan: Default::default(),
             store_verdict: Default::default(),
             depth: 0,
+            next_frame_id: 0,
             shape_extraction: None,
             check_shape_probes: false,
             budget: &ExecutionBudget::UNBOUNDED,
@@ -51258,6 +52025,10 @@ mandatory = true
             pipelines: Default::default(),
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
+            counted_strings: std::collections::BTreeSet::new(),
+            identity_collections: immutable_collections::IdentityCollections::default(),
+            string_pool: reference_identity::StringPoolState::default(),
+            counted_text_objects: std::collections::BTreeSet::new(),
             gson_writers: BTreeMap::new(),
             string_builder_capacities: BTreeMap::new(),
 
@@ -51272,6 +52043,7 @@ mandatory = true
             io_writer_bytes: BTreeMap::new(),
             io_stream_positions: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
+            io_writer_sinks: BTreeMap::new(),
             io_file_bytes: BTreeMap::new(),
             io_paths: BTreeMap::new(),
             io_files: BTreeMap::new(),
@@ -51287,6 +52059,7 @@ mandatory = true
             stream_plan: Default::default(),
             store_verdict: Default::default(),
             depth: 0,
+            next_frame_id: 0,
             shape_extraction: None,
             check_shape_probes: false,
             budget: &ExecutionBudget::UNBOUNDED,
@@ -56535,6 +57308,10 @@ mandatory = true
             pipelines: Default::default(),
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
+            counted_strings: std::collections::BTreeSet::new(),
+            identity_collections: immutable_collections::IdentityCollections::default(),
+            string_pool: reference_identity::StringPoolState::default(),
+            counted_text_objects: std::collections::BTreeSet::new(),
             gson_writers: BTreeMap::new(),
             string_builder_capacities: BTreeMap::new(),
 
@@ -56549,6 +57326,7 @@ mandatory = true
             io_writer_bytes: BTreeMap::new(),
             io_stream_positions: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
+            io_writer_sinks: BTreeMap::new(),
             io_file_bytes: BTreeMap::new(),
             io_paths: BTreeMap::new(),
             io_files: BTreeMap::new(),
@@ -56564,6 +57342,7 @@ mandatory = true
             stream_plan: Default::default(),
             store_verdict: Default::default(),
             depth: 0,
+            next_frame_id: 0,
             shape_extraction: None,
             check_shape_probes: false,
             budget: &ExecutionBudget::UNBOUNDED,
@@ -56604,6 +57383,10 @@ mandatory = true
             pipelines: Default::default(),
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
+            counted_strings: std::collections::BTreeSet::new(),
+            identity_collections: immutable_collections::IdentityCollections::default(),
+            string_pool: reference_identity::StringPoolState::default(),
+            counted_text_objects: std::collections::BTreeSet::new(),
             gson_writers: BTreeMap::new(),
             string_builder_capacities: BTreeMap::new(),
 
@@ -56618,6 +57401,7 @@ mandatory = true
             io_writer_bytes: BTreeMap::new(),
             io_stream_positions: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
+            io_writer_sinks: BTreeMap::new(),
             io_file_bytes: BTreeMap::new(),
             io_paths: BTreeMap::new(),
             io_files: BTreeMap::new(),
@@ -56633,6 +57417,7 @@ mandatory = true
             stream_plan: Default::default(),
             store_verdict: Default::default(),
             depth: 0,
+            next_frame_id: 0,
             shape_extraction: None,
             check_shape_probes: false,
             budget: &ExecutionBudget::UNBOUNDED,
