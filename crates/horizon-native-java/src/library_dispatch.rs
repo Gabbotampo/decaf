@@ -19,6 +19,11 @@ impl<H: Host> Runtime<'_, H> {
         class: &str,
         method: &str,
     ) -> Result<Option<Value>, NativeError> {
+        if let Some(receiver) = receiver
+            && let Some(result) = crate::commons_fraction::instance_call(r, receiver, args)
+        {
+            return result.map(Some);
+        }
         // `EnumSet.allOf` is implemented by the JDK from the enum class's
         // declared constants.  Jar enums are available in the class table;
         // retain their declaration order in the mutable collection row so
