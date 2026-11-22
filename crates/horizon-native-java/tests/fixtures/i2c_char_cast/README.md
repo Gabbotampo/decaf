@@ -4,7 +4,7 @@
 `(value as u8) as i32`, so every `(char)` cast, `char` compound assignment (`c += 300`) and `char` increment of a
 value above 255 came out wrong (`(char) 256` gave 0, `(char) -1` gave 255). `i2b` and `i2s` were already right.
 
-`demo/Probe.java` is the only class the test ships; it needs nothing but the JDK. Its inputs come from a static
+`demo/Probe.java` is the class `java25.txt` is about (`demo/Lone.java` is a second, two-method class, see below); it needs nothing but the JDK. Its inputs come from a static
 array, so javac emits a real `i2c`/`i2b`/`i2s` for each cast (checked with `javap -c`: 61 `i2c`, 17 `i2b`, 16 `i2s`).
 Values: 0, 65, 127, 128, 255, 256, 32767, 32768, 0x4e2d, 0xd7ff, 0xd800, 0xdfff, 0xffff, 0x10000, 0x10041, -1, -128,
 -129, -32768, -32769, Integer.MIN_VALUE, Integer.MAX_VALUE, 0x12345678, 0x7fff8000. Methods (one `name=value` line
@@ -14,8 +14,13 @@ each in `java25.txt`): `charCast`, `byteCast`, `shortCast` (each value printed a
 (static and instance char fields), `charArrays` (stores and compound assignment on `char[]`), `narrowArrays`
 (`byte[]`, `short[]`), `charStrings`, `charCalls`.
 
-`charStrings` leaves lone surrogates out: a `String` here is Rust text, so the runtime counts an `append` of one
-(`jdk_string_builder.rs`) and does not answer it. That stays counted.
+`charStrings` leaves lone surrogates out: a `String` here is Rust text, so a lone surrogate half cannot be held.
+Counted (never answered): `StringBuilder.append(char)` of one (`jdk_string_builder.rs`), and a `char` of one in a string
+concatenation or a record `toString` (`java_value_text`; it used to print the number: `"a" + (char) 0xd800` gave `a55296`). Not counted and not covered here, and already wrong on upstream/main for a lone surrogate that comes from
+a literal (`"\ud800".charAt(0)`): `String.valueOf(char)`, `Character.toString`, boxed `Character.toString`,
+`String.concat`/`join`/`repeat`/`replace` with one, and `indexOf`/`charAt`/`length`/`hashCode` on text built from one.
+`demo/Lone.java` (not part of `java25.txt`) pins the counted concatenation: `loneConcat` must be counted, `plainConcat`
+(`"a" + (char) 0x4e2d`, Java 25: `61 4e2d`) must be answered.
 
 `Run.java` prints each method's result. `java25.txt` was captured on 2026-11-22:
 

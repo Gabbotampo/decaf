@@ -16312,9 +16312,19 @@ fn java_value_text<H: Host>(
     }
     Ok(match value {
         Value::Int(value) if desc == "Z" => (*value != 0).to_string(),
-        Value::Int(value) if desc == "C" => {
-            char::from_u32(*value as u32).map_or_else(|| value.to_string(), String::from)
-        }
+        Value::Int(value) if desc == "C" => match char::from_u32(*value as u32) {
+            Some(unit) => String::from(unit),
+            None => {
+                // A lone surrogate half cannot live in Rust text. Java prints the half itself;
+                // this printed its number. Count the observable `String.valueOf(char)`.
+                host.unknown_operand_call(&MethodRef {
+                    owner: "java/lang/String".into(),
+                    name: "valueOf".into(),
+                    descriptor: "(C)Ljava/lang/String;".into(),
+                })?;
+                value.to_string()
+            }
+        },
         Value::Int(value) => value.to_string(),
         Value::Long(value) => value.to_string(),
         Value::Float(value) if desc == "F" => format_java_float32(*value),
