@@ -216,26 +216,74 @@ impl<H: Host> Runtime<'_, H> {
     }
 
     /// Whether a counted unknown call is provably unable to run jar bytecode or
-    /// touch any Java collection or static state: a host-modelled `final` pure
-    /// value-domain JDK class (not present in the jar or linked jars) whose
-    /// receiver is not a jar object and whose receiver and arguments contain no
-    /// jar objects, lambdas, collections, arrays, or host handles at all.
+    /// touch any Java collection or static state: either a host-modelled `final`
+    /// pure value-domain JDK class, or a compile-only external static `void`
+    /// sink outside the jar, linked jars, platform/JDK/game packages, and
+    /// modelled libraries (e.g. host-boundary marks like `HookSink.mark(...)`),
+    /// when receiver and arguments contain no jar objects, lambdas, collections,
+    /// arrays, or host handles at all.
     pub(crate) fn counted_call_is_identity_inert(
         &self,
         r: &MethodRef,
         receiver: Option<&Value>,
         args: &[Value],
     ) -> bool {
-        if !self.host.models_class(&r.owner)
-            || self.has_class(&r.owner)
+        let is_inert_operand = |value: &Value| {
+            !crate::jar_object::is_object(value)
+                && match value {
+                    Value::Void
+                    | Value::Int(_)
+                    | Value::Long(_)
+                    | Value::Float(_)
+                    | Value::Boxed(_)
+                    | Value::Ref(None) => true,
+                    Value::Ref(Some(text)) => {
+                        !self.is_live_stream(text)
+                            && !self.string_builders.contains_key(text)
+                            && !self.host.holds_collection(value)
+                            && !self.host.is_unmodifiable_collection(text)
+                            && self.host.view_copy_source(text).is_none()
+                            && self.host.reversed_view_source(text).is_none()
+                            && self.host.sub_list_link(text).is_none()
+                            && value_class::string_shape(text) == value_class::Shape::String
+                            && matches!(
+                                class_of_text(text).as_deref(),
+                                None | Some("java/lang/String")
+                            )
+                    }
+                    Value::Host(_) => false,
+                }
+        };
+        if !(receiver.is_none_or(is_inert_operand) && args.iter().all(is_inert_operand)) {
+            return false;
+        }
+        if self.has_class(&r.owner)
             || self.linked.contains_key(&r.owner)
             || receiver.is_some_and(crate::jar_object::is_object)
         {
             return false;
         }
+        // Compile-only external static `void` sinks (not in the jar, linked
+        // jars, platform/JDK/game packages, or modelled libraries) taking only
+        // inert primitive/null/plain-String arguments stay counted in
+        // `unknown_host_calls` without bumping the identity epoch and neutering
+        // unrelated `IdentityHashMap`s in the same firing (matching
+        // `HashMap`/`HashSet` and jar statics).
+        if receiver.is_none()
+            && !host_models_class(&r.owner)
+            && !self.host.models_class(&r.owner)
+            && !jvm_dispatch::library_modelled(&r.owner)
+            && !r.owner.starts_with("org/spongepowered/")
+            && r.descriptor.ends_with(")V")
+        {
+            return true;
+        }
+        if !self.host.models_class(&r.owner) {
+            return false;
+        }
         // Only `final` JDK value classes (no jar subclassing possible; excludes
         // non-final value types such as `BigInteger` / `BigDecimal`).
-        let pure_value_owner = matches!(
+        matches!(
             r.owner.as_str(),
             "java/lang/Boolean"
                 | "java/lang/Byte"
@@ -263,24 +311,7 @@ impl<H: Host> Runtime<'_, H> {
                 | "java/time/Month"
                 | "java/time/ZoneOffset"
                 | "java/util/UUID"
-        );
-        if !pure_value_owner {
-            return false;
-        }
-        let is_inert_operand = |value: &Value| {
-            !crate::jar_object::is_object(value)
-                && match value {
-                    Value::Void
-                    | Value::Int(_)
-                    | Value::Long(_)
-                    | Value::Float(_)
-                    | Value::Boxed(_)
-                    | Value::Ref(None) => true,
-                    Value::Ref(Some(text)) => value_class::is_plain_string(text),
-                    Value::Host(_) => false,
-                }
-        };
-        receiver.is_none_or(is_inert_operand) && args.iter().all(is_inert_operand)
+        )
     }
 
     /// Whether a counted call may have changed `collection` (#464), either
