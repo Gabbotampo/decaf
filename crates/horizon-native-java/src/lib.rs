@@ -37292,7 +37292,8 @@ impl<H: Host> Runtime<'_, H> {
                     let value = pop_int(&mut stack, class, method, at)?;
                     let value = match op {
                         0x91 => (value as i8) as i32,
-                        0x92 => (value as u8) as i32,
+                        // i2c: truncate to `char` and zero-extend (JVMS 6.5), so 16 bits, not 8.
+                        0x92 => (value as u16) as i32,
                         _ => (value as i16) as i32,
                     };
                     stack.push(Value::Int(value));
