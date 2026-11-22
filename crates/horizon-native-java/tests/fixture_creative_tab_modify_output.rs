@@ -1390,3 +1390,188 @@ fn anchor_placement_and_prepend_match_java25_fabric_api_oracle() {
         "ItemStack anchor matching an opaque-component stack must be counted"
     );
 }
+
+const COMPONENT_ANCHOR_PROBE: &str = r##"
+package demo;
+
+import net.fabricmc.fabric.api.creativetab.v1.CreativeModeTabEvents;
+import net.minecraft.core.Registry;
+import net.minecraft.core.component.DataComponents;
+import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.core.registries.Registries;
+import net.minecraft.nbt.CompoundTag;
+import net.minecraft.resources.Identifier;
+import net.minecraft.resources.ResourceKey;
+import net.minecraft.util.Unit;
+import net.minecraft.world.item.CreativeModeTab;
+import net.minecraft.world.item.Item;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.Items;
+import net.minecraft.world.item.component.CustomData;
+
+public final class ComponentAnchorProbe {
+    public static void setup() {
+        Item marker = Registry.register(
+            BuiltInRegistries.ITEM,
+            Identifier.parse("demo:marker"),
+            new Item(new Item.Properties())
+        );
+
+        ResourceKey<CreativeModeTab> tab = ResourceKey.create(
+            Registries.CREATIVE_MODE_TAB,
+            Identifier.parse("demo:comp_anchor")
+        );
+        CreativeModeTabEvents.modifyOutputEvent(tab).register(entries -> {
+            ItemStack damagedAnchor = new ItemStack(Items.DIAMOND_SWORD);
+            damagedAnchor.set(DataComponents.DAMAGE, 12);
+            CompoundTag tag = new CompoundTag();
+            tag.putInt("tier", 3);
+            CustomData.set(DataComponents.CUSTOM_DATA, damagedAnchor, tag);
+            damagedAnchor.set(DataComponents.UNBREAKABLE, Unit.INSTANCE);
+            entries.insertAfter(damagedAnchor, new ItemStack(marker));
+        });
+    }
+}
+"##;
+
+#[test]
+fn component_stack_anchor_distinguishes_modelled_components_with_zero_unknown_calls() {
+    use horizon_native_java::{Nbt, NbtCompound, RuntimeComponentValue};
+
+    let mut sources = vec![
+        ("demo/ComponentAnchorProbe.java", COMPONENT_ANCHOR_PROBE),
+        (
+            "net/minecraft/world/item/Items.java",
+            "package net.minecraft.world.item; public final class Items { public static final Item DIAMOND_SWORD = null; }",
+        ),
+        (
+            "net/minecraft/core/component/DataComponentType.java",
+            "package net.minecraft.core.component; public interface DataComponentType<T> {}",
+        ),
+        (
+            "net/minecraft/core/component/DataComponents.java",
+            r#"package net.minecraft.core.component;
+import net.minecraft.util.Unit;
+import net.minecraft.world.item.component.CustomData;
+public final class DataComponents {
+    public static final DataComponentType<Integer> DAMAGE = null;
+    public static final DataComponentType<CustomData> CUSTOM_DATA = null;
+    public static final DataComponentType<Unit> UNBREAKABLE = null;
+}"#,
+        ),
+        (
+            "net/minecraft/util/Unit.java",
+            "package net.minecraft.util; public enum Unit { INSTANCE }",
+        ),
+        (
+            "net/minecraft/nbt/CompoundTag.java",
+            "package net.minecraft.nbt; public class CompoundTag { public CompoundTag() {} public void putInt(String k, int v) {} }",
+        ),
+        (
+            "net/minecraft/world/item/component/CustomData.java",
+            "package net.minecraft.world.item.component; import net.minecraft.core.component.DataComponentType; import net.minecraft.nbt.CompoundTag; import net.minecraft.world.item.ItemStack; public final class CustomData { public static void set(DataComponentType<CustomData> type, ItemStack stack, CompoundTag tag) {} }",
+        ),
+        (
+            "net/minecraft/world/item/ItemStack.java",
+            r#"package net.minecraft.world.item;
+import net.minecraft.core.component.DataComponentType;
+import net.minecraft.world.flag.FeatureFlagSet;
+import net.minecraft.world.level.ItemLike;
+public final class ItemStack {
+    public static final ItemStack EMPTY = null;
+    public ItemStack(ItemLike item) {}
+    public ItemStack(ItemLike item, int count) {}
+    public <T> T set(DataComponentType<? super T> type, T value) { throw new AssertionError(); }
+    public boolean isEmpty() { throw new AssertionError(); }
+    public int getCount() { throw new AssertionError(); }
+    public Item getItem() { throw new AssertionError(); }
+    public boolean is(Item item) { throw new AssertionError(); }
+    public boolean isItemEnabled(FeatureFlagSet enabledFeatures) { throw new AssertionError(); }
+}"#,
+        ),
+    ];
+    for &(path, src) in STUBS {
+        if path != "net/minecraft/world/item/ItemStack.java" {
+            sources.push((path, src));
+        }
+    }
+    let fixture = javac_fixture::Fixture::build("creative-tab-component-anchor", &sources);
+    let mut host = fixture.jar.seed_host(StdHost::new());
+    fixture
+        .jar
+        .invoke_method("demo/ComponentAnchorProbe", "setup", "()V", None, &mut host)
+        .unwrap();
+
+    let plain_sword = host.make_item_stack_for_id("minecraft:diamond_sword", 1, false);
+    let mut nbt = NbtCompound::new();
+    nbt.insert("tier".into(), Nbt::Int(3));
+    let matching_sword = host.make_host_item_stack_with_components(
+        None,
+        "minecraft:diamond_sword",
+        1,
+        vec![
+            (
+                "minecraft:damage".into(),
+                Some(RuntimeComponentValue::Int(12)),
+            ),
+            (
+                "minecraft:custom_data".into(),
+                Some(RuntimeComponentValue::CustomData(nbt)),
+            ),
+            (
+                "minecraft:unbreakable".into(),
+                Some(RuntimeComponentValue::Unit),
+            ),
+        ],
+        false,
+        Vec::new(),
+    );
+    let different_sword = host.make_host_item_stack_with_components(
+        None,
+        "minecraft:diamond_sword",
+        1,
+        vec![(
+            "minecraft:damage".into(),
+            Some(RuntimeComponentValue::Int(5)),
+        )],
+        false,
+        Vec::new(),
+    );
+
+    let out = fixture
+        .jar
+        .creative_tab_contents_with(
+            &mut host,
+            "demo:comp_anchor",
+            CreativeTabBuildContext {
+                initial_display_stacks: vec![
+                    plain_sword.clone(),
+                    matching_sword.clone(),
+                    different_sword.clone(),
+                ],
+                initial_search_tab_stacks: vec![plain_sword, matching_sword, different_sword],
+                ..CreativeTabBuildContext::default()
+            },
+        )
+        .unwrap();
+
+    let ids: Vec<String> = out
+        .display_stacks
+        .iter()
+        .map(|s| host.item_stack_item_id(s).unwrap())
+        .collect();
+    assert_eq!(
+        ids,
+        vec![
+            "minecraft:diamond_sword",
+            "minecraft:diamond_sword",
+            "demo:marker",
+            "minecraft:diamond_sword",
+        ]
+    );
+    assert_eq!(
+        host.unknown_host_calls(),
+        Vec::<(String, usize)>::new(),
+        "modelled component ItemStack anchor must have zero unknown host calls"
+    );
+}

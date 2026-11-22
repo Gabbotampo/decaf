@@ -638,6 +638,10 @@ pub enum HostKind {
     RecipeCommonInfo,
     /// Vanilla's `RecipeHolder` (`recipe_models.rs`).
     RecipeHolder,
+    /// Vanilla's `CustomData` holding a copied `CompoundTag` (`recipe_models.rs`).
+    CustomData,
+    /// Vanilla's `net.minecraft.util.Unit.INSTANCE` singleton (`recipe_models.rs`).
+    Unit,
     /// Fabric CreativeModeTab builder and built tab handles.
     CreativeModeTabBuilder,
     CreativeModeTab,
@@ -2873,6 +2877,20 @@ const KINDS: &[KindInfo] = &[
         class: ClassRule::FromKey(|_| crate::recipe_models::RECIPE_HOLDER),
         canonical: always_canonical,
         methods: &crate::recipe_models::HOLDER_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::CustomData,
+        tag: "cdat",
+        class: ClassRule::FromKey(|_| crate::recipe_models::CUSTOM_DATA),
+        canonical: always_canonical,
+        methods: &crate::recipe_models::CUSTOM_DATA_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::Unit,
+        tag: "unit",
+        class: ClassRule::Fixed(crate::recipe_models::UNIT),
+        canonical: always_canonical,
+        methods: &crate::recipe_models::UNIT_METHODS,
     },
     KindInfo {
         kind: HostKind::CreativeModeTabBuilder,

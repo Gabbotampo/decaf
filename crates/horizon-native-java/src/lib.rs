@@ -330,6 +330,8 @@ pub use java_nbt::{MAX_DEPTH as NBT_MAX_DEPTH, Nbt, NbtCompound};
 pub use mixin_extras::{GameHookShape, MixinExtrasKind, MixinExtrasPlan};
 pub use mixin_plugins::ConfigPluginReport;
 use mixin_plugins::ConfigPlugins;
+pub use recipe_models::{RuntimeComponentValue, StackComponents};
+pub use vanilla_item_data::all_vanilla_data_component_ids;
 pub use weaver::{
     ReturnMode, ShiftBy, WovenClasses, callback_info_class, callback_info_returnable_class,
     weave_class, weave_class_with_extras, weave_classes, weave_classes_with_extras, weave_head,
@@ -5692,6 +5694,58 @@ impl StdHost {
         self.recipes.alloc_stack(live)
     }
 
+    /// Allocate a modelled host `ItemStack` carrying converted component overrides/removals and
+    /// tracking any unrepresentable component keys as opaque so Java reads count rather than
+    /// seeing defaults.
+    pub fn make_host_item_stack_with_components(
+        &mut self,
+        item_override: Option<Value>,
+        item_id: &str,
+        count: i32,
+        patch: Vec<(String, Option<RuntimeComponentValue>)>,
+        opaque_components: bool,
+        opaque_keys: Vec<String>,
+    ) -> Value {
+        recipe_models::build_host_stack(
+            self,
+            item_override,
+            item_id,
+            count,
+            patch,
+            opaque_components,
+            opaque_keys,
+        )
+    }
+
+    /// Extract item id, count, and modelled component patch entries from a runtime `ItemStack`.
+    pub fn item_stack_components(&self, stack: &Value) -> Option<StackComponents> {
+        recipe_models::extract_stack_components(self, stack)
+    }
+
+    /// Allocate a modelled `TooltipDisplay` handle reflecting the host's real tooltip visibility.
+    pub fn make_tooltip_display(
+        &mut self,
+        hide_tooltip: bool,
+        hidden_components: Vec<String>,
+        hidden_known: bool,
+    ) -> Value {
+        self.recipes
+            .alloc_tooltip_display(recipe_models::TooltipDisplayData {
+                hide_tooltip,
+                hidden_components,
+                hidden_known,
+            })
+    }
+
+    /// Every `minecraft:data_component_type` id registered by loaded jars on this host.
+    pub fn registered_data_component_ids(&self) -> Vec<String> {
+        self.registrations
+            .iter()
+            .filter(|entry| entry.registry == "minecraft:data_component_type")
+            .map(|entry| entry.id.clone())
+            .collect()
+    }
+
     /// Finish a creative-tab callback and return the display stacks in their recorded order.
     pub fn take_creative_tab_output(&mut self, output: &Value) -> Option<Vec<Value>> {
         host_creative_tab::take_output(&mut self.creative_tab, output)
@@ -9371,116 +9425,29 @@ impl Host for StdHost {
         else {
             return Ok(Some(false));
         };
-        let recipes = &self.recipes;
-        let registrations = &self.registrations;
-        // Borrow `creative_tab` mutably while reading stack/item state from `recipes` /
-        // `registrations` through a lightweight read helper.
-        let mut matches = |entry: &Value| -> Result<Option<bool>, NativeError> {
-            let read_entry = |stack: &Value| -> Option<(Value, bool)> {
-                if game_object::handle_key(stack) == Some("client/stack/empty") {
-                    return Some((host_creative_tab::air_item_value(), true));
+        let mut creative_tab = std::mem::take(&mut self.creative_tab);
+        let result = {
+            let host = &*self;
+            let mut matches = |entry: &Value| -> Result<Option<bool>, NativeError> {
+                if !anchor_is_stack {
+                    let Some((entry_item, _, _)) = host.read_item_stack_impl(entry) else {
+                        return Ok(None);
+                    };
+                    return Ok(Self::same_item_value(&entry_item, anchor));
                 }
-                if let Value::Host(handle) = stack
-                    && handle.kind() == HostKind::ItemStack
-                {
-                    if let Some(live) = recipes.stacks.get(handle.key()) {
-                        if live.is_empty() {
-                            return Some((host_creative_tab::air_item_value(), true));
-                        }
-                        let item = live.item_value.clone().unwrap_or_else(|| {
-                            let id = live.item_id.as_deref().unwrap_or("minecraft:air");
-                            registrations
-                                .iter()
-                                .rev()
-                                .find(|r| r.registry == "minecraft:item" && r.id == id)
-                                .map(|r| r.value.clone())
-                                .unwrap_or_else(|| {
-                                    game_object::server_value(format!("game/item/{id}"))
-                                })
-                        });
-                        return Some((item, false));
-                    }
-                    if let Some(data) = host_creative_tab::host_item_stack_data(stack) {
-                        return if host_creative_tab::is_empty_stack_data(&data.item, data.count) {
-                            Some((host_creative_tab::air_item_value(), true))
-                        } else {
-                            Some((data.item, false))
-                        };
-                    }
-                }
-                None
+                recipe_models::stacks_same_item_same_components(host, anchor, entry)
             };
-            let known_empty_patch = |stack: &Value| -> Option<bool> {
-                if game_object::handle_key(stack) == Some("client/stack/empty") {
-                    return Some(true);
-                }
-                if let Value::Host(handle) = stack
-                    && handle.kind() == HostKind::ItemStack
-                {
-                    if let Some(live) = recipes.stacks.get(handle.key()) {
-                        if live.opaque_components {
-                            return None;
-                        }
-                        return Some(live.patch.is_empty());
-                    }
-                    if host_creative_tab::host_item_stack_data(stack).is_some() {
-                        return Some(true);
-                    }
-                }
-                None
-            };
-            if !anchor_is_stack {
-                let Some((entry_item, _)) = read_entry(entry) else {
-                    return Ok(None);
-                };
-                return Ok(Self::same_item_value(&entry_item, anchor));
-            }
-            // `FabricCreativeModeTabOutput.insertBefore`/`insertAfter` (`ItemStack` anchor):
-            // calls `ItemStack.isSameItemSameComponents(anchor, entry)` inside the list loop,
-            // so a null `anchor` throws HotSpot's exact NPE only when the list is non-empty.
-            if matches!(anchor, Value::Ref(None)) {
-                return Err(NativeError::UncaughtException {
-                    class: "java/lang/NullPointerException".into(),
-                    message: Some(
-                        "Cannot invoke \"net.minecraft.world.item.ItemStack.is(Object)\" because \"a\" is null"
-                            .into(),
-                    ),
-                    frame: None,
-                });
-            }
-            let (Some((anchor_item, anchor_empty)), Some((entry_item, entry_empty))) =
-                (read_entry(anchor), read_entry(entry))
-            else {
-                return Ok(None);
-            };
-            let Some(same_item) = Self::same_item_value(&anchor_item, &entry_item) else {
-                return Ok(None);
-            };
-            if !same_item {
-                return Ok(Some(false));
-            }
-            if anchor_empty && entry_empty {
-                return Ok(Some(true));
-            }
-            if anchor_empty != entry_empty {
-                return Ok(Some(false));
-            }
-            Ok(
-                match (known_empty_patch(anchor), known_empty_patch(entry)) {
-                    (Some(true), Some(true)) => Some(true),
-                    (Some(true), Some(false)) | (Some(false), Some(true)) => Some(false),
-                    _ => None,
-                },
+            host_creative_tab::insert_relative_verified(
+                &mut creative_tab,
+                output,
+                stacks,
+                visibility,
+                before,
+                &mut matches,
             )
         };
-        host_creative_tab::insert_relative_verified(
-            &mut self.creative_tab,
-            output,
-            stacks,
-            visibility,
-            before,
-            &mut matches,
-        )
+        self.creative_tab = creative_tab;
+        result
     }
 
     fn invoke(&mut self, r: &MethodRef, args: &[Value]) -> Result<Value, NativeError> {

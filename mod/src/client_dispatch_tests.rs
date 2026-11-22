@@ -438,8 +438,43 @@ const CLIENT_DISPATCH_STUBS: &[(&str, &str)] = &[
         "package net.minecraft.core; public interface DefaultedRegistry<T> extends Registry<T> {}",
     ),
     (
+        "net/minecraft/core/component/DataComponentType.java",
+        "package net.minecraft.core.component; public interface DataComponentType<T> {}",
+    ),
+    (
+        "net/minecraft/core/component/DataComponents.java",
+        r#"package net.minecraft.core.component;
+import net.minecraft.network.chat.Component;
+import net.minecraft.util.Unit;
+import net.minecraft.world.item.component.CustomData;
+import net.minecraft.world.item.component.TooltipDisplay;
+public final class DataComponents {
+    public static final DataComponentType<Integer> DAMAGE = null;
+    public static final DataComponentType<Integer> MAX_DAMAGE = null;
+    public static final DataComponentType<Component> CUSTOM_NAME = null;
+    public static final DataComponentType<CustomData> CUSTOM_DATA = null;
+    public static final DataComponentType<Unit> UNBREAKABLE = null;
+    public static final DataComponentType<Object> LORE = null;
+    public static final DataComponentType<Object> BANNER_PATTERNS = null;
+    public static final DataComponentType<Object> ENCHANTMENTS = null;
+    public static final DataComponentType<TooltipDisplay> TOOLTIP_DISPLAY = null;
+}"#,
+    ),
+    (
+        "net/minecraft/util/Unit.java",
+        "package net.minecraft.util; public enum Unit { INSTANCE }",
+    ),
+    (
+        "net/minecraft/nbt/CompoundTag.java",
+        "package net.minecraft.nbt; public class CompoundTag { public CompoundTag() {} public void putInt(String k, int v) {} public int getIntOr(String k, int def) { throw new AssertionError(); } }",
+    ),
+    (
+        "net/minecraft/world/item/component/CustomData.java",
+        "package net.minecraft.world.item.component; import net.minecraft.core.component.DataComponentType; import net.minecraft.nbt.CompoundTag; import net.minecraft.world.item.ItemStack; public final class CustomData { public static void set(DataComponentType<CustomData> type, ItemStack stack, CompoundTag tag) {} public CompoundTag copyTag() { throw new AssertionError(); } }",
+    ),
+    (
         "net/minecraft/core/registries/BuiltInRegistries.java",
-        "package net.minecraft.core.registries; import net.minecraft.core.DefaultedRegistry; import net.minecraft.world.item.Item; public final class BuiltInRegistries { public static final DefaultedRegistry<Item> ITEM = null; }",
+        "package net.minecraft.core.registries; import net.minecraft.core.DefaultedRegistry; import net.minecraft.core.Registry; import net.minecraft.core.component.DataComponentType; import net.minecraft.world.item.Item; public final class BuiltInRegistries { public static final DefaultedRegistry<Item> ITEM = null; public static final Registry<DataComponentType<?>> DATA_COMPONENT_TYPE = null; }",
     ),
     (
         "net/minecraft/network/chat/Component.java",
@@ -467,7 +502,13 @@ const CLIENT_DISPATCH_STUBS: &[(&str, &str)] = &[
     ),
     (
         "net/minecraft/world/item/component/TooltipDisplay.java",
-        "package net.minecraft.world.item.component; public final class TooltipDisplay {}",
+        r#"package net.minecraft.world.item.component;
+import net.minecraft.core.component.DataComponentType;
+public final class TooltipDisplay {
+    public boolean hideTooltip() { throw new AssertionError(); }
+    public boolean shows(DataComponentType<?> type) { throw new AssertionError(); }
+    public TooltipDisplay withHidden(DataComponentType<?> type, boolean hidden) { throw new AssertionError(); }
+}"#,
     ),
     (
         "net/minecraft/world/item/TooltipFlag.java",
@@ -484,6 +525,7 @@ import net.minecraft.world.level.ItemLike;
 public class Item implements ItemLike {
     public static class Properties {
         public Properties() {}
+        public Properties durability(int maxDamage) { throw new AssertionError(); }
         public Properties requiredFeatures(FeatureFlag... flags) { throw new AssertionError(); }
     }
     public interface TooltipContext {}
@@ -494,11 +536,23 @@ public class Item implements ItemLike {
     ),
     (
         "net/minecraft/world/item/Items.java",
-        "package net.minecraft.world.item; public final class Items { public static final Item STONE = null; public static final Item DIRT = null; public static final Item GOLD_INGOT = null; }",
+        "package net.minecraft.world.item; public final class Items { public static final Item STONE = null; public static final Item DIRT = null; public static final Item GOLD_INGOT = null; public static final Item DIAMOND_SWORD = null; public static final Item APPLE = null; public static final Item BREAD = null; }",
     ),
     (
         "net/minecraft/world/item/ItemStack.java",
-        "package net.minecraft.world.item; import net.minecraft.world.level.ItemLike; public final class ItemStack { public ItemStack(ItemLike item) {} }",
+        r#"package net.minecraft.world.item;
+import net.minecraft.core.component.DataComponentType;
+import net.minecraft.world.level.ItemLike;
+public final class ItemStack {
+    public ItemStack(ItemLike item) {}
+    public <T> T get(DataComponentType<? extends T> type) { throw new AssertionError(); }
+    public <T> T set(DataComponentType<? super T> type, T value) { throw new AssertionError(); }
+    public <T> T remove(DataComponentType<? extends T> type) { throw new AssertionError(); }
+    public boolean has(DataComponentType<?> type) { throw new AssertionError(); }
+    public int getDamageValue() { throw new AssertionError(); }
+    public int getMaxDamage() { throw new AssertionError(); }
+    public boolean isDamaged() { throw new AssertionError(); }
+}"#,
     ),
     (
         "net/minecraft/world/item/CreativeModeTab.java",
@@ -520,7 +574,7 @@ public class CreativeModeTab {
     ),
     (
         "net/minecraft/world/item/CreativeModeTabs.java",
-        "package net.minecraft.world.item; import net.minecraft.resources.ResourceKey; public final class CreativeModeTabs { public static final ResourceKey<CreativeModeTab> FUNCTIONAL_BLOCKS = null; public static final ResourceKey<CreativeModeTab> COMBAT = null; }",
+        "package net.minecraft.world.item; import net.minecraft.resources.ResourceKey; public final class CreativeModeTabs { public static final ResourceKey<CreativeModeTab> FUNCTIONAL_BLOCKS = null; public static final ResourceKey<CreativeModeTab> COMBAT = null; public static final ResourceKey<CreativeModeTab> INGREDIENTS = null; public static final ResourceKey<CreativeModeTab> TOOLS_AND_UTILITIES = null; public static final ResourceKey<CreativeModeTab> FOOD_AND_DRINKS = null; }",
     ),
     (
         "net/fabricmc/fabric/api/event/Event.java",
@@ -539,8 +593,10 @@ public class FabricCreativeModeTabOutput implements CreativeModeTab.Output {
     public void prepend(ItemStack stack, CreativeModeTab.TabVisibility visibility) { throw new AssertionError(); }
     public void insertBefore(ItemLike anchor, Collection<ItemStack> stacks, CreativeModeTab.TabVisibility visibility) { throw new AssertionError(); }
     public void insertBefore(ItemLike anchor, ItemLike... items) { throw new AssertionError(); }
+    public void insertBefore(ItemStack anchor, ItemLike... items) { throw new AssertionError(); }
     public void insertAfter(ItemLike anchor, Collection<ItemStack> stacks, CreativeModeTab.TabVisibility visibility) { throw new AssertionError(); }
     public void insertAfter(ItemLike anchor, ItemLike... items) { throw new AssertionError(); }
+    public void insertAfter(ItemStack anchor, ItemLike... items) { throw new AssertionError(); }
 }"#,
     ),
     (
@@ -1333,14 +1389,58 @@ public class FabricCreativeModeTabOutput implements CreativeModeTab.Output {
             // Only the 2 conversion counts for `demo:not_in_sunrise` (2 -> 4); zero duplicate errors.
             assert_eq!(report_row(&java)["unknown_host_call_count"], 4);
 
-            // `ItemStack` anchor against damaged stone in Combat must count as unknown instead of
-            // falsely matching components.
+            // `ItemStack` anchor against damaged stone (modelled `minecraft:damage` component)
+            // proves inequality cleanly with zero new unknown calls, appending after `dirt`.
             let edit = mod_api::__private::creative_tab_edit(22);
             {
                 let mut editor = host.editor.borrow_mut();
                 editor.active = Some(edit);
-                editor.parent = vec![damaged_stone.clone()];
-                editor.search = vec![damaged_stone];
+                editor.parent = vec![damaged_stone.clone(), dirt.clone()];
+                editor.search = vec![damaged_stone, dirt];
+            }
+            mod_api::dispatch_build_creative_mode_tab_contents(
+                HostSide::Client(&mut host),
+                "minecraft:combat",
+                vec!["minecraft:vanilla".to_owned()],
+                CreativeTabPermissions::Normal,
+                edit,
+            );
+            assert_eq!(
+                host.tab_entries(CreativeTabList::Parent),
+                vec![
+                    ("minecraft:stone".to_owned(), 1),
+                    ("minecraft:dirt".to_owned(), 1),
+                    ("demo:after_custom".to_owned(), 1),
+                    ("demo:all_tab_extra".to_owned(), 1),
+                ]
+            );
+            assert_eq!(
+                report_row(&java)["unknown_host_call_count"],
+                4,
+                "modelled component difference on ItemStack anchor must add zero unknown calls"
+            );
+
+            // `ItemStack` anchor against an unmodelled/opaque component (`minecraft:enchantments`)
+            // in Combat must count as unknown instead of falsely equating components.
+            let mut opaque_stone = host.stack("minecraft:stone");
+            opaque_stone
+                .set_components(
+                    [(
+                        "minecraft:enchantments".into(),
+                        Tag::compound(vec![(
+                            "levels",
+                            Tag::compound(vec![("minecraft:sharpness", Tag::Int(5))]),
+                        )]),
+                    )]
+                    .into(),
+                )
+                .unwrap();
+            let edit = mod_api::__private::creative_tab_edit(23);
+            {
+                let mut editor = host.editor.borrow_mut();
+                editor.active = Some(edit);
+                editor.parent = vec![opaque_stone.clone()];
+                editor.search = vec![opaque_stone];
             }
             mod_api::dispatch_build_creative_mode_tab_contents(
                 HostSide::Client(&mut host),
@@ -1354,7 +1454,7 @@ public class FabricCreativeModeTabOutput implements CreativeModeTab.Output {
                     .as_u64()
                     .unwrap()
                     > 4,
-                "ItemStack anchor matching custom-component stack must be counted"
+                "ItemStack anchor matching an opaque-component stack must be counted"
             );
 
             // Direct boundary check on `convert_tooltip_component`: non-component Value is refused.
@@ -1366,6 +1466,684 @@ public class FabricCreativeModeTabOutput implements CreativeModeTab.Output {
             );
             assert_eq!(text, None);
             assert!(refused);
+
+            Ok::<_, ()>(())
+        })
+        .unwrap();
+    });
+}
+
+const CREATIVE_COMPONENTS_MOD: &str = r#"package demo;
+import net.fabricmc.api.ModInitializer;
+import net.fabricmc.fabric.api.creativetab.v1.CreativeModeTabEvents;
+import net.minecraft.core.Registry;
+import net.minecraft.core.component.DataComponentType;
+import net.minecraft.core.component.DataComponents;
+import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.nbt.CompoundTag;
+import net.minecraft.network.chat.Component;
+import net.minecraft.resources.Identifier;
+import net.minecraft.util.Unit;
+import net.minecraft.world.item.CreativeModeTabs;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.Items;
+import net.minecraft.world.item.component.CustomData;
+
+public final class CreativeComponentsMod implements ModInitializer {
+    @Override
+    public void onInitialize() {
+        DataComponentType<Object> unrep = Registry.register(
+            BuiltInRegistries.DATA_COMPONENT_TYPE,
+            Identifier.fromNamespaceAndPath("demo", "unrepresentable"),
+            new DataComponentType<Object>() {}
+        );
+
+        CreativeModeTabEvents.modifyOutputEvent(CreativeModeTabs.COMBAT).register(entries -> {
+            ItemStack plain = new ItemStack(Items.DIAMOND_SWORD);
+
+            ItemStack damaged = new ItemStack(Items.DIAMOND_SWORD);
+            damaged.set(DataComponents.DAMAGE, 12);
+
+            ItemStack named = new ItemStack(Items.DIAMOND_SWORD);
+            named.set(DataComponents.CUSTOM_NAME, Component.literal("Runeblade"));
+
+            ItemStack customData = new ItemStack(Items.DIAMOND_SWORD);
+            CompoundTag tag = new CompoundTag();
+            tag.putInt("tier", 3);
+            CustomData.set(DataComponents.CUSTOM_DATA, customData, tag);
+
+            ItemStack unbreakable = new ItemStack(Items.DIAMOND_SWORD);
+            unbreakable.set(DataComponents.UNBREAKABLE, Unit.INSTANCE);
+
+            ItemStack noMaxDamage = new ItemStack(Items.DIAMOND_SWORD);
+            noMaxDamage.remove(DataComponents.MAX_DAMAGE);
+
+            // Unrepresentable custom component must be skipped and counted, never emitted as plain.
+            ItemStack unrepresentable = new ItemStack(Items.DIAMOND_SWORD);
+            unrepresentable.set(unrep, new Object());
+
+            // Exact duplicate of `damaged` must deduplicate cleanly without counting.
+            ItemStack damagedDup = new ItemStack(Items.DIAMOND_SWORD);
+            damagedDup.set(DataComponents.DAMAGE, 12);
+
+            entries.accept(plain);
+            entries.accept(damaged);
+            entries.accept(named);
+            entries.accept(customData);
+            entries.accept(unbreakable);
+            entries.accept(noMaxDamage);
+            entries.accept(unrepresentable);
+            entries.accept(damagedDup);
+        });
+
+        CreativeModeTabEvents.modifyOutputEvent(CreativeModeTabs.INGREDIENTS).register(entries -> {
+            ItemStack damagedAnchor = new ItemStack(Items.DIAMOND_SWORD);
+            damagedAnchor.set(DataComponents.DAMAGE, 12);
+            entries.insertAfter(damagedAnchor, Items.APPLE);
+        });
+    }
+}
+"#;
+
+#[test]
+fn creative_tab_preserves_custom_components_and_skips_unrepresentable_stacks() {
+    let mut sources = CLIENT_DISPATCH_STUBS.to_vec();
+    sources.push(("demo/CreativeComponentsMod.java", CREATIVE_COMPONENTS_MOD));
+    let jar_bytes = build_javac_jar(
+        "client-creative-components",
+        r#"{"schemaVersion":1,"id":"demo","version":"1.0","entrypoints":{"main":["demo.CreativeComponentsMod"]}}"#,
+        &sources,
+    );
+
+    let java = Arc::new(HorizonJava::default());
+    java.lock_client()
+        .set_fixture_files(vec![("demo-components.jar".to_owned(), jar_bytes)]);
+
+    let mods = vec![ModEntry::new(
+        "horizon_java",
+        Box::new(SharedHorizonJava(Arc::clone(&java))),
+    )];
+    mod_api::testing::with_mods(mods.into(), || {
+        mod_api::testing::rebuild_parts(|| {
+            let mut host = TestClientHost::new(&[
+                "minecraft:stone",
+                "minecraft:diamond_sword",
+                "minecraft:apple",
+            ]);
+            mod_api::dispatch_client_setup(&mut host);
+            assert_eq!(report_row(&java)["unknown_host_call_count"], 0);
+
+            let edit = host.begin_tab(30, &["minecraft:stone"], &["minecraft:stone"]);
+            mod_api::dispatch_build_creative_mode_tab_contents(
+                HostSide::Client(&mut host),
+                "minecraft:combat",
+                vec!["minecraft:vanilla".to_owned()],
+                CreativeTabPermissions::Normal,
+                edit,
+            );
+
+            // Java 25 oracle: plain, damaged(12), custom_name("Runeblade"), custom_data({tier:3}),
+            // unbreakable({}), and !max_damage({}) are all distinct in ItemStackLinkedSet; the
+            // duplicate damaged(12) collapses cleanly; the unrepresentable stack is skipped & counted.
+            let editor = host.editor.borrow();
+            assert_eq!(editor.parent.len(), 7, "parent entries: {:?}", editor.parent);
+            assert_eq!(editor.search.len(), 7, "search entries: {:?}", editor.search);
+            for list in [&editor.parent, &editor.search] {
+                assert_eq!(list[0].item().id(&host), "minecraft:stone");
+                assert_eq!(list[1].item().id(&host), "minecraft:diamond_sword");
+                assert_eq!(list[1].damage_component(), None);
+                assert!(list[1].components().is_none());
+
+                assert_eq!(list[2].item().id(&host), "minecraft:diamond_sword");
+                assert_eq!(list[2].damage_component(), Some(12));
+
+                assert_eq!(list[3].item().id(&host), "minecraft:diamond_sword");
+                assert!(
+                    list[3]
+                        .components()
+                        .and_then(|c| c.as_nbt().get(&"minecraft:custom_name".into()))
+                        .is_some(),
+                    "expected minecraft:custom_name on entry 3"
+                );
+                assert!(!list[3].is_stackable_with(&list[1]));
+
+                assert_eq!(list[4].item().id(&host), "minecraft:diamond_sword");
+                assert_eq!(
+                    list[4]
+                        .components()
+                        .and_then(|c| c.as_nbt().get(&"minecraft:custom_data".into()))
+                        .and_then(|t| t.get("tier")),
+                    Some(&Tag::Int(3))
+                );
+
+                assert_eq!(list[5].item().id(&host), "minecraft:diamond_sword");
+                assert_eq!(
+                    list[5]
+                        .components()
+                        .and_then(|c| c.as_nbt().get(&"minecraft:unbreakable".into())),
+                    Some(&Tag::Compound(mod_api::Compound::new()))
+                );
+
+                assert_eq!(list[6].item().id(&host), "minecraft:diamond_sword");
+                assert_eq!(
+                    list[6]
+                        .components()
+                        .and_then(|c| c.as_nbt().get(&"!minecraft:max_damage".into())),
+                    Some(&Tag::Compound(mod_api::Compound::new()))
+                );
+            }
+            drop(editor);
+            assert_eq!(
+                report_row(&java)["unknown_host_call_count"],
+                2,
+                "unrepresentable custom component must be counted once for Parent and once for Search"
+            );
+
+            // Seeded damaged sword vs plain sword: `insertAfter(damaged(12), APPLE)` lands
+            // directly after the damaged sword and before the plain sword with zero new counts.
+            let mut damaged = host.stack("minecraft:diamond_sword");
+            damaged.set_damage(12);
+            let plain = host.stack("minecraft:diamond_sword");
+            let edit = mod_api::__private::creative_tab_edit(31);
+            {
+                let mut editor = host.editor.borrow_mut();
+                editor.active = Some(edit);
+                editor.parent = vec![damaged.clone(), plain.clone()];
+                editor.search = vec![damaged, plain];
+            }
+            mod_api::dispatch_build_creative_mode_tab_contents(
+                HostSide::Client(&mut host),
+                "minecraft:ingredients",
+                vec!["minecraft:vanilla".to_owned()],
+                CreativeTabPermissions::Normal,
+                edit,
+            );
+            assert_eq!(
+                host.tab_entries(CreativeTabList::Parent),
+                vec![
+                    ("minecraft:diamond_sword".to_owned(), 1),
+                    ("minecraft:apple".to_owned(), 1),
+                    ("minecraft:diamond_sword".to_owned(), 1),
+                ]
+            );
+            assert_eq!(host.editor.borrow().parent[0].damage_component(), Some(12));
+            assert_eq!(host.editor.borrow().parent[2].damage_component(), None);
+            assert_eq!(report_row(&java)["unknown_host_call_count"], 2);
+
+            Ok::<_, ()>(())
+        })
+        .unwrap();
+    });
+}
+
+const TOOLTIP_REAL_STATE_MOD: &str = r#"package demo;
+import java.util.function.Consumer;
+import net.fabricmc.api.ModInitializer;
+import net.minecraft.core.Registry;
+import net.minecraft.core.component.DataComponents;
+import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.network.chat.Component;
+import net.minecraft.resources.Identifier;
+import net.minecraft.world.item.Item;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.TooltipFlag;
+import net.minecraft.world.item.component.CustomData;
+import net.minecraft.world.item.component.TooltipDisplay;
+
+public final class TooltipRealStateMod implements ModInitializer {
+    static final class StateProbeItem extends Item {
+        StateProbeItem(Properties props) {
+            super(props);
+        }
+
+        @Override
+        public void appendHoverText(
+            ItemStack stack,
+            TooltipContext context,
+            TooltipDisplay display,
+            Consumer<Component> out,
+            TooltipFlag flag
+        ) {
+            int dmg = stack.getDamageValue();
+            boolean unb = stack.has(DataComponents.UNBREAKABLE);
+            CustomData cd = stack.get(DataComponents.CUSTOM_DATA);
+            int tier = cd != null ? cd.copyTag().getIntOr("tier", -1) : -1;
+            boolean hide = display.hideTooltip();
+            boolean lore = display.shows(DataComponents.LORE);
+            boolean dmgShow = display.shows(DataComponents.DAMAGE);
+            boolean banner = display.shows(DataComponents.BANNER_PATTERNS);
+            out.accept(Component.literal(
+                "dmg=" + dmg
+                + "|unb=" + unb
+                + "|tier=" + tier
+                + "|hide=" + hide
+                + "|lore=" + lore
+                + "|dmgShow=" + dmgShow
+                + "|banner=" + banner
+            ));
+        }
+    }
+
+    static final class OpaqueProbeItem extends Item {
+        OpaqueProbeItem(Properties props) {
+            super(props);
+        }
+
+        @Override
+        public void appendHoverText(
+            ItemStack stack,
+            TooltipContext context,
+            TooltipDisplay display,
+            Consumer<Component> out,
+            TooltipFlag flag
+        ) {
+            CustomData cd = stack.get(DataComponents.CUSTOM_DATA);
+            int tier = cd != null ? cd.copyTag().getIntOr("tier", -1) : -1;
+            // Reading an unmodelled component present on the stack must be counted.
+            stack.get(DataComponents.ENCHANTMENTS);
+            out.accept(Component.literal("tier=" + tier));
+        }
+    }
+
+    @Override
+    public void onInitialize() {
+        Registry.register(
+            BuiltInRegistries.ITEM,
+            Identifier.fromNamespaceAndPath("demo", "probe_item"),
+            new StateProbeItem(new Item.Properties().durability(100))
+        );
+        Registry.register(
+            BuiltInRegistries.ITEM,
+            Identifier.fromNamespaceAndPath("demo", "opaque_probe_item"),
+            new OpaqueProbeItem(new Item.Properties())
+        );
+    }
+}
+"#;
+
+#[test]
+fn item_tooltip_passes_real_stack_components_and_tooltip_display() {
+    let mut sources = CLIENT_DISPATCH_STUBS.to_vec();
+    sources.push(("demo/TooltipRealStateMod.java", TOOLTIP_REAL_STATE_MOD));
+    let jar_bytes = build_javac_jar(
+        "client-tooltip-real-state",
+        r#"{"schemaVersion":1,"id":"demo","version":"1.0","entrypoints":{"main":["demo.TooltipRealStateMod"]}}"#,
+        &sources,
+    );
+
+    let java = Arc::new(HorizonJava::default());
+    java.lock_client()
+        .set_fixture_files(vec![("demo-tooltip-state.jar".to_owned(), jar_bytes)]);
+
+    let mods = vec![ModEntry::new(
+        "horizon_java",
+        Box::new(SharedHorizonJava(Arc::clone(&java))),
+    )];
+    mod_api::testing::with_mods(mods.into(), || {
+        mod_api::testing::rebuild_parts(|| {
+            let mut host = TestClientHost::new(&["demo:probe_item", "demo:opaque_probe_item"]);
+            mod_api::dispatch_client_setup(&mut host);
+            assert_eq!(report_row(&java)["unknown_host_call_count"], 0);
+
+            // A) Real stack with damage, unbreakable, custom_data, and hidden `minecraft:lore`.
+            let mut rich = host.stack("demo:probe_item");
+            rich.set_damage(7);
+            rich.set_components(
+                [
+                    (
+                        "minecraft:unbreakable".into(),
+                        Tag::Compound(mod_api::Compound::new()),
+                    ),
+                    (
+                        "minecraft:custom_data".into(),
+                        Tag::compound(vec![("tier", Tag::Int(4))]),
+                    ),
+                    (
+                        "minecraft:tooltip_display".into(),
+                        Tag::compound(vec![(
+                            "hidden_components",
+                            Tag::List(vec![Tag::String("minecraft:lore".into())]),
+                        )]),
+                    ),
+                ]
+                .into(),
+            )
+            .unwrap();
+            let rich_display = TooltipDisplay::for_stack(&rich);
+            let mut lines = vec![(Text::literal("Probe"), 0xFFFF_FFFF)];
+            mod_api::dispatch_item_tooltip(
+                &host,
+                mod_api::__private::ItemTooltipCall {
+                    player: 0,
+                    player_entity_id: 1,
+                    stack: &rich,
+                    display: &rich_display,
+                    advanced: false,
+                    creative: false,
+                    lines: &mut lines,
+                },
+            );
+            assert_eq!(
+                lines,
+                vec![
+                    (Text::literal("Probe"), 0xFFFF_FFFF),
+                    (
+                        Text::literal("dmg=7|unb=true|tier=4|hide=false|lore=false|dmgShow=true|banner=true"),
+                        u32::MAX
+                    ),
+                ]
+            );
+            assert_eq!(report_row(&java)["unknown_host_call_count"], 0);
+
+            // B) Ominous banner implicit TooltipDisplay hides `minecraft:banner_patterns`.
+            let plain = host.stack("demo:probe_item");
+            let ominous_display = TooltipDisplay::from_component(None, true);
+            let mut ominous_lines = vec![(Text::literal("Probe"), 0xFFFF_FFFF)];
+            mod_api::dispatch_item_tooltip(
+                &host,
+                mod_api::__private::ItemTooltipCall {
+                    player: 0,
+                    player_entity_id: 1,
+                    stack: &plain,
+                    display: &ominous_display,
+                    advanced: false,
+                    creative: false,
+                    lines: &mut ominous_lines,
+                },
+            );
+            assert_eq!(
+                ominous_lines,
+                vec![
+                    (Text::literal("Probe"), 0xFFFF_FFFF),
+                    (
+                        Text::literal("dmg=0|unb=false|tier=-1|hide=false|lore=true|dmgShow=true|banner=false"),
+                        u32::MAX
+                    ),
+                ]
+            );
+            assert_eq!(report_row(&java)["unknown_host_call_count"], 0);
+
+            // C) `hide_tooltip: 1b` in creative mode passes `hideTooltip() == true` and
+            //    `shows(...) == false` for every component (Java 25 TooltipDisplay semantics).
+            let mut hidden = host.stack("demo:probe_item");
+            hidden
+                .set_components(
+                    [(
+                        "minecraft:tooltip_display".into(),
+                        Tag::compound(vec![("hide_tooltip", Tag::Byte(1))]),
+                    )]
+                    .into(),
+                )
+                .unwrap();
+            let hidden_display = TooltipDisplay::for_stack(&hidden);
+            let mut hidden_lines = vec![(Text::literal("Probe"), 0xFFFF_FFFF)];
+            mod_api::dispatch_item_tooltip(
+                &host,
+                mod_api::__private::ItemTooltipCall {
+                    player: 0,
+                    player_entity_id: 1,
+                    stack: &hidden,
+                    display: &hidden_display,
+                    advanced: false,
+                    creative: true,
+                    lines: &mut hidden_lines,
+                },
+            );
+            assert_eq!(
+                hidden_lines,
+                vec![
+                    (Text::literal("Probe"), 0xFFFF_FFFF),
+                    (
+                        Text::literal("dmg=0|unb=false|tier=-1|hide=true|lore=false|dmgShow=false|banner=false"),
+                        u32::MAX
+                    ),
+                ]
+            );
+            assert_eq!(report_row(&java)["unknown_host_call_count"], 0);
+
+            // D) Stack with an unrepresentable component (`minecraft:enchantments`): modelled
+            //    `CUSTOM_DATA` still reads accurately, while reading `ENCHANTMENTS` is counted.
+            let mut opaque_stack = host.stack("demo:opaque_probe_item");
+            opaque_stack
+                .set_components(
+                    [
+                        (
+                            "minecraft:custom_data".into(),
+                            Tag::compound(vec![("tier", Tag::Int(9))]),
+                        ),
+                        (
+                            "minecraft:enchantments".into(),
+                            Tag::compound(vec![(
+                                "levels",
+                                Tag::compound(vec![("minecraft:sharpness", Tag::Int(5))]),
+                            )]),
+                        ),
+                    ]
+                    .into(),
+                )
+                .unwrap();
+            let opaque_display = TooltipDisplay::for_stack(&opaque_stack);
+            let mut opaque_lines = vec![(Text::literal("Opaque"), 0xFFFF_FFFF)];
+            mod_api::dispatch_item_tooltip(
+                &host,
+                mod_api::__private::ItemTooltipCall {
+                    player: 0,
+                    player_entity_id: 1,
+                    stack: &opaque_stack,
+                    display: &opaque_display,
+                    advanced: false,
+                    creative: false,
+                    lines: &mut opaque_lines,
+                },
+            );
+            assert_eq!(
+                opaque_lines,
+                vec![
+                    (Text::literal("Opaque"), 0xFFFF_FFFF),
+                    (Text::literal("tier=9"), u32::MAX),
+                ]
+            );
+            assert_eq!(
+                report_row(&java)["unknown_host_call_count"],
+                1,
+                "reading an unrepresentable component in tooltip must be counted"
+            );
+
+            // E) Malformed `minecraft:tooltip_display` tag must be counted rather than silently
+            //    falling back to `TooltipDisplay.DEFAULT`.
+            let mut bad_td_stack = host.stack("demo:probe_item");
+            bad_td_stack
+                .set_components(
+                    [(
+                        "minecraft:tooltip_display".into(),
+                        Tag::String("malformed".into()),
+                    )]
+                    .into(),
+                )
+                .unwrap();
+            let bad_td_display = TooltipDisplay::for_stack(&bad_td_stack);
+            let mut bad_td_lines = vec![(Text::literal("Probe"), 0xFFFF_FFFF)];
+            mod_api::dispatch_item_tooltip(
+                &host,
+                mod_api::__private::ItemTooltipCall {
+                    player: 0,
+                    player_entity_id: 1,
+                    stack: &bad_td_stack,
+                    display: &bad_td_display,
+                    advanced: false,
+                    creative: false,
+                    lines: &mut bad_td_lines,
+                },
+            );
+            assert!(
+                report_row(&java)["unknown_host_call_count"]
+                    .as_u64()
+                    .unwrap()
+                    > 1,
+                "malformed tooltip_display must be counted"
+            );
+
+            Ok::<_, ()>(())
+        })
+        .unwrap();
+    });
+}
+
+const DUPLICATE_REORDER_MOD: &str = r#"package demo;
+import net.fabricmc.api.ModInitializer;
+import net.fabricmc.fabric.api.creativetab.v1.CreativeModeTabEvents;
+import net.minecraft.world.item.CreativeModeTabs;
+import net.minecraft.world.item.Items;
+
+public final class DuplicateReorderMod implements ModInitializer {
+    @Override
+    public void onInitialize() {
+        // Java 25 + Fabric API 5.0.21 oracle case1:
+        // raw [stone, dirt, stone, apple, bread] -> set [stone, dirt, apple, bread]
+        CreativeModeTabEvents.modifyOutputEvent(CreativeModeTabs.FUNCTIONAL_BLOCKS).register(entries -> {
+            entries.accept(Items.STONE);
+            entries.accept(Items.BREAD);
+            entries.insertAfter(Items.STONE, Items.APPLE);
+        });
+
+        // Java 25 + Fabric API 5.0.21 oracle case2:
+        // raw [dirt, stone, dirt, apple] -> set [dirt, stone, apple]
+        CreativeModeTabEvents.modifyOutputEvent(CreativeModeTabs.COMBAT).register(entries -> {
+            entries.prepend(Items.DIRT);
+            entries.insertAfter(Items.DIRT, Items.APPLE);
+        });
+
+        // Java 25 + Fabric API 5.0.21 oracle case3:
+        // raw [apple, dirt, stone, dirt, bread] -> set [apple, dirt, stone, bread]
+        CreativeModeTabEvents.modifyOutputEvent(CreativeModeTabs.INGREDIENTS).register(entries -> {
+            entries.insertBefore(Items.STONE, Items.DIRT);
+            entries.insertBefore(Items.DIRT, Items.APPLE);
+            entries.insertAfter(Items.DIRT, Items.BREAD);
+        });
+
+        // Java 25 + Fabric API 5.0.21 oracle case4:
+        // raw [stone, dirt, stone, apple] -> set [stone, dirt, apple]
+        CreativeModeTabEvents.modifyOutputEvent(CreativeModeTabs.TOOLS_AND_UTILITIES).register(entries -> {
+            entries.accept(Items.STONE);
+            entries.insertAfter(Items.STONE, Items.APPLE);
+        });
+
+        // Java 25 + Fabric API 5.0.21 oracle case4b:
+        // raw [stone, bread, dirt, stone, apple] -> set [stone, bread, dirt, apple]
+        CreativeModeTabEvents.modifyOutputEvent(CreativeModeTabs.FOOD_AND_DRINKS).register(entries -> {
+            entries.insertBefore(Items.DIRT, Items.BREAD);
+            entries.accept(Items.STONE);
+            entries.insertAfter(Items.STONE, Items.APPLE);
+        });
+    }
+}
+"#;
+
+#[test]
+fn creative_tab_duplicate_reordering_matches_java25_fabric_oracle() {
+    let mut sources = CLIENT_DISPATCH_STUBS.to_vec();
+    sources.push(("demo/DuplicateReorderMod.java", DUPLICATE_REORDER_MOD));
+    let jar_bytes = build_javac_jar(
+        "client-duplicate-reorder",
+        r#"{"schemaVersion":1,"id":"demo","version":"1.0","entrypoints":{"main":["demo.DuplicateReorderMod"]}}"#,
+        &sources,
+    );
+
+    let java = Arc::new(HorizonJava::default());
+    java.lock_client()
+        .set_fixture_files(vec![("demo-reorder.jar".to_owned(), jar_bytes)]);
+
+    let mods = vec![ModEntry::new(
+        "horizon_java",
+        Box::new(SharedHorizonJava(Arc::clone(&java))),
+    )];
+    mod_api::testing::with_mods(mods.into(), || {
+        mod_api::testing::rebuild_parts(|| {
+            let mut host = TestClientHost::new(&[
+                "minecraft:stone",
+                "minecraft:dirt",
+                "minecraft:apple",
+                "minecraft:bread",
+            ]);
+            mod_api::dispatch_client_setup(&mut host);
+            assert_eq!(report_row(&java)["unknown_host_call_count"], 0);
+
+            let cases: &[(&str, u64, &[&str])] = &[
+                (
+                    "minecraft:functional_blocks",
+                    40,
+                    &[
+                        "minecraft:stone",
+                        "minecraft:dirt",
+                        "minecraft:apple",
+                        "minecraft:bread",
+                    ],
+                ),
+                (
+                    "minecraft:combat",
+                    41,
+                    &["minecraft:dirt", "minecraft:stone", "minecraft:apple"],
+                ),
+                (
+                    "minecraft:ingredients",
+                    42,
+                    &[
+                        "minecraft:apple",
+                        "minecraft:dirt",
+                        "minecraft:stone",
+                        "minecraft:bread",
+                    ],
+                ),
+                (
+                    "minecraft:tools_and_utilities",
+                    43,
+                    &["minecraft:stone", "minecraft:dirt", "minecraft:apple"],
+                ),
+                (
+                    "minecraft:food_and_drinks",
+                    44,
+                    &[
+                        "minecraft:stone",
+                        "minecraft:bread",
+                        "minecraft:dirt",
+                        "minecraft:apple",
+                    ],
+                ),
+            ];
+
+            for &(tab, id, expected_ids) in cases {
+                let edit = host.begin_tab(
+                    id,
+                    &["minecraft:stone", "minecraft:dirt"],
+                    &["minecraft:stone", "minecraft:dirt"],
+                );
+                mod_api::dispatch_build_creative_mode_tab_contents(
+                    HostSide::Client(&mut host),
+                    tab,
+                    vec!["minecraft:vanilla".to_owned()],
+                    CreativeTabPermissions::Normal,
+                    edit,
+                );
+                let expected: Vec<(String, u32)> = expected_ids
+                    .iter()
+                    .map(|item| ((*item).to_owned(), 1))
+                    .collect();
+                assert_eq!(
+                    host.tab_entries(CreativeTabList::Parent),
+                    expected,
+                    "Parent mismatch for {tab}"
+                );
+                assert_eq!(
+                    host.tab_entries(CreativeTabList::Search),
+                    expected,
+                    "Search mismatch for {tab}"
+                );
+            }
+            assert_eq!(
+                report_row(&java)["unknown_host_call_count"],
+                0,
+                "duplicate reconciliation must have zero unknown host calls"
+            );
 
             Ok::<_, ()>(())
         })
