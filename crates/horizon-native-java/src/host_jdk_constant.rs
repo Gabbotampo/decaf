@@ -268,6 +268,24 @@ pub(crate) struct MatcherParts {
     pub(crate) fixed: bool,
 }
 
+/// A matcher's serial and whether its input is fixed, without copying the
+/// pattern and the input: what every call on a matcher needs, however long
+/// its text.
+pub(crate) fn matcher_identity(value: &Value) -> Option<(u64, bool)> {
+    let Value::Host(handle) = value else {
+        return None;
+    };
+    if handle.kind() != HostKind::RegexMatcher {
+        return None;
+    }
+    match handle.held() {
+        [Value::Long(serial), _, _, Value::Int(fixed)] => Some((*serial as u64, *fixed != 0)),
+        // A handle rebuilt from its key holds nothing: read it back.
+        [] => matcher_parts(value).map(|parts| (parts.serial, parts.fixed)),
+        _ => None,
+    }
+}
+
 /// The parts of a `Matcher` handle.
 pub(crate) fn matcher_parts(value: &Value) -> Option<MatcherParts> {
     let Value::Host(handle) = value else {

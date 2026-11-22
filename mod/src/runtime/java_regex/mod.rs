@@ -41,7 +41,7 @@ mod syntax;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use cursor::{Cursor, Found};
+pub(crate) use cursor::{Compiled, Cursor, Found};
 use engine::{Limits, Matcher, Program};
 
 /// Why a call is outside the modelled subset; the caller counts it.
@@ -147,6 +147,11 @@ impl Regex {
     /// `Matcher.groupCount()`.
     pub(crate) fn group_count(&self) -> usize {
         self.program.groups
+    }
+
+    /// Whether the pattern has a quantifier (see [`Program::repeats`]).
+    pub(crate) fn repeats(&self) -> bool {
+        self.program.repeats
     }
 
     /// The group a name refers to.

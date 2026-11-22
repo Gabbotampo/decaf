@@ -196,6 +196,15 @@ pub(crate) struct Program {
     /// nested in a repeated group). Reading it is counted; the match itself
     /// is exact.
     pub(crate) tainted: Vec<bool>,
+    /// Whether the pattern has a quantifier anywhere (`?`, `*`, `+`, `{n,m}`,
+    /// greedy, lazy or possessive, on a character or a group).
+    ///
+    /// Java's repeated atoms end in the shared accept node, which sets
+    /// `Matcher.last` on every iteration, whether or not the attempt then
+    /// succeeds. The engine writes `last` only where a lookaround or an atomic
+    /// group ends ([`End::Sub`]) and where the match ends, so after a failed
+    /// attempt its `last` is not Java's for such a pattern.
+    pub(crate) repeats: bool,
 }
 
 struct Compiler<'t> {
@@ -226,6 +235,16 @@ fn nullable(ast: &Ast) -> bool {
         Ast::Alt(items) => items.iter().any(nullable),
         Ast::Group(_, node) | Ast::Atomic(node) => nullable(node),
         Ast::Repeat { node, min, .. } => *min == 0 || nullable(node),
+    }
+}
+
+/// Whether `ast` has a quantifier anywhere.
+fn has_repeat(ast: &Ast) -> bool {
+    match ast {
+        Ast::Repeat { .. } => true,
+        Ast::Concat(items) | Ast::Alt(items) => items.iter().any(has_repeat),
+        Ast::Group(_, node) | Ast::Look { node, .. } | Ast::Atomic(node) => has_repeat(node),
+        Ast::Empty | Ast::One(_) | Ast::Backref(_) | Ast::Assert(_) => false,
     }
 }
 
@@ -481,6 +500,7 @@ impl Compiler<'_> {
 pub(crate) fn compile(parsed: Parsed) -> R<Program> {
     let mut tainted = vec![false; parsed.groups + 1];
     taint(&parsed.ast, &mut tainted);
+    let repeats = has_repeat(&parsed.ast);
     let mut compiler = Compiler {
         nodes: Vec::new(),
         locals: 0,
@@ -500,6 +520,7 @@ pub(crate) fn compile(parsed: Parsed) -> R<Program> {
         groups: parsed.groups,
         names: parsed.names,
         tainted,
+        repeats,
     })
 }
 

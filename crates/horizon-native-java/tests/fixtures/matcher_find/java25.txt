@@ -4,7 +4,7 @@ find_group	find=true group=#ff0000 group1=ff0000 group0=#ff0000
 find_start_end	find=true start=2 end=9 start1=3 end1=9 start0=2 end0=9
 find_groupCount	find=true count=1
 find_repeated	find1=true group1=ff0000 find2=true last_group1=00ff00 start=8 end=15
-find_exhausted	find1=true find2=false find3=false
+find_exhausted	find1=true find2=false
 reset_then_find	find1=true after_reset=true group=#ff0000
 reset_returns_receiver	same=true
 matcher_empty_input	find=false
@@ -44,9 +44,9 @@ trace_anchor_start	[0,1) false false
 trace_anchor_end	[1,2) false false
 trace_word_boundary	[0,0) [2,2) [3,3) [5,5) false
 trace_lookbehind	[1,2) [4,5) false false
-trace_nbt_path	false false false
-trace_nbt_closed	[3,8) false false
-trace_lazy	[0,3) [4,6) false false
+trace_nbt_path	false
+trace_nbt_closed	[3,8) false
+trace_lazy	[0,3) [4,6) false
 trace_alternation	[0,1) [1,2) [2,3) false
 nbt_group	find=true group=[2]
 loop_count	count=3
@@ -59,7 +59,6 @@ find_from_past_end	java.lang.IndexOutOfBoundsException: Illegal start index
 find_from_negative	java.lang.IndexOutOfBoundsException: Illegal start index
 find_from_then_find	a=true b=true group1=333333
 find_from_resets	a=true group1=111111
-find_from_miss_then_find	a=false b=true
 find_from_miss_group	java.lang.IllegalStateException: No match found
 find_from_bad_keeps_match	error=Illegal start index group=#111111
 matches_then_group	matches=true group=abc-42 g1=abc g2=42 start=0 end=6
@@ -73,10 +72,287 @@ matches_twice	first=true second=true
 matches_then_reset_find	matches=true find=true start=0
 failed_matches_keeps_last	find=true matches=false find2=false
 failed_matches_lookahead_moves_last	find=true matches=false find2=true start=1 end=1
-failed_matches_empty_star	find=true matches=false find2=true start=0 end=0
 failed_matches_first_matches	matches=false find=false
 failed_matches_lookahead_twice	find=truetrue matches=false find3=true start=2
 two_matchers	a=222222 b=111111
 method_reference	a=true b=true c=false
 matcher_kept_in_static	first=111111
 matcher_kept_in_static_next	second=true 222222
+seq[a?b|abab|mg]	m=false g!java.lang.IllegalStateException:No match found
+seq[a?b|abab|mmh]	m=false m=false h!java.lang.IllegalStateException:No match found
+seq[a?b|abab|m1g]	m=false 1=true g=b
+seq[a?b|abab|mrfg]	m=false r f=true g=ab
+seq[a?b|abab|m2e]	m=false 2=true e=4
+seq[a?b|abab|mmmc]	m=false m=false m=false c=0
+seq[a?b|abab|ms]	m=false s!java.lang.IllegalStateException:No match found
+seq[a{2}|aab|mg]	m=false g!java.lang.IllegalStateException:No match found
+seq[a{2}|aab|mmh]	m=false m=false h!java.lang.IllegalStateException:No match found
+seq[a{2}|aab|m1g]	m=false 1=false g!java.lang.IllegalStateException:No match found
+seq[a{2}|aab|mrfg]	m=false r f=true g=aa
+seq[a{2}|aab|m2e]	m=false 2=false e!java.lang.IllegalStateException:No match found
+seq[a{2}|aab|mmmc]	m=false m=false m=false c=0
+seq[a{2}|aab|ms]	m=false s!java.lang.IllegalStateException:No match found
+seq[.?|aa|mg]	m=false g!java.lang.IllegalStateException:No match found
+seq[.?|aa|mmh]	m=false m=false h!java.lang.IllegalStateException:No match found
+seq[.?|aa|m1g]	m=false 1=true g=a
+seq[.?|aa|mrfg]	m=false r f=true g=a
+seq[.?|aa|m2e]	m=false 2=true e=2
+seq[.?|aa|mmmc]	m=false m=false m=false c=0
+seq[.?|aa|ms]	m=false s!java.lang.IllegalStateException:No match found
+seq[b?(?=a)|ab|mg]	m=false g!java.lang.IllegalStateException:No match found
+seq[b?(?=a)|ab|mmh]	m=false m=false h!java.lang.IllegalStateException:No match found
+seq[b?(?=a)|ab|m1g]	m=false 1=false g!java.lang.IllegalStateException:No match found
+seq[b?(?=a)|ab|mrfg]	m=false r f=true g=
+seq[b?(?=a)|ab|m2e]	m=false 2=false e!java.lang.IllegalStateException:No match found
+seq[b?(?=a)|ab|mmmc]	m=false m=false m=false c=0
+seq[b?(?=a)|ab|ms]	m=false s!java.lang.IllegalStateException:No match found
+seq[a?$|aaa|mg]	m=false g!java.lang.IllegalStateException:No match found
+seq[a?$|aaa|mmh]	m=false m=false h!java.lang.IllegalStateException:No match found
+seq[a?$|aaa|m1g]	m=false 1=true g=a
+seq[a?$|aaa|mrfg]	m=false r f=true g=a
+seq[a?$|aaa|m2e]	m=false 2=true e=3
+seq[a?$|aaa|mmmc]	m=false m=false m=false c=0
+seq[a?$|aaa|ms]	m=false s!java.lang.IllegalStateException:No match found
+seq[#([0-9a-fA-F]{6})|#ff0000 #00ff00|mg]	m=false g!java.lang.IllegalStateException:No match found
+seq[#([0-9a-fA-F]{6})|#ff0000 #00ff00|mmh]	m=false m=false h!java.lang.IllegalStateException:No match found
+seq[#([0-9a-fA-F]{6})|#ff0000 #00ff00|m1g]	m=false 1=true g=#00ff00
+seq[#([0-9a-fA-F]{6})|#ff0000 #00ff00|mrfg]	m=false r f=true g=#ff0000
+seq[#([0-9a-fA-F]{6})|#ff0000 #00ff00|m2e]	m=false 2=true e=15
+seq[#([0-9a-fA-F]{6})|#ff0000 #00ff00|mmmc]	m=false m=false m=false c=1
+seq[#([0-9a-fA-F]{6})|#ff0000 #00ff00|ms]	m=false s!java.lang.IllegalStateException:No match found
+seq[a.*?b|aba\u0085|mg]	m=false g!java.lang.IllegalStateException:No match found
+seq[a.*?b|aba\u0085|mmh]	m=false m=false h!java.lang.IllegalStateException:No match found
+seq[a.*?b|aba\u0085|m1g]	m=false 1=false g!java.lang.IllegalStateException:No match found
+seq[a.*?b|aba\u0085|mrfg]	m=false r f=true g=ab
+seq[a.*?b|aba\u0085|m2e]	m=false 2=false e!java.lang.IllegalStateException:No match found
+seq[a.*?b|aba\u0085|mmmc]	m=false m=false m=false c=0
+seq[a.*?b|aba\u0085|ms]	m=false s!java.lang.IllegalStateException:No match found
+seq[a*+b|aabx|mg]	m=false g!java.lang.IllegalStateException:No match found
+seq[a*+b|aabx|mmh]	m=false m=false h!java.lang.IllegalStateException:No match found
+seq[a*+b|aabx|m1g]	m=false 1=true g=ab
+seq[a*+b|aabx|mrfg]	m=false r f=true g=aab
+seq[a*+b|aabx|m2e]	m=false 2=true e=3
+seq[a*+b|aabx|mmmc]	m=false m=false m=false c=0
+seq[a*+b|aabx|ms]	m=false s!java.lang.IllegalStateException:No match found
+seq[(?:ab)*c|abab|mg]	m=false g!java.lang.IllegalStateException:No match found
+seq[(?:ab)*c|abab|mmh]	m=false m=false h!java.lang.IllegalStateException:No match found
+seq[(?:ab)*c|abab|m1g]	m=false 1=false g!java.lang.IllegalStateException:No match found
+seq[(?:ab)*c|abab|mrfg]	m=false r f=false g!java.lang.IllegalStateException:No match found
+seq[(?:ab)*c|abab|m2e]	m=false 2=false e!java.lang.IllegalStateException:No match found
+seq[(?:ab)*c|abab|mmmc]	m=false m=false m=false c=0
+seq[(?:ab)*c|abab|ms]	m=false s!java.lang.IllegalStateException:No match found
+seq[(a)*|aab|mg]	m=false g!java.lang.IllegalStateException:No match found
+seq[(a)*|aab|mmh]	m=false m=false h!java.lang.IllegalStateException:No match found
+seq[(a)*|aab|m1g]	m=false 1=true g=a
+seq[(a)*|aab|mrfg]	m=false r f=true g=aa
+seq[(a)*|aab|m2e]	m=false 2=true e=2
+seq[(a)*|aab|mmmc]	m=false m=false m=false c=1
+seq[(a)*|aab|ms]	m=false s!java.lang.IllegalStateException:No match found
+seq[[a-c]{2,3}|abcd|mg]	m=false g!java.lang.IllegalStateException:No match found
+seq[[a-c]{2,3}|abcd|mmh]	m=false m=false h!java.lang.IllegalStateException:No match found
+seq[[a-c]{2,3}|abcd|m1g]	m=false 1=true g=bc
+seq[[a-c]{2,3}|abcd|mrfg]	m=false r f=true g=abc
+seq[[a-c]{2,3}|abcd|m2e]	m=false 2=false e!java.lang.IllegalStateException:No match found
+seq[[a-c]{2,3}|abcd|mmmc]	m=false m=false m=false c=0
+seq[[a-c]{2,3}|abcd|ms]	m=false s!java.lang.IllegalStateException:No match found
+seq[\d{3}|12 345|mg]	m=false g!java.lang.IllegalStateException:No match found
+seq[\d{3}|12 345|mmh]	m=false m=false h!java.lang.IllegalStateException:No match found
+seq[\d{3}|12 345|m1g]	m=false 1=true g=345
+seq[\d{3}|12 345|mrfg]	m=false r f=true g=345
+seq[\d{3}|12 345|m2e]	m=false 2=true e=6
+seq[\d{3}|12 345|mmmc]	m=false m=false m=false c=0
+seq[\d{3}|12 345|ms]	m=false s!java.lang.IllegalStateException:No match found
+seq[(a{2})+b|aaab|mg]	m=false g!java.lang.IllegalStateException:No match found
+seq[(a{2})+b|aaab|mmh]	m=false m=false h!java.lang.IllegalStateException:No match found
+seq[(a{2})+b|aaab|m1g]	m=false 1=true g=aab
+seq[(a{2})+b|aaab|mrfg]	m=false r f=true g=aab
+seq[(a{2})+b|aaab|m2e]	m=false 2=false e!java.lang.IllegalStateException:No match found
+seq[(a{2})+b|aaab|mmmc]	m=false m=false m=false c=1
+seq[(a{2})+b|aaab|ms]	m=false s!java.lang.IllegalStateException:No match found
+seq[a?b?c?|xyz|mg]	m=false g!java.lang.IllegalStateException:No match found
+seq[a?b?c?|xyz|mmh]	m=false m=false h!java.lang.IllegalStateException:No match found
+seq[a?b?c?|xyz|m1g]	m=false 1=true g=
+seq[a?b?c?|xyz|mrfg]	m=false r f=true g=
+seq[a?b?c?|xyz|m2e]	m=false 2=true e=2
+seq[a?b?c?|xyz|mmmc]	m=false m=false m=false c=0
+seq[a?b?c?|xyz|ms]	m=false s!java.lang.IllegalStateException:No match found
+seq[(?i)a?B|aab|mg]	m=false g!java.lang.IllegalStateException:No match found
+seq[(?i)a?B|aab|mmh]	m=false m=false h!java.lang.IllegalStateException:No match found
+seq[(?i)a?B|aab|m1g]	m=false 1=true g=ab
+seq[(?i)a?B|aab|mrfg]	m=false r f=true g=ab
+seq[(?i)a?B|aab|m2e]	m=false 2=true e=3
+seq[(?i)a?B|aab|mmmc]	m=false m=false m=false c=0
+seq[(?i)a?B|aab|ms]	m=false s!java.lang.IllegalStateException:No match found
+seq[a??b|abab|mg]	m=false g!java.lang.IllegalStateException:No match found
+seq[a??b|abab|mmh]	m=false m=false h!java.lang.IllegalStateException:No match found
+seq[a??b|abab|m1g]	m=false 1=true g=b
+seq[a??b|abab|mrfg]	m=false r f=true g=ab
+seq[a??b|abab|m2e]	m=false 2=true e=4
+seq[a??b|abab|mmmc]	m=false m=false m=false c=0
+seq[a??b|abab|ms]	m=false s!java.lang.IllegalStateException:No match found
+seq[a{2,}+|aaab|mg]	m=false g!java.lang.IllegalStateException:No match found
+seq[a{2,}+|aaab|mmh]	m=false m=false h!java.lang.IllegalStateException:No match found
+seq[a{2,}+|aaab|m1g]	m=false 1=true g=aa
+seq[a{2,}+|aaab|mrfg]	m=false r f=true g=aaa
+seq[a{2,}+|aaab|m2e]	m=false 2=false e!java.lang.IllegalStateException:No match found
+seq[a{2,}+|aaab|mmmc]	m=false m=false m=false c=0
+seq[a{2,}+|aaab|ms]	m=false s!java.lang.IllegalStateException:No match found
+seq[(ab)?c|abab|mg]	m=false g!java.lang.IllegalStateException:No match found
+seq[(ab)?c|abab|mmh]	m=false m=false h!java.lang.IllegalStateException:No match found
+seq[(ab)?c|abab|m1g]	m=false 1=false g!java.lang.IllegalStateException:No match found
+seq[(ab)?c|abab|mrfg]	m=false r f=false g!java.lang.IllegalStateException:No match found
+seq[(ab)?c|abab|m2e]	m=false 2=false e!java.lang.IllegalStateException:No match found
+seq[(ab)?c|abab|mmmc]	m=false m=false m=false c=1
+seq[(ab)?c|abab|ms]	m=false s!java.lang.IllegalStateException:No match found
+seq[x*|ab|mg]	m=false g!java.lang.IllegalStateException:No match found
+seq[x*|ab|mmh]	m=false m=false h!java.lang.IllegalStateException:No match found
+seq[x*|ab|m1g]	m=false 1=true g=
+seq[x*|ab|mrfg]	m=false r f=true g=
+seq[x*|ab|m2e]	m=false 2=true e=2
+seq[x*|ab|mmmc]	m=false m=false m=false c=0
+seq[x*|ab|ms]	m=false s!java.lang.IllegalStateException:No match found
+seq[a{2}|ab|fg]	f=false g!java.lang.IllegalStateException:No match found
+seq[a{2}|ab|fmg]	f=false m=false g!java.lang.IllegalStateException:No match found
+seq[a{2}|ab|f0g]	f=false 0=false g!java.lang.IllegalStateException:No match found
+seq[a{2}|ab|frfg]	f=false r f=false g!java.lang.IllegalStateException:No match found
+seq[a{2}|ab|fs]	f=false s!java.lang.IllegalStateException:No match found
+seq[a{2}|ab|f9]	f=false 9!java.lang.IndexOutOfBoundsException:Illegal start index
+seq[a{2}|ab|fr]	f=false r
+seq[a?b|xx|fg]	f=false g!java.lang.IllegalStateException:No match found
+seq[a?b|xx|fmg]	f=false m=false g!java.lang.IllegalStateException:No match found
+seq[a?b|xx|f0g]	f=false 0=false g!java.lang.IllegalStateException:No match found
+seq[a?b|xx|frfg]	f=false r f=false g!java.lang.IllegalStateException:No match found
+seq[a?b|xx|fs]	f=false s!java.lang.IllegalStateException:No match found
+seq[a?b|xx|f9]	f=false 9!java.lang.IndexOutOfBoundsException:Illegal start index
+seq[a?b|xx|fr]	f=false r
+seq[#([0-9a-fA-F]{6})|#ff0 zz|fg]	f=false g!java.lang.IllegalStateException:No match found
+seq[#([0-9a-fA-F]{6})|#ff0 zz|fmg]	f=false m=false g!java.lang.IllegalStateException:No match found
+seq[#([0-9a-fA-F]{6})|#ff0 zz|f0g]	f=false 0=false g!java.lang.IllegalStateException:No match found
+seq[#([0-9a-fA-F]{6})|#ff0 zz|frfg]	f=false r f=false g!java.lang.IllegalStateException:No match found
+seq[#([0-9a-fA-F]{6})|#ff0 zz|fs]	f=false s!java.lang.IllegalStateException:No match found
+seq[#([0-9a-fA-F]{6})|#ff0 zz|f9]	f=false 9!java.lang.IndexOutOfBoundsException:Illegal start index
+seq[#([0-9a-fA-F]{6})|#ff0 zz|fr]	f=false r
+seq[[a-c]{2,3}|a x|fg]	f=false g!java.lang.IllegalStateException:No match found
+seq[[a-c]{2,3}|a x|fmg]	f=false m=false g!java.lang.IllegalStateException:No match found
+seq[[a-c]{2,3}|a x|f0g]	f=false 0=false g!java.lang.IllegalStateException:No match found
+seq[[a-c]{2,3}|a x|frfg]	f=false r f=false g!java.lang.IllegalStateException:No match found
+seq[[a-c]{2,3}|a x|fs]	f=false s!java.lang.IllegalStateException:No match found
+seq[[a-c]{2,3}|a x|f9]	f=false 9!java.lang.IndexOutOfBoundsException:Illegal start index
+seq[[a-c]{2,3}|a x|fr]	f=false r
+seq[\d{3}|12 34|fg]	f=false g!java.lang.IllegalStateException:No match found
+seq[\d{3}|12 34|fmg]	f=false m=false g!java.lang.IllegalStateException:No match found
+seq[\d{3}|12 34|f0g]	f=false 0=false g!java.lang.IllegalStateException:No match found
+seq[\d{3}|12 34|frfg]	f=false r f=false g!java.lang.IllegalStateException:No match found
+seq[\d{3}|12 34|fs]	f=false s!java.lang.IllegalStateException:No match found
+seq[\d{3}|12 34|f9]	f=false 9!java.lang.IndexOutOfBoundsException:Illegal start index
+seq[\d{3}|12 34|fr]	f=false r
+seq[(a{2})+b|ab|fg]	f=false g!java.lang.IllegalStateException:No match found
+seq[(a{2})+b|ab|fmg]	f=false m=false g!java.lang.IllegalStateException:No match found
+seq[(a{2})+b|ab|f0g]	f=false 0=false g!java.lang.IllegalStateException:No match found
+seq[(a{2})+b|ab|frfg]	f=false r f=false g!java.lang.IllegalStateException:No match found
+seq[(a{2})+b|ab|fs]	f=false s!java.lang.IllegalStateException:No match found
+seq[(a{2})+b|ab|f9]	f=false 9!java.lang.IndexOutOfBoundsException:Illegal start index
+seq[(a{2})+b|ab|fr]	f=false r
+seq[a+b|aac|fg]	f=false g!java.lang.IllegalStateException:No match found
+seq[a+b|aac|fmg]	f=false m=false g!java.lang.IllegalStateException:No match found
+seq[a+b|aac|f0g]	f=false 0=false g!java.lang.IllegalStateException:No match found
+seq[a+b|aac|frfg]	f=false r f=false g!java.lang.IllegalStateException:No match found
+seq[a+b|aac|fs]	f=false s!java.lang.IllegalStateException:No match found
+seq[a+b|aac|f9]	f=false 9!java.lang.IndexOutOfBoundsException:Illegal start index
+seq[a+b|aac|fr]	f=false r
+seq[(?:ab)+c|ababd|fg]	f=false g!java.lang.IllegalStateException:No match found
+seq[(?:ab)+c|ababd|fmg]	f=false m=false g!java.lang.IllegalStateException:No match found
+seq[(?:ab)+c|ababd|f0g]	f=false 0=false g!java.lang.IllegalStateException:No match found
+seq[(?:ab)+c|ababd|frfg]	f=false r f=false g!java.lang.IllegalStateException:No match found
+seq[(?:ab)+c|ababd|fs]	f=false s!java.lang.IllegalStateException:No match found
+seq[(?:ab)+c|ababd|f9]	f=false 9!java.lang.IndexOutOfBoundsException:Illegal start index
+seq[(?:ab)+c|ababd|fr]	f=false r
+seq[\[[^\[]*]$|foo[bar|fg]	f=false g!java.lang.IllegalStateException:No match found
+seq[\[[^\[]*]$|foo[bar|fmg]	f=false m=false g!java.lang.IllegalStateException:No match found
+seq[\[[^\[]*]$|foo[bar|f0g]	f=false 0=false g!java.lang.IllegalStateException:No match found
+seq[\[[^\[]*]$|foo[bar|frfg]	f=false r f=false g!java.lang.IllegalStateException:No match found
+seq[\[[^\[]*]$|foo[bar|fs]	f=false s!java.lang.IllegalStateException:No match found
+seq[\[[^\[]*]$|foo[bar|f9]	f=false 9!java.lang.IndexOutOfBoundsException:Illegal start index
+seq[\[[^\[]*]$|foo[bar|fr]	f=false r
+seq[(?=a)b|aab|fg]	f=false g!java.lang.IllegalStateException:No match found
+seq[(?=a)b|aab|fmg]	f=false m=false g!java.lang.IllegalStateException:No match found
+seq[(?=a)b|aab|f0g]	f=false 0=false g!java.lang.IllegalStateException:No match found
+seq[(?=a)b|aab|frfg]	f=false r f=false g!java.lang.IllegalStateException:No match found
+seq[(?=a)b|aab|fs]	f=false s!java.lang.IllegalStateException:No match found
+seq[(?=a)b|aab|f9]	f=false 9!java.lang.IndexOutOfBoundsException:Illegal start index
+seq[(?=a)b|aab|fr]	f=false r
+seq[(?=a)(?=a)b|aab|fg]	f=false g!java.lang.IllegalStateException:No match found
+seq[(?=a)(?=a)b|aab|fmg]	f=false m=false g!java.lang.IllegalStateException:No match found
+seq[(?=a)(?=a)b|aab|f0g]	f=false 0=false g!java.lang.IllegalStateException:No match found
+seq[(?=a)(?=a)b|aab|frfg]	f=false r f=false g!java.lang.IllegalStateException:No match found
+seq[(?=a)(?=a)b|aab|fs]	f=false s!java.lang.IllegalStateException:No match found
+seq[(?=a)(?=a)b|aab|f9]	f=false 9!java.lang.IndexOutOfBoundsException:Illegal start index
+seq[(?=a)(?=a)b|aab|fr]	f=false r
+seq[(?>a)b|aac|fg]	f=false g!java.lang.IllegalStateException:No match found
+seq[(?>a)b|aac|fmg]	f=false m=false g!java.lang.IllegalStateException:No match found
+seq[(?>a)b|aac|f0g]	f=false 0=false g!java.lang.IllegalStateException:No match found
+seq[(?>a)b|aac|frfg]	f=false r f=false g!java.lang.IllegalStateException:No match found
+seq[(?>a)b|aac|fs]	f=false s!java.lang.IllegalStateException:No match found
+seq[(?>a)b|aac|f9]	f=false 9!java.lang.IndexOutOfBoundsException:Illegal start index
+seq[(?>a)b|aac|fr]	f=false r
+seq[(?!b)c|aab|fg]	f=false g!java.lang.IllegalStateException:No match found
+seq[(?!b)c|aab|fmg]	f=false m=false g!java.lang.IllegalStateException:No match found
+seq[(?!b)c|aab|f0g]	f=false 0=false g!java.lang.IllegalStateException:No match found
+seq[(?!b)c|aab|frfg]	f=false r f=false g!java.lang.IllegalStateException:No match found
+seq[(?!b)c|aab|fs]	f=false s!java.lang.IllegalStateException:No match found
+seq[(?!b)c|aab|f9]	f=false 9!java.lang.IndexOutOfBoundsException:Illegal start index
+seq[(?!b)c|aab|fr]	f=false r
+seq[(?<=a)c|aab|fg]	f=false g!java.lang.IllegalStateException:No match found
+seq[(?<=a)c|aab|fmg]	f=false m=false g!java.lang.IllegalStateException:No match found
+seq[(?<=a)c|aab|f0g]	f=false 0=false g!java.lang.IllegalStateException:No match found
+seq[(?<=a)c|aab|frfg]	f=false r f=false g!java.lang.IllegalStateException:No match found
+seq[(?<=a)c|aab|fs]	f=false s!java.lang.IllegalStateException:No match found
+seq[(?<=a)c|aab|f9]	f=false 9!java.lang.IndexOutOfBoundsException:Illegal start index
+seq[(?<=a)c|aab|fr]	f=false r
+seq[(?<=a)c|aab|ffg]	f=false f=false g!java.lang.IllegalStateException:No match found
+seq[(?<!a)b|aab|fg]	f=false g!java.lang.IllegalStateException:No match found
+seq[(?<!a)b|aab|fmg]	f=false m=false g!java.lang.IllegalStateException:No match found
+seq[(?<!a)b|aab|f0g]	f=false 0=false g!java.lang.IllegalStateException:No match found
+seq[(?<!a)b|aab|frfg]	f=false r f=false g!java.lang.IllegalStateException:No match found
+seq[(?<!a)b|aab|fs]	f=false s!java.lang.IllegalStateException:No match found
+seq[(?<!a)b|aab|f9]	f=false 9!java.lang.IndexOutOfBoundsException:Illegal start index
+seq[(?<!a)b|aab|fr]	f=false r
+seq[(?<!a)b|aab|ffg]	f=false f=false g!java.lang.IllegalStateException:No match found
+--counted--
+seq[a?b|abab|mfg]	m=false f=true g=b
+seq[a{2}|aab|mfg]	m=false f=false g!java.lang.IllegalStateException:No match found
+seq[.?|aa|mfg]	m=false f=true g=a
+seq[b?(?=a)|ab|mfg]	m=false f=false g!java.lang.IllegalStateException:No match found
+seq[a?$|aaa|mfg]	m=false f=true g=a
+seq[#([0-9a-fA-F]{6})|#ff0000 #00ff00|mfg]	m=false f=true g=#00ff00
+seq[a.*?b|aba\u0085|mfg]	m=false f=false g!java.lang.IllegalStateException:No match found
+seq[a*+b|aabx|mfg]	m=false f=true g=b
+seq[(?:ab)*c|abab|mfg]	m=false f=false g!java.lang.IllegalStateException:No match found
+seq[(a)*|aab|mfg]	m=false f=true g=
+seq[[a-c]{2,3}|abcd|mfg]	m=false f=false g!java.lang.IllegalStateException:No match found
+seq[\d{3}|12 345|mfg]	m=false f=true g=345
+seq[(a{2})+b|aaab|mfg]	m=false f=false g!java.lang.IllegalStateException:No match found
+seq[a?b?c?|xyz|mfg]	m=false f=true g=
+seq[(?i)a?B|aab|mfg]	m=false f=true g=ab
+seq[a??b|abab|mfg]	m=false f=true g=b
+seq[a{2,}+|aaab|mfg]	m=false f=false g!java.lang.IllegalStateException:No match found
+seq[(ab)?c|abab|mfg]	m=false f=false g!java.lang.IllegalStateException:No match found
+seq[x*|ab|mfg]	m=false f=true g=
+seq[a{2}|ab|ffg]	f=false f=false g!java.lang.IllegalStateException:No match found
+seq[a?b|xx|ffg]	f=false f=false g!java.lang.IllegalStateException:No match found
+seq[#([0-9a-fA-F]{6})|#ff0 zz|ffg]	f=false f=false g!java.lang.IllegalStateException:No match found
+seq[[a-c]{2,3}|a x|ffg]	f=false f=false g!java.lang.IllegalStateException:No match found
+seq[\d{3}|12 34|ffg]	f=false f=false g!java.lang.IllegalStateException:No match found
+seq[(a{2})+b|ab|ffg]	f=false f=false g!java.lang.IllegalStateException:No match found
+seq[a+b|aac|ffg]	f=false f=false g!java.lang.IllegalStateException:No match found
+seq[(?:ab)+c|ababd|ffg]	f=false f=false g!java.lang.IllegalStateException:No match found
+seq[\[[^\[]*]$|foo[bar|ffg]	f=false f=false g!java.lang.IllegalStateException:No match found
+seq[(?=a)b|aab|ffg]	f=false f=false g!java.lang.IllegalStateException:No match found
+seq[(?=a)(?=a)b|aab|ffg]	f=false f=false g!java.lang.IllegalStateException:No match found
+seq[(?>a)b|aac|ffg]	f=false f=false g!java.lang.IllegalStateException:No match found
+seq[(?!b)c|aab|ffg]	f=false f=false g!java.lang.IllegalStateException:No match found
+seq[#([0-9a-fA-F]{6})|#111111|f7fg]	f=true 7=false f=true g=#111111
+seq[x*|ab|fmfg]	f=true m=false f=true g=
+seq[#([0-9a-fA-F]{6})|#ff0000|fffg]	f=true f=false f=false g!java.lang.IllegalStateException:No match found
+seq[a.*?b|axbxab|ffffg]	f=true f=true f=false f=false g!java.lang.IllegalStateException:No match found
+seq[\[[^\[]*]$|foo[bar]|fffg]	f=true f=false f=false g!java.lang.IllegalStateException:No match found

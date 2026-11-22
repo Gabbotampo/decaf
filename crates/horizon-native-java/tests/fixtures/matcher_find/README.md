@@ -6,9 +6,15 @@ what it found (`group`, `start`, `end`, `groupCount`), plus `find(int)`,
 fabric-carpet compiles (`#([0-9a-fA-F]{6})` in `Messenger`, `\[[^\[]*]$` in
 `NBTSerializableValue`) and on small patterns that pin where the next search
 starts (empty matches, a miss that follows one, a lookahead that moves
-`Matcher.last`). `java25.txt` is the probe's raw output on the real JDK 25; the
+`Matcher.last`), and call sequences (`seq[pattern|input|ops]` rows) that run
+after an attempt that failed over a quantified pattern. `java25.txt` is the probe's raw output on the real JDK 25; the
 rows are one `name<TAB>result` line each, an exception printed as its class and
-message.
+message. The `rows()` part (320 lines) is what the runtime answers; the
+`counted()` part after the `--counted--` line (37 lines) holds Java's answer to
+calls the runtime must not answer, and the test only checks they are counted.
+A `seq[...]` row runs its `ops` on a fresh matcher: `f` find(), `m` matches(),
+`g` group(), `h` group(1), `s` start(), `e` end(), `r` reset(), `c`
+groupCount(), a digit `d` find(d); a call that throws prints `op!class:message`.
 
 Captured on 2026-11-22 with (the probe uses only the JDK; no library jar is on
 the class path):
@@ -35,18 +41,80 @@ and `strings` on `carpet/utils/Messenger.class` and
 
 ## What is answered, what is counted
 
-Answered exactly (every row above): `find()`, `find(int)`, `matches()`,
-`reset()`, `group()`, `group(int)`, `start()`, `start(int)`, `end()`, `end(int)`
-and `groupCount()` on a matcher over a `String`, for a pattern and input the
-`java_regex` engine decides, with Java's `IllegalStateException` ("No match
-found") and `IndexOutOfBoundsException` ("No group n", "Illegal start index").
+**Answered exactly**, each shown by the `rows()` lines above: `find()`,
+`find(int)`, `matches()`, `reset()`, `group()`, `group(int)`, `start()`,
+`start(int)`, `end()`, `end(int)` and `groupCount()` on a matcher over a
+`String`, for a pattern and input the `java_regex` engine decides, with Java's
+`IllegalStateException` ("No match found") and `IndexOutOfBoundsException`
+("No group n", "Illegal start index"), except `group()` and `group(int)` over
+an input that may hold U+FFFD (see **Not claimed**). The rows pin, among the
+rest:
 
-Counted, never guessed (no row, because the runtime does not answer them):
-`find()` after an empty match at the end of the input (the `false` is answered,
-the matcher is not followed after it), a `find()` that fails after a lookaround
-moved `last`, a matcher over a `StringBuilder`'s text, a group whose value the
-engine does not promise, a pattern or input outside the engine's subset, and
-every other `Matcher` method (`lookingAt`, `region`, `usePattern`,
-`reset(CharSequence)`, `replaceAll`, `appendReplacement`, `results`,
-`group(String)`...). Calling one of the state-changing ones counts every later
-call on that matcher too. `regex_matcher.rs` has unit tests for these.
+- the empty-match rule (`find()` resumes one `char` after an empty match) and
+  what a failed `matches()` leaves for the next `find()`, **for patterns with
+  no quantifier** (`a`, `(?=a)`, `(\w+)-(\d+)`...);
+- after a failed `matches()` or `find()` over a pattern **with** a quantifier
+  (`a?b`, `a{2}`, `.?`, `#([0-9a-fA-F]{6})`, `a.*?b`, `a*+b`, `(?:ab)*c`,
+  `(a{2})+b`...): `group`, `start`, `end` (which throw), `matches()`,
+  `find(int)` and `reset()` followed by `find()`; none of them reads `last`.
+
+**Counted, never guessed:**
+
+- A `find()` after an attempt that failed over a pattern with a quantifier on
+  a character or a group (`?`, `*`, `+`, `{n,m}`, lazy and possessive forms),
+  and the calls after it, whether the attempt was a `find()`, a `find(int)` or
+  a `matches()`. Java's repeated atoms set `Matcher.last` on every
+  iteration, including in an attempt that fails, so the next `find()` resumes
+  from a place the runtime does not know; the 37 `counted()` rows hold Java's
+  answers (a `find()` that is `true` here, `false` there) and the test checks
+  the runtime answers none of those `find()`s or the `group()`s after them. The
+  `false` of the failed attempt itself is answered. A successful attempt sets
+  `last` to the match's end, so only misses lose it, and a later successful
+  `matches()`, `find(int)` or `reset()` finds it again.
+- A `find()` after a `find()` that failed once a lookahead or an atomic group
+  had run (`(?=a)b`, `(?=a)(?=a)b`, `(?>a)b`, `(?!b)c`; `FAILED_LOOK`): Java
+  left `last` at that sub-pattern's end, wherever the start positions it tried
+  stopped. Counted like the quantified case, and the calls that do not read
+  `last` are answered after it (`FAILED_LOOK` rows in `rows()`). After a failed
+  lookbehind (`FAILED_BEHIND`) the runtime follows the matcher and answers the
+  second `find()` too; these rows show Java's answers (`false`), but they
+  cannot tell whether Java's `last` moved there, since a search that failed
+  from the start fails again from anywhere after it.
+- `find()` after an empty match at the end of the input (the `false` is
+  answered, the matcher is not followed after it).
+- A matcher over a `StringBuilder`'s text, a group whose value the engine does
+  not promise, a pattern or input outside the engine's subset, and every other
+  `Matcher` method (`lookingAt`, `region`, `usePattern`, `reset(CharSequence)`,
+  `replaceAll`, `appendReplacement`, `results`, `group(String)`...). Calling a
+  state-changing one counts every later call on that matcher too.
+  `regex_matcher.rs` has unit tests for these.
+
+**Not claimed:** the oracle has no row with a lone surrogate. A `String`
+holding one (`"\ud800"`) is already U+FFFD inside the runtime, before any
+`Matcher` is involved (an existing departure, not changed here), so
+`group()` on an input that held a lone surrogate returns U+FFFD where Java
+returns the surrogate, and the runtime cannot tell that text from a real
+U+FFFD. `group()` over an input that may hold U+FFFD is therefore not shown
+exact by these rows.
+
+**Differential fuzz (not committed, not a gate).** The runtime and a JDK 25.0.5.1
+`Matcher` were run on random and exhaustive call sequences (`find`, `matches`,
+`group`, `group(1)`, `start`, `end`, `reset`, `groupCount`, `find(int)` with
+fresh matchers) over 92 patterns and 38 inputs: 39,968 cases (seed 1) and
+47,968 cases (seed 7). Every call the runtime answered equalled Java's:
+120,313 and 153,367 answered calls, no difference; 38,571 and 41,776 calls were
+counted. This is evidence, not an oracle row: only the rows above are in the
+tree.
+
+**Cost.** The compiled pattern and the input read as `char`s are kept per
+matcher (256 matchers and 4 Mi `char`s of input at most, then emptied), so a
+`while (m.find())` loop pays for each search, not for the length of the input
+and the pattern's compile on every call. No row measures it. Measured on
+2026-11-22 (fast profile, one machine, `while (m.find())` over `"ab"` repeated
+n times, wall clock): before this change (e20997b8) 0.80 s for n = 20,000 and
+10.85 s for n = 80,000; after, 0.12 s and 0.80 s, and 10.3 s for n = 320,000.
+The search itself is linear now (`regex_matcher::tests::a_long_search_compiles_and_reads_the_input_once`
+runs 40,000 `char`s; a throwaway run of the same loop for n = 5,000 / 20,000 /
+80,000 took 8 / 31 / 128 ms in a debug build), but the whole loop through the
+interpreter is still more than linear at n = 320,000; where that cost sits was
+not found (the module's own part is the linear one above).

@@ -57,7 +57,111 @@ public final class Probe {
         return b.toString();
     }
 
+    /** A call's text as printable ASCII, for a row's name and result. */
+    static String esc(String s) {
+        if (s == null) {
+            return "null";
+        }
+        StringBuilder b = new StringBuilder();
+        for (char c : s.toCharArray()) {
+            if (c < 0x20 || c > 0x7e) {
+                String hex = Integer.toHexString(c);
+                b.append("\\u").append("0000".substring(hex.length())).append(hex);
+            } else {
+                b.append(c);
+            }
+        }
+        return b.toString();
+    }
+
+    /**
+     * One call of a call sequence: `f` find(), `m` matches(), `g` group(), `h`
+     * group(1), `s` start(), `e` end(), `r` reset(), `c` groupCount(), a digit
+     * `d` find(d).
+     */
+    static String step(Matcher m, char op) {
+        try {
+            switch (op) {
+                case 'f': return "f=" + m.find();
+                case 'm': return "m=" + m.matches();
+                case 'g': return "g=" + esc(m.group());
+                case 'h': return "h=" + esc(m.group(1));
+                case 's': return "s=" + m.start();
+                case 'e': return "e=" + m.end();
+                case 'r': m.reset(); return "r";
+                case 'c': return "c=" + m.groupCount();
+                default: return op + "=" + m.find(op - '0');
+            }
+        } catch (Throwable e) {
+            return op + "!" + e.getClass().getName() + ":" + e.getMessage();
+        }
+    }
+
+    /**
+     * `ops`, one call each on a fresh matcher; one result per call. Written
+     * flat (no row lambda): the runtime admits only so many jar frames on a
+     * debug test thread, and the oracle must not depend on the build.
+     */
+    static void sequence(String pattern, String input, String ops) {
+        out.append("seq[").append(esc(pattern)).append('|').append(esc(input)).append('|')
+            .append(ops).append("]\t");
+        try {
+            Matcher m = Pattern.compile(pattern).matcher(input);
+            for (int i = 0; i < ops.length(); i++) {
+                if (i > 0) {
+                    out.append(' ');
+                }
+                out.append(step(m, ops.charAt(i)));
+            }
+        } catch (Throwable e) {
+            out.append(e.getClass().getName()).append(": ").append(e.getMessage());
+        }
+        out.append('\n');
+    }
+
+    /**
+     * Matchers whose first `matches()` fails over a pattern with a quantified
+     * atom (`a?`, `a{2}`, `.?`, lazy, possessive, a repeated group): Java's
+     * repeated atoms set `Matcher.last` on every iteration, so the next
+     * `find()` resumes where the failed attempt left it.
+     */
+    static final String[][] FAILED_MATCHES = {
+        {"a?b", "abab"}, {"a{2}", "aab"}, {".?", "aa"}, {"b?(?=a)", "ab"}, {"a?$", "aaa"},
+        {"#([0-9a-fA-F]{6})", "#ff0000 #00ff00"}, {"a.*?b", "aba\u0085"}, {"a*+b", "aabx"},
+        {"(?:ab)*c", "abab"}, {"(a)*", "aab"}, {"[a-c]{2,3}", "abcd"}, {"\\d{3}", "12 345"},
+        {"(a{2})+b", "aaab"}, {"a?b?c?", "xyz"}, {"(?i)a?B", "aab"}, {"a??b", "abab"},
+        {"a{2,}+", "aaab"}, {"(ab)?c", "abab"}, {"x*", "ab"},
+    };
+
+    /** Matchers whose first `find()` fails over a pattern with a quantified atom. */
+    static final String[][] FAILED_FIND = {
+        {"a{2}", "ab"}, {"a?b", "xx"}, {"#([0-9a-fA-F]{6})", "#ff0 zz"}, {"[a-c]{2,3}", "a x"},
+        {"\\d{3}", "12 34"}, {"(a{2})+b", "ab"}, {"a+b", "aac"}, {"(?:ab)+c", "ababd"},
+        {"\\[[^\\[]*]$", "foo[bar"},
+    };
+
+    /**
+     * Matchers whose first `find()` fails after a lookaround or an atomic group
+     * ran, which leaves `Matcher.last` at the end of the sub-pattern it
+     * reached (no quantifier is involved).
+     */
+    static final String[][] FAILED_LOOK = {
+        {"(?=a)b", "aab"}, {"(?=a)(?=a)b", "aab"}, {"(?>a)b", "aac"}, {"(?!b)c", "aab"},
+    };
+
+    /**
+     * Matchers whose first `find()` fails after a lookbehind ran: it does not
+     * set `last`, so the `find()` after it is answered (it is `false`: a search
+     * that failed from the start fails from anywhere after it).
+     */
+    static final String[][] FAILED_BEHIND = {{"(?<=a)c", "aab"}, {"(?<!a)b", "aab"}};
+
+    /** What a failed attempt leaves that nothing reads `last` for. */
+    static final String[] AFTER_FAILED_MATCHES = {"mg", "mmh", "m1g", "mrfg", "m2e", "mmmc", "ms"};
+    static final String[] AFTER_FAILED_FIND = {"fg", "fmg", "f0g", "frfg", "fs", "f9", "fr"};
+
     static String rows() {
+        out = new StringBuilder();
         row("find_match", () -> "find=" + m(HEX, "say #ff0000 please").find());
         row("find_nomatch", () -> "find=" + m(HEX, "hello world").find());
         row("find_group", () -> {
@@ -90,8 +194,7 @@ public final class Probe {
             Matcher m = m(HEX, "#ff0000");
             boolean first = m.find();
             boolean second = m.find();
-            boolean third = m.find();
-            return "find1=" + first + " find2=" + second + " find3=" + third;
+            return "find1=" + first + " find2=" + second;
         });
         row("reset_then_find", () -> {
             Matcher m = m(HEX, "#ff0000");
@@ -207,9 +310,9 @@ public final class Probe {
         row("trace_anchor_end", () -> trace("a$", "aa", 3));
         row("trace_word_boundary", () -> trace("\\b", "ab cd", 5));
         row("trace_lookbehind", () -> trace("(?<=a)b", "ab ab", 4));
-        row("trace_nbt_path", () -> trace("\\[[^\\[]*]$", "foo[bar", 3));
-        row("trace_nbt_closed", () -> trace("\\[[^\\[]*]$", "foo[bar]", 3));
-        row("trace_lazy", () -> trace("a.*?b", "axbxab", 4));
+        row("trace_nbt_path", () -> trace("\\[[^\\[]*]$", "foo[bar", 1));
+        row("trace_nbt_closed", () -> trace("\\[[^\\[]*]$", "foo[bar]", 2));
+        row("trace_lazy", () -> trace("a.*?b", "axbxab", 3));
         row("trace_alternation", () -> trace("a|ab|b", "abb", 4));
         row("nbt_group", () -> {
             Matcher m = m("\\[[^\\[]*]$", "list[1].name[2]");
@@ -265,13 +368,6 @@ public final class Probe {
             m.find();
             boolean a = m.find(0);
             return "a=" + a + " group1=" + m.group(1);
-        });
-        row("find_from_miss_then_find", () -> {
-            Matcher m = m(HEX, "#111111 #222222");
-            m.find();
-            boolean a = m.find(8 + 7);
-            boolean b = m.find();
-            return "a=" + a + " b=" + b;
         });
         row("find_from_miss_group", () -> {
             Matcher m = m(HEX, "#111111");
@@ -363,14 +459,6 @@ public final class Probe {
             return "find=" + a + " matches=" + b + " find2=" + c + " start=" + m.start()
                     + " end=" + m.end();
         });
-        row("failed_matches_empty_star", () -> {
-            Matcher m = m("x*", "ab");
-            boolean a = m.find();
-            boolean b = m.matches();
-            boolean c = m.find();
-            return "find=" + a + " matches=" + b + " find2=" + c + " start=" + m.start()
-                    + " end=" + m.end();
-        });
         row("failed_matches_first_matches", () -> {
             Matcher m = m("(?=a)", "ab");
             boolean b = m.matches();
@@ -414,6 +502,59 @@ public final class Probe {
             boolean b = keep.find();
             return "second=" + b + " " + keep.group(1);
         });
+
+        // Answered: after a failed attempt over a quantified pattern, what does
+        // not read `last` (group, start, end, matches, find(int), reset).
+        for (String[] c : FAILED_MATCHES) {
+            for (String ops : AFTER_FAILED_MATCHES) {
+                sequence(c[0], c[1], ops);
+            }
+        }
+        for (String[] c : FAILED_FIND) {
+            for (String ops : AFTER_FAILED_FIND) {
+                sequence(c[0], c[1], ops);
+            }
+        }
+        for (String[] c : FAILED_LOOK) {
+            for (String ops : AFTER_FAILED_FIND) {
+                sequence(c[0], c[1], ops);
+            }
+        }
+        for (String[] c : FAILED_BEHIND) {
+            for (String ops : AFTER_FAILED_FIND) {
+                sequence(c[0], c[1], ops);
+            }
+            sequence(c[0], c[1], "ffg");
+        }
+        return out.toString();
+    }
+
+    /**
+     * Counted: the `find()` after a failed attempt over a quantified pattern,
+     * and the `group()` after it. The rows hold Java's answer; the runtime does
+     * not give it. Each row ends in exactly one counted `find()` and one
+     * counted `group()`.
+     */
+    static String counted() {
+        out = new StringBuilder();
+        for (String[] c : FAILED_MATCHES) {
+            sequence(c[0], c[1], "mfg");
+        }
+        for (String[] c : FAILED_FIND) {
+            sequence(c[0], c[1], "ffg");
+        }
+        for (String[] c : FAILED_LOOK) {
+            sequence(c[0], c[1], "ffg");
+        }
+        // A `find(int)` that fails over a quantified pattern, then `find()`
+        // (Java: `last` is 0 after the reset and no atom ran, so it is `true`),
+        // and a `find()` after an empty match and a failed `matches()`.
+        sequence(HEX, "#111111", "f7fg");
+        sequence("x*", "ab", "fmfg");
+        // A `find()` after a miss that ended a run of matches.
+        sequence(HEX, "#ff0000", "fffg");
+        sequence("a.*?b", "axbxab", "ffffg");
+        sequence("\\[[^\\[]*]$", "foo[bar]", "fffg");
         return out.toString();
     }
 
@@ -421,5 +562,7 @@ public final class Probe {
 
     public static void main(String[] args) {
         System.out.print(rows());
+        System.out.print("--counted--\n");
+        System.out.print(counted());
     }
 }

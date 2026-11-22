@@ -19,17 +19,31 @@
 //! (Java's would see later appends), and one a call changed in a way not
 //! modelled: `lookingAt`, `region`, `usePattern`, `reset(CharSequence)`,
 //! `replaceAll`, `appendReplacement`, `results` and the rest.
+//!
+//! A matcher whose last attempt failed over a pattern with a quantifier (or
+//! after a lookaround moved `last`) is followed less far: its `find()` is
+//! counted, because Java's `last` is not the engine's (see
+//! `java_regex::Cursor`); what does not read `last` is still answered.
+//!
+//! The compiled pattern and the input read as `char`s are kept per matcher
+//! ([`Subjects`]), so a `while (m.find())` loop costs what each search costs,
+//! not the length of the input and the pattern's compile on every call.
 
 use std::collections::BTreeMap;
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 
-use crate::runtime::host_jdk_constant::{MatcherParts, matcher_parts, next_matcher_serial};
-use crate::runtime::java_regex::{self, Cursor, Found, Regex};
+use crate::runtime::host_jdk_constant::{matcher_identity, matcher_parts, next_matcher_serial};
+use crate::runtime::java_regex::{self, Compiled, Cursor, Found};
 use crate::runtime::regex_calls::thrown;
 use crate::runtime::{MethodRef, NativeError, StdHost, Value, expect_int};
 
 /// Matchers whose position is kept; at the bound the table is emptied.
 const MAX_TRACKED: usize = 16_384;
+/// Matchers whose compiled pattern and input are kept, and the `char`s of
+/// input they may hold in all; past either the cache is emptied (a later call
+/// compiles again, which is slower, never different).
+const MAX_SUBJECTS: usize = 256;
+const MAX_SUBJECT_CHARS: usize = 4 << 20;
 
 /// One matcher's state.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -92,8 +106,64 @@ fn store(serial: u64, state: Tracked) {
     table().store(serial, state, MAX_TRACKED, next_matcher_serial());
 }
 
+/// The compiled pattern and the input of the matchers recently called, by
+/// serial. A matcher's pattern and input never change, so an entry is right
+/// for as long as it lives; one that is gone is made again from the handle.
+#[derive(Debug, Default)]
+struct Subjects {
+    by_serial: BTreeMap<u64, Arc<Compiled>>,
+    /// `char`s of input held in all.
+    chars: usize,
+}
+
+static SUBJECTS: Mutex<Subjects> = Mutex::new(Subjects {
+    by_serial: BTreeMap::new(),
+    chars: 0,
+});
+
+impl Subjects {
+    fn insert(&mut self, serial: u64, subject: Arc<Compiled>, max: usize, max_chars: usize) {
+        if self.by_serial.len() >= max || self.chars + subject.len() > max_chars {
+            self.by_serial.clear();
+            self.chars = 0;
+        }
+        self.chars += subject.len();
+        if let Some(old) = self.by_serial.insert(serial, subject) {
+            self.chars -= old.len();
+        }
+    }
+}
+
+/// The subject of matcher `receiver`; `None` for a pattern or an input the
+/// engine does not run.
+fn subject(receiver: &Value, serial: u64) -> Option<Arc<Compiled>> {
+    let cached = SUBJECTS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .by_serial
+        .get(&serial)
+        .cloned();
+    if cached.is_some() {
+        return cached;
+    }
+    let parts = matcher_parts(receiver)?;
+    let subject = Arc::new(Compiled::new(&parts.pattern, &parts.input).ok()?);
+    SUBJECTS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(serial, subject.clone(), MAX_SUBJECTS, MAX_SUBJECT_CHARS);
+    Some(subject)
+}
+
 fn boolean(value: bool) -> Option<Value> {
     Some(Value::Int(i32::from(value)))
+}
+
+/// A matcher handle's serial and whether its input is fixed.
+#[derive(Clone, Copy)]
+struct Id {
+    serial: u64,
+    fixed: bool,
 }
 
 /// A call on a `Matcher` handle; `Ok(None)` leaves it counted.
@@ -102,29 +172,31 @@ pub(crate) fn invoke(
     receiver: Option<&Value>,
     args: &[Value],
 ) -> Result<Option<Value>, NativeError> {
-    let Some(parts) = receiver.and_then(matcher_parts) else {
+    let Some(receiver) = receiver else {
         return Ok(None);
     };
+    let Some((serial, fixed)) = matcher_identity(receiver) else {
+        return Ok(None);
+    };
+    let id = Id { serial, fixed };
     let int_argument = || expect_int(r, StdHost::argument(r, args, 0)?);
     match (r.name.as_str(), r.descriptor.as_str()) {
-        ("matches", "()Z") => matches(&parts),
-        ("find", "()Z") => find(&parts, None),
-        ("find", "(I)Z") => find(&parts, Some(int_argument()?)),
-        ("reset", "()Ljava/util/regex/Matcher;") => reset(&parts, receiver),
-        ("group", "()Ljava/lang/String;") => query(&parts, Query::Group(0)),
-        ("group", "(I)Ljava/lang/String;") => query(&parts, Query::Group(int_argument()?)),
-        ("start", "()I") => query(&parts, Query::Start(0)),
-        ("start", "(I)I") => query(&parts, Query::Start(int_argument()?)),
-        ("end", "()I") => query(&parts, Query::End(0)),
-        ("end", "(I)I") => query(&parts, Query::End(int_argument()?)),
-        ("groupCount", "()I") => query(&parts, Query::GroupCount),
+        ("matches", "()Z") => matches(id, receiver),
+        ("find", "()Z") => find(id, receiver, None),
+        ("find", "(I)Z") => find(id, receiver, Some(int_argument()?)),
+        ("reset", "()Ljava/util/regex/Matcher;") => reset(id, receiver),
+        ("group", "()Ljava/lang/String;") => query(id, receiver, Query::Group(0)),
+        ("group", "(I)Ljava/lang/String;") => query(id, receiver, Query::Group(int_argument()?)),
+        ("start", "()I") => query(id, receiver, Query::Start(0)),
+        ("start", "(I)I") => query(id, receiver, Query::Start(int_argument()?)),
+        ("end", "()I") => query(id, receiver, Query::End(0)),
+        ("end", "(I)I") => query(id, receiver, Query::End(int_argument()?)),
+        ("groupCount", "()I") => query(id, receiver, Query::GroupCount),
         // Anything else may change the matcher (`lookingAt`, `region`,
         // `usePattern`, `reset(CharSequence)`, `replaceAll`...) in a way its
         // position does not describe.
         _ => {
-            if let Some(receiver) = receiver {
-                note_host_call(r, receiver);
-            }
+            note_host_call(r, receiver);
             Ok(None)
         }
     }
@@ -138,10 +210,8 @@ pub(crate) fn note_host_call(r: &MethodRef, receiver: &Value) {
     if r.owner != "java/util/regex/Matcher" || reads_only(r.name.as_str()) {
         return;
     }
-    if let Some(parts) = matcher_parts(receiver)
-        && parts.fixed
-    {
-        store(parts.serial, Tracked::Unknown);
+    if let Some((serial, true)) = matcher_identity(receiver) {
+        store(serial, Tracked::Unknown);
     }
 }
 
@@ -171,29 +241,39 @@ fn reads_only(name: &str) -> bool {
 }
 
 /// The position to continue from; `None` when this matcher cannot be followed.
-fn followed(parts: &MatcherParts) -> Option<Cursor> {
-    if !parts.fixed {
+fn followed(id: Id) -> Option<Cursor> {
+    if !id.fixed {
         return None;
     }
-    match load(parts.serial) {
+    match load(id.serial) {
         Tracked::Cursor(cursor) => Some(cursor),
         Tracked::Unknown => None,
     }
 }
 
 /// `find()` (`from` is `None`) and `find(int)`.
-fn find(parts: &MatcherParts, from: Option<i32>) -> Result<Option<Value>, NativeError> {
-    let Some(mut cursor) = followed(parts) else {
+fn find(id: Id, receiver: &Value, from: Option<i32>) -> Result<Option<Value>, NativeError> {
+    let Some(mut cursor) = followed(id) else {
         return Ok(None);
     };
-    let outcome = Regex::compile(&parts.pattern, 0).and_then(|regex| match from {
-        None => cursor.find(&regex, &parts.input).map(Ok),
-        Some(from) => cursor.find_from(&regex, &parts.input, from),
-    });
+    let Some(subject) = subject(receiver, id.serial) else {
+        store(id.serial, Tracked::Unknown);
+        return Ok(None);
+    };
+    let outcome = match from {
+        None => cursor.find(&subject).map(Ok),
+        Some(from) => cursor.find_from(&subject, from),
+    };
     match outcome {
+        Ok(Ok(Found::Counted)) => {
+            // Java searches from somewhere this cursor does not know, and it
+            // will have moved: the matcher is followed no more.
+            store(id.serial, Tracked::Unknown);
+            Ok(None)
+        }
         Ok(Ok(found)) => {
             store(
-                parts.serial,
+                id.serial,
                 if found == Found::NoThenUnmodelled {
                     Tracked::Unknown
                 } else {
@@ -205,7 +285,7 @@ fn find(parts: &MatcherParts, from: Option<i32>) -> Result<Option<Value>, Native
         // `find(int)` out of range throws and leaves the matcher as it was.
         Ok(Err(exception)) => Err(thrown(exception)),
         Err(_) => {
-            store(parts.serial, Tracked::Unknown);
+            store(id.serial, Tracked::Unknown);
             Ok(None)
         }
     }
@@ -213,33 +293,37 @@ fn find(parts: &MatcherParts, from: Option<i32>) -> Result<Option<Value>, Native
 
 /// `matches()`: its answer needs no position, but it leaves one. A matcher
 /// that is not followed is answered from its text alone, as before.
-fn matches(parts: &MatcherParts) -> Result<Option<Value>, NativeError> {
-    let Some(mut cursor) = followed(parts) else {
-        return Ok(java_regex::matches(&parts.pattern, &parts.input)
-            .ok()
-            .and_then(boolean));
+fn matches(id: Id, receiver: &Value) -> Result<Option<Value>, NativeError> {
+    let Some(mut cursor) = followed(id) else {
+        return Ok(matcher_parts(receiver).and_then(|parts| {
+            java_regex::matches(&parts.pattern, &parts.input)
+                .ok()
+                .and_then(boolean)
+        }));
     };
-    let outcome =
-        Regex::compile(&parts.pattern, 0).and_then(|regex| cursor.matches(&regex, &parts.input));
-    match outcome {
+    let Some(subject) = subject(receiver, id.serial) else {
+        store(id.serial, Tracked::Unknown);
+        return Ok(None);
+    };
+    match cursor.matches(&subject) {
         Ok(matched) => {
-            store(parts.serial, Tracked::Cursor(cursor));
+            store(id.serial, Tracked::Cursor(cursor));
             Ok(boolean(matched))
         }
         Err(_) => {
-            store(parts.serial, Tracked::Unknown);
+            store(id.serial, Tracked::Unknown);
             Ok(None)
         }
     }
 }
 
-fn reset(parts: &MatcherParts, receiver: Option<&Value>) -> Result<Option<Value>, NativeError> {
-    let Some(mut cursor) = followed(parts) else {
+fn reset(id: Id, receiver: &Value) -> Result<Option<Value>, NativeError> {
+    let Some(mut cursor) = followed(id) else {
         return Ok(None);
     };
     cursor.reset();
-    store(parts.serial, Tracked::Cursor(cursor));
-    Ok(receiver.cloned())
+    store(id.serial, Tracked::Cursor(cursor));
+    Ok(Some(receiver.clone()))
 }
 
 #[derive(Clone, Copy)]
@@ -250,26 +334,23 @@ enum Query {
     GroupCount,
 }
 
-fn query(parts: &MatcherParts, query: Query) -> Result<Option<Value>, NativeError> {
-    let Some(cursor) = followed(parts) else {
+fn query(id: Id, receiver: &Value, query: Query) -> Result<Option<Value>, NativeError> {
+    let Some(cursor) = followed(id) else {
         return Ok(None);
     };
-    let Ok(regex) = Regex::compile(&parts.pattern, 0) else {
+    let Some(subject) = subject(receiver, id.serial) else {
         return Ok(None);
     };
     let answer = match query {
-        Query::GroupCount => return Ok(Some(Value::Int(regex.group_count() as i32))),
-        Query::Group(n) => cursor
-            .group(&regex, &parts.input, n)
-            .map(|group| group.map(Value::Ref)),
-        Query::Start(n) => cursor.start(&regex, n).map(|start| start.map(Value::Int)),
-        Query::End(n) => cursor.end(&regex, n).map(|end| end.map(Value::Int)),
+        Query::GroupCount => return Ok(Some(Value::Int(subject.group_count() as i32))),
+        Query::Group(n) => cursor.group(&subject, n).map(|group| group.map(Value::Ref)),
+        Query::Start(n) => cursor.start(&subject, n).map(|start| start.map(Value::Int)),
+        Query::End(n) => cursor.end(&subject, n).map(|end| end.map(Value::Int)),
     };
     match answer {
         Ok(Ok(value)) => Ok(Some(value)),
         Ok(Err(exception)) => Err(thrown(exception)),
-        // A group whose value is not Java's to promise, or an input the
-        // engine cannot read.
+        // A group whose value is not Java's to promise.
         Err(_) => Ok(None),
     }
 }
@@ -402,6 +483,113 @@ mod tests {
         assert_eq!(group(&n), Some(Value::Ref(Some("#111111".into()))));
     }
 
+    fn matches(receiver: &Value) -> Option<Value> {
+        call(receiver, "matches", "()Z", &[])
+    }
+
+    fn find_from(receiver: &Value, from: i32) -> Option<Value> {
+        call(receiver, "find", "(I)Z", &[Value::Int(from)])
+    }
+
+    fn start(receiver: &Value) -> Option<Value> {
+        call(receiver, "start", "()I", &[])
+    }
+
+    #[test]
+    fn a_quantified_atom_that_failed_leaves_last_unknown_so_find_is_counted() {
+        // Java's `a?` sets `last` to 1 on the way to the failed `matches()`
+        // and the next `find()` resumes there; the engine does not follow it.
+        for (pattern, input) in [
+            ("a?b", "abab"),
+            ("a{2}", "aab"),
+            (".?", "aa"),
+            ("a.*?b", "aba\u{85}"),
+            ("a*+b", "aabx"),
+            ("(ab)*c", "abab"),
+            (HEX, "#ff0000 #00ff00"),
+        ] {
+            let m = matcher(pattern, input, true);
+            assert!(matches(&m).is_some(), "{pattern}");
+            assert_eq!(find(&m), None, "{pattern}");
+            assert_eq!(group(&m), None, "{pattern}");
+        }
+    }
+
+    #[test]
+    fn what_does_not_read_last_is_still_answered_after_such_a_miss() {
+        // The failed `matches()` left no match: `group()` throws, `matches()`
+        // tries again from the start, `find(int)` and `reset()` start over.
+        let m = matcher("a?b", "abab", true);
+        assert_eq!(matches(&m), Some(Value::Int(0)));
+        let r = MethodRef {
+            owner: "java/util/regex/Matcher".into(),
+            name: "group".into(),
+            descriptor: "()Ljava/lang/String;".into(),
+        };
+        assert!(invoke(&r, Some(&m), &[]).is_err());
+        assert_eq!(matches(&m), Some(Value::Int(0)));
+        assert_eq!(find_from(&m, 1), Some(Value::Int(1)));
+        assert_eq!(start(&m), Some(Value::Int(1)));
+        assert_eq!(find(&m), Some(Value::Int(1)));
+        assert_eq!(start(&m), Some(Value::Int(2)));
+        // A failed `find(int)` loses `last` again; `reset()` finds it.
+        assert_eq!(find_from(&m, 4), Some(Value::Int(0)));
+        let n = matcher("a?b", "abab", true);
+        assert_eq!(matches(&n), Some(Value::Int(0)));
+        call(&n, "reset", "()Ljava/util/regex/Matcher;", &[]).unwrap();
+        assert_eq!(find(&n), Some(Value::Int(1)));
+        assert_eq!(start(&n), Some(Value::Int(0)));
+    }
+
+    #[test]
+    fn a_successful_matches_after_a_lost_last_follows_again() {
+        let m = matcher("a?b", "ab", true);
+        assert_eq!(find_from(&m, 1), Some(Value::Int(1)));
+        assert_eq!(find_from(&m, 2), Some(Value::Int(0)));
+        assert_eq!(matches(&m), Some(Value::Int(1)));
+        assert_eq!(find(&m), Some(Value::Int(0)));
+    }
+
+    #[test]
+    fn a_pattern_without_quantifiers_still_follows_a_failed_attempt() {
+        // No repeated atom sets `last`: Java's resume position is known.
+        let m = matcher("a", "ab", true);
+        assert_eq!(matches(&m), Some(Value::Int(0)));
+        assert_eq!(find(&m), Some(Value::Int(1)));
+        assert_eq!(start(&m), Some(Value::Int(0)));
+    }
+
+    #[test]
+    fn a_long_search_compiles_and_reads_the_input_once() {
+        let input = "ab".repeat(20_000);
+        let m = matcher("ab", &input, true);
+        let mut found = 0;
+        while find(&m) == Some(Value::Int(1)) {
+            found += 1;
+        }
+        assert_eq!(found, 20_000);
+    }
+
+    #[test]
+    fn the_subject_cache_forgets_when_full() {
+        let mut subjects = Subjects::default();
+        let one = Arc::new(Compiled::new("a", "aaa").unwrap());
+        subjects.insert(1, one.clone(), 2, 100);
+        subjects.insert(2, one.clone(), 2, 100);
+        assert_eq!(subjects.by_serial.len(), 2);
+        assert_eq!(subjects.chars, 6);
+        subjects.insert(3, one.clone(), 2, 100);
+        assert_eq!(subjects.by_serial.len(), 1);
+        assert_eq!(subjects.chars, 3);
+        // By weight: 3 + 3 fits in 8, a third 3 does not.
+        subjects.insert(4, one.clone(), 9, 8);
+        assert_eq!(subjects.by_serial.len(), 2);
+        assert_eq!(subjects.chars, 6);
+        subjects.insert(5, one, 9, 8);
+        assert_eq!(subjects.by_serial.len(), 1);
+        assert_eq!(subjects.chars, 3);
+    }
+
     #[test]
     fn the_table_forgets_by_serial_when_full() {
         let mut table = Table {
@@ -411,8 +599,8 @@ mod tests {
         let followed = Tracked::Cursor(Cursor::default());
         let moved = {
             let mut cursor = Cursor::default();
-            let regex = Regex::compile("a", 0).unwrap();
-            cursor.find(&regex, "aa").unwrap();
+            let subject = Compiled::new("a", "aa").unwrap();
+            cursor.find(&subject).unwrap();
             Tracked::Cursor(cursor)
         };
         assert_ne!(followed, moved);
