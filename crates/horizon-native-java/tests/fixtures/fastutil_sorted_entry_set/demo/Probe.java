@@ -9,10 +9,12 @@ import it.unimi.dsi.fastutil.objects.Object2BooleanRBTreeMap;
 import it.unimi.dsi.fastutil.objects.Object2BooleanSortedMap;
 import it.unimi.dsi.fastutil.objects.ObjectBidirectionalIterator;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.function.BiFunction;
 
 /**
  * Oracle for fastutil 8.5.18 Object2Boolean*Map entry-set iteration with String keys.
@@ -71,6 +73,29 @@ public class Probe {
 
     static String keys(Object2BooleanLinkedOpenHashMap<String> map) {
         return keys(map.object2BooleanEntrySet().iterator());
+    }
+
+    /** The number of entries an iterator visits. */
+    static int count(Iterator<?> it) {
+        int n = 0;
+        while (it.hasNext()) {
+            it.next();
+            n++;
+        }
+        return n;
+    }
+
+    /** Each entry as <char count>:<first char code>=<value>, so a lone surrogate shows. */
+    static String surrogateText(Object2BooleanLinkedOpenHashMap<String> map) {
+        StringBuilder sb = new StringBuilder();
+        Iterator<Object2BooleanMap.Entry<String>> it = map.object2BooleanEntrySet().iterator();
+        while (it.hasNext()) {
+            Object2BooleanMap.Entry<String> e = it.next();
+            String key = e.getKey();
+            sb.append(key.length()).append(':').append(key.isEmpty() ? -1 : (int) key.charAt(0))
+                    .append('=').append(e.getBooleanValue()).append(';');
+        }
+        return sb.toString();
     }
 
     static Object2BooleanLinkedOpenHashMap<String> linked() {
@@ -246,6 +271,35 @@ public class Probe {
             it.next();
             return "no exception " + more;
         }));
+        // An entry set kept while the map does not change is the map's view: read twice, and a
+        // fresh entry set per use sees a put.
+        line("LINKED.entry-set-kept-unchanged", of(() -> {
+            Object2BooleanLinkedOpenHashMap<String> m = linked();
+            Object2BooleanSortedMap.FastSortedEntrySet<String> es = m.object2BooleanEntrySet();
+            return keys(es.iterator()) + "|" + keys(es.iterator());
+        }));
+        line("LINKED.entry-set-fresh-per-use", of(() -> {
+            Object2BooleanLinkedOpenHashMap<String> m = linked();
+            String before = keys(m.object2BooleanEntrySet().iterator());
+            m.put("date", true);
+            return before + "|" + keys(m.object2BooleanEntrySet().iterator());
+        }));
+        // Keys of any length and code point, none a lone surrogate or U+FFFD.
+        line("LINKED.iterator-unicode-keys", of(() -> {
+            Object2BooleanLinkedOpenHashMap<String> m = new Object2BooleanLinkedOpenHashMap<>();
+            m.put("", true);
+            m.put("\u0000", false);
+            m.put("\u00e9", true);
+            m.put("\ud83d\ude00", false);
+            m.put("a\u0000b", true);
+            StringBuilder sb = new StringBuilder();
+            Iterator<Object2BooleanMap.Entry<String>> it = m.object2BooleanEntrySet().iterator();
+            while (it.hasNext()) {
+                Object2BooleanMap.Entry<String> e = it.next();
+                sb.append(e.getKey().length()).append(e.getBooleanValue()).append(';');
+            }
+            return sb + "|" + m.size();
+        }));
         return out.toString();
     }
 
@@ -382,6 +436,160 @@ public class Probe {
         Object2BooleanSortedMap.FastSortedEntrySet<String> es = m.object2BooleanEntrySet();
         m.put("date", true);
         return keys(es.iterator());
+    }
+
+    /** An entry set kept across a put is a live view; the host's is a copy made before it. */
+    static String keptCountAfterPutBody() {
+        Object2BooleanLinkedOpenHashMap<String> m = linked();
+        Object2BooleanSortedMap.FastSortedEntrySet<String> es = m.object2BooleanEntrySet();
+        m.put("x", true);
+        return "" + count(es.iterator());
+    }
+
+    static String keptCountAfterRemoveBody() {
+        Object2BooleanLinkedOpenHashMap<String> m = linked();
+        Object2BooleanSortedMap.FastSortedEntrySet<String> es = m.object2BooleanEntrySet();
+        m.removeBoolean("apple");
+        return "" + count(es.iterator());
+    }
+
+    static String keptCountThenClearBody() {
+        Object2BooleanLinkedOpenHashMap<String> m = linked();
+        Object2BooleanSortedMap.FastSortedEntrySet<String> es = m.object2BooleanEntrySet();
+        m.clear();
+        return "" + count(es.iterator());
+    }
+
+    /** The set made on an empty map sees the key put later. */
+    static String keptEmptyThenPutBody() {
+        Object2BooleanLinkedOpenHashMap<String> m = new Object2BooleanLinkedOpenHashMap<>();
+        Object2BooleanSortedMap.FastSortedEntrySet<String> es = m.object2BooleanEntrySet();
+        m.put("x", true);
+        return "" + es.iterator().hasNext();
+    }
+
+    /** A set read, then the map changed, then read again. */
+    static String keptTwoIterationsBody() {
+        Object2BooleanLinkedOpenHashMap<String> m = linked();
+        Object2BooleanSortedMap.FastSortedEntrySet<String> es = m.object2BooleanEntrySet();
+        int a = count(es.iterator());
+        m.put("x", true);
+        int b = count(es.iterator());
+        return a + "|" + b;
+    }
+
+    /** The map changed through an iterator's remove(), then the set it came from is read. */
+    static String keptAfterIteratorRemoveBody() {
+        Object2BooleanLinkedOpenHashMap<String> m = linked();
+        Object2BooleanSortedMap.FastSortedEntrySet<String> es = m.object2BooleanEntrySet();
+        ObjectBidirectionalIterator<Object2BooleanMap.Entry<String>> it = es.iterator();
+        it.next();
+        it.remove();
+        return "" + count(es.iterator()) + m.size();
+    }
+
+    /** A key put and removed again: the same keys in the same order, but not the same map. */
+    static String keptPutRemoveBody() {
+        Object2BooleanLinkedOpenHashMap<String> m = linked();
+        Object2BooleanSortedMap.FastSortedEntrySet<String> es = m.object2BooleanEntrySet();
+        m.put("x", true);
+        m.removeBoolean("x");
+        return "" + count(es.iterator());
+    }
+
+    /** A value changed through a put of a present key: the entries read the map's value. */
+    static String keptPutExistingBody() {
+        Object2BooleanLinkedOpenHashMap<String> m = linked();
+        Object2BooleanSortedMap.FastSortedEntrySet<String> es = m.object2BooleanEntrySet();
+        m.put("banana", false);
+        StringBuilder sb = new StringBuilder();
+        Iterator<Object2BooleanMap.Entry<String>> it = es.iterator();
+        while (it.hasNext()) {
+            Object2BooleanMap.Entry<String> e = it.next();
+            sb.append(e.getKey()).append(e.getBooleanValue()).append(';');
+        }
+        return sb.toString();
+    }
+
+    /** Two keys that are lone surrogates: the host stores each as U+FFFD, so as one key. */
+    static String surrogateKeysBody() {
+        Object2BooleanLinkedOpenHashMap<String> m = new Object2BooleanLinkedOpenHashMap<>();
+        m.put("\ud800", true);
+        m.put("\udc00", false);
+        return m.size() + "|" + surrogateText(m);
+    }
+
+    static String fffdAndSurrogateKeysBody() {
+        Object2BooleanLinkedOpenHashMap<String> m = new Object2BooleanLinkedOpenHashMap<>();
+        m.put("\ufffd", true);
+        m.put("\ud800", false);
+        return m.size() + "|" + surrogateText(m);
+    }
+
+    /** A lone surrogate key removed again leaves the other one behind. */
+    static String surrogateRemoveBody() {
+        Object2BooleanLinkedOpenHashMap<String> m = new Object2BooleanLinkedOpenHashMap<>();
+        m.put("x", true);
+        m.put("\ud800", false);
+        m.put("\udc00", true);
+        m.removeBoolean("\ud800");
+        return m.size() + "|" + surrogateText(m);
+    }
+
+    /** A genuine U+FFFD key: counted as well, the host cannot tell it from a lone surrogate. */
+    static String fffdKeyBody() {
+        Object2BooleanLinkedOpenHashMap<String> m = new Object2BooleanLinkedOpenHashMap<>();
+        m.put("\ufffd", true);
+        m.put("a", false);
+        return m.size() + "|" + surrogateText(m);
+    }
+
+    /** A null value put through the java.util.Map type: NullPointerException, the key is not added. */
+    static String nullValuePutBody() {
+        Object2BooleanLinkedOpenHashMap<String> m = linked();
+        Map<String, Boolean> viewed = m;
+        try {
+            viewed.put("n", null);
+        } catch (NullPointerException expected) {
+            // The unboxing of the value.
+        }
+        return surrogateText(m) + "|" + m.size();
+    }
+
+    /** Writes the runtime does not follow: a bulk put, and a wrapper around the map. */
+    static String putAllBody() {
+        Object2BooleanLinkedOpenHashMap<String> m = linked();
+        LinkedHashMap<String, Boolean> more = new LinkedHashMap<>();
+        more.put("date", true);
+        more.put("apple", true);
+        m.putAll(more);
+        return surrogateText(m) + "|" + m.size();
+    }
+
+    static String wrapperBody() {
+        Object2BooleanLinkedOpenHashMap<String> m = linked();
+        Map<String, Boolean> wrapped = Collections.synchronizedMap(m);
+        wrapped.put("date", true);
+        return surrogateText(m) + "|" + m.size();
+    }
+
+    /** A method reference to the map's put, handed to library code: two lone surrogate keys. */
+    static String methodRefPutBody() {
+        Object2BooleanLinkedOpenHashMap<String> m = linked();
+        Map<String, Boolean> viewed = m;
+        BiFunction<String, Boolean, Boolean> put = viewed::put;
+        List<String> keys = new ArrayList<>();
+        keys.add("\ud800");
+        keys.add("\udc00");
+        keys.forEach(k -> put.apply(k, true));
+        return m.size() + "|" + surrogateText(m);
+    }
+
+    static String computeBody() {
+        Object2BooleanLinkedOpenHashMap<String> m = linked();
+        Map<String, Boolean> viewed = m;
+        viewed.computeIfAbsent("date", k -> true);
+        return surrogateText(m) + "|" + m.size();
     }
 
     /** A Hash.Strategy replaces the key's own equals and hashCode. */
@@ -596,6 +804,91 @@ public class Probe {
         return of(Probe::sortedIteratorOrderBody);
     }
 
+    /** Run on its own: the exception a counted call's neutral answer causes is caught as a row's is. */
+    public static String keptCountAfterPut() {
+        return of(Probe::keptCountAfterPutBody);
+    }
+
+    /** Run on its own: the exception a counted call's neutral answer causes is caught as a row's is. */
+    public static String keptCountAfterRemove() {
+        return of(Probe::keptCountAfterRemoveBody);
+    }
+
+    /** Run on its own: the exception a counted call's neutral answer causes is caught as a row's is. */
+    public static String keptCountThenClear() {
+        return of(Probe::keptCountThenClearBody);
+    }
+
+    /** Run on its own: the exception a counted call's neutral answer causes is caught as a row's is. */
+    public static String keptEmptyThenPut() {
+        return of(Probe::keptEmptyThenPutBody);
+    }
+
+    /** Run on its own: the exception a counted call's neutral answer causes is caught as a row's is. */
+    public static String keptTwoIterations() {
+        return of(Probe::keptTwoIterationsBody);
+    }
+
+    /** Run on its own: the exception a counted call's neutral answer causes is caught as a row's is. */
+    public static String keptAfterIteratorRemove() {
+        return of(Probe::keptAfterIteratorRemoveBody);
+    }
+
+    /** Run on its own: the exception a counted call's neutral answer causes is caught as a row's is. */
+    public static String keptPutRemove() {
+        return of(Probe::keptPutRemoveBody);
+    }
+
+    /** Run on its own: the exception a counted call's neutral answer causes is caught as a row's is. */
+    public static String keptPutExisting() {
+        return of(Probe::keptPutExistingBody);
+    }
+
+    /** Run on its own: the exception a counted call's neutral answer causes is caught as a row's is. */
+    public static String surrogateKeys() {
+        return of(Probe::surrogateKeysBody);
+    }
+
+    /** Run on its own: the exception a counted call's neutral answer causes is caught as a row's is. */
+    public static String fffdAndSurrogateKeys() {
+        return of(Probe::fffdAndSurrogateKeysBody);
+    }
+
+    /** Run on its own: the exception a counted call's neutral answer causes is caught as a row's is. */
+    public static String surrogateRemove() {
+        return of(Probe::surrogateRemoveBody);
+    }
+
+    /** Run on its own: the exception a counted call's neutral answer causes is caught as a row's is. */
+    public static String fffdKey() {
+        return of(Probe::fffdKeyBody);
+    }
+
+    /** Run on its own: the exception a counted call's neutral answer causes is caught as a row's is. */
+    public static String nullValuePut() {
+        return of(Probe::nullValuePutBody);
+    }
+
+    /** Run on its own: the exception a counted call's neutral answer causes is caught as a row's is. */
+    public static String putAll() {
+        return of(Probe::putAllBody);
+    }
+
+    /** Run on its own: the exception a counted call's neutral answer causes is caught as a row's is. */
+    public static String wrapper() {
+        return of(Probe::wrapperBody);
+    }
+
+    /** Run on its own: the exception a counted call's neutral answer causes is caught as a row's is. */
+    public static String compute() {
+        return of(Probe::computeBody);
+    }
+
+    /** Run on its own: the exception a counted call's neutral answer causes is caught as a row's is. */
+    public static String methodRefPut() {
+        return of(Probe::methodRefPutBody);
+    }
+
     public static String countedRows() {
         out = new StringBuilder();
         line("LINKED.fastIterator-order", fastIteratorOrder());
@@ -610,6 +903,23 @@ public class Probe {
         line("LINKED.entry-setValue", entrySetValue());
         line("LINKED.iterator-previous", iteratorPrevious());
         line("LINKED.entry-set-kept", entrySetKept());
+        line("LINKED.kept-count-after-put", keptCountAfterPut());
+        line("LINKED.kept-count-after-remove", keptCountAfterRemove());
+        line("LINKED.kept-count-then-clear", keptCountThenClear());
+        line("LINKED.kept-empty-then-put", keptEmptyThenPut());
+        line("LINKED.kept-two-iterations", keptTwoIterations());
+        line("LINKED.kept-after-iterator-remove", keptAfterIteratorRemove());
+        line("LINKED.kept-put-remove", keptPutRemove());
+        line("LINKED.kept-put-existing", keptPutExisting());
+        line("KEYS.surrogate-pair-merged", surrogateKeys());
+        line("KEYS.fffd-and-surrogate", fffdAndSurrogateKeys());
+        line("KEYS.surrogate-removed", surrogateRemove());
+        line("KEYS.fffd-genuine", fffdKey());
+        line("KEYS.null-value-put", nullValuePut());
+        line("MUTATE.put-all", putAll());
+        line("MUTATE.wrapper", wrapper());
+        line("MUTATE.compute-if-absent", compute());
+        line("MUTATE.method-ref-put", methodRefPut());
         line("CUSTOM.iterator-strategy", customStrategy());
         line("COPY.map-ctor", copyMapCtor());
         line("COPY.fastutil-ctor", copyFastutilCtor());

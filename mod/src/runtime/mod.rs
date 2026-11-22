@@ -38343,6 +38343,9 @@ impl<H: Host> Runtime<'_, H> {
                     let taint_receiver = receiver.clone();
                     let unknown_before = self.host.counted_unknown_calls();
                     let mut dispatched: Option<Value> = None;
+                    // A call that makes an exact fastutil map's host table differ from the Java
+                    // map ends its exactness (`iteration_guard.rs`).
+                    self.note_fastutil_map_call(&r, receiver.as_ref(), &args);
                     // SetFromMap inherits AbstractSet.equals. Handle it at
                     // the runtime boundary so an argument whose class is a
                     // jar implementation of Set is checked through its own

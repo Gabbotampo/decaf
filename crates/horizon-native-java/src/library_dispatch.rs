@@ -19,6 +19,9 @@ impl<H: Host> Runtime<'_, H> {
         class: &str,
         method: &str,
     ) -> Result<Option<Value>, NativeError> {
+        // Also a method reference to a fastutil map's method (`map::put`), which reaches the
+        // model without the call instruction's dispatch (`iteration_guard.rs`).
+        self.note_fastutil_map_call(r, receiver, args);
         if let Some(receiver) = receiver
             && let Some(result) = crate::commons_fraction::instance_call(r, receiver, args)
         {

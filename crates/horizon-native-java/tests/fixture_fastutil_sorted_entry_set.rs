@@ -125,6 +125,83 @@ fn fastutil_sorted_entry_set_leaves_the_rest_counted() {
         ("iteratorPrevious", "LINKED.iterator-previous", vec![]),
         // The kept entry set is a live view; the host's is a copy.
         ("entrySetKept", "LINKED.entry-set-kept", vec![]),
+        // The same, in every way the host's copy and the live view part: a put, a remove, a
+        // clear, an iterator's remove, a put and remove that restore the keys, a changed value;
+        // keys the host cannot tell apart (a lone surrogate is stored as U+FFFD); a null value
+        // the host stores as `false`; writes the runtime does not follow.
+        (
+            "keptCountAfterPut",
+            "LINKED.kept-count-after-put",
+            vec![iterator.clone()],
+        ),
+        (
+            "keptCountAfterRemove",
+            "LINKED.kept-count-after-remove",
+            vec![iterator.clone()],
+        ),
+        (
+            "keptCountThenClear",
+            "LINKED.kept-count-then-clear",
+            vec![iterator.clone()],
+        ),
+        (
+            "keptEmptyThenPut",
+            "LINKED.kept-empty-then-put",
+            vec![iterator.clone()],
+        ),
+        (
+            "keptTwoIterations",
+            "LINKED.kept-two-iterations",
+            vec![iterator.clone()],
+        ),
+        (
+            "keptAfterIteratorRemove",
+            "LINKED.kept-after-iterator-remove",
+            vec![iterator.clone()],
+        ),
+        (
+            "keptPutRemove",
+            "LINKED.kept-put-remove",
+            vec![iterator.clone()],
+        ),
+        (
+            "keptPutExisting",
+            "LINKED.kept-put-existing",
+            vec![iterator.clone()],
+        ),
+        (
+            "surrogateKeys",
+            "KEYS.surrogate-pair-merged",
+            vec![iterator.clone()],
+        ),
+        (
+            "fffdAndSurrogateKeys",
+            "KEYS.fffd-and-surrogate",
+            vec![iterator.clone()],
+        ),
+        (
+            "surrogateRemove",
+            "KEYS.surrogate-removed",
+            vec![iterator.clone()],
+        ),
+        ("fffdKey", "KEYS.fffd-genuine", vec![iterator.clone()]),
+        (
+            "nullValuePut",
+            "KEYS.null-value-put",
+            vec![iterator.clone()],
+        ),
+        ("putAll", "MUTATE.put-all", vec![iterator.clone()]),
+        ("wrapper", "MUTATE.wrapper", vec![iterator.clone()]),
+        (
+            "compute",
+            "MUTATE.compute-if-absent",
+            vec![iterator.clone()],
+        ),
+        (
+            "methodRefPut",
+            "MUTATE.method-ref-put",
+            vec![iterator.clone()],
+        ),
         // A map the host table does not mirror: a strategy, constructors with arguments, keys the
         // host compares by identity or boxes.
         ("customStrategy", "CUSTOM.iterator-strategy", vec![]),

@@ -12,3 +12,6 @@ LINKED.iterator-reput	apple,cherry,banana
 LINKED.iterator-order-empty-key	b,a,c,aa,
 LINKED.iterator-put-existing	bananafalse;applefalse;cherrytrue;|3
 LINKED.iterator-empty	java.util.NoSuchElementException: 
+LINKED.entry-set-kept-unchanged	banana,apple,cherry|banana,apple,cherry
+LINKED.entry-set-fresh-per-use	banana,apple,cherry|banana,apple,cherry,date
+LINKED.iterator-unicode-keys	0true;1false;1true;2false;3true;|5

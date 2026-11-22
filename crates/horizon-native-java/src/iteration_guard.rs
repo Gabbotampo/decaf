@@ -391,16 +391,97 @@ impl<H: Host> Runtime<'_, H> {
             return false;
         }
         let map = crate::jar_object::stored_value(&map);
-        self.host.is_exact_fastutil_map(&map)
-            && self
-                .host
-                .mutable_collection_entries(&map)
-                .is_some_and(|entries| {
-                    entries.chunks(2).all(|pair| {
-                        matches!(pair.first(), Some(Value::Ref(Some(text)))
-                            if crate::value_class::is_plain_string(text))
-                    })
-                })
+        if !self.host.is_exact_fastutil_map(&map) {
+            return false;
+        }
+        let Some(live) = self.host.mutable_collection_entries(&map) else {
+            return false;
+        };
+        if !live.chunks(2).all(|pair| {
+            matches!(pair.first(), Some(Value::Ref(Some(text)))
+                if crate::value_class::is_plain_string(text))
+        }) {
+            return false;
+        }
+        // The Java entry set is a live view of the map; the host's is a copy made when the
+        // program asked for it, which the fastutil put/remove/clear do not refresh. It is the
+        // map's view now only if it holds the map's keys in the map's order and every entry
+        // still reads (an entry reads only while the map is unchanged since it was made): a
+        // copy kept across a change of the map is counted.
+        let Ok(copy) = self.collection_elements(entry_set) else {
+            return false;
+        };
+        copy.len() * 2 == live.len()
+            && copy.iter().zip(live.chunks(2)).all(|(entry, pair)| {
+                self.host
+                    .map_entry_parts(entry)
+                    .is_some_and(|(key, _)| Some(&key) == pair.first())
+            })
+    }
+
+    /// Where a call may change what the host's table of an exact fastutil map
+    /// ([`Self::is_linked_fastutil_entry_set`]) holds from what the Java map holds: the map
+    /// stops being exact, for good, and its entry set's iterator is counted from then on.
+    ///
+    /// The host's table keeps a key that is a lone surrogate as U+FFFD, so two Java keys can be
+    /// one host key, and a key removed again leaves no trace: a call with a U+FFFD in its text
+    /// arguments ends exactness (a genuine U+FFFD too: conservative). A `put` of a null value
+    /// is a `NullPointerException` in Java (the unboxing) which the host stores as `false`.
+    /// Only the calls the oracle rows use (`put`/`remove`/`get`/`clear`/`size`/... and their
+    /// primitive forms) keep a map exact; any other call on it (a bulk write, `compute`,
+    /// `merge`) and a wrapper made around it (`Collections.synchronizedMap`, `Object2BooleanMaps`)
+    /// ends it, as their writes are not followed here.
+    pub(crate) fn note_fastutil_map_call(
+        &mut self,
+        r: &MethodRef,
+        receiver: Option<&Value>,
+        args: &[Value],
+    ) {
+        let ends = match receiver {
+            None => {
+                let wrapper = r.owner == "java/util/Collections"
+                    || r.owner.starts_with("it/unimi/dsi/fastutil/");
+                if wrapper {
+                    for argument in args {
+                        if self.host.is_exact_fastutil_map(argument) {
+                            self.host.mark_exact_fastutil_map(argument, false);
+                        }
+                    }
+                }
+                return;
+            }
+            Some(receiver) if self.host.is_exact_fastutil_map(receiver) => {
+                let name = r.name.as_str();
+                let written = matches!(
+                    name,
+                    "put" | "putBoolean" | "remove" | "removeBoolean" | "clear"
+                );
+                let read = matches!(
+                    name,
+                    "get"
+                        | "getBoolean"
+                        | "getOrDefault"
+                        | "containsKey"
+                        | "containsValue"
+                        | "size"
+                        | "isEmpty"
+                        | "object2BooleanEntrySet"
+                        | "defaultReturnValue"
+                        | "hashCode"
+                        | "toString"
+                        | "getClass"
+                );
+                (!written && !read)
+                    || args
+                        .iter()
+                        .any(|value| matches!(value, Value::Ref(Some(text)) if text.contains('\u{FFFD}')))
+                    || (name == "put" && matches!(args.get(1), Some(Value::Ref(None))))
+            }
+            Some(_) => false,
+        };
+        if ends && let Some(receiver) = receiver {
+            self.host.mark_exact_fastutil_map(receiver, false);
+        }
     }
 
     /// Guard the iterator over the entry set `entry_set` of a fastutil map
