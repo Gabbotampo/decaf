@@ -1,7 +1,7 @@
 //! Live Runes altar placement through the general block-context bridge.
 
 use horizon_native_java::{
-    BlockPlaceContextData, Entrypoint, HostKind, HostRef, NativeJar, StdHost, Value,
+    BlockPlaceContextData, Entrypoint, HostKind, HostRef, NativeJar, Placer, StdHost, Value,
 };
 use std::path::Path;
 
@@ -9,22 +9,41 @@ fn direction(name: &str) -> Value {
     Value::Ref(Some(format!("enum/net/minecraft/core/Direction/{name}")))
 }
 
-fn context(yaw: f32) -> BlockPlaceContextData {
+fn player_context(yaw: f32) -> BlockPlaceContextData {
     BlockPlaceContextData {
         clicked_pos: [0, 64, 0],
         clicked_face: direction("UP"),
         click_location: [0.5, 65.0, 0.5],
         inside: false,
-        yaw,
-        pitch: 0.0,
-        secondary_use: false,
         replacing_clicked_on_block: false,
         can_place: true,
-        player: Value::Host(HostRef::new(
-            HostKind::GameEntity,
-            "game/player/placement-test",
+        placer: Placer::Player {
+            player: Value::Host(HostRef::new(
+                HostKind::GameEntity,
+                "game/player/placement-test",
+            )),
+            yaw,
+            pitch: 0.0,
+            secondary_use: false,
+        },
+        item_in_hand: StdHost::empty_item_stack(),
+        level: Value::Host(HostRef::new(
+            HostKind::GameLevel,
+            "game/level/minecraft:overworld",
         )),
-        item_in_hand: Value::Host(HostRef::new(HostKind::ItemStack, "empty")),
+    }
+}
+
+fn unknown_placer_context() -> BlockPlaceContextData {
+    BlockPlaceContextData {
+        clicked_pos: [0, 64, 0],
+        clicked_face: direction("UP"),
+        click_location: [0.5, 65.0, 0.5],
+        inside: false,
+        replacing_clicked_on_block: false,
+        can_place: true,
+        placer: Placer::Unknown,
+        item_in_hand: StdHost::empty_item_stack(),
         level: Value::Host(HostRef::new(
             HostKind::GameLevel,
             "game/level/minecraft:overworld",
@@ -46,6 +65,12 @@ fn real_runes_altar_placement_uses_opposite_horizontal_look() {
         jar.execute(&class, method.as_deref(), "main", &mut host)
             .expect("Runes main entrypoint");
     }
+    assert_eq!(
+        host.unknown_host_call_count(),
+        0,
+        "Runes main entrypoint unknowns: {:?}",
+        host.unknown_host_calls()
+    );
     let block = host
         .registrations()
         .iter()
@@ -61,7 +86,7 @@ fn real_runes_altar_placement_uses_opposite_horizontal_look() {
     ] {
         let expected = expected.to_ascii_lowercase();
         let state = jar
-            .block_state_for_placement(block.clone(), context(yaw), &mut host)
+            .block_state_for_placement(block.clone(), player_context(yaw), &mut host)
             .expect("placement override")
             .expect("altar is placeable");
         let Value::Ref(Some(marker)) = state else {
@@ -80,4 +105,19 @@ fn real_runes_altar_placement_uses_opposite_horizontal_look() {
             "{marker} for yaw {yaw}"
         );
     }
+    assert_eq!(host.unknown_host_call_count(), 0);
+
+    // Under Placer::Unknown (the honest state until the SDK supplies placer identity),
+    // Runes' getHorizontalDirection() call is counted rather than guessed.
+    let _ = jar.block_state_for_placement(block, unknown_placer_context(), &mut host);
+    assert!(
+        host.unknown_host_call_count() >= 1,
+        "expected unknown placer call to be counted"
+    );
+    assert!(
+        host.unknown_host_calls().iter().any(|(call, _)| call
+            == "net/minecraft/world/item/context/BlockPlaceContext#getHorizontalDirection()Lnet/minecraft/core/Direction;"),
+        "expected getHorizontalDirection unknown, got {:?}",
+        host.unknown_host_calls()
+    );
 }

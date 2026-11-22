@@ -299,7 +299,13 @@ impl StdHost {
         }
         for context in self.placement_contexts.values() {
             value(&context.clicked_face, out);
-            value(&context.player, out);
+            match &context.placer {
+                crate::Placer::Player { player, .. } => value(player, out),
+                crate::Placer::None {
+                    direction: Some(direction),
+                } => value(direction, out),
+                crate::Placer::None { direction: None } | crate::Placer::Unknown => {}
+            }
             value(&context.item_in_hand, out);
             value(&context.level, out);
         }

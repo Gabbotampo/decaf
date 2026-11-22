@@ -51,15 +51,40 @@ pub(crate) fn state_for_placement(
         .block_state_for_placement(block, context, &mut jar.host)
 }
 
+pub(crate) enum PlacementContentOutcome {
+    /// Java returned `null` (vanilla placement refusal) with no unknown calls.
+    Refused,
+    /// Java returned a decoded `(block_id, properties)` state with no unknown calls.
+    State(String, BTreeMap<String, String>),
+    /// Java returned a non-null state whose block could not be decoded (e.g. unregistered).
+    UnknownState,
+    /// One or more unmodelled / unknown-placer calls were hit during execution.
+    CountedUnknown(usize),
+}
+
 pub(crate) fn state_for_placement_content(
     jar: &mut LoadedJar,
     block_id: &str,
     context: runtime::BlockPlaceContextData,
-) -> Result<Option<Option<(String, BTreeMap<String, String>)>>, runtime::NativeError> {
-    let Some(state) = state_for_placement(jar, block_id, context)? else {
-        return Ok(None);
+) -> Result<PlacementContentOutcome, runtime::NativeError> {
+    let unknown_before = jar.host.unknown_host_call_count();
+    let result = state_for_placement(jar, block_id, context);
+    let unknown_delta = jar
+        .host
+        .unknown_host_call_count()
+        .saturating_sub(unknown_before);
+    jar.row.callback_unknown_host_calls += unknown_delta;
+    let state = result?;
+    if unknown_delta > 0 {
+        return Ok(PlacementContentOutcome::CountedUnknown(unknown_delta));
+    }
+    let Some(state) = state else {
+        return Ok(PlacementContentOutcome::Refused);
     };
-    Ok(Some(jar.host.block_state_content(&state)))
+    Ok(match jar.host.block_state_content(&state) {
+        Some((id, props)) => PlacementContentOutcome::State(id, props),
+        None => PlacementContentOutcome::UnknownState,
+    })
 }
 
 /// This mod's manifest id (`mod/sunrise-mod.toml`): the package whose namespaces the game's
@@ -110,7 +135,7 @@ impl State {
         &mut self,
         block_id: &str,
         context: runtime::BlockPlaceContextData,
-    ) -> Result<Option<Option<(String, BTreeMap<String, String>)>>, runtime::NativeError> {
+    ) -> Result<Option<PlacementContentOutcome>, runtime::NativeError> {
         for jar in &mut self.jars {
             if jar
                 .host
@@ -118,7 +143,7 @@ impl State {
                 .iter()
                 .any(|entry| entry.registry == "minecraft:block" && entry.id == block_id)
             {
-                return state_for_placement_content(jar, block_id, context);
+                return state_for_placement_content(jar, block_id, context).map(Some);
             }
         }
         Ok(None)
