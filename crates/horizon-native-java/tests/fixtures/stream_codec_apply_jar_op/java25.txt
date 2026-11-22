@@ -4,3 +4,15 @@ resultNull=outNull=true
 throws=java.lang.IllegalStateException:boom
 nullOp=java.lang.NullPointerException:Cannot invoke "net.minecraft.network.codec.StreamCodec$CodecOperation.apply(net.minecraft.network.codec.StreamCodec)" because "operation" is null
 geckolibShape=opIsCodec=true
+captureInt=k=7,same=true
+captureSelf=same=true
+boundRef=calls=1,seen=true,out=true
+constructorRef=wrap=true,inner=true,notBase=true
+staticRefUnit=decoded=true,notBase=true
+staticRefOptional=codec=true,notReceiver=true
+caughtAndFinally=in;finally;demo.Probe$Boom:b1;again=true
+nested=outer-in;inner;outer-out;same=true
+nestedModelled=calls=1,codec=true,notBase=true
+chained=calls=2,same=true
+kinds=unit:calls=1,seen=true,out=true | of:calls=1,seen=true,out=true | ofMember:calls=1,seen=true,out=true | composite:calls=1,seen=true,out=true | map:calls=1,seen=true,out=true | stringUtf8:calls=1,seen=true,out=true | optional:calls=1,seen=true,out=true | collection:calls=1,seen=true,out=true | cast:calls=1,seen=true,out=true | applyList:calls=1,seen=true,out=true
+nullKinds=unit:java.lang.NullPointerException:Cannot invoke "net.minecraft.network.codec.StreamCodec$CodecOperation.apply(net.minecraft.network.codec.StreamCodec)" because "operation" is null | of:java.lang.NullPointerException:Cannot invoke "net.minecraft.network.codec.StreamCodec$CodecOperation.apply(net.minecraft.network.codec.StreamCodec)" because "operation" is null | composite:java.lang.NullPointerException:Cannot invoke "net.minecraft.network.codec.StreamCodec$CodecOperation.apply(net.minecraft.network.codec.StreamCodec)" because "operation" is null | stringUtf8:java.lang.NullPointerException:Cannot invoke "net.minecraft.network.codec.StreamCodec$CodecOperation.apply(net.minecraft.network.codec.StreamCodec)" because "operation" is null | optional:java.lang.NullPointerException:Cannot invoke "net.minecraft.network.codec.StreamCodec$CodecOperation.apply(net.minecraft.network.codec.StreamCodec)" because "operation" is null
