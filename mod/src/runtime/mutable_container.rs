@@ -19,6 +19,7 @@ fn items_field_ref() -> MethodRef {
     }
 }
 
+#[inline(never)]
 pub(crate) fn field_owner(class: &str, name: &str, descriptor: &str) -> Option<&'static str> {
     if matches!(class, SIMPLE_MUTABLE_CONTAINER | GROWABLE_MUTABLE_CONTAINER)
         && name == "items"
@@ -30,6 +31,7 @@ pub(crate) fn field_owner(class: &str, name: &str, descriptor: &str) -> Option<&
     }
 }
 
+#[inline(never)]
 pub(crate) fn is_final_field(field: &MethodRef) -> bool {
     field.owner == SIMPLE_MUTABLE_CONTAINER
         && field.name == "items"
@@ -46,6 +48,7 @@ fn receiver_extends_container<H: Host>(runtime: &Runtime<'_, H>, receiver: &Valu
         || runtime.jar_extends(class, GROWABLE_MUTABLE_CONTAINER)
 }
 
+#[inline(never)]
 pub(crate) fn runtime_call<H: Host>(
     runtime: &mut Runtime<'_, H>,
     r: &MethodRef,

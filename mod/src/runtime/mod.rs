@@ -35217,6 +35217,91 @@ impl<H: Host> Runtime<'_, H> {
         self.invoke_hash_collection(r, op, receiver, args)
     }
 
+    /// Out-of-line `putfield` write for instance fields so `invoke_frame` keeps
+    /// only one catch site for the final-field and menu-field write guards.
+    #[inline(never)]
+    fn put_instance_field(
+        &mut self,
+        receiver: &Value,
+        r: &MethodRef,
+        value: Value,
+    ) -> Result<(), NativeError> {
+        let Some(key) = instance_field_key(receiver, r) else {
+            return Ok(());
+        };
+        if !self.fields.contains_key(&key) {
+            self.refuse_collected(receiver, r)?;
+        }
+        if mutable_container::is_final_field(r) {
+            self.host.unknown_operand_call(r)?;
+            return Ok(());
+        }
+        match self.host.menu_field_set(receiver, r, &value) {
+            menu_models::FieldSetResult::Written => {}
+            menu_models::FieldSetResult::NotOwned => {
+                self.fields.insert(key, value);
+            }
+            menu_models::FieldSetResult::Counted => {
+                self.host.unknown_operand_call(r)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Out-of-line stage for JDK skeletons, spliterators, NeoForge IMC, Commons Lang,
+    /// and vanilla mutable-container calls, keeping their dispatch locals out of
+    /// `invoke_frame`.
+    #[inline(never)]
+    fn invoke_jdk_and_runtime_models(
+        &mut self,
+        r: &MethodRef,
+        op: u8,
+        receiver: Option<&Value>,
+        args: &[Value],
+        class: &str,
+        method: &str,
+    ) -> Result<Option<Value>, NativeError> {
+        if let Some(value) = self.invoke_jdk_skeleton(r, op, receiver, args)? {
+            return Ok(Some(value));
+        }
+        if let Some(value) = self.invoke_jdk_spliterator(r, op, receiver, args, class, method)? {
+            return Ok(Some(value));
+        }
+        if let Some(value) = self.invoke_neoforge_imc(r, receiver, args, class, method)? {
+            return Ok(Some(value));
+        }
+        if let Some(value) = commons_lang::runtime_call(self, r, receiver, args)? {
+            return Ok(Some(value));
+        }
+        mutable_container::runtime_call(self, r, op, receiver, args)
+    }
+
+    /// Out-of-line stage for unbuilt `String` constructors, DFU codec, and recipe
+    /// runtime models, keeping their dispatch locals out of `invoke_frame`.
+    #[inline(never)]
+    fn invoke_codec_and_recipe_models(
+        &mut self,
+        r: &MethodRef,
+        receiver: Option<&Value>,
+        args: &[Value],
+    ) -> Result<Option<Value>, NativeError> {
+        if let Some(value) = string_constructors::count(self, r)? {
+            return Ok(Some(value));
+        }
+        if let Some(value) = dfu_codec::runtime_instance_call(self, r, receiver, args)? {
+            return Ok(Some(value));
+        }
+        if let Some(value) = recipe_models::runtime_recipe_manager_call(self, r, receiver, args)? {
+            return Ok(Some(value));
+        }
+        if receiver.is_none()
+            && let Some(value) = recipe_models::runtime_static_call(self, r, args)?
+        {
+            return Ok(Some(value));
+        }
+        Ok(None)
+    }
+
     fn prepare_entity_data_hierarchy(&mut self, args: &[Value]) {
         let Some(mut class_name) = args
             .first()
@@ -36621,25 +36706,8 @@ impl<H: Host> Runtime<'_, H> {
                     if outcome == AnchorOutcome::Normal && receiver == Value::Ref(None) {
                         invoke_or_catch!(at, Err(null_checks::assign_field_on_null(&r)))
                     }
-                    if outcome == AnchorOutcome::Normal
-                        && let Some(key) = instance_field_key(&receiver, &r)
-                    {
-                        if !self.fields.contains_key(&key) {
-                            self.refuse_collected(&receiver, &r)?;
-                        }
-                        if mutable_container::is_final_field(&r) {
-                            invoke_or_catch!(at, self.host.unknown_operand_call(&r));
-                        } else {
-                            match self.host.menu_field_set(&receiver, &r, &value) {
-                                menu_models::FieldSetResult::Written => {}
-                                menu_models::FieldSetResult::NotOwned => {
-                                    self.fields.insert(key, value);
-                                }
-                                menu_models::FieldSetResult::Counted => {
-                                    invoke_or_catch!(at, self.host.unknown_operand_call(&r));
-                                }
-                            }
-                        }
+                    if outcome == AnchorOutcome::Normal {
+                        invoke_or_catch!(at, self.put_instance_field(&receiver, &r, value));
                     }
                 }
                 0xb6..=0xb9 => {
@@ -37202,24 +37270,7 @@ impl<H: Host> Runtime<'_, H> {
                     if dispatched.is_none()
                         && let Some(value) = invoke_or_catch!(
                             at,
-                            self.invoke_jdk_skeleton(&r, op, receiver.as_ref(), &args)
-                        )
-                    {
-                        dispatched = Some({
-                            // A JDK skeleton's body or a JDK interface default the
-                            // receiver inherits (`jdk_skeletons/`). It never
-                            // claims a call the jar copy above runs: that one
-                            // takes only static/`invokespecial` calls whose member
-                            // a jar class declares, while a skeleton
-                            // `invokespecial` needs the member to resolve to the
-                            // JDK class, as the JVM's resolution does.
-                            value
-                        });
-                    }
-                    if dispatched.is_none()
-                        && let Some(value) = invoke_or_catch!(
-                            at,
-                            self.invoke_jdk_spliterator(
+                            self.invoke_jdk_and_runtime_models(
                                 &r,
                                 op,
                                 receiver.as_ref(),
@@ -37227,37 +37278,6 @@ impl<H: Host> Runtime<'_, H> {
                                 class,
                                 method
                             )
-                        )
-                    {
-                        dispatched = Some({
-                            // The JDK's spliterators and `StreamSupport.stream`
-                            // (`jdk_spliterators.rs`).
-                            value
-                        });
-                    }
-                    if dispatched.is_none()
-                        && let Some(value) = invoke_or_catch!(
-                            at,
-                            self.invoke_neoforge_imc(&r, receiver.as_ref(), &args, class, method)
-                        )
-                    {
-                        dispatched = Some({
-                            // FML's `InterModComms` (`neoforge_imc.rs`).
-                            value
-                        });
-                    }
-                    if dispatched.is_none()
-                        && let Some(value) = invoke_or_catch!(
-                            at,
-                            commons_lang::runtime_call(self, &r, receiver.as_ref(), &args)
-                        )
-                    {
-                        dispatched = Some(value);
-                    }
-                    if dispatched.is_none()
-                        && let Some(value) = invoke_or_catch!(
-                            at,
-                            mutable_container::runtime_call(self, &r, op, receiver.as_ref(), &args)
                         )
                     {
                         dispatched = Some(value);
@@ -37284,40 +37304,9 @@ impl<H: Host> Runtime<'_, H> {
                         });
                     }
                     if dispatched.is_none()
-                        && let Some(value) =
-                            invoke_or_catch!(at, string_constructors::count(self, &r))
-                    {
-                        dispatched = Some({
-                            // `new String(...)` builds no text yet: counted.
-                            value
-                        });
-                    }
-                    if dispatched.is_none()
                         && let Some(value) = invoke_or_catch!(
                             at,
-                            dfu_codec::runtime_instance_call(self, &r, receiver.as_ref(), &args)
-                        )
-                    {
-                        dispatched = Some(value);
-                    }
-                    if dispatched.is_none()
-                        && let Some(value) = invoke_or_catch!(
-                            at,
-                            recipe_models::runtime_recipe_manager_call(
-                                self,
-                                &r,
-                                receiver.as_ref(),
-                                &args
-                            )
-                        )
-                    {
-                        dispatched = Some(value);
-                    }
-                    if dispatched.is_none()
-                        && receiver.is_none()
-                        && let Some(value) = invoke_or_catch!(
-                            at,
-                            recipe_models::runtime_static_call(self, &r, &args)
+                            self.invoke_codec_and_recipe_models(&r, receiver.as_ref(), &args)
                         )
                     {
                         dispatched = Some(value);

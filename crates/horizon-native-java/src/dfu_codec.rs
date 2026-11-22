@@ -872,6 +872,7 @@ fn runtime_record_builder<H: Host>(
 
 /// Runtime-dependent members of the unit MapCodec nodes. Construction stays in [`invoke`]
 /// because it only needs the host's per-jar budget; execution needs the callback/runtime.
+#[inline(never)]
 pub(crate) fn runtime_instance_call<H: Host>(
     runtime: &mut Runtime<'_, H>,
     r: &MethodRef,

@@ -138,6 +138,7 @@ pub(crate) fn static_call(
     })
 }
 
+#[inline(never)]
 pub(crate) fn runtime_call<H: Host>(
     runtime: &mut Runtime<'_, H>,
     r: &MethodRef,
