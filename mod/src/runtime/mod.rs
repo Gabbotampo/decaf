@@ -13548,6 +13548,33 @@ impl Host for StdHost {
             ("java/nio/file/Path", "isAbsolute", "()Z") => {
                 Ok(Value::Int(i32::from(path_text(receiver).starts_with('/'))))
             }
+            // `UnixPath.startsWith`: the same root-ness and the argument's names
+            // are the receiver's leading names (`host_path::starts_with`, checked
+            // against a Java 25 run in `fixture_path_starts_with`). A null
+            // argument (NPE), text `getPath` refuses (NUL: `InvalidPathException`),
+            // text that is not ASCII (`sun.jnu.encoding`) and anything that is no
+            // modelled `Path` are counted.
+            ("java/nio/file/Path", "startsWith", "(Ljava/lang/String;)Z")
+            | ("java/nio/file/Path", "startsWith", "(Ljava/nio/file/Path;)Z") => {
+                let this = path_text(receiver);
+                let prefix = match Self::argument(r, args, 0)? {
+                    Value::Ref(Some(text)) if r.descriptor.starts_with("(Ljava/lang/String;") => {
+                        Some(host_path::unix_normal(text))
+                    }
+                    other => host_path::path_key(other).map(str::to_owned),
+                };
+                match prefix {
+                    Some(prefix)
+                        if host_path::encodable(this)
+                            && host_path::encodable(&prefix)
+                            && !this.contains('\0')
+                            && !prefix.contains('\0') =>
+                    {
+                        Ok(Value::Int(i32::from(host_path::starts_with(this, &prefix))))
+                    }
+                    _ => self.unknown_host_call(r),
+                }
+            }
             ("java/nio/file/Path", "toAbsolutePath", "()Ljava/nio/file/Path;") => Ok(path_value(
                 &host_path::sandbox_absolute(path_text(receiver)),
             )),
