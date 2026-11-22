@@ -108,6 +108,7 @@ use runtime::{ExecutionBudget, GameHookEffect, GameObject, NativeJar, StdHost};
 use serde_json::json;
 
 mod attachments;
+mod block_use;
 mod client;
 mod content;
 pub mod game_dispatch;
@@ -134,7 +135,7 @@ const LOG: &str = "Horizon Java";
 /// the per-server state.
 #[derive(Default)]
 pub struct HorizonJava {
-    state: Mutex<State>,
+    state: Arc<Mutex<State>>,
     client: Mutex<client::State>,
     /// Serializes state access with top-level Java dispatches while allowing same-thread access
     /// through the thread-local frame owned by `game_dispatch`.
@@ -218,6 +219,9 @@ struct LoadedJar {
     /// on game objects between firings (`game_hooks.rs`).
     hooks: runtime::GameHookRegistrations,
     hook_state: runtime::GameHookState,
+    /// Menus opened through `Block.use*` -> `player.openMenu(MenuProvider)` (`block_use.rs`),
+    /// with their Java values retained on `host` for W11 live menu execution.
+    open_menus: Vec<block_use::RecordedOpenMenu>,
 }
 
 /// One Java command this bridge can run: its usage, the literal path that selects it, the
@@ -432,6 +436,12 @@ fn hyphenated_uuid(uuid: u128) -> String {
 
 #[mod_api::sunrise_mod]
 impl Hooks for HorizonJava {
+    /// Register scoped Sunrise parts (such as [`block_use::JavaBlockUsePart`]) for Java mod blocks.
+    fn register(&self, registrar: &mut dyn mod_api::Registrar, context: &RegistrationContext) {
+        content::register_block_parts(&self.state, registrar, context);
+        self.refresh_game_hook_plan_bits();
+    }
+
     /// The content root still accepts native block declarations here, at the Registration phase
     /// and before any resource loads (NeoForge's `RegisterEvent` drained from
     /// `DeferredRegister.Blocks`). This is the one moment a jar's registrations can become content
@@ -2584,6 +2594,10 @@ impl State {
             jar.row.command_unknown_host_calls = 0;
             jar.row.commands_translated = 0;
             jar.row.commands_refused_at_registration = 0;
+            jar.row.block_use = block_use::Tally::default();
+            for recorded in jar.open_menus.drain(..) {
+                jar.host.release_open_menu_effect(&recorded.effect);
+            }
             // No player value carries into another server's world.
             jar.host.reset_attachment_values();
         }
@@ -2630,6 +2644,8 @@ struct JarRow {
     content_skipped: BTreeMap<String, (usize, usize)>,
     /// Game-class Mixin callbacks: bound or not, and what their firings did (`game_hooks.rs`).
     game_hooks: game_hooks::Tally,
+    /// Block-use hooks (`use_item_on` / `use_without_item`) and `openMenu` bridge outcomes (`block_use.rs`).
+    block_use: block_use::Tally,
 }
 
 impl JarRow {
@@ -2655,6 +2671,7 @@ impl JarRow {
             content_items: 0,
             content_skipped: BTreeMap::new(),
             game_hooks: game_hooks::Tally::default(),
+            block_use: block_use::Tally::default(),
         }
     }
 
@@ -2700,6 +2717,7 @@ impl JarRow {
             "entity_interact_client_skipped": self.entity_interact_client_skipped,
             "entity_interact_try_empty_hand": self.entity_interact_try_empty_hand,
             "game_hooks": self.game_hooks.json(),
+            "block_use": self.block_use.json(),
             "content": {
                 "blocks": self.content_blocks,
                 "items": self.content_items,
@@ -2869,6 +2887,7 @@ fn load_jar(
             content_items: 0,
             content_skipped: BTreeMap::new(),
             game_hooks: game_hooks::Tally::default(),
+            block_use: block_use::Tally::default(),
         });
     }
     let unknown = host.unknown_host_call_count();
@@ -2899,6 +2918,7 @@ fn load_jar(
             content_items: 0,
             content_skipped: BTreeMap::new(),
             game_hooks: game_hooks::Tally::default(),
+            block_use: block_use::Tally::default(),
         },
         jar,
         host,
@@ -2911,6 +2931,7 @@ fn load_jar(
         failures,
         hooks,
         hook_state: runtime::GameHookState::default(),
+        open_menus: Vec::new(),
     })
     .map(|mut loaded| {
         loaded.row.game_hooks = tally;
@@ -3588,6 +3609,7 @@ mod tests {
                     failures: Vec::new(),
                     hooks: runtime::GameHookRegistrations::default(),
                     hook_state: runtime::GameHookState::default(),
+                    open_menus: Vec::new(),
                 }
             })
             .collect();

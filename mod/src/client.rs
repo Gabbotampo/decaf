@@ -574,7 +574,7 @@ fn nbt_component_to_json(tag: &mod_api::Tag) -> Option<String> {
     serde_json::to_string(&val).ok()
 }
 
-fn runtime_stack_from_api(
+pub(crate) fn runtime_stack_from_api(
     host: &dyn mod_api::Host,
     runtime_host: &mut StdHost,
     item_override: Option<Value>,
