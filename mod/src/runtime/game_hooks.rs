@@ -525,6 +525,9 @@ pub enum JarCallRedirect {
     /// Run this jar method instead (the Mixin class's implementation of an
     /// interface it adds to the game object).
     Jar(MethodRef),
+    /// Count or refuse an ambiguous call (for example, a multi-target `@Shadow`
+    /// that matches zero or multiple targets on the receiver).
+    Ambiguous(MethodRef),
 }
 
 /// The Mixin classes of one jar that target game classes, read once.
@@ -1993,15 +1996,21 @@ impl<H: Host> Host for GameHookHost<'_, H> {
                 .shadow_methods
                 .contains(&format!("{class}|{}|{}", method.name, method.descriptor))
         {
-            let owner =
-                crate::runtime::interface_mixins::resolve_shadow_target(targets, &receiver_hierarchy)
-                    .unwrap_or(class)
-                    .to_owned();
-            return Some(JarCallRedirect::Host(MethodRef {
-                owner,
-                name: method.name.clone(),
-                descriptor: method.descriptor.clone(),
-            }));
+            return match crate::runtime::interface_mixins::resolve_shadow_target(
+                targets,
+                &receiver_hierarchy,
+            ) {
+                Some(owner) => Some(JarCallRedirect::Host(MethodRef {
+                    owner: owner.to_owned(),
+                    name: method.name.clone(),
+                    descriptor: method.descriptor.clone(),
+                })),
+                None => Some(JarCallRedirect::Ambiguous(MethodRef {
+                    owner: class.to_owned(),
+                    name: method.name.clone(),
+                    descriptor: method.descriptor.clone(),
+                })),
+            };
         }
         if method.code.is_some() {
             return None;
@@ -2574,6 +2583,73 @@ mod tests {
                 "net/minecraft/server/level/ServerPlayer#sendSystemMessage(Lnet/minecraft/network/chat/Component;)V".into(),
                 1
             )]
+        );
+    }
+
+    #[test]
+    fn redirect_jar_call_marks_ambiguous_multi_target_shadow_instead_of_falling_back_to_mixin_owner()
+     {
+        let mut inner = StdHost::new();
+        let mut context = GameHookContext::default();
+        let player = context.insert(
+            GameObject::player(1, "Alex")
+                .with_incarnation(1, 0)
+                .with_entity_id(42),
+        );
+        let mut model = MixinModel::default();
+        model.targets.insert(
+            "demo/AmbiguousShadowMixin".into(),
+            vec![
+                "net/minecraft/server/level/ServerPlayer".into(),
+                "net/minecraft/world/entity/player/Player".into(),
+            ],
+        );
+        model.targets.insert(
+            "demo/UnambiguousShadowMixin".into(),
+            vec![
+                "net/minecraft/world/entity/player/Player".into(),
+                "net/minecraft/world/level/Level".into(),
+            ],
+        );
+        model
+            .shadow_methods
+            .insert("demo/AmbiguousShadowMixin|getId|()I".into());
+        model
+            .shadow_methods
+            .insert("demo/UnambiguousShadowMixin|getId|()I".into());
+
+        let mut initialized = BTreeSet::new();
+        let hook_host = GameHookHost {
+            inner: &mut inner,
+            context: &mut context,
+            model: &model,
+            initialized: &mut initialized,
+        };
+        let method = Method {
+            access: 0x0401,
+            name: "getId".into(),
+            descriptor: "()I".into(),
+            code: None,
+            max_stack: 0,
+            max_locals: 0,
+            annotations: Vec::new(),
+        };
+
+        assert_eq!(
+            hook_host.redirect_jar_call("demo/UnambiguousShadowMixin", &method, Some(&player)),
+            Some(JarCallRedirect::Host(MethodRef {
+                owner: "net/minecraft/world/entity/player/Player".into(),
+                name: "getId".into(),
+                descriptor: "()I".into(),
+            }))
+        );
+        assert_eq!(
+            hook_host.redirect_jar_call("demo/AmbiguousShadowMixin", &method, Some(&player)),
+            Some(JarCallRedirect::Ambiguous(MethodRef {
+                owner: "demo/AmbiguousShadowMixin".into(),
+                name: "getId".into(),
+                descriptor: "()I".into(),
+            }))
         );
     }
 

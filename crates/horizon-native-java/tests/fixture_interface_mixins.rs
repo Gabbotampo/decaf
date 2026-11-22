@@ -7,7 +7,7 @@ mod scratch;
 
 use horizon_native_java::{
     ExecutionBudget, GameHookContext, GameHookState, GameObject, MixinSide, MixinSkipReason,
-    NativeJar, StdHost, Value,
+    NativeError, NativeJar, StdHost, Value,
     client_surface::{ClientLevel, ClientPlayer, ClientSnapshot},
     events::{EventContext, EventFacade, EventFiring, FacadeEntity, FacadePlayer, GameEvent},
 };
@@ -2889,6 +2889,9 @@ import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.level.Level;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Shadow;
+import org.spongepowered.asm.mixin.injection.At;
+import org.spongepowered.asm.mixin.injection.Inject;
+import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
 @Mixin({Player.class, Level.class})
 public abstract class MultiShadowMixin implements MultiDuck {
@@ -2897,21 +2900,42 @@ public abstract class MultiShadowMixin implements MultiDuck {
 
     @Override public boolean checkClient() { return this.isClientSide(); }
     @Override public int checkId() { return this.getId(); }
+
+    @Inject(method = "tick()V", at = @At("HEAD"))
+    private void onMultiTick(CallbackInfo ci) {
+        if (ShadowProbe.hookMode == 1) {
+            ShadowProbe.hookResult = this.getId();
+        }
+    }
 }
 "#,
     );
     sources.insert(
         "demo/AmbiguousShadowMixin.java",
         r#"package demo;
+import java.util.function.IntSupplier;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.entity.player.Player;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Shadow;
+import org.spongepowered.asm.mixin.injection.At;
+import org.spongepowered.asm.mixin.injection.Inject;
+import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
 @Mixin({ServerPlayer.class, Player.class})
 public abstract class AmbiguousShadowMixin implements AmbiguousDuck {
     @Shadow public abstract int getId();
     @Override public int ambiguousId() { return this.getId(); }
+
+    @Inject(method = "tick()V", at = @At("HEAD"))
+    private void onAmbiguousTick(CallbackInfo ci) {
+        if (ShadowProbe.hookMode == 2) {
+            ShadowProbe.hookResult = this.getId();
+        } else if (ShadowProbe.hookMode == 3) {
+            IntSupplier ref = this::getId;
+            ShadowProbe.hookResult = ref.getAsInt();
+        }
+    }
 }
 "#,
     );
@@ -2922,6 +2946,10 @@ import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.level.Level;
 
 public final class ShadowProbe {
+    public static int hookMode = 0;
+    public static int hookResult = -1;
+    public static void configureHook(int mode) { hookMode = mode; hookResult = -1; }
+    public static int readHookResult() { return hookResult; }
     public static String checkBoth(Player p, Level l) {
         return ((MultiDuck) p).checkId() + "," + ((MultiDuck) l).checkClient();
     }
@@ -3025,4 +3053,612 @@ public final class ShadowProbe {
         err.is_err(),
         "ambiguous multi-target @Shadow must refuse loudly on strict host: {err:?}"
     );
+
+    // Round 2 P1 #1: verify the same resolution and ambiguity counting/refusal through
+    // `run_game_hook_in` (both direct `this.getId()` and method-reference `this::getId`,
+    // which exercises `GameHookHost::redirect_jar_call` directly).
+    let weave = jar.plan_load_time_weave_with_game_hooks(MixinSide::Server);
+    let registrations = jar.register_game_hooks(&weave).unwrap();
+
+    // Mode 1: non-ambiguous `@Mixin({Player.class, Level.class})` inside `run_game_hook_in` -> 42.
+    let mut hook_host = StdHost::new().with_environment_type("SERVER");
+    let mut hook_state = GameHookState::default();
+    jar.invoke_method_with_args(
+        "demo.ShadowProbe",
+        "configureHook",
+        "(I)V",
+        None,
+        &[Value::Int(1)],
+        &mut hook_host,
+    )
+    .unwrap();
+    let mut ctx1 = GameHookContext::new();
+    let hp1 = ctx1.insert(
+        GameObject::player(1, "Multi")
+            .with_incarnation(1, 0)
+            .with_entity_id(42),
+    );
+    jar.run_game_hook_in(
+        &registrations,
+        &mut hook_state,
+        &mut ctx1,
+        "java_base_player_tick_head",
+        Some(hp1),
+        &[],
+        &mut hook_host,
+        &ExecutionBudget::within(Duration::from_secs(5)),
+    )
+    .unwrap();
+    assert_eq!(
+        jar.invoke_method(
+            "demo.ShadowProbe",
+            "readHookResult",
+            "()I",
+            None,
+            &mut hook_host,
+        )
+        .unwrap(),
+        Value::Int(42)
+    );
+    assert_eq!(hook_host.unknown_host_call_count(), 0);
+
+    // Modes 2 & 3: ambiguous `@Mixin({ServerPlayer.class, Player.class})` inside `run_game_hook_in`
+    // must count on lenient host (returning 0, never 42) and refuse loudly on strict host.
+    for mode in [2, 3] {
+        let mut lenient = StdHost::new().with_environment_type("SERVER");
+        let mut state_l = GameHookState::default();
+        jar.invoke_method_with_args(
+            "demo.ShadowProbe",
+            "configureHook",
+            "(I)V",
+            None,
+            &[Value::Int(mode)],
+            &mut lenient,
+        )
+        .unwrap();
+        let mut ctx_l = GameHookContext::new();
+        let hp_l = ctx_l.insert(
+            GameObject::player(1, "Multi")
+                .with_incarnation(1, 0)
+                .with_entity_id(42),
+        );
+        jar.run_game_hook_in(
+            &registrations,
+            &mut state_l,
+            &mut ctx_l,
+            "java_base_player_tick_head",
+            Some(hp_l),
+            &[],
+            &mut lenient,
+            &ExecutionBudget::within(Duration::from_secs(5)),
+        )
+        .unwrap();
+        let got = jar
+            .invoke_method(
+                "demo.ShadowProbe",
+                "readHookResult",
+                "()I",
+                None,
+                &mut lenient,
+            )
+            .unwrap();
+        assert_eq!(
+            got,
+            Value::Int(0),
+            "mode={mode}: ambiguous @Shadow in run_game_hook_in must not answer 42 by name"
+        );
+        assert_eq!(
+            lenient.unknown_host_call_count(),
+            1,
+            "mode={mode}: ambiguous @Shadow in run_game_hook_in must be counted: {:?}",
+            lenient.unknown_host_calls()
+        );
+
+        let mut strict_hook = StdHost::new()
+            .with_environment_type("SERVER")
+            .with_strict_unknown_host_calls();
+        let mut state_s = GameHookState::default();
+        jar.invoke_method_with_args(
+            "demo.ShadowProbe",
+            "configureHook",
+            "(I)V",
+            None,
+            &[Value::Int(mode)],
+            &mut strict_hook,
+        )
+        .unwrap();
+        let mut ctx_s = GameHookContext::new();
+        let hp_s = ctx_s.insert(
+            GameObject::player(1, "Multi")
+                .with_incarnation(1, 0)
+                .with_entity_id(42),
+        );
+        let hook_err = jar.run_game_hook_in(
+            &registrations,
+            &mut state_s,
+            &mut ctx_s,
+            "java_base_player_tick_head",
+            Some(hp_s),
+            &[],
+            &mut strict_hook,
+            &ExecutionBudget::within(Duration::from_secs(5)),
+        );
+        assert!(
+            hook_err.is_err(),
+            "mode={mode}: ambiguous @Shadow in run_game_hook_in must refuse on strict host: {hook_err:?}"
+        );
+    }
+}
+
+/// Round 2 P1 #2 with JDK 25 `javac` + JVM probes:
+/// - `vanilla_host_methods.tsv` follows target hierarchies into JDK 25 (`Container extends
+///   java/lang/Iterable`), so `Inventory` inherits `Iterable.forEach` and `Iterable.spliterator`.
+/// - Adding an unrelated interface `default` for `forEach`/`spliterator` on `Inventory` (or
+///   two unrelated interface defaults on `Player`) throws `IncompatibleClassChangeError`
+///   ("Conflicting default methods"), matching JDK 25's "inherits unrelated defaults" rule,
+///   whereas a strict subinterface of `Iterable` overrides `Iterable.forEach` cleanly.
+#[test]
+fn jdk_interface_defaults_and_unrelated_default_conflicts_match_jdk25() {
+    // 1. Live JDK 25 `javac` + runtime probes pinning the JVM semantics.
+    let oracle_root = scratch::Scratch::new("interface-mixin-jdk25-unrelated-defaults");
+    let compile_probe = |subdir: &str, files: &[(&str, &str)]| -> std::process::Output {
+        let dir = oracle_root.join(subdir);
+        let out = dir.join("classes");
+        fs::create_dir_all(&out).unwrap();
+        let mut src_paths = Vec::new();
+        for (rel, body) in files {
+            let p = dir.join("src").join(rel);
+            fs::create_dir_all(p.parent().unwrap()).unwrap();
+            fs::write(&p, body).unwrap();
+            src_paths.push(p);
+        }
+        Command::new(javac())
+            .arg("-d")
+            .arg(&out)
+            .args(&src_paths)
+            .output()
+            .expect("run javac")
+    };
+
+    // 1a. Unrelated default `forEach` on `Iterable` subclass -> javac rejects ("unrelated defaults").
+    let out_foreach = compile_probe(
+        "probe-foreach",
+        &[
+            (
+                "Duck.java",
+                "import java.util.function.Consumer; public interface Duck { default void forEach(Consumer<? super String> c) { c.accept(\"duck\"); } }\n",
+            ),
+            (
+                "Inv.java",
+                "import java.util.*; public class Inv implements Iterable<String>, Duck { public Iterator<String> iterator() { return List.of(\"inv\").iterator(); } }\n",
+            ),
+        ],
+    );
+    let stderr_foreach = String::from_utf8_lossy(&out_foreach.stderr);
+    assert!(
+        !out_foreach.status.success() && stderr_foreach.contains("unrelated defaults"),
+        "expected JDK 25 javac to reject unrelated default forEach:\n{stderr_foreach}"
+    );
+
+    // 1b. Unrelated default `spliterator` on `Iterable` subclass -> javac rejects ("unrelated defaults").
+    let out_split = compile_probe(
+        "probe-spliterator",
+        &[
+            (
+                "Duck.java",
+                "import java.util.Spliterator; public interface Duck { default Spliterator<String> spliterator() { return null; } }\n",
+            ),
+            (
+                "Inv.java",
+                "import java.util.*; public class Inv implements Iterable<String>, Duck { public Iterator<String> iterator() { return List.of(\"inv\").iterator(); } }\n",
+            ),
+        ],
+    );
+    let stderr_split = String::from_utf8_lossy(&out_split.stderr);
+    assert!(
+        !out_split.status.success() && stderr_split.contains("unrelated defaults"),
+        "expected JDK 25 javac to reject unrelated default spliterator:\n{stderr_split}"
+    );
+
+    // 1c. Strict subinterface of `Iterable` overriding `default forEach` -> javac accepts & runs subinterface.
+    let out_sub = compile_probe(
+        "probe-sub",
+        &[
+            (
+                "SubDuck.java",
+                "import java.util.function.Consumer; public interface SubDuck extends Iterable<String> { default void forEach(Consumer<? super String> c) { c.accept(\"sub\"); } }\n",
+            ),
+            (
+                "Inv.java",
+                "import java.util.*; public class Inv implements Iterable<String>, SubDuck { public Iterator<String> iterator() { return List.of(\"inv\").iterator(); } }\n",
+            ),
+            (
+                "Main.java",
+                "public class Main { public static void main(String[] a) { var sb = new StringBuilder(); ((SubDuck) new Inv()).forEach(sb::append); System.out.print(sb); } }\n",
+            ),
+        ],
+    );
+    assert!(
+        out_sub.status.success(),
+        "expected JDK 25 javac to accept strict subinterface default:\n{}",
+        String::from_utf8_lossy(&out_sub.stderr)
+    );
+    let run_sub = Command::new(java_bin())
+        .arg("-cp")
+        .arg(oracle_root.join("probe-sub/classes"))
+        .arg("Main")
+        .output()
+        .expect("run java");
+    assert!(run_sub.status.success());
+    assert_eq!(String::from_utf8_lossy(&run_sub.stdout), "sub");
+
+    // 1d. Two unrelated interface defaults `PingA` & `PingB` -> javac rejects ("unrelated defaults").
+    let out_pair = compile_probe(
+        "probe-pair",
+        &[
+            (
+                "PingA.java",
+                "public interface PingA { default int ping() { return 1; } }\n",
+            ),
+            (
+                "PingB.java",
+                "public interface PingB { default int ping() { return 2; } }\n",
+            ),
+            ("C.java", "public class C implements PingA, PingB {}\n"),
+        ],
+    );
+    let stderr_pair = String::from_utf8_lossy(&out_pair.stderr);
+    assert!(
+        !out_pair.status.success() && stderr_pair.contains("unrelated defaults"),
+        "expected JDK 25 javac to reject unrelated defaults PingA/PingB:\n{stderr_pair}"
+    );
+
+    // 1e. Separate-compilation runtime probe (exact Mixin bytecode weaving): throws IncompatibleClassChangeError.
+    let rt_dir = oracle_root.join("probe-runtime");
+    let rt_classes = rt_dir.join("classes");
+    fs::create_dir_all(&rt_classes).unwrap();
+    let rt_duck = rt_dir.join("Duck.java");
+    let rt_inv = rt_dir.join("Inv.java");
+    let rt_main = rt_dir.join("Main.java");
+    fs::write(&rt_duck, "public interface Duck {}\n").unwrap();
+    fs::write(
+        &rt_inv,
+        "import java.util.*; public class Inv implements Iterable<String>, Duck { public Iterator<String> iterator() { return List.of(\"inv\").iterator(); } }\n",
+    )
+    .unwrap();
+    assert!(
+        Command::new(javac())
+            .arg("-d")
+            .arg(&rt_classes)
+            .arg(&rt_duck)
+            .arg(&rt_inv)
+            .status()
+            .unwrap()
+            .success()
+    );
+    fs::write(
+        &rt_duck,
+        "import java.util.function.Consumer; public interface Duck { default void forEach(Consumer<? super String> c) { c.accept(\"duck\"); } }\n",
+    )
+    .unwrap();
+    fs::write(
+        &rt_main,
+        "public class Main { public static void main(String[] a) { ((Duck) new Inv()).forEach(x -> {}); } }\n",
+    )
+    .unwrap();
+    assert!(
+        Command::new(javac())
+            .arg("-cp")
+            .arg(&rt_classes)
+            .arg("-d")
+            .arg(&rt_classes)
+            .arg(&rt_duck)
+            .arg(&rt_main)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let run_rt = Command::new(java_bin())
+        .arg("-cp")
+        .arg(&rt_classes)
+        .arg("Main")
+        .output()
+        .expect("run java");
+    let rt_err = String::from_utf8_lossy(&run_rt.stderr);
+    assert!(
+        !run_rt.status.success()
+            && rt_err.contains("java.lang.IncompatibleClassChangeError")
+            && rt_err.contains("Conflicting default methods"),
+        "expected JDK 25 runtime IncompatibleClassChangeError:\n{rt_err}"
+    );
+
+    // 2. Build Decaf test jar exercising Inventory (`Container extends Iterable`) + unrelated
+    //    default `forEach`/`spliterator`, strict subinterface default, and two unrelated Player defaults.
+    let mut sources = mixin_stubs();
+    sources.insert(
+        "net/minecraft/world/item/ItemStack.java",
+        "package net.minecraft.world.item;\npublic class ItemStack {}\n",
+    );
+    sources.insert(
+        "net/minecraft/world/Container.java",
+        "package net.minecraft.world;\nimport net.minecraft.world.item.ItemStack;\npublic interface Container extends Iterable<ItemStack> {}\n",
+    );
+    sources.insert(
+        "net/minecraft/world/entity/player/Inventory.java",
+        "package net.minecraft.world.entity.player;\nimport java.util.Iterator;\nimport net.minecraft.world.Container;\nimport net.minecraft.world.item.ItemStack;\npublic class Inventory implements Container { public Iterator<ItemStack> iterator() { return null; } }\n",
+    );
+    sources.insert(
+        "net/minecraft/client/player/AbstractClientPlayer.java",
+        "package net.minecraft.client.player;\nimport net.minecraft.world.entity.player.Player;\npublic class AbstractClientPlayer extends Player {}\n",
+    );
+    sources.insert(
+        "net/minecraft/client/player/LocalPlayer.java",
+        "package net.minecraft.client.player;\nimport net.minecraft.world.entity.player.Inventory;\npublic class LocalPlayer extends AbstractClientPlayer { public Inventory getInventory() { return null; } }\n",
+    );
+    sources.insert(
+        "net/minecraft/client/Minecraft.java",
+        "package net.minecraft.client;\nimport net.minecraft.client.player.LocalPlayer;\npublic class Minecraft { public LocalPlayer player; public static Minecraft getInstance() { return null; } }\n",
+    );
+    sources.insert(
+        "demo/ForEachDuck.java",
+        r#"package demo;
+import java.util.Spliterator;
+import java.util.function.Consumer;
+import net.minecraft.world.item.ItemStack;
+
+public interface ForEachDuck {
+    default void forEach(Consumer<? super ItemStack> c) {
+        JdkDefaultProbe.ranUnrelatedDuck = true;
+    }
+    default Spliterator<ItemStack> spliterator() {
+        JdkDefaultProbe.ranUnrelatedDuck = true;
+        return null;
+    }
+}
+"#,
+    );
+    sources.insert(
+        "demo/SubIterableDuck.java",
+        r#"package demo;
+import java.util.function.Consumer;
+import net.minecraft.world.item.ItemStack;
+
+public interface SubIterableDuck extends Iterable<ItemStack> {
+    default void forEach(Consumer<? super ItemStack> c) {
+        JdkDefaultProbe.subResult = "sub";
+    }
+}
+"#,
+    );
+    sources.insert(
+        "demo/InvConflictMixin.java",
+        r#"package demo;
+import net.minecraft.world.entity.player.Inventory;
+import org.spongepowered.asm.mixin.Mixin;
+
+@Mixin(Inventory.class)
+public abstract class InvConflictMixin implements ForEachDuck {}
+"#,
+    );
+    sources.insert(
+        "demo/InvSubMixin.java",
+        r#"package demo;
+import net.minecraft.world.entity.player.Inventory;
+import org.spongepowered.asm.mixin.Mixin;
+
+@Mixin(Inventory.class)
+public abstract class InvSubMixin implements SubIterableDuck {}
+"#,
+    );
+    sources.insert(
+        "demo/PingA.java",
+        "package demo;\npublic interface PingA { default int ping() { return 1; } }\n",
+    );
+    sources.insert(
+        "demo/PingB.java",
+        "package demo;\npublic interface PingB { default int ping() { return 2; } }\n",
+    );
+    sources.insert(
+        "demo/PingAMixin.java",
+        r#"package demo;
+import net.minecraft.world.entity.player.Player;
+import org.spongepowered.asm.mixin.Mixin;
+
+@Mixin(Player.class)
+public abstract class PingAMixin implements PingA {}
+"#,
+    );
+    sources.insert(
+        "demo/PingBMixin.java",
+        r#"package demo;
+import net.minecraft.world.entity.player.Player;
+import org.spongepowered.asm.mixin.Mixin;
+
+@Mixin(Player.class)
+public abstract class PingBMixin implements PingB {}
+"#,
+    );
+    sources.insert(
+        "demo/JdkDefaultProbe.java",
+        r#"package demo;
+import net.minecraft.client.Minecraft;
+import net.minecraft.world.entity.player.Player;
+
+public final class JdkDefaultProbe {
+    public static boolean ranUnrelatedDuck = false;
+    public static String subResult = "";
+
+    public static void callInvForEach() {
+        Object inv = Minecraft.getInstance().player.getInventory();
+        ((ForEachDuck) inv).forEach(x -> {});
+    }
+    public static Object callInvSpliterator() {
+        Object inv = Minecraft.getInstance().player.getInventory();
+        return ((ForEachDuck) inv).spliterator();
+    }
+    public static String callInvSubForEach() {
+        subResult = "";
+        Object inv = Minecraft.getInstance().player.getInventory();
+        ((SubIterableDuck) inv).forEach(x -> {});
+        return subResult;
+    }
+    public static boolean didRunUnrelatedDuck() {
+        return ranUnrelatedDuck;
+    }
+    public static int callUnrelatedPlayerDefaults(Player p) {
+        return ((PingA) p).ping();
+    }
+}
+"#,
+    );
+
+    let mut excluded = COMPILE_ONLY_STUBS.to_vec();
+    excluded.extend([
+        "net/minecraft/world/item/ItemStack.class",
+        "net/minecraft/world/Container.class",
+        "net/minecraft/world/entity/player/Inventory.class",
+        "net/minecraft/client/player/AbstractClientPlayer.class",
+        "net/minecraft/client/player/LocalPlayer.class",
+        "net/minecraft/client/Minecraft.class",
+    ]);
+
+    // Jar 1: unrelated `ForEachDuck` on Inventory + unrelated `PingA`/`PingB` on Player.
+    let jar_conflict_path = build_jar(
+        "jdk-default-conflict",
+        sources.clone(),
+        &[
+            (
+                "fabric.mod.json",
+                r#"{"id":"jdkconflict","version":"1.0","mixins":["demo.mixins.json"]}"#,
+            ),
+            (
+                "demo.mixins.json",
+                r#"{"required":true,"package":"demo","mixins":["InvConflictMixin","PingAMixin","PingBMixin"]}"#,
+            ),
+        ],
+        &excluded,
+    );
+    let jar_conflict = NativeJar::from_path(&jar_conflict_path).unwrap();
+
+    let mut client = StdHost::new().with_environment_type("CLIENT");
+    let frame = Arc::new(ClientSnapshot {
+        level: Some(ClientLevel {
+            dimension: "minecraft:overworld".into(),
+            ..ClientLevel::default()
+        }),
+        player: Some(ClientPlayer {
+            uuid: 7,
+            name: "InvHero".into(),
+            entity_id: 100,
+            ..ClientPlayer::default()
+        }),
+        ..ClientSnapshot::default()
+    });
+    client.begin_client_frame(Arc::clone(&frame), &[]);
+
+    // 2a. `ForEachDuck.forEach` conflicts with `java/lang/Iterable.forEach` -> IncompatibleClassChangeError.
+    let foreach_err = jar_conflict.invoke_method(
+        "demo.JdkDefaultProbe",
+        "callInvForEach",
+        "()V",
+        None,
+        &mut client,
+    );
+    assert!(
+        matches!(
+            &foreach_err,
+            Err(NativeError::UncaughtException { class, message: Some(msg), .. })
+                if class == "java/lang/IncompatibleClassChangeError"
+                    && msg.contains("java/lang/Iterable.forEach")
+                    && msg.contains("demo/ForEachDuck.forEach")
+        ),
+        "expected IncompatibleClassChangeError between Iterable.forEach and ForEachDuck.forEach, got: {foreach_err:?}"
+    );
+
+    // 2b. `ForEachDuck.spliterator` conflicts with `java/lang/Iterable.spliterator` -> IncompatibleClassChangeError.
+    let split_err = jar_conflict.invoke_method(
+        "demo.JdkDefaultProbe",
+        "callInvSpliterator",
+        "()Ljava/lang/Object;",
+        None,
+        &mut client,
+    );
+    assert!(
+        matches!(
+            &split_err,
+            Err(NativeError::UncaughtException { class, message: Some(msg), .. })
+                if class == "java/lang/IncompatibleClassChangeError"
+                    && msg.contains("java/lang/Iterable.spliterator")
+                    && msg.contains("demo/ForEachDuck.spliterator")
+        ),
+        "expected IncompatibleClassChangeError between Iterable.spliterator and ForEachDuck.spliterator, got: {split_err:?}"
+    );
+    assert_eq!(
+        jar_conflict
+            .invoke_method(
+                "demo.JdkDefaultProbe",
+                "didRunUnrelatedDuck",
+                "()Z",
+                None,
+                &mut client,
+            )
+            .unwrap(),
+        Value::Int(0),
+        "unrelated Duck defaults must never have executed"
+    );
+    client.end_client_frame();
+
+    // 2c. Two unrelated injected defaults (`PingA.ping` & `PingB.ping`) on `Player` -> IncompatibleClassChangeError.
+    let mut server = StdHost::new().with_environment_type("SERVER");
+    let player = server_player(1, "ConflictHero", 1, 0, 42);
+    let pair_err = jar_conflict.invoke_method_with_args(
+        "demo.JdkDefaultProbe",
+        "callUnrelatedPlayerDefaults",
+        "(Lnet/minecraft/world/entity/player/Player;)I",
+        None,
+        std::slice::from_ref(&player),
+        &mut server,
+    );
+    assert!(
+        matches!(
+            &pair_err,
+            Err(NativeError::UncaughtException { class, message: Some(msg), .. })
+                if class == "java/lang/IncompatibleClassChangeError"
+                    && msg.contains("demo/PingA.ping")
+                    && msg.contains("demo/PingB.ping")
+        ),
+        "expected IncompatibleClassChangeError between PingA.ping and PingB.ping, got: {pair_err:?}"
+    );
+
+    // 3. Jar 2: strict subinterface `SubIterableDuck extends Iterable` overrides `Iterable.forEach` cleanly!
+    let jar_sub_path = build_jar(
+        "jdk-default-subinterface",
+        sources,
+        &[
+            (
+                "fabric.mod.json",
+                r#"{"id":"jdksub","version":"1.0","mixins":["demo.mixins.json"]}"#,
+            ),
+            (
+                "demo.mixins.json",
+                r#"{"required":true,"package":"demo","mixins":["InvSubMixin"]}"#,
+            ),
+        ],
+        &excluded,
+    );
+    let jar_sub = NativeJar::from_path(&jar_sub_path).unwrap();
+    let mut sub_client = StdHost::new().with_environment_type("CLIENT");
+    sub_client.begin_client_frame(frame, &[]);
+    let sub_out = jar_sub
+        .invoke_method(
+            "demo.JdkDefaultProbe",
+            "callInvSubForEach",
+            "()Ljava/lang/String;",
+            None,
+            &mut sub_client,
+        )
+        .unwrap();
+    sub_client.end_client_frame();
+    assert_eq!(sub_out, Value::Ref(Some("sub".into())));
+    assert_eq!(sub_client.unknown_host_call_count(), 0);
 }

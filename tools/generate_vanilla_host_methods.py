@@ -13,7 +13,11 @@ through host dispatch (answering when modelled, or counting/refusing when not).
 from __future__ import annotations
 
 import argparse
+import os
+import shutil
 import struct
+import subprocess
+import tempfile
 import zipfile
 from pathlib import Path
 
@@ -150,15 +154,103 @@ def parse_class(data: bytes) -> tuple[bool, str, list[str], list[tuple[str, str]
     return is_iface, super_name, ifaces, sorted(methods)
 
 
+JRT_READER_JAVA = """import java.io.*;
+import java.net.URI;
+import java.nio.file.*;
+import java.util.*;
+
+public class JrtClassReader {
+    public static void main(String[] args) throws Exception {
+        FileSystem fs = FileSystems.getFileSystem(URI.create("jrt:/"));
+        List<Path> modDirs = new ArrayList<>();
+        try (var s = Files.list(fs.getPath("/modules"))) {
+            s.forEach(modDirs::add);
+        }
+        modDirs.sort(Comparator.comparing(Path::toString));
+        DataOutputStream out = new DataOutputStream(new BufferedOutputStream(System.out));
+        for (String cname : args) {
+            byte[] found = null;
+            for (Path mod : modDirs) {
+                Path p = mod.resolve(cname + ".class");
+                if (Files.isRegularFile(p)) {
+                    found = Files.readAllBytes(p);
+                    break;
+                }
+            }
+            out.writeUTF(cname);
+            if (found == null) {
+                out.writeInt(-1);
+            } else {
+                out.writeInt(found.length);
+                out.write(found);
+            }
+        }
+        out.flush();
+    }
+}
+"""
+
+
+def find_java_bin(jdk: Path | None) -> Path:
+    if jdk is not None:
+        candidate = jdk / "bin" / "java"
+        if candidate.is_file():
+            return candidate
+        raise SystemExit(f"--jdk does not contain bin/java: {jdk}")
+    java_home = os.environ.get("JAVA_HOME")
+    if java_home:
+        candidate = Path(java_home) / "bin" / "java"
+        if candidate.is_file():
+            return candidate
+    which = shutil.which("java")
+    if which:
+        return Path(which)
+    raise SystemExit("could not locate JDK `java` binary; pass --jdk <path>")
+
+
+def read_jrt_classes(java_bin: Path, names: list[str]) -> dict[str, bytes]:
+    if not names:
+        return {}
+    with tempfile.TemporaryDirectory() as td:
+        src = Path(td) / "JrtClassReader.java"
+        src.write_text(JRT_READER_JAVA, encoding="utf-8")
+        proc = subprocess.run(
+            [str(java_bin), str(src), *names],
+            check=True,
+            capture_output=True,
+        )
+    buf = proc.stdout
+    off = 0
+    found: dict[str, bytes] = {}
+    while off < len(buf):
+        nlen = struct.unpack_from(">H", buf, off)[0]
+        off += 2
+        cname = buf[off : off + nlen].decode("utf-8")
+        off += nlen
+        clen = struct.unpack_from(">i", buf, off)[0]
+        off += 4
+        if clen >= 0:
+            found[cname] = buf[off : off + clen]
+            off += clen
+    return found
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--jar", type=Path, action="append", required=True)
+    parser.add_argument(
+        "--jdk",
+        type=Path,
+        default=None,
+        help="Path to the JDK 25 home used to resolve platform superclasses/interfaces via jrt:/",
+    )
     parser.add_argument(
         "--output",
         type=Path,
         default=Path("crates/horizon-native-java/src/vanilla_host_methods.tsv"),
     )
     args = parser.parse_args()
+    java_bin = find_java_bin(args.jdk)
 
     zips = [zipfile.ZipFile(path) for path in args.jar]
     try:
@@ -169,31 +261,56 @@ def main() -> int:
                     entries[name] = (z, name)
 
         parsed: dict[str, tuple[bool, str, list[str], list[tuple[str, str]]]] = {}
+        pending: set[str] = set()
+        unresolved: set[str] = set()
 
-        def load(cname: str) -> None:
-            if not cname or cname in parsed or cname == "java/lang/Object":
+        def enqueue(cname: str) -> None:
+            if not cname or cname == "java/lang/Object" or cname in parsed or cname in unresolved:
                 return
-            hit = entries.get(cname + ".class")
-            if hit is None:
-                return
-            z, entry = hit
-            is_i, sup, ifaces, methods = parse_class(z.read(entry))
-            parsed[cname] = (is_i, sup, ifaces, methods)
-            load(sup)
-            for iface in ifaces:
-                load(iface)
+            pending.add(cname)
 
-        missing = []
         for target in HOST_MODELLED_GAME_TARGETS:
-            if (target + ".class") not in entries:
-                missing.append(target)
-            else:
-                load(target)
-        if missing:
-            raise SystemExit(f"missing HOST_MODELLED_GAME_TARGETS in jars: {missing}")
+            enqueue(target)
+
+        while pending:
+            batch = sorted(pending)
+            pending.clear()
+            jrt_needed: list[str] = []
+            for cname in batch:
+                hit = entries.get(cname + ".class")
+                if hit is not None:
+                    z, entry = hit
+                    is_i, sup, ifaces, methods = parse_class(z.read(entry))
+                    parsed[cname] = (is_i, sup, ifaces, methods)
+                    enqueue(sup)
+                    for iface in ifaces:
+                        enqueue(iface)
+                else:
+                    jrt_needed.append(cname)
+            if jrt_needed:
+                jrt_bytes = read_jrt_classes(java_bin, jrt_needed)
+                for cname in jrt_needed:
+                    data = jrt_bytes.get(cname)
+                    if data is None:
+                        unresolved.add(cname)
+                        continue
+                    is_i, sup, ifaces, methods = parse_class(data)
+                    parsed[cname] = (is_i, sup, ifaces, methods)
+                    enqueue(sup)
+                    for iface in ifaces:
+                        enqueue(iface)
+
+        if unresolved:
+            raise SystemExit(
+                f"unresolved hierarchy types (add missing jars or check --jdk): {sorted(unresolved)}"
+            )
+
+        missing_targets = [t for t in HOST_MODELLED_GAME_TARGETS if t not in parsed]
+        if missing_targets:
+            raise SystemExit(f"missing HOST_MODELLED_GAME_TARGETS: {missing_targets}")
 
         lines = [
-            "# Vanilla 26.3 + authlib 10.0.77 target hierarchy and method signatures (names only; no code).",
+            "# Vanilla 26.3 + authlib 10.0.77 + JDK 25 target hierarchy and method signatures (names only; no code).",
             "# Generated by tools/generate_vanilla_host_methods.py.",
             "# C<tab>class<tab>super<tab>iface1,iface2,...",
             "# I<tab>interface<tab><tab>super_iface1,...",

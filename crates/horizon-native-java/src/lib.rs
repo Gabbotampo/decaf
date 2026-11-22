@@ -36385,6 +36385,10 @@ impl<H: Host> Runtime<'_, H> {
                 JarCallRedirect::Jar(r) => {
                     self.invoke(&r.owner, &r.name, &r.descriptor, receiver, args)
                 }
+                JarCallRedirect::Ambiguous(r) => {
+                    self.host.unknown_operand_call(&r)?;
+                    Ok(Value::default_for(return_desc(&r.descriptor)))
+                }
             };
         }
         // A `static` accessor in a Mixin interface has a placeholder body that

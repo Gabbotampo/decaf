@@ -27,7 +27,6 @@ use std::sync::OnceLock;
 use crate::checkcast::class_access;
 use crate::game_hooks::{MIXIN_SHADOW_DESCRIPTOR, member_annotations};
 use crate::hook_shapes::mixin_config_gate_with_plugins;
-use crate::jvm_dispatch::DefaultSelection;
 use crate::mixin_plugins::ConfigPlugins;
 use crate::{
     Annotation, ClassFile, Host, LoadTimeMixinWeave, MethodRef, MixinConfig, MixinExtrasKind,
@@ -222,6 +221,21 @@ struct VanillaHostMethods {
     interfaces: BTreeMap<&'static str, VanillaTypeInfo>,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum VanillaMethodCheck {
+    /// A class in the target's superclass chain (or `java/lang/Object`) declares the
+    /// method; under JVMS §5.4.3.3, class methods always win over interface defaults.
+    ClassMethod(&'static str),
+    /// No class in the superclass chain declares the method, and the full class +
+    /// interface closure of the target is present in `vanilla_host_methods.tsv`.
+    /// Lists all maximally-specific vanilla/JDK interfaces declaring a `default` method.
+    VanillaDefaults(Vec<&'static str>),
+    /// A class or interface edge in the target's hierarchy closure is missing from
+    /// `vanilla_host_methods.tsv`, so callers must fail closed (count/refuse) rather
+    /// than letting an injected interface default win.
+    MissingHierarchyEdge(String),
+}
+
 impl VanillaHostMethods {
     fn parse(tsv: &'static str) -> Self {
         let mut table = Self::default();
@@ -289,33 +303,58 @@ impl VanillaHostMethods {
         table
     }
 
-    /// Return the vanilla owner that already declares `(name, descriptor)` on a target
-    /// with declared hierarchy `declared`, blocking fallback to an injected interface's
-    /// `default` method under JVMS §5.4.3.3 ("classes win over interfaces").
+    /// Whether `iface` equals or transitively extends `wanted` within the vanilla/JDK table.
+    fn interface_extends(&self, iface: &str, wanted: &str) -> bool {
+        if iface == wanted {
+            return true;
+        }
+        let mut queue: VecDeque<&str> = VecDeque::from([iface]);
+        let mut seen: BTreeSet<&str> = BTreeSet::new();
+        while let Some(cur) = queue.pop_front() {
+            if !seen.insert(cur) {
+                continue;
+            }
+            if let Some(info) = self.interfaces.get(cur) {
+                for &parent in &info.interfaces {
+                    if parent == wanted {
+                        return true;
+                    }
+                    queue.push_back(parent);
+                }
+            }
+        }
+        false
+    }
+
+    /// Inspect `declared`'s full vanilla/JDK class and interface hierarchy for
+    /// `(name, descriptor)` under JVMS §5.4.3.3 / §5.4.3.4:
     ///
-    /// 1. Any non-private, non-static method declared on a class in `declared`'s vanilla
+    /// 1. Any non-private, non-static method declared on a class in `declared`'s
     ///    superclass chain (or `java/lang/Object`) wins over every interface default.
-    /// 2. Any concrete `default` method on a vanilla interface implemented by that class
-    ///    hierarchy blocks an unrelated injected default (unless one of `injected_ifaces`
-    ///    is a strict subinterface of that vanilla interface).
-    fn declaring_owner(
+    /// 2. Otherwise, walk the full vanilla/JDK interface closure for `default` methods.
+    /// 3. If ANY class or interface edge in `declared`'s closure is missing from the
+    ///    table, return [`VanillaMethodCheck::MissingHierarchyEdge`] so callers fail
+    ///    closed rather than silently skipping the missing edge.
+    fn check_target_methods(
         &self,
         declared: &[String],
         name: &str,
         descriptor: &str,
-        injected_ifaces: &[&str],
-        interface_extends: impl Fn(&str, &str) -> bool,
-    ) -> Option<&'static str> {
+    ) -> VanillaMethodCheck {
         if JAVA_OBJECT_METHODS
             .iter()
             .any(|(m, d)| *m == name && *d == descriptor)
         {
-            return Some("java/lang/Object");
+            return VanillaMethodCheck::ClassMethod("java/lang/Object");
+        }
+        if declared.is_empty() {
+            return VanillaMethodCheck::MissingHierarchyEdge("<empty>".to_owned());
         }
 
         // 1. Walk class hierarchy (most specific first) and collect direct vanilla interfaces.
         let mut seen_classes: BTreeSet<&str> = BTreeSet::new();
         let mut iface_queue: VecDeque<&'static str> = VecDeque::new();
+        let mut missing_edge: Option<String> = None;
         for start in declared {
             let mut cur = start.as_str();
             for _ in 0..32 {
@@ -324,7 +363,7 @@ impl VanillaHostMethods {
                 }
                 if let Some((&key, info)) = self.classes.get_key_value(cur) {
                     if info.methods.contains(&(name, descriptor)) {
-                        return Some(key);
+                        return VanillaMethodCheck::ClassMethod(key);
                     }
                     iface_queue.extend(info.interfaces.iter().copied());
                     cur = info.super_name;
@@ -332,33 +371,78 @@ impl VanillaHostMethods {
                     iface_queue.push_back(key);
                     break;
                 } else {
+                    missing_edge.get_or_insert_with(|| cur.to_owned());
                     break;
                 }
             }
         }
 
-        // 2. Walk the target's own vanilla interface closure for concrete default methods.
+        // 2. Walk the target's full vanilla/JDK interface closure for concrete default methods.
         let mut seen_ifaces: BTreeSet<&'static str> = BTreeSet::new();
+        let mut default_owners: Vec<&'static str> = Vec::new();
         while let Some(iface) = iface_queue.pop_front() {
             if !seen_ifaces.insert(iface) {
                 continue;
             }
             let Some((&key, info)) = self.interfaces.get_key_value(iface) else {
+                missing_edge.get_or_insert_with(|| iface.to_owned());
                 continue;
             };
             if info.methods.contains(&(name, descriptor)) {
-                let overridden_by_subinterface = injected_ifaces
-                    .iter()
-                    .any(|inj| *inj != key && interface_extends(inj, key));
-                if !overridden_by_subinterface {
-                    return Some(key);
-                }
+                default_owners.push(key);
             }
             iface_queue.extend(info.interfaces.iter().copied());
         }
 
-        None
+        // Fail closed when any class or interface edge in the target's closure is missing
+        // from the table rather than silently letting an injected default win.
+        if let Some(missing) = missing_edge {
+            return VanillaMethodCheck::MissingHierarchyEdge(missing);
+        }
+
+        let maximal = default_owners
+            .iter()
+            .copied()
+            .filter(|&owner| {
+                !default_owners
+                    .iter()
+                    .any(|&other| other != owner && self.interface_extends(other, owner))
+            })
+            .collect();
+        VanillaMethodCheck::VanillaDefaults(maximal)
     }
+}
+
+/// Whether `iface` equals or transitively extends `wanted`, walking both jar classfiles
+/// and `vanilla_host_methods.tsv` (including JDK superinterfaces).
+fn iface_extends_with_vanilla<H: Host>(
+    runtime: &Runtime<'_, H>,
+    table: &VanillaHostMethods,
+    iface: &str,
+    wanted: &str,
+) -> bool {
+    if iface == wanted {
+        return true;
+    }
+    if runtime.interface_extends(iface, wanted) || table.interface_extends(iface, wanted) {
+        return true;
+    }
+    let mut queue = VecDeque::from([iface.to_owned()]);
+    let mut seen = BTreeSet::new();
+    while let Some(cur) = queue.pop_front() {
+        if cur == wanted {
+            return true;
+        }
+        if seen.len() >= crate::MAX_SUPERCLASS_WALK || !seen.insert(cur.clone()) {
+            continue;
+        }
+        if let Some(file) = runtime.class(&cur) {
+            queue.extend(file.interface_names());
+        } else if let Some(info) = table.interfaces.get(cur.as_str()) {
+            queue.extend(info.interfaces.iter().map(|s| (*s).to_owned()));
+        }
+    }
+    false
 }
 
 fn vanilla_host_methods() -> &'static VanillaHostMethods {
@@ -1320,7 +1404,8 @@ impl<H: Host> Runtime<'_, H> {
             None,
             Mixin(String),
             Ambiguous,
-            TargetClassMethod(&'static str),
+            UnknownTargetHierarchy,
+            TargetClassMethod(String),
             InterfaceDefault(String),
             DefaultConflict(Vec<String>),
             UnimplementedInterface,
@@ -1330,8 +1415,7 @@ impl<H: Host> Runtime<'_, H> {
             let index = self.runtime_mixin_index();
             let mut matching_mixins_by_level: Vec<Vec<String>> = Vec::new();
             let mut any_matching_mixin = false;
-            let mut all_matching_mixins: Vec<String> = Vec::new();
-            let mut injected_ifaces: Vec<String> = Vec::new();
+            let mut all_active_mixins: Vec<String> = Vec::new();
 
             for target_type in &declared {
                 let Some(mixins) = index.interface_by_target.get(target_type.as_str()) else {
@@ -1339,21 +1423,15 @@ impl<H: Host> Runtime<'_, H> {
                 };
                 let mut level_impls = Vec::new();
                 for active in mixins {
+                    if !all_active_mixins.contains(&active.mixin) {
+                        all_active_mixins.push(active.mixin.clone());
+                    }
                     let implements_owner = active
                         .interfaces
                         .iter()
                         .any(|iface| iface == &r.owner || self.interface_extends(iface, &r.owner));
-                    if !implements_owner {
-                        continue;
-                    }
-                    any_matching_mixin = true;
-                    if !all_matching_mixins.contains(&active.mixin) {
-                        all_matching_mixins.push(active.mixin.clone());
-                    }
-                    for iface in &active.interfaces {
-                        if !injected_ifaces.contains(iface) {
-                            injected_ifaces.push(iface.clone());
-                        }
+                    if implements_owner {
+                        any_matching_mixin = true;
                     }
                     if active
                         .added_public_methods
@@ -1377,41 +1455,86 @@ impl<H: Host> Runtime<'_, H> {
                     Resolution::Mixin(top_level.into_iter().next().unwrap_or_default())
                 }
             } else {
-                // JVMS §5.4.3.3 ("classes win over interfaces"): before falling back to an
-                // injected interface's `default` method, check whether the target's vanilla
-                // class hierarchy (or an unoverridden vanilla interface default on it)
-                // already declares `(name, descriptor)`. If so, dispatch through the host
-                // (which returns the modelled value or counts/refuses unmodelled methods)
-                // rather than letting the injected default shadow the class's method.
-                let iface_refs: Vec<&str> = injected_ifaces.iter().map(String::as_str).collect();
-                if let Some(target_owner) = vanilla_host_methods().declaring_owner(
-                    &declared,
-                    &r.name,
-                    &r.descriptor,
-                    &iface_refs,
-                    |a, b| self.interface_extends(a, b),
-                ) {
-                    Resolution::TargetClassMethod(target_owner)
-                } else {
-                    // No mixin overrides and no target class method exists: look for a
-                    // maximally specific default method on the injected interfaces.
-                    match self.maximally_specific_default(
-                        &all_matching_mixins,
-                        &r.name,
-                        &r.descriptor,
-                    ) {
-                        DefaultSelection::Selected(iface) => Resolution::InterfaceDefault(iface),
-                        DefaultSelection::Conflict(owners) => Resolution::DefaultConflict(owners),
-                        DefaultSelection::None | DefaultSelection::Abstract => {
-                            if self
-                                .class(&r.owner)
-                                .and_then(|file| file.method(&r.name, &r.descriptor))
-                                .is_some_and(|m| !m.is_static() && m.code.is_some())
-                            {
-                                Resolution::InterfaceDefault(r.owner.clone())
-                            } else {
-                                Resolution::UnimplementedInterface
+                // JVMS §5.4.3.3 / §5.4.3.4 ("classes win over interfaces" + maximally-specific
+                // superinterface defaults):
+                // 1. Any method declared by the target's vanilla/JDK superclass chain wins over
+                //    every interface default and dispatches through the host.
+                // 2. Any missing edge in the target's hierarchy fails closed (counted/refused).
+                // 3. Otherwise combine the target's vanilla/JDK interface defaults with all
+                //    injected interfaces' declarations: two unrelated defaults conflict with
+                //    `IncompatibleClassChangeError`.
+                let table = vanilla_host_methods();
+                match table.check_target_methods(&declared, &r.name, &r.descriptor) {
+                    VanillaMethodCheck::ClassMethod(target_owner) => {
+                        Resolution::TargetClassMethod(target_owner.to_owned())
+                    }
+                    VanillaMethodCheck::MissingHierarchyEdge(_) => {
+                        Resolution::UnknownTargetHierarchy
+                    }
+                    VanillaMethodCheck::VanillaDefaults(vanilla_defaults) => {
+                        // Collect all non-static, non-private declarations across the full
+                        // superinterface closure of all active mixins on this target.
+                        let mut queue = VecDeque::new();
+                        for mixin in &all_active_mixins {
+                            if let Some(file) = self.class(mixin) {
+                                queue.extend(file.interface_names());
                             }
+                        }
+                        let mut seen_ifaces = Vec::new();
+                        // (owner, has_body, is_vanilla_host_default)
+                        let mut all_declaring: Vec<(String, bool, bool)> = vanilla_defaults
+                            .into_iter()
+                            .map(|owner| (owner.to_owned(), true, true))
+                            .collect();
+                        while let Some(iface) = queue.pop_front() {
+                            if seen_ifaces.len() >= crate::MAX_SUPERCLASS_WALK {
+                                break;
+                            }
+                            if seen_ifaces.contains(&iface) {
+                                continue;
+                            }
+                            if let Some(file) = self.class(&iface) {
+                                queue.extend(file.interface_names());
+                                if let Some(m) = file.method(&r.name, &r.descriptor)
+                                    && !m.is_static()
+                                    && m.access & ACC_PRIVATE == 0
+                                    && !all_declaring.iter().any(|(o, _, _)| o == &iface)
+                                {
+                                    all_declaring.push((iface.clone(), m.code.is_some(), false));
+                                }
+                                seen_ifaces.push(iface);
+                            } else if let Some(info) = table.interfaces.get(iface.as_str()) {
+                                queue.extend(info.interfaces.iter().map(|s| (*s).to_owned()));
+                                if info
+                                    .methods
+                                    .contains(&(r.name.as_str(), r.descriptor.as_str()))
+                                    && !all_declaring.iter().any(|(o, _, _)| o == &iface)
+                                {
+                                    all_declaring.push((iface.clone(), true, true));
+                                }
+                                seen_ifaces.push(iface);
+                            }
+                        }
+                        let maximal: Vec<&(String, bool, bool)> = all_declaring
+                            .iter()
+                            .filter(|(iface, _, _)| {
+                                !all_declaring.iter().any(|(other, _, _)| {
+                                    other != iface
+                                        && iface_extends_with_vanilla(self, table, other, iface)
+                                })
+                            })
+                            .collect();
+                        let concrete: Vec<&(String, bool, bool)> = maximal
+                            .into_iter()
+                            .filter(|(_, has_body, _)| *has_body)
+                            .collect();
+                        match concrete.as_slice() {
+                            [] => Resolution::UnimplementedInterface,
+                            [(owner, _, true)] => Resolution::TargetClassMethod(owner.clone()),
+                            [(owner, _, false)] => Resolution::InterfaceDefault(owner.clone()),
+                            many => Resolution::DefaultConflict(
+                                many.iter().map(|(owner, _, _)| owner.clone()).collect(),
+                            ),
                         }
                     }
                 }
@@ -1425,13 +1548,13 @@ impl<H: Host> Runtime<'_, H> {
                 self.invoke(&mixin, &r.name, &r.descriptor, Some(receiver.clone()), args)
                     .map(Some)
             }
-            Resolution::Ambiguous => {
+            Resolution::Ambiguous | Resolution::UnknownTargetHierarchy => {
                 self.host.unknown_operand_call(r)?;
                 Ok(Some(Value::default_for(return_desc(&r.descriptor))))
             }
             Resolution::TargetClassMethod(owner) => {
                 let target_ref = MethodRef {
-                    owner: owner.to_owned(),
+                    owner,
                     name: r.name.clone(),
                     descriptor: r.descriptor.clone(),
                 };
@@ -1712,5 +1835,81 @@ mod tests {
         assert!(!is_host_modelled_game_target(
             "net/minecraft/world/level/chunk/LevelChunk"
         ));
+    }
+
+    #[test]
+    fn vanilla_host_methods_table_is_hierarchy_closed_and_includes_jdk_defaults() {
+        let table = vanilla_host_methods();
+        for target in HOST_MODELLED_GAME_TARGETS {
+            assert!(
+                table.classes.contains_key(target) || table.interfaces.contains_key(target),
+                "HOST_MODELLED_GAME_TARGETS entry {target} missing from vanilla_host_methods.tsv"
+            );
+        }
+        for (cname, info) in &table.classes {
+            if !info.super_name.is_empty() && info.super_name != "java/lang/Object" {
+                assert!(
+                    table.classes.contains_key(info.super_name),
+                    "class {cname} superclass {} missing from vanilla_host_methods.tsv",
+                    info.super_name
+                );
+            }
+            for &iface in &info.interfaces {
+                assert!(
+                    table.interfaces.contains_key(iface),
+                    "class {cname} interface {iface} missing from vanilla_host_methods.tsv"
+                );
+            }
+        }
+        for (iname, info) in &table.interfaces {
+            for &parent in &info.interfaces {
+                assert!(
+                    table.interfaces.contains_key(parent),
+                    "interface {iname} superinterface {parent} missing from vanilla_host_methods.tsv"
+                );
+            }
+        }
+        let inv = vec!["net/minecraft/world/entity/player/Inventory".to_owned()];
+        assert_eq!(
+            table.check_target_methods(&inv, "forEach", "(Ljava/util/function/Consumer;)V"),
+            VanillaMethodCheck::VanillaDefaults(vec!["java/lang/Iterable"]),
+        );
+        assert_eq!(
+            table.check_target_methods(&inv, "spliterator", "()Ljava/util/Spliterator;"),
+            VanillaMethodCheck::VanillaDefaults(vec!["java/lang/Iterable"]),
+        );
+        let player = vec![
+            "net/minecraft/server/level/ServerPlayer".to_owned(),
+            "net/minecraft/world/entity/player/Player".to_owned(),
+        ];
+        assert_eq!(
+            table.check_target_methods(&player, "getId", "()I"),
+            VanillaMethodCheck::ClassMethod("net/minecraft/world/entity/Entity"),
+        );
+        assert_eq!(
+            table.check_target_methods(&player, "getScore", "()I"),
+            VanillaMethodCheck::ClassMethod("net/minecraft/world/entity/player/Player"),
+        );
+    }
+
+    #[test]
+    fn check_target_methods_fails_closed_on_missing_hierarchy_edge() {
+        let synthetic = VanillaHostMethods::parse(
+            "C\tdemo/MissingSuper\tdemo/NotInTable\t\n\
+             C\tdemo/HasIface\tjava/lang/Object\tdemo/IfaceWithMissingParent\n\
+             I\tdemo/IfaceWithMissingParent\t\tdemo/MissingParent\n",
+        );
+        assert_eq!(
+            synthetic.check_target_methods(&["demo/MissingSuper".to_owned()], "foo", "()V"),
+            VanillaMethodCheck::MissingHierarchyEdge("demo/NotInTable".to_owned()),
+        );
+        assert_eq!(
+            synthetic.check_target_methods(&["demo/HasIface".to_owned()], "foo", "()V"),
+            VanillaMethodCheck::MissingHierarchyEdge("demo/MissingParent".to_owned()),
+        );
+        assert_eq!(
+            synthetic.check_target_methods(&["demo/UnknownStart".to_owned()], "foo", "()V"),
+            VanillaMethodCheck::MissingHierarchyEdge("demo/UnknownStart".to_owned()),
+        );
     }
 }
