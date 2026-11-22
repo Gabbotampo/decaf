@@ -60,6 +60,8 @@ const SEMANTIC: &[&str] = &[
     "1.0.0.0",
     "26.3",
     "1.20.1-rc.1",
+    "1.21.1",
+    "25",
 ];
 
 /// The texts `java25.txt` parses to a `StringVersion` (`instanceof SemanticVersion` is false).
@@ -135,17 +137,20 @@ fn the_game_version_is_java25s_for_every_semantic_text() {
 /// A text the oracle shows as a `StringVersion`, or does not show at all, is the plain `String` it
 /// was before this change: no handle, so no `SemanticVersion` accessor is answered for it
 /// (`getVersionComponentCount` on it is counted). What the interpreter answers for `instanceof` on
-/// a plain `String` is unchanged and is not an oracle row here.
+/// a plain `String` is unchanged, is not Fabric's answer for a `StringVersion`, and is not asserted.
 #[test]
 fn other_texts_stay_plain_strings() {
-    for text in STRING_VERSIONS.iter().chain(&["1.0.0-", "1.21.1", "x"]) {
+    for text in STRING_VERSIONS.iter().chain(&["1.0.0-", "x"]) {
         let fixture = build("fabric-semantic-version-other", text);
         let mut host = fixture
             .jar
             .seed_host(StdHost::new().with_environment_type("SERVER"));
-        assert_eq!(
-            fixture.text_on(&mut host, "mod"),
-            format!("instanceof=false version=false comparable=true friendly={text}"),
+        // Only the friendly string is checked: what `instanceof Version` answers on a plain `String`
+        // is the interpreter's, not Fabric's (Java 25: true for a `StringVersion`).
+        assert!(
+            fixture
+                .text_on(&mut host, "mod")
+                .ends_with(&format!(" friendly={text}")),
             "{text}"
         );
         assert!(
@@ -173,6 +178,21 @@ fn other_texts_stay_plain_strings() {
             host.unknown_host_calls()
         );
     }
+}
+
+/// The built-in `java` mod's version is the specification version, `25`.
+#[test]
+fn the_java_mods_version_is_java25s() {
+    let fixture = build("fabric-semantic-version-java", "1.0");
+    let mut host = fixture
+        .jar
+        .seed_host(StdHost::new().with_environment_type("SERVER"));
+    assert_eq!(fixture.text_on(&mut host, "java"), oracle("25"));
+    assert!(
+        host.unknown_host_calls().is_empty(),
+        "{:?}",
+        host.unknown_host_calls()
+    );
 }
 
 /// An unknown game version is still unknown: `getVersion` is counted, as it was.

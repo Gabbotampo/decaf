@@ -66,6 +66,8 @@ const SEMANTIC: &[Row] = &[
     row("1.0.0.0", &[1, 0, 0, 0], None, None),
     row("26.3", &[26, 3], None, None),
     row("1.20.1-rc.1", &[1, 20, 1], Some("rc.1"), None),
+    row("1.21.1", &[1, 21, 1], None, None),
+    row("25", &[25], None, None),
 ];
 
 fn lookup(text: &str) -> Option<&'static Row> {

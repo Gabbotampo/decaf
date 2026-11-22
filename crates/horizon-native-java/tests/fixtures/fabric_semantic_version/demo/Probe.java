@@ -25,6 +25,12 @@ public final class Probe {
                 .getMetadata().getVersion());
     }
 
+    /** Decaf: the built-in `java` mod's version. */
+    public static String java() {
+        return describe(FabricLoader.getInstance().getModContainer("java").orElseThrow()
+                .getMetadata().getVersion());
+    }
+
     /** Decaf: `compareTo`, which no oracle row covers (counted). */
     public static String compared() {
         Version version = FabricLoader.getInstance().getModContainer("probe-fixture").orElseThrow()
