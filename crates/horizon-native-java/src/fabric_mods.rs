@@ -45,6 +45,9 @@
 //! **`java` and `minecraft`** are the loader's `BuiltinModMetadata` (see
 //! `builtin_metadata`).
 //!
+//! **Version:** `getVersion()` is a `SemanticVersion` object for the texts
+//! `fabric_version.rs` has an oracle row for, and the version text otherwise (as before).
+//!
 //! **Counted, not answered:** iterating a custom object or array
 //! (`serde_json` here keeps object keys sorted, not in file order),
 //! `ContactInformation.asMap` (a `HashMap` in Fabric), `getCustomValues`,
@@ -655,7 +658,7 @@ impl StdHost {
             ("getType", "()Ljava/lang/String;") => Ok(text("fabric")),
             ("getVersion", "()Lnet/fabricmc/loader/api/Version;") => Ok(field("version")
                 .and_then(serde_json::Value::as_str)
-                .map_or(Value::Ref(None), text)),
+                .map_or(Value::Ref(None), crate::fabric_version::version_value)),
             ("getName", "()Ljava/lang/String;") => Ok(text(
                 field("name")
                     .and_then(serde_json::Value::as_str)
@@ -774,9 +777,13 @@ impl StdHost {
             ("getType", "()Ljava/lang/String;") => Some(text("builtin")),
             ("getVersion", "()Lnet/fabricmc/loader/api/Version;") => {
                 if id == "java" {
-                    Some(text(JAVA_SPECIFICATION_VERSION))
+                    Some(crate::fabric_version::version_value(
+                        JAVA_SPECIFICATION_VERSION,
+                    ))
                 } else {
-                    self.game_version.clone().map(text)
+                    self.game_version
+                        .as_deref()
+                        .map(crate::fabric_version::version_value)
                 }
             }
             ("getName", "()Ljava/lang/String;") if id == "minecraft" => Some(text("Minecraft")),

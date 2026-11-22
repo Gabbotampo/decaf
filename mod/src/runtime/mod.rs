@@ -79,6 +79,7 @@ mod fabric_creative_tab;
 mod fabric_mods;
 mod fabric_registry;
 mod fabric_resource_conditions;
+mod fabric_version;
 mod facade_saved_data;
 mod facade_server;
 mod facade_text;
@@ -10967,6 +10968,12 @@ impl Host for StdHost {
             return value;
         }
         self.record(r, Some(receiver), args);
+        // Fabric's `SemanticVersion` handles (`fabric_version.rs`).
+        match fabric_version::instance_call(r, receiver, args) {
+            fabric_version::Call::Other => {}
+            fabric_version::Call::Counted => return self.unknown_host_call(r),
+            fabric_version::Call::Answer(answer) => return answer,
+        }
         if r.name == "equals"
             && r.descriptor == "(Ljava/lang/Object;)Z"
             && let Some(other) = args.first()
