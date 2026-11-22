@@ -1,6 +1,8 @@
 package demo;
 
 import com.mojang.serialization.Codec;
+import com.mojang.serialization.DataResult;
+import com.mojang.serialization.Lifecycle;
 import com.mojang.serialization.MapCodec;
 import com.mojang.serialization.codecs.RecordCodecBuilder;
 import java.util.ArrayList;
@@ -212,6 +214,18 @@ public final class BundleApiProbe {
     sb.append("ctor.str_dec=").append(fmtFraction(Fraction.getFraction("0.25"))).append('\n');
     sb.append("ctor.str_int=").append(fmtFraction(Fraction.getFraction("7"))).append('\n');
     sb.append("ctor.str_neg=").append(fmtFraction(Fraction.getFraction("-5/10"))).append('\n');
+    sb.append("ctor.str_hex_4=").append(fmtFraction(Fraction.getFraction("0x1.0p2"))).append('\n');
+    sb.append("ctor.str_hex_neg=").append(fmtFraction(Fraction.getFraction("-0x1.8p1"))).append('\n');
+    sb.append("ctor.str_hex_upper=").append(fmtFraction(Fraction.getFraction("0X.8P2"))).append('\n');
+    sb.append("ctor.str_hex_dot=").append(fmtFraction(Fraction.getFraction("0x1.p0"))).append('\n');
+    sb.append("ctor.str_hex_d=").append(fmtFraction(Fraction.getFraction("0x1.0p2d"))).append('\n');
+    sb.append("ctor.str_hex_f=").append(fmtFraction(Fraction.getFraction("0x1.0p2F"))).append('\n');
+    sb.append("ctor.str_hex_ws=").append(fmtFraction(Fraction.getFraction(" 0x1.0p-1 "))).append('\n');
+    sb.append("ctor.str_hex_uflow=").append(fmtFraction(Fraction.getFraction("0x1.0p-2000"))).append('\n');
+    sb.append("ctor.str_dec_d=").append(fmtFraction(Fraction.getFraction("1.5d"))).append('\n');
+    sb.append("ctor.str_dec_f=").append(fmtFraction(Fraction.getFraction("1.5F"))).append('\n');
+    sb.append("ctor.str_dec_lead=").append(fmtFraction(Fraction.getFraction(".5"))).append('\n');
+    sb.append("ctor.str_dec_trail=").append(fmtFraction(Fraction.getFraction("5."))).append('\n');
 
     Fraction occ = Fraction.ZERO
         .add(Fraction.getFraction(1, 64))
@@ -255,6 +269,16 @@ public final class BundleApiProbe {
     sb.append("ex.sub_ovf=").append(captureEx(() -> Fraction.getFraction(Integer.MIN_VALUE, 1).subtract(Fraction.ONE))).append('\n');
     sb.append("ex.mul_ovf=").append(captureEx(() -> Fraction.getFraction(Integer.MAX_VALUE, 2).multiplyBy(Fraction.getFraction(3, 1)))).append('\n');
     sb.append("ex.add_null=").append(captureEx(() -> Fraction.ONE.add(null))).append('\n');
+    sb.append("ex.hex_ovf=").append(captureEx(() -> Fraction.getFraction("0x1.0p1000"))).append('\n');
+    sb.append("ex.hex_nodot=").append(captureEx(() -> Fraction.getFraction("0x1p2"))).append('\n');
+    sb.append("ex.hex_nodigits=").append(captureEx(() -> Fraction.getFraction("0x.p0"))).append('\n');
+    sb.append("ex.hex_noexp=").append(captureEx(() -> Fraction.getFraction("0x1.0p"))).append('\n');
+    sb.append("ex.dec_underscore=").append(captureEx(() -> Fraction.getFraction("1.0_0"))).append('\n');
+    sb.append("ex.cmp_null=").append(captureEx(() -> Fraction.ONE.compareTo(null))).append('\n');
+    @SuppressWarnings({"unchecked", "rawtypes"})
+    Comparable rawOne = Fraction.ONE;
+    sb.append("ex.cmp_str=").append(captureEx(() -> rawOne.compareTo("x"))).append('\n');
+    sb.append("ex.cmp_int=").append(captureEx(() -> rawOne.compareTo(42))).append('\n');
 
     sb.append("mth.mul_0=").append(Mth.mulAndTruncate(Fraction.ZERO, 12)).append('\n');
     sb.append("mth.mul_half=").append(Mth.mulAndTruncate(Fraction.ONE_HALF, 12)).append('\n');
@@ -324,6 +348,156 @@ public final class BundleApiProbe {
 
   public static boolean predicateCodecNonNull() {
     return PredicateLike.CODEC != null;
+  }
+
+  public static Codec<PredicateLike> predicateLikeCodec() {
+    return PredicateLike.CODEC;
+  }
+
+  public static Codec<ItemPredicate> itemPredicateCodec() {
+    return ItemPredicate.CODEC;
+  }
+
+  public static Codec<ItemStackTemplate> itemStackTemplateCodec() {
+    return ItemStackTemplate.CODEC;
+  }
+
+  public static Codec<Object> nullCreateCodec() {
+    return RecordCodecBuilder.create(i -> null);
+  }
+
+  public static MapCodec<Object> nullMapCodec() {
+    return RecordCodecBuilder.mapCodec(i -> null);
+  }
+
+  public static Codec<Object> nullMapAsCodec() {
+    return RecordCodecBuilder.mapCodec(i -> null).codec();
+  }
+
+  public static String nullBuilderRows() {
+    Codec<Object> nullCreate = nullCreateCodec();
+    MapCodec<Object> nullMap = nullMapCodec();
+    StringBuilder sb = new StringBuilder();
+    sb.append("nullbuilder.create_nonnull=").append(nullCreate != null).append('\n');
+    sb.append("nullbuilder.map_nonnull=").append(nullMap != null).append('\n');
+    sb.append("nullbuilder.create_str=").append(captureEx(nullCreate::toString)).append('\n');
+    sb.append("nullbuilder.map_str=").append(captureEx(nullMap::toString)).append('\n');
+    sb.append("nullbuilder.map_codec_str=").append(captureEx(() -> nullMap.codec().toString())).append('\n');
+    return sb.toString();
+  }
+
+  public static Codec<Integer> posFlatXmapCodec() {
+    return Codec.INT.flatXmap(
+        n -> n > 0 ? DataResult.success(n) : DataResult.error(() -> "bad value: " + n),
+        n -> n > 0 ? DataResult.success(n) : DataResult.error(() -> "bad encode: " + n));
+  }
+
+  public static Codec<Integer> partialFlatXmapCodec() {
+    return Codec.INT.flatXmap(
+        n -> n > 0 ? DataResult.success(n) : DataResult.error(() -> "clamped: " + n, 1),
+        DataResult::success);
+  }
+
+  public static Codec<List<Integer>> boundedIntListCodec() {
+    return Codec.INT.listOf(2, 3);
+  }
+
+  public static Codec<List<Integer>> unboundedIntListCodec() {
+    return Codec.INT.listOf();
+  }
+
+  public static String dataResultRows() {
+    StringBuilder sb = new StringBuilder();
+    DataResult<Object> mappedNull = DataResult.success(1).map(v -> null);
+    sb.append("dr.map_nullret_succ=").append(mappedNull.isSuccess()).append('\n');
+    sb.append("dr.map_nullret_get=").append(captureEx(mappedNull::getOrThrow)).append('\n');
+    sb.append("dr.map_nullret_result=").append(captureEx(mappedNull::result)).append('\n');
+    sb.append("dr.map_nullfn=").append(captureEx(() -> DataResult.success(1).map(null))).append('\n');
+    sb.append("dr.err_map_nullfn=")
+        .append(captureEx(() -> DataResult.error(() -> "e").map(null).isError()))
+        .append('\n');
+    sb.append("dr.err_partial_map_nullfn=")
+        .append(captureEx(() -> DataResult.error(() -> "e", 1).map(null)))
+        .append('\n');
+    sb.append("dr.err_partial_map_nullret_empty=")
+        .append(DataResult.error(() -> "e", 1).map(v -> null).resultOrPartial().isEmpty())
+        .append('\n');
+    return sb.toString();
+  }
+
+  public static MapCodec<Integer> opt4MapCodec() {
+    return Codec.INT.optionalFieldOf("x", Lifecycle.stable(), 7, Lifecycle.experimental());
+  }
+
+  public static Codec<Integer> opt4Codec() {
+    return opt4MapCodec().codec();
+  }
+
+  public static String opt4ToString() {
+    return opt4MapCodec().toString();
+  }
+
+  public static String describeObject(Object value) {
+    return String.valueOf(value);
+  }
+
+  public static StreamCodec<Object, String> utf8HugeCodec() {
+    return ByteBufCodecs.stringUtf8(1_000_000_000);
+  }
+
+  public static StreamCodec<Object, String> utf8NegCodec() {
+    return ByteBufCodecs.stringUtf8(-1);
+  }
+
+  public record Named(String label) {
+    @Override
+    public String toString() {
+      return "Named(" + label + ")";
+    }
+  }
+
+  public static StreamCodec<Object, String> unitNullCodec() {
+    return StreamCodec.unit(null);
+  }
+
+  public static StreamCodec<Object, String> unitExpCodec() {
+    return StreamCodec.unit("expected");
+  }
+
+  public static StreamCodec<Object, Integer> unitOneCodec() {
+    return StreamCodec.unit(1);
+  }
+
+  public static StreamCodec<Object, Named> unitNamedCodec() {
+    return StreamCodec.unit(new Named("exp"));
+  }
+
+  public static Named actualNamed() {
+    return new Named("act");
+  }
+
+  public static String unitDirectRows() {
+    StreamCodec<Object, String> unitNull = unitNullCodec();
+    StreamCodec<Object, String> unitExp = unitExpCodec();
+    StreamCodec<Object, Integer> unitOne = unitOneCodec();
+    StreamCodec<Object, Named> unitNamed = unitNamedCodec();
+    StringBuilder sb = new StringBuilder();
+    sb.append("ex.unit_null_actual=")
+        .append(captureEx(() -> { unitNull.encode(null, "actual"); return "ok"; }))
+        .append('\n');
+    sb.append("ex.unit_exp_null=")
+        .append(captureEx(() -> { unitExp.encode(null, null); return "ok"; }))
+        .append('\n');
+    sb.append("ex.unit_null_null=")
+        .append(captureEx(() -> { unitNull.encode(null, null); return "ok"; }))
+        .append('\n');
+    sb.append("ex.unit_int_mismatch=")
+        .append(captureEx(() -> { unitOne.encode(null, 2); return "ok"; }))
+        .append('\n');
+    sb.append("ex.unit_named_mismatch=")
+        .append(captureEx(() -> { unitNamed.encode(null, new Named("act")); return "ok"; }))
+        .append('\n');
+    return sb.toString();
   }
 
   public static String describeBundleComponent(BundleLikeComponent comp) {
@@ -463,7 +637,21 @@ public final class BundleApiProbe {
     }
 
     @Override
+    public MapCodec<ItemPredicate> optionalFieldOf(
+        String name,
+        Lifecycle fieldLifecycle,
+        ItemPredicate defaultValue,
+        Lifecycle lifecycleOfDefault) {
+      return null;
+    }
+
+    @Override
     public Codec<List<ItemPredicate>> listOf() {
+      return null;
+    }
+
+    @Override
+    public Codec<List<ItemPredicate>> listOf(int minSize, int maxSize) {
       return null;
     }
 
@@ -471,6 +659,13 @@ public final class BundleApiProbe {
     public <S> Codec<S> xmap(
         Function<? super ItemPredicate, ? extends S> to,
         Function<? super S, ? extends ItemPredicate> from) {
+      return null;
+    }
+
+    @Override
+    public <S> Codec<S> flatXmap(
+        Function<? super ItemPredicate, ? extends DataResult<S>> to,
+        Function<? super S, ? extends DataResult<ItemPredicate>> from) {
       return null;
     }
   }

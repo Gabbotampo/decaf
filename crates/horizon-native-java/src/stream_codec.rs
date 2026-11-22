@@ -357,8 +357,88 @@ pub(crate) fn instance_call(
     Some(Ok(codec(&format!("{STREAM_CODEC_PREFIX}4"), &values)))
 }
 
-/// Runtime-dependent behavior of `StreamCodec$3` (`StreamCodec.unit`). The expected object's
-/// own virtual `equals` is invoked; comparing interpreter keys would silently change Java.
+/// Exact MC 26.3 `StreamCodec$3.encode(buf, value)` (`StreamCodec.unit(expected)`):
+/// calls `value.equals(expected)` (so `value == null` throws NPE even when `expected == null`,
+/// while `expected == null` and non-null `value` throws `IllegalStateException` with Java's
+/// `String.valueOf` of both values). Returns `Ok(false)` if any inner call was counted.
+fn encode_unit<H: Host>(
+    runtime: &mut Runtime<'_, H>,
+    expected: &Value,
+    actual: &Value,
+) -> Result<bool, NativeError> {
+    if matches!(actual, Value::Ref(None)) {
+        return Err(NativeError::UncaughtException {
+            class: "java/lang/NullPointerException".into(),
+            message: Some(
+                "Cannot invoke \"Object.equals(Object)\" because \"value\" is null".into(),
+            ),
+            frame: None,
+        });
+    }
+    let before_eq = runtime.host.counted_unknown_calls();
+    let equal = match runtime.call_virtual(
+        crate::jdk_call::Site::Virtual,
+        "java/lang/Object",
+        "equals",
+        "(Ljava/lang/Object;)Z",
+        actual,
+        std::slice::from_ref(expected),
+    ) {
+        Ok(Value::Int(value)) if runtime.host.counted_unknown_calls() == before_eq => value != 0,
+        Ok(_) => return Ok(false),
+        Err(NativeError::UncaughtException { .. })
+            if runtime.host.counted_unknown_calls() != before_eq =>
+        {
+            return Ok(false);
+        }
+        Err(error) => return Err(error),
+    };
+    if equal {
+        return Ok(true);
+    }
+    let before_str = runtime.host.counted_unknown_calls();
+    let actual_text = match runtime.value_of_text(
+        actual,
+        "Ljava/lang/Object;",
+        "net/minecraft/network/codec/StreamCodec$3",
+        "encode",
+    ) {
+        Ok(text) if runtime.host.counted_unknown_calls() == before_str => text,
+        Ok(_) => return Ok(false),
+        Err(NativeError::UncaughtException { .. })
+            if runtime.host.counted_unknown_calls() != before_str =>
+        {
+            return Ok(false);
+        }
+        Err(error) => return Err(error),
+    };
+    let expected_text = match runtime.value_of_text(
+        expected,
+        "Ljava/lang/Object;",
+        "net/minecraft/network/codec/StreamCodec$3",
+        "encode",
+    ) {
+        Ok(text) if runtime.host.counted_unknown_calls() == before_str => text,
+        Ok(_) => return Ok(false),
+        Err(NativeError::UncaughtException { .. })
+            if runtime.host.counted_unknown_calls() != before_str =>
+        {
+            return Ok(false);
+        }
+        Err(error) => return Err(error),
+    };
+    Err(NativeError::UncaughtException {
+        class: "java/lang/IllegalStateException".into(),
+        message: Some(format!(
+            "Can't encode '{actual_text}', expected '{expected_text}'"
+        )),
+        frame: None,
+    })
+}
+
+/// Runtime-dependent behavior of `StreamCodec$3` (`StreamCodec.unit`). The encoded value's
+/// own virtual `equals` is invoked (`value.equals(expected)`); comparing interpreter keys
+/// would silently change Java.
 pub(crate) fn runtime_instance_call<H: Host>(
     runtime: &mut Runtime<'_, H>,
     r: &MethodRef,
@@ -379,47 +459,11 @@ pub(crate) fn runtime_instance_call<H: Host>(
         ("decode", "(Ljava/lang/Object;)Ljava/lang/Object;") => Some(Ok(expected)),
         ("encode", "(Ljava/lang/Object;Ljava/lang/Object;)V") => {
             let actual = args.get(1)?.clone();
-            if matches!(expected, Value::Ref(None)) {
-                return Some(Err(NativeError::UncaughtException {
-                    class: "java/lang/NullPointerException".into(),
-                    message: Some(
-                        "Cannot invoke \"Object.equals(Object)\" because \"value\" is null".into(),
-                    ),
-                    frame: None,
-                }));
+            match encode_unit(runtime, &expected, &actual) {
+                Ok(true) => Some(Ok(Value::Void)),
+                Ok(false) => None,
+                Err(error) => Some(Err(error)),
             }
-            let equals = runtime.call_virtual(
-                crate::jdk_call::Site::Virtual,
-                "java/lang/Object",
-                "equals",
-                "(Ljava/lang/Object;)Z",
-                &expected,
-                std::slice::from_ref(&actual),
-            );
-            let equal = match equals {
-                Ok(Value::Int(value)) => value != 0,
-                Ok(_) => return None,
-                Err(error) => return Some(Err(error)),
-            };
-            if equal {
-                return Some(Ok(Value::Void));
-            }
-            let text = |value: &Value| match value {
-                Value::Ref(Some(text)) => Some(text.clone()),
-                Value::Ref(None) => Some("null".to_owned()),
-                Value::Int(value) => Some(value.to_string()),
-                Value::Long(value) => Some(value.to_string()),
-                Value::Float(value) => Some(value.to_string()),
-                _ => None,
-            };
-            let (Some(actual), Some(expected)) = (text(&actual), text(&expected)) else {
-                return None;
-            };
-            Some(Err(NativeError::UncaughtException {
-                class: "java/lang/IllegalStateException".into(),
-                message: Some(format!("Can't encode '{actual}', expected '{expected}'")),
-                frame: None,
-            }))
         }
         _ => None,
     }
@@ -548,7 +592,7 @@ fn write_utf8_string(out: &mut Vec<u8>, text: &str, max_len: i32) -> Result<(), 
         )));
     }
     let bytes = text.as_bytes();
-    let max_bytes = max_len.saturating_mul(3);
+    let max_bytes = max_len.wrapping_mul(3);
     if (bytes.len() as i32) > max_bytes {
         return Err(encoder_exception(format!(
             "String too big (was {} bytes encoded, max {max_bytes})",
@@ -561,7 +605,7 @@ fn write_utf8_string(out: &mut Vec<u8>, text: &str, max_len: i32) -> Result<(), 
 }
 
 fn read_utf8_string(buf: &[u8], pos: &mut usize, max_len: i32) -> Result<String, NativeError> {
-    let max_bytes = max_len.saturating_mul(3);
+    let max_bytes = max_len.wrapping_mul(3);
     let byte_len = read_var_int(buf, pos)?;
     if byte_len > max_bytes {
         return Err(decoder_exception(format!(
@@ -802,30 +846,7 @@ fn encode_bytes_depth<H: Host>(
             let Some(expected) = held.get(2) else {
                 return Ok(false);
             };
-            if matches!(expected, Value::Ref(None)) {
-                return Err(npe());
-            }
-            let before = runtime.host.counted_unknown_calls();
-            let eq = runtime.call_virtual(
-                crate::jdk_call::Site::Virtual,
-                "java/lang/Object",
-                "equals",
-                "(Ljava/lang/Object;)Z",
-                expected,
-                std::slice::from_ref(value),
-            )?;
-            if runtime.host.counted_unknown_calls() != before {
-                return Ok(false);
-            }
-            if matches!(eq, Value::Int(n) if n != 0) {
-                Ok(true)
-            } else {
-                Err(NativeError::UncaughtException {
-                    class: "java/lang/IllegalStateException".into(),
-                    message: Some(format!("Can't encode '{value:?}', expected '{expected:?}'")),
-                    frame: None,
-                })
-            }
+            encode_unit(runtime, expected, value)
         }
         "net/minecraft/network/codec/StreamCodec$4" => {
             let (Some(inner), Some(from_cb)) = (held.get(2), held.get(4)) else {

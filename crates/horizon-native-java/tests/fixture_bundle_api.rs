@@ -47,6 +47,30 @@ const STUBS: &[(&str, &str)] = &[
          }",
     ),
     (
+        "com/mojang/serialization/Lifecycle.java",
+        "package com.mojang.serialization;\n\
+         public class Lifecycle {\n\
+           public static Lifecycle stable() { throw new AssertionError(); }\n\
+           public static Lifecycle experimental() { throw new AssertionError(); }\n\
+         }",
+    ),
+    (
+        "com/mojang/serialization/DataResult.java",
+        "package com.mojang.serialization;\n\
+         import java.util.Optional; import java.util.function.*;\n\
+         public interface DataResult<R> {\n\
+           static <R> DataResult<R> success(R result) { throw new AssertionError(); }\n\
+           static <R> DataResult<R> error(Supplier<String> message) { throw new AssertionError(); }\n\
+           static <R> DataResult<R> error(Supplier<String> message, R partial) { throw new AssertionError(); }\n\
+           boolean isSuccess();\n\
+           boolean isError();\n\
+           R getOrThrow();\n\
+           Optional<R> result();\n\
+           Optional<R> resultOrPartial();\n\
+           <T> DataResult<T> map(Function<? super R, ? extends T> function);\n\
+         }",
+    ),
+    (
         "com/mojang/serialization/Codec.java",
         "package com.mojang.serialization;\n\
          import com.mojang.serialization.codecs.PrimitiveCodec;\n\
@@ -57,8 +81,11 @@ const STUBS: &[(&str, &str)] = &[
            MapCodec<A> fieldOf(String name);\n\
            MapCodec<Optional<A>> optionalFieldOf(String name);\n\
            MapCodec<A> optionalFieldOf(String name, A defaultValue);\n\
+           MapCodec<A> optionalFieldOf(String name, Lifecycle fieldLifecycle, A defaultValue, Lifecycle lifecycleOfDefault);\n\
            Codec<List<A>> listOf();\n\
+           Codec<List<A>> listOf(int minSize, int maxSize);\n\
            <S> Codec<S> xmap(Function<? super A, ? extends S> to, Function<? super S, ? extends A> from);\n\
+           <S> Codec<S> flatXmap(Function<? super A, ? extends DataResult<S>> to, Function<? super S, ? extends DataResult<A>> from);\n\
          }",
     ),
     (
@@ -71,10 +98,11 @@ const STUBS: &[(&str, &str)] = &[
         "com/mojang/serialization/codecs/RecordCodecBuilder.java",
         "package com.mojang.serialization.codecs;\n\
          import com.mojang.datafixers.Products; import com.mojang.datafixers.kinds.*;\n\
-         import com.mojang.serialization.Codec; import java.util.function.Function;\n\
+         import com.mojang.serialization.Codec; import com.mojang.serialization.MapCodec; import java.util.function.Function;\n\
          public final class RecordCodecBuilder<O, F> implements App<RecordCodecBuilder.Mu<O>, F> {\n\
            public static final class Mu<O> {}\n\
            public static <O> Codec<O> create(Function<Instance<O>, ? extends App<Mu<O>, O>> builder) { throw new AssertionError(); }\n\
+           public static <O> MapCodec<O> mapCodec(Function<Instance<O>, ? extends App<Mu<O>, O>> builder) { throw new AssertionError(); }\n\
            public static final class Instance<O> implements Applicative<Mu<O>, Instance.Mu<O>> {\n\
              public static final class Mu<O> {}\n\
              public <T1> Products.P1<RecordCodecBuilder.Mu<O>, T1> group(App<RecordCodecBuilder.Mu<O>, T1> t1) { throw new AssertionError(); }\n\
@@ -153,6 +181,7 @@ const STUBS: &[(&str, &str)] = &[
            @FunctionalInterface interface CodecOperation<B, S, T> { StreamCodec<B, T> apply(StreamCodec<B, S> codec); }\n\
            default <O> StreamCodec<B, O> apply(CodecOperation<B, V, O> op) { throw new AssertionError(); }\n\
            default <O> StreamCodec<B, O> map(Function<? super V, ? extends O> to, Function<? super O, ? extends V> from) { throw new AssertionError(); }\n\
+           static <B, V> StreamCodec<B, V> unit(V expected) { throw new AssertionError(); }\n\
            static <B, C, T1, T2> StreamCodec<B, C> composite(StreamCodec<? super B, T1> c1, Function<C, T1> g1, StreamCodec<? super B, T2> c2, Function<C, T2> g2, BiFunction<T1, T2, C> ctor) { throw new AssertionError(); }\n\
          }",
     ),
@@ -163,6 +192,7 @@ const STUBS: &[(&str, &str)] = &[
          public interface ByteBufCodecs {\n\
            StreamCodec<Object, Integer> VAR_INT = null;\n\
            StreamCodec<Object, String> STRING_UTF8 = null;\n\
+           static StreamCodec<Object, String> stringUtf8(int maxLength) { throw new AssertionError(); }\n\
            static <B, V> StreamCodec.CodecOperation<B, V, List<V>> list() { throw new AssertionError(); }\n\
            static <B, V> StreamCodec.CodecOperation<B, V, List<V>> list(int maxSize) { throw new AssertionError(); }\n\
            static <B, V> StreamCodec.CodecOperation<B, V, List<V>> fixedSizeList(int size) { throw new AssertionError(); }\n\
@@ -307,6 +337,36 @@ fn record_codec_round_trips_match_java25_oracle() {
     let f = fixture();
     let mut host = f.jar.seed_host(StdHost::new());
 
+    fn fmt_ex<T: std::fmt::Debug>(res: Result<T, NativeError>) -> String {
+        match res {
+            Err(NativeError::UncaughtException { class, message, .. }) => format!(
+                "EX:{}:{}",
+                class.replace('/', "."),
+                message.unwrap_or_else(|| "null".into())
+            ),
+            other => panic!("expected UncaughtException, got {other:?}"),
+        }
+    }
+
+    let describe_obj = |host: &mut StdHost, val: &Value| -> String {
+        match f
+            .jar
+            .invoke_method_with_args(
+                "demo/BundleApiProbe",
+                "describeObject",
+                "(Ljava/lang/Object;)Ljava/lang/String;",
+                None,
+                std::slice::from_ref(val),
+                host,
+            )
+            .unwrap()
+        {
+            Value::Ref(Some(s)) => s,
+            other => panic!("unexpected describeObject result: {other:?}"),
+        }
+    };
+
+    let mut actual = String::new();
     let pred_ok = f
         .jar
         .invoke_method_with_args(
@@ -318,7 +378,10 @@ fn record_codec_round_trips_match_java25_oracle() {
             &mut host,
         )
         .unwrap();
-    assert_eq!(pred_ok, Value::Int(1));
+    actual.push_str(&format!(
+        "predicate.codec_nonnull={}\n",
+        pred_ok == Value::Int(1)
+    ));
 
     let codec = f
         .jar
@@ -356,65 +419,388 @@ fn record_codec_round_trips_match_java25_oracle() {
             "08_bad_mult_type",
             r#"{"content":[],"size_multiplier":"four"}"#,
         ),
+        (
+            "09_mixed_partial",
+            r#"{"content":["minecraft:apple",{"id":"minecraft:diamond","count":0}],"size_multiplier":3}"#,
+        ),
     ];
 
-    let mut expected_rows = std::collections::BTreeMap::new();
-    for line in ORACLE_RECORD_CODEC.lines() {
-        if let Some((k, v)) = line.split_once('=') {
-            expected_rows.insert(k, v);
-        }
-    }
-    assert_eq!(expected_rows.get("predicate.codec_nonnull"), Some(&"true"));
-
     for (name, raw) in inputs {
-        let key = format!("case.{name}");
-        let expected = expected_rows
-            .get(key.as_str())
-            .unwrap_or_else(|| panic!("missing oracle row {key}"));
         let json: serde_json::Value = serde_json::from_str(raw).unwrap();
         let decoded = f
             .jar
             .decode_dfu_codec_json(&codec, &json, &mut host)
             .unwrap();
-        if *expected == "ERROR" {
-            assert!(
-                matches!(decoded, DfuCodecResult::Error(_)),
-                "case {name}: expected Error, got {decoded:?}"
-            );
-            continue;
+        match decoded {
+            DfuCodecResult::Ok(comp) => {
+                let desc = match f
+                    .jar
+                    .invoke_method_with_args(
+                        "demo/BundleApiProbe",
+                        "describeBundleComponent",
+                        "(Ldemo/BundleApiProbe$BundleLikeComponent;)Ljava/lang/String;",
+                        None,
+                        std::slice::from_ref(&comp),
+                        &mut host,
+                    )
+                    .unwrap()
+                {
+                    Value::Ref(Some(s)) => s,
+                    other => panic!("unexpected description: {other:?}"),
+                };
+                let encoded = match f
+                    .jar
+                    .encode_dfu_codec_json(&codec, &comp, &mut host)
+                    .unwrap()
+                {
+                    DfuCodecResult::Ok(j) => j,
+                    other => panic!("case {name}: encode failed: {other:?}"),
+                };
+                actual.push_str(&format!(
+                    "case.{name}=OK|{desc}|json={}\n",
+                    serde_json::to_string(&encoded).unwrap()
+                ));
+            }
+            DfuCodecResult::Error { message, partial } => {
+                actual.push_str(&format!("case.{name}=ERROR|msg={message}"));
+                if let Some(p) = partial {
+                    let desc = match f
+                        .jar
+                        .invoke_method_with_args(
+                            "demo/BundleApiProbe",
+                            "describeBundleComponent",
+                            "(Ldemo/BundleApiProbe$BundleLikeComponent;)Ljava/lang/String;",
+                            None,
+                            std::slice::from_ref(&p),
+                            &mut host,
+                        )
+                        .unwrap()
+                    {
+                        Value::Ref(Some(s)) => s,
+                        other => panic!("unexpected partial description: {other:?}"),
+                    };
+                    let encoded = match f.jar.encode_dfu_codec_json(&codec, &p, &mut host).unwrap()
+                    {
+                        DfuCodecResult::Ok(j) => j,
+                        other => panic!("case {name}: partial encode failed: {other:?}"),
+                    };
+                    actual.push_str(&format!(
+                        "|partial={desc}|json={}\n",
+                        serde_json::to_string(&encoded).unwrap()
+                    ));
+                } else {
+                    actual.push_str("|partial=NONE\n");
+                }
+            }
+            DfuCodecResult::Unmodelled(u) => panic!("case {name}: unexpected Unmodelled: {u}"),
         }
-        let DfuCodecResult::Ok(comp) = decoded else {
-            panic!("case {name}: expected Ok, got {decoded:?}");
-        };
-        let desc = match f
-            .jar
-            .invoke_method_with_args(
-                "demo/BundleApiProbe",
-                "describeBundleComponent",
-                "(Ldemo/BundleApiProbe$BundleLikeComponent;)Ljava/lang/String;",
-                None,
-                std::slice::from_ref(&comp),
-                &mut host,
-            )
-            .unwrap()
-        {
-            Value::Ref(Some(s)) => s,
-            other => panic!("unexpected description: {other:?}"),
-        };
-        let encoded = match f
-            .jar
-            .encode_dfu_codec_json(&codec, &comp, &mut host)
-            .unwrap()
-        {
-            DfuCodecResult::Ok(j) => j,
-            other => panic!("case {name}: encode failed: {other:?}"),
-        };
-        let (exp_prefix, exp_json_str) = expected.split_once("|json=").unwrap();
-        let exp_json: serde_json::Value = serde_json::from_str(exp_json_str).unwrap();
-        assert_eq!(format!("OK|{desc}"), exp_prefix, "case {name} header");
-        assert_eq!(encoded, exp_json, "case {name} encoded JSON");
     }
 
+    // ItemStackTemplate.CODEC either-error and partial cases
+    let tpl_codec = f
+        .jar
+        .invoke_method_with_args(
+            "demo/BundleApiProbe",
+            "itemStackTemplateCodec",
+            "()Lcom/mojang/serialization/Codec;",
+            None,
+            &[],
+            &mut host,
+        )
+        .unwrap();
+    let tpl_cases: &[(&str, &str)] = &[
+        ("01_air_str", r#""minecraft:air""#),
+        ("02_num", "42"),
+        ("03_unknown_item", r#""minecraft:not_an_item""#),
+        ("04_empty_obj", "{}"),
+        ("05_non_str_id", r#"{"id":123}"#),
+        (
+            "06_air_and_bad_count",
+            r#"{"id":"minecraft:air","count":0}"#,
+        ),
+        (
+            "07_bad_count_str",
+            r#"{"id":"minecraft:apple","count":"two"}"#,
+        ),
+    ];
+    for (name, raw) in tpl_cases {
+        let json: serde_json::Value = serde_json::from_str(raw).unwrap();
+        let DfuCodecResult::Error { message, partial } = f
+            .jar
+            .decode_dfu_codec_json(&tpl_codec, &json, &mut host)
+            .unwrap()
+        else {
+            panic!("tpl.{name}: expected Error");
+        };
+        actual.push_str(&format!("tpl.{name}=ERROR|msg={message}"));
+        if let Some(p) = partial {
+            let DfuCodecResult::Ok(j) = f
+                .jar
+                .encode_dfu_codec_json(&tpl_codec, &p, &mut host)
+                .unwrap()
+            else {
+                panic!("tpl.{name}: expected Ok encoding partial");
+            };
+            actual.push_str(&format!(
+                "|partial={}\n",
+                serde_json::to_string(&j).unwrap()
+            ));
+        } else {
+            actual.push_str("|partial=NONE\n");
+        }
+    }
+
+    // RecordCodecBuilder null-builder cases
+    actual.push_str(&probe_text(&f, &mut host, "nullBuilderRows"));
+    let null_create = f
+        .jar
+        .invoke_method_with_args(
+            "demo/BundleApiProbe",
+            "nullCreateCodec",
+            "()Lcom/mojang/serialization/Codec;",
+            None,
+            &[],
+            &mut host,
+        )
+        .unwrap();
+    let null_map_codec = f
+        .jar
+        .invoke_method_with_args(
+            "demo/BundleApiProbe",
+            "nullMapAsCodec",
+            "()Lcom/mojang/serialization/Codec;",
+            None,
+            &[],
+            &mut host,
+        )
+        .unwrap();
+    actual.push_str(&format!(
+        "nullbuilder.create_parse_obj={}\n",
+        fmt_ex(
+            f.jar
+                .decode_dfu_codec_json(&null_create, &serde_json::json!({}), &mut host)
+        )
+    ));
+    match f
+        .jar
+        .decode_dfu_codec_json(&null_create, &serde_json::json!(1), &mut host)
+        .unwrap()
+    {
+        DfuCodecResult::Error {
+            message,
+            partial: None,
+        } => {
+            actual.push_str(&format!(
+                "nullbuilder.create_parse_nonobj=ERROR|msg={message}\n"
+            ));
+        }
+        other => panic!("expected Error for non-object parse on nullCreate, got {other:?}"),
+    }
+    actual.push_str(&format!(
+        "nullbuilder.create_encode={}\n",
+        fmt_ex(
+            f.jar
+                .encode_dfu_codec_json(&null_create, &Value::Ref(Some("x".into())), &mut host)
+        )
+    ));
+    actual.push_str(&format!(
+        "nullbuilder.map_codec_parse_obj={}\n",
+        fmt_ex(
+            f.jar
+                .decode_dfu_codec_json(&null_map_codec, &serde_json::json!({}), &mut host)
+        )
+    ));
+    actual.push_str(&format!(
+        "nullbuilder.map_codec_encode={}\n",
+        fmt_ex(f.jar.encode_dfu_codec_json(
+            &null_map_codec,
+            &Value::Ref(Some("x".into())),
+            &mut host
+        ))
+    ));
+
+    // Callback DataResult.error message preservation + partial propagation + list bounds
+    let pos_fx = f
+        .jar
+        .invoke_method_with_args(
+            "demo/BundleApiProbe",
+            "posFlatXmapCodec",
+            "()Lcom/mojang/serialization/Codec;",
+            None,
+            &[],
+            &mut host,
+        )
+        .unwrap();
+    let DfuCodecResult::Error {
+        message: fx_dec_err,
+        partial: None,
+    } = f
+        .jar
+        .decode_dfu_codec_json(&pos_fx, &serde_json::json!(-3), &mut host)
+        .unwrap()
+    else {
+        panic!("expected Error for posFlatXmapCodec decode");
+    };
+    actual.push_str(&format!("fx.dec_err={fx_dec_err}\n"));
+    let DfuCodecResult::Error {
+        message: fx_enc_err,
+        ..
+    } = f
+        .jar
+        .encode_dfu_codec_json(&pos_fx, &Value::Int(-3), &mut host)
+        .unwrap()
+    else {
+        panic!("expected Error for posFlatXmapCodec encode");
+    };
+    actual.push_str(&format!("fx.enc_err={fx_enc_err}\n"));
+
+    let partial_fx = f
+        .jar
+        .invoke_method_with_args(
+            "demo/BundleApiProbe",
+            "partialFlatXmapCodec",
+            "()Lcom/mojang/serialization/Codec;",
+            None,
+            &[],
+            &mut host,
+        )
+        .unwrap();
+    let DfuCodecResult::Error {
+        message: pfx_msg,
+        partial: Some(pfx_val),
+    } = f
+        .jar
+        .decode_dfu_codec_json(&partial_fx, &serde_json::json!(-3), &mut host)
+        .unwrap()
+    else {
+        panic!("expected Error with partial for partialFlatXmapCodec");
+    };
+    actual.push_str(&format!(
+        "fx.partial=msg={pfx_msg}|partial={}\n",
+        describe_obj(&mut host, &pfx_val)
+    ));
+
+    let bounded_list = f
+        .jar
+        .invoke_method_with_args(
+            "demo/BundleApiProbe",
+            "boundedIntListCodec",
+            "()Lcom/mojang/serialization/Codec;",
+            None,
+            &[],
+            &mut host,
+        )
+        .unwrap();
+    let unbounded_list = f
+        .jar
+        .invoke_method_with_args(
+            "demo/BundleApiProbe",
+            "unboundedIntListCodec",
+            "()Lcom/mojang/serialization/Codec;",
+            None,
+            &[],
+            &mut host,
+        )
+        .unwrap();
+    for (label, list_codec, raw) in [
+        ("list.short", &bounded_list, "[1]"),
+        ("list.long", &bounded_list, "[1,2,3,4]"),
+        ("list.elem_err", &unbounded_list, r#"[1,"a",3]"#),
+    ] {
+        let json: serde_json::Value = serde_json::from_str(raw).unwrap();
+        let DfuCodecResult::Error { message, partial } = f
+            .jar
+            .decode_dfu_codec_json(list_codec, &json, &mut host)
+            .unwrap()
+        else {
+            panic!("{label}: expected Error");
+        };
+        let partial_str = partial
+            .as_ref()
+            .map(|v| describe_obj(&mut host, v))
+            .unwrap_or_else(|| "NONE".into());
+        actual.push_str(&format!("{label}=msg={message}|partial={partial_str}\n"));
+    }
+
+    // DataResult.map null-return / null-function semantics
+    actual.push_str(&probe_text(&f, &mut host, "dataResultRows"));
+
+    // 4-arg optionalFieldOf(String, Lifecycle, A, Lifecycle)
+    actual.push_str(&format!(
+        "opt4.str={}\n",
+        probe_text(&f, &mut host, "opt4ToString")
+    ));
+    let opt4_codec = f
+        .jar
+        .invoke_method_with_args(
+            "demo/BundleApiProbe",
+            "opt4Codec",
+            "()Lcom/mojang/serialization/Codec;",
+            None,
+            &[],
+            &mut host,
+        )
+        .unwrap();
+    let DfuCodecResult::Ok(opt4_missing) = f
+        .jar
+        .decode_dfu_codec_json(&opt4_codec, &serde_json::json!({}), &mut host)
+        .unwrap()
+    else {
+        panic!("opt4_missing decode failed");
+    };
+    actual.push_str(&format!(
+        "opt4.dec_missing={}\n",
+        describe_obj(&mut host, &opt4_missing)
+    ));
+    let DfuCodecResult::Ok(opt4_present) = f
+        .jar
+        .decode_dfu_codec_json(&opt4_codec, &serde_json::json!({"x": 9}), &mut host)
+        .unwrap()
+    else {
+        panic!("opt4_present decode failed");
+    };
+    actual.push_str(&format!(
+        "opt4.dec_present={}\n",
+        describe_obj(&mut host, &opt4_present)
+    ));
+    let DfuCodecResult::Ok(opt4_enc_def) = f
+        .jar
+        .encode_dfu_codec_json(&opt4_codec, &Value::Int(7), &mut host)
+        .unwrap()
+    else {
+        panic!("opt4_enc_def failed");
+    };
+    actual.push_str(&format!(
+        "opt4.enc_default={}\n",
+        serde_json::to_string(&opt4_enc_def).unwrap()
+    ));
+    let DfuCodecResult::Ok(opt4_enc_nondef) = f
+        .jar
+        .encode_dfu_codec_json(&opt4_codec, &Value::Int(9), &mut host)
+        .unwrap()
+    else {
+        panic!("opt4_enc_nondef failed");
+    };
+    actual.push_str(&format!(
+        "opt4.enc_nondefault={}\n",
+        serde_json::to_string(&opt4_enc_nondef).unwrap()
+    ));
+
+    let actual_lines: Vec<&str> = actual.lines().collect();
+    let expected_lines: Vec<&str> = ORACLE_RECORD_CODEC.lines().collect();
+    assert_eq!(actual_lines.len(), expected_lines.len());
+    for (act, exp) in actual_lines.iter().zip(expected_lines.iter()) {
+        if let (Some((act_prefix, act_json)), Some((exp_prefix, exp_json))) =
+            (act.split_once("|json="), exp.split_once("|json="))
+        {
+            assert_eq!(act_prefix, exp_prefix);
+            let act_val: serde_json::Value = serde_json::from_str(act_json).unwrap();
+            let exp_val: serde_json::Value = serde_json::from_str(exp_json).unwrap();
+            assert_eq!(act_val, exp_val, "JSON mismatch for {exp_prefix}");
+        } else {
+            assert_eq!(act, exp);
+        }
+    }
     assert!(
         host.unknown_host_calls().is_empty(),
         "unexpected unknowns: {:?}",
@@ -631,6 +1017,139 @@ fn stream_codec_list_round_trips_match_java25_oracle() {
         )
     ));
 
+    // Finding 1: stringUtf8 wrapping int*3 overflow
+    let utf8_huge = f
+        .jar
+        .invoke_method_with_args(
+            "demo/BundleApiProbe",
+            "utf8HugeCodec",
+            "()Lnet/minecraft/network/codec/StreamCodec;",
+            None,
+            &[],
+            &mut host,
+        )
+        .unwrap();
+    let utf8_neg = f
+        .jar
+        .invoke_method_with_args(
+            "demo/BundleApiProbe",
+            "utf8NegCodec",
+            "()Lnet/minecraft/network/codec/StreamCodec;",
+            None,
+            &[],
+            &mut host,
+        )
+        .unwrap();
+    actual.push_str(&format!(
+        "ex.utf8_huge_enc={}\n",
+        fmt_ex(f.jar.encode_stream_codec_bytes(
+            &utf8_huge,
+            &Value::Ref(Some(String::new())),
+            &mut host
+        ))
+    ));
+    actual.push_str(&format!(
+        "ex.utf8_huge_dec={}\n",
+        fmt_ex(f.jar.decode_stream_codec_bytes(&utf8_huge, &[0], &mut host))
+    ));
+    actual.push_str(&format!(
+        "ex.utf8_neg_enc={}\n",
+        fmt_ex(f.jar.encode_stream_codec_bytes(
+            &utf8_neg,
+            &Value::Ref(Some(String::new())),
+            &mut host
+        ))
+    ));
+    actual.push_str(&format!(
+        "ex.utf8_neg_dec={}\n",
+        fmt_ex(f.jar.decode_stream_codec_bytes(&utf8_neg, &[0], &mut host))
+    ));
+
+    // Finding 3: StreamCodec.unit via wire path AND direct Java call path
+    let unit_null = f
+        .jar
+        .invoke_method_with_args(
+            "demo/BundleApiProbe",
+            "unitNullCodec",
+            "()Lnet/minecraft/network/codec/StreamCodec;",
+            None,
+            &[],
+            &mut host,
+        )
+        .unwrap();
+    let unit_exp = f
+        .jar
+        .invoke_method_with_args(
+            "demo/BundleApiProbe",
+            "unitExpCodec",
+            "()Lnet/minecraft/network/codec/StreamCodec;",
+            None,
+            &[],
+            &mut host,
+        )
+        .unwrap();
+    let unit_one = f
+        .jar
+        .invoke_method_with_args(
+            "demo/BundleApiProbe",
+            "unitOneCodec",
+            "()Lnet/minecraft/network/codec/StreamCodec;",
+            None,
+            &[],
+            &mut host,
+        )
+        .unwrap();
+    let unit_named = f
+        .jar
+        .invoke_method_with_args(
+            "demo/BundleApiProbe",
+            "unitNamedCodec",
+            "()Lnet/minecraft/network/codec/StreamCodec;",
+            None,
+            &[],
+            &mut host,
+        )
+        .unwrap();
+    let actual_named = f
+        .jar
+        .invoke_method_with_args(
+            "demo/BundleApiProbe",
+            "actualNamed",
+            "()Ldemo/BundleApiProbe$Named;",
+            None,
+            &[],
+            &mut host,
+        )
+        .unwrap();
+    let wire_unit_rows = format!(
+        "ex.unit_null_actual={}\nex.unit_exp_null={}\nex.unit_null_null={}\nex.unit_int_mismatch={}\nex.unit_named_mismatch={}\n",
+        fmt_ex(f.jar.encode_stream_codec_bytes(
+            &unit_null,
+            &Value::Ref(Some("actual".into())),
+            &mut host
+        )),
+        fmt_ex(
+            f.jar
+                .encode_stream_codec_bytes(&unit_exp, &Value::Ref(None), &mut host)
+        ),
+        fmt_ex(
+            f.jar
+                .encode_stream_codec_bytes(&unit_null, &Value::Ref(None), &mut host)
+        ),
+        fmt_ex(f.jar.encode_stream_codec_bytes(
+            &unit_one,
+            &Value::Boxed(horizon_native_java::Boxed::Integer(2)),
+            &mut host
+        )),
+        fmt_ex(
+            f.jar
+                .encode_stream_codec_bytes(&unit_named, &actual_named, &mut host)
+        ),
+    );
+    let direct_unit_rows = probe_text(&f, &mut host, "unitDirectRows");
+    assert_eq!(wire_unit_rows, direct_unit_rows);
+    actual.push_str(&wire_unit_rows);
+
     assert_eq!(actual, ORACLE_STREAM_CODEC);
     assert!(
         host.unknown_host_calls().is_empty(),
@@ -751,6 +1270,83 @@ fn counted_placeholder_traps_stay_counted() {
         "expected NPE for CollectionPredicate.codec(null), got {res}"
     );
     assert!(host_null.unknown_host_calls().is_empty());
+
+    // 5. Finding 6: ItemPredicate.CODEC and CollectionPredicate.codec(ItemPredicate.CODEC)
+    //    are unmodelled for JSON execution and must ALWAYS count an unknown call on decode/encode,
+    //    never returning Unmodelled silently.
+    let mut host_pred_dec = f.jar.seed_host(StdHost::new());
+    let item_pred_codec = f
+        .jar
+        .invoke_method_with_args(
+            "demo/BundleApiProbe",
+            "itemPredicateCodec",
+            "()Lcom/mojang/serialization/Codec;",
+            None,
+            &[],
+            &mut host_pred_dec,
+        )
+        .unwrap();
+    assert!(host_pred_dec.unknown_host_calls().is_empty());
+    let pred_dec = f
+        .jar
+        .decode_dfu_codec_json(
+            &item_pred_codec,
+            &serde_json::json!({"items": "minecraft:apple"}),
+            &mut host_pred_dec,
+        )
+        .unwrap();
+    assert!(
+        matches!(pred_dec, DfuCodecResult::Unmodelled(_)),
+        "expected Unmodelled for ItemPredicate.CODEC decode, got {pred_dec:?}"
+    );
+    assert!(
+        host_pred_dec.unknown_host_call_count() > 0,
+        "ItemPredicate.CODEC decode must be counted on host"
+    );
+
+    let mut host_pred_enc = f.jar.seed_host(StdHost::new());
+    let pred_enc = f
+        .jar
+        .encode_dfu_codec_json(&item_pred_codec, &Value::Ref(None), &mut host_pred_enc)
+        .unwrap();
+    assert!(
+        matches!(pred_enc, DfuCodecResult::Unmodelled(_)),
+        "expected Unmodelled for ItemPredicate.CODEC encode, got {pred_enc:?}"
+    );
+    assert!(
+        host_pred_enc.unknown_host_call_count() > 0,
+        "ItemPredicate.CODEC encode must be counted on host"
+    );
+
+    let mut host_pred_like = f.jar.seed_host(StdHost::new());
+    let pred_like_codec = f
+        .jar
+        .invoke_method_with_args(
+            "demo/BundleApiProbe",
+            "predicateLikeCodec",
+            "()Lcom/mojang/serialization/Codec;",
+            None,
+            &[],
+            &mut host_pred_like,
+        )
+        .unwrap();
+    assert!(host_pred_like.unknown_host_calls().is_empty());
+    let pred_like_dec = f
+        .jar
+        .decode_dfu_codec_json(
+            &pred_like_codec,
+            &serde_json::json!({"items": {"contains": [{"items": "minecraft:apple"}]}}),
+            &mut host_pred_like,
+        )
+        .unwrap();
+    assert!(
+        matches!(pred_like_dec, DfuCodecResult::Unmodelled(_)),
+        "expected Unmodelled for PredicateLike.CODEC decode with items, got {pred_like_dec:?}"
+    );
+    assert!(
+        host_pred_like.unknown_host_call_count() > 0,
+        "PredicateLike.CODEC decode with items must be counted on host"
+    );
 }
 
 #[test]

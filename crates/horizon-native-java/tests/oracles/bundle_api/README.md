@@ -33,15 +33,20 @@ mkdir -p scratch/oracle-classes
 ## Captures
 
 - `fraction.txt`: all 12 `Fraction` constants, identity (`==`) vs `.equals()` vs `.compareTo()`,
-  constructors (`(II)`, `(III)`, `(D)`, `(String)`, `getReducedFraction`), arithmetic
-  (`add`, `subtract`, `multiplyBy`, `divideBy`, `negate`, `abs`, `invert`, `reduce`, `pow`),
-  overflow/error exception classes and messages, and `Mth.mulAndTruncate(Fraction, int)`.
+  constructors (`(II)`, `(III)`, `(D)`, `(String)` including Java hex float literals,
+  `getReducedFraction`), arithmetic (`add`, `subtract`, `multiplyBy`, `divideBy`, `negate`, `abs`,
+  `invert`, `reduce`, `pow`), overflow/error exception classes and messages (including
+  `compareTo(null)` helpful NPE and `compareTo(Object)` full module/loader CCE), and
+  `Mth.mulAndTruncate(Fraction, int)`.
 - `argb.txt`: `ARGB.colorFromFloat(FFFF)` normal + out-of-range + NaN/Inf edge cases,
   `as8BitChannel`, channel extractors, `color`, `gray`, `multiply`, `average`, float accessors.
-- `record_codec.txt`: `RecordCodecBuilder.create`, `Products$P1` / `P2`, `optionalFieldOf`,
-  `ItemPredicate.CODEC`, `CollectionPredicate.codec`, and `ItemStackTemplate.CODEC.listOf().xmap(...)`
-  JSON decode and encode round trips (including default omission and error cases).
+- `record_codec.txt`: `RecordCodecBuilder.create`, `mapCodec`, null-builder NPEs, `Products$P1` /
+  `P2`, `optionalFieldOf` (including 4-arg lifecycle overload), `flatXmap` custom error messages
+  and partial propagation, `listOf(min, max)` bounds and partials, `DataResult.map` null cases,
+  `ItemPredicate.CODEC`, `CollectionPredicate.codec`, `ItemStackTemplate.CODEC` either-errors and
+  partials, and `ItemStackTemplate.CODEC.listOf().xmap(...)` JSON decode/encode round trips.
 - `stream_codec_list.txt`: `ByteBufCodecs.list()`, `list(maxSize)`, `fixedSizeList(n)`,
-  `collection(ctor, maxSize)`, `optional(...)`, `StreamCodec.apply(CodecOperation)`,
-  `StreamCodec.map(...)`, and `StreamCodec.composite(...)` wire hex bytes, decoded equality,
-  implementation class names, and `EncoderException`/`DecoderException` size-limit errors.
+  `collection(ctor, maxSize)`, `optional(...)`, `stringUtf8` wrapping `int*3` overflow,
+  `StreamCodec.unit` (`value.equals(expected)` and Java `toString` mismatch messages),
+  `StreamCodec.apply(CodecOperation)`, `StreamCodec.map(...)`, and `StreamCodec.composite(...)`
+  wire hex bytes, decoded equality, implementation class names, and size-limit errors.

@@ -107,10 +107,15 @@ fn number_format(message: String) -> NativeError {
 
 fn value_class_name(value: &Value) -> Option<&str> {
     match value {
-        Value::Ref(Some(text)) if crate::runtime::value_class::is_plain_string(text) => {
-            Some("java/lang/String")
+        Value::Ref(Some(text)) => {
+            if let Some(class) = crate::runtime::jar_object::object_class(value) {
+                Some(class)
+            } else if crate::runtime::value_class::is_plain_string(text) {
+                Some("java/lang/String")
+            } else {
+                None
+            }
         }
-        Value::Ref(Some(_)) => None,
         Value::Host(handle) => handle.class(),
         Value::Boxed(b) => Some(match b {
             crate::runtime::Boxed::Boolean(_) => "java/lang/Boolean",
@@ -124,17 +129,6 @@ fn value_class_name(value: &Value) -> Option<&str> {
         Value::Long(_) => Some("java/lang/Long"),
         Value::Float(_) => Some("java/lang/Double"),
         Value::Ref(None) | Value::Void => None,
-    }
-}
-
-fn class_cast(found: &str) -> NativeError {
-    NativeError::UncaughtException {
-        class: "java/lang/ClassCastException".into(),
-        message: Some(format!(
-            "class {} cannot be cast to class org.apache.commons.lang3.math.Fraction",
-            found.replace('/', ".")
-        )),
-        frame: None,
     }
 }
 
@@ -337,41 +331,216 @@ fn parse_java_int(text: &str) -> Result<i32, NativeError> {
     }
 }
 
+fn parse_java_hex_double(body: &str, negative: bool) -> Option<f64> {
+    let body = body.strip_suffix(['f', 'F', 'd', 'D']).unwrap_or(body);
+    let rest = body
+        .strip_prefix("0x")
+        .or_else(|| body.strip_prefix("0X"))?;
+    let exp_pos = rest.find(['p', 'P'])?;
+    let sig_part = &rest[..exp_pos];
+    let exp_part = &rest[exp_pos + 1..];
+
+    let (exp_neg, exp_digits) = if let Some(d) = exp_part.strip_prefix('-') {
+        (true, d)
+    } else if let Some(d) = exp_part.strip_prefix('+') {
+        (false, d)
+    } else {
+        (false, exp_part)
+    };
+    if exp_digits.is_empty() || !exp_digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let mut exp_mag = 0_i64;
+    for b in exp_digits.bytes() {
+        exp_mag = exp_mag
+            .saturating_mul(10)
+            .saturating_add(i64::from(b - b'0'))
+            .min(1_000_000_000);
+    }
+    let bin_exp = if exp_neg { -exp_mag } else { exp_mag };
+
+    let (int_hex, frac_hex) = match sig_part.split_once('.') {
+        Some((i, f)) => {
+            if f.contains('.') {
+                return None;
+            }
+            (i, f)
+        }
+        None => (sig_part, ""),
+    };
+    if int_hex.is_empty() && frac_hex.is_empty() {
+        return None;
+    }
+    if !int_hex.bytes().all(|b| b.is_ascii_hexdigit())
+        || !frac_hex.bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        return None;
+    }
+
+    let hex_val = |b: u8| -> u64 {
+        match b {
+            b'0'..=b'9' => u64::from(b - b'0'),
+            b'a'..=b'f' => u64::from(b - b'a' + 10),
+            b'A'..=b'F' => u64::from(b - b'A' + 10),
+            _ => unreachable!(),
+        }
+    };
+
+    let mut started = false;
+    let mut sig = 0_u64;
+    let mut sig_bits = 0_u32;
+    let mut sticky = false;
+    let mut msb_exp = 0_i64;
+
+    for b in int_hex.bytes() {
+        let d = hex_val(b);
+        for shift in (0..4).rev() {
+            let bit = (d >> shift) & 1;
+            if !started {
+                if bit == 1 {
+                    started = true;
+                    sig = 1;
+                    sig_bits = 1;
+                    msb_exp = 0;
+                }
+            } else {
+                msb_exp = msb_exp.saturating_add(1);
+                if sig_bits < 55 {
+                    sig = (sig << 1) | bit;
+                    sig_bits += 1;
+                } else if bit == 1 {
+                    sticky = true;
+                }
+            }
+        }
+    }
+
+    let mut frac_shift = 0_i64;
+    for b in frac_hex.bytes() {
+        let d = hex_val(b);
+        for shift in (0..4).rev() {
+            let bit = (d >> shift) & 1;
+            if !started {
+                frac_shift = frac_shift.saturating_sub(1);
+                if bit == 1 {
+                    started = true;
+                    sig = 1;
+                    sig_bits = 1;
+                    msb_exp = frac_shift;
+                }
+            } else if sig_bits < 55 {
+                sig = (sig << 1) | bit;
+                sig_bits += 1;
+            } else if bit == 1 {
+                sticky = true;
+            }
+        }
+    }
+
+    let sign_bit = u64::from(negative) << 63;
+    if !started {
+        return Some(f64::from_bits(sign_bit));
+    }
+
+    sig <<= 55 - sig_bits;
+    let exp = bin_exp.saturating_add(msb_exp);
+    if exp >= -1022 {
+        let mantissa = sig >> 2;
+        let guard = (sig >> 1) & 1 != 0;
+        let round_sticky = (sig & 1 != 0) || sticky;
+        let round_up = guard && (round_sticky || (mantissa & 1) == 1);
+        let mut m = mantissa + u64::from(round_up);
+        let mut e = exp;
+        if m == (1_u64 << 53) {
+            m >>= 1;
+            e += 1;
+        }
+        if e > 1023 {
+            return Some(f64::from_bits(sign_bit | (0x7ff_u64 << 52)));
+        }
+        let biased = (e + 1023) as u64;
+        return Some(f64::from_bits(
+            sign_bit | (biased << 52) | (m & ((1_u64 << 52) - 1)),
+        ));
+    }
+
+    // Subnormal or underflow: `sig` has leading 1 at bit 54, value = sig * 2^(exp - 54).
+    // Align to 2^-1074 by shifting right by `(-1020 - exp)` (at least 3).
+    let rshift_i64 = -1020_i64 - exp;
+    if rshift_i64 > 55 {
+        return Some(f64::from_bits(sign_bit));
+    }
+    let rshift = rshift_i64 as u32;
+    let mut m = sig >> rshift;
+    let half_bit = (sig >> (rshift - 1)) & 1 != 0;
+    let lower_mask = (1_u64 << (rshift - 1)) - 1;
+    let rest_sticky = sticky || (sig & lower_mask) != 0;
+    if half_bit && (rest_sticky || (m & 1) == 1) {
+        m += 1;
+    }
+    Some(f64::from_bits(sign_bit | m))
+}
+
+fn is_java_decimal_float(body: &str) -> bool {
+    let (mant, exp) = match body.find(['e', 'E']) {
+        Some(pos) => (&body[..pos], Some(&body[pos + 1..])),
+        None => (body, None),
+    };
+    if let Some(exp_str) = exp {
+        let digits = exp_str.strip_prefix(['+', '-']).unwrap_or(exp_str);
+        if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+            return false;
+        }
+    }
+    let (int_part, frac_part) = match mant.split_once('.') {
+        Some((i, f)) => {
+            if f.contains('.') {
+                return false;
+            }
+            (i, f)
+        }
+        None => (mant, ""),
+    };
+    if int_part.is_empty() && frac_part.is_empty() {
+        return false;
+    }
+    int_part.bytes().all(|b| b.is_ascii_digit()) && frac_part.bytes().all(|b| b.is_ascii_digit())
+}
+
 fn parse_java_double(raw: &str) -> Result<f64, NativeError> {
     let trimmed = raw.trim_matches(|ch: char| ch <= ' ');
     if trimmed.is_empty() {
         return Err(number_format("empty String".to_owned()));
     }
-    if matches!(trimmed, "NaN" | "+NaN" | "-NaN") {
+    let (negative, body) = if let Some(rest) = trimmed.strip_prefix('-') {
+        (true, rest)
+    } else if let Some(rest) = trimmed.strip_prefix('+') {
+        (false, rest)
+    } else {
+        (false, trimmed)
+    };
+    if body == "NaN" {
         return Ok(f64::NAN);
     }
-    if matches!(trimmed, "Infinity" | "+Infinity") {
-        return Ok(f64::INFINITY);
+    if body == "Infinity" {
+        return Ok(if negative {
+            f64::NEG_INFINITY
+        } else {
+            f64::INFINITY
+        });
     }
-    if trimmed == "-Infinity" {
-        return Ok(f64::NEG_INFINITY);
+    if body.starts_with("0x") || body.starts_with("0X") {
+        return parse_java_hex_double(body, negative)
+            .ok_or_else(|| number_format(format!("For input string: \"{trimmed}\"")));
     }
-    let stripped = trimmed
-        .strip_suffix(['d', 'D', 'f', 'F'])
-        .unwrap_or(trimmed);
-    // Reject Rust-only spellings (`inf`, `nan`, `_`) that Java's `Double.parseDouble` rejects.
-    if stripped.is_empty()
-        || stripped.contains('_')
-        || stripped.eq_ignore_ascii_case("inf")
-        || stripped.eq_ignore_ascii_case("+inf")
-        || stripped.eq_ignore_ascii_case("-inf")
-        || stripped.eq_ignore_ascii_case("infinity")
-        || stripped.eq_ignore_ascii_case("+infinity")
-        || stripped.eq_ignore_ascii_case("-infinity")
-        || stripped.eq_ignore_ascii_case("nan")
-        || stripped.eq_ignore_ascii_case("+nan")
-        || stripped.eq_ignore_ascii_case("-nan")
-    {
-        return Err(number_format(format!("For input string: \"{raw}\"")));
+    let stripped = body.strip_suffix(['d', 'D', 'f', 'F']).unwrap_or(body);
+    if !is_java_decimal_float(stripped) {
+        return Err(number_format(format!("For input string: \"{trimmed}\"")));
     }
-    stripped
+    let parsed = stripped
         .parse::<f64>()
-        .map_err(|_| number_format(format!("For input string: \"{raw}\"")))
+        .map_err(|_| number_format(format!("For input string: \"{trimmed}\"")))?;
+    Ok(if negative { -parsed } else { parsed })
 }
 
 fn get_fraction_string(value: &Value) -> Option<Result<Value, NativeError>> {
@@ -726,13 +895,15 @@ pub(crate) fn instance_call(
         ("compareTo", "(Lorg/apache/commons/lang3/math/Fraction;)I", [other])
         | ("compareTo", "(Ljava/lang/Object;)I", [other]) => {
             if matches!(other, Value::Ref(None)) {
-                return Some(Err(npe(None)));
+                return Some(Err(npe(Some(
+                    "Cannot read field \"numerator\" because \"other\" is null",
+                ))));
             }
             if let Some((num2, den2)) = fraction_parts(other) {
                 Some(Ok(Value::Int(compare_parts(num, den, num2, den2))))
             } else {
                 let class = value_class_name(other)?;
-                Some(Err(class_cast(class)))
+                Some(Err(crate::runtime::checkcast::class_cast_exception(class, FRACTION)))
             }
         }
         ("toString", "()Ljava/lang/String;", []) => {
@@ -797,13 +968,15 @@ fn fraction_compare_to(
         return Ok(None);
     };
     if matches!(other, Value::Ref(None)) {
-        return Err(npe(None));
+        return Err(npe(Some(
+            "Cannot read field \"numerator\" because \"other\" is null",
+        )));
     }
     if let Some((num2, den2)) = fraction_parts(other) {
         return Ok(Some(compare_parts(num1, den1, num2, den2)));
     }
     match value_class_name(other) {
-        Some(class) => Err(class_cast(class)),
+        Some(class) => Err(crate::runtime::checkcast::class_cast_exception(class, FRACTION)),
         None => Ok(None),
     }
 }

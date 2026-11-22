@@ -5,6 +5,8 @@ import com.google.gson.JsonParser;
 import com.mojang.serialization.Codec;
 import com.mojang.serialization.DataResult;
 import com.mojang.serialization.JsonOps;
+import com.mojang.serialization.Lifecycle;
+import com.mojang.serialization.MapCodec;
 import com.mojang.serialization.codecs.RecordCodecBuilder;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
@@ -187,6 +189,18 @@ public final class BundleApiOracle {
     sb.append("ctor.str_dec=").append(fmtFraction(Fraction.getFraction("0.25"))).append('\n');
     sb.append("ctor.str_int=").append(fmtFraction(Fraction.getFraction("7"))).append('\n');
     sb.append("ctor.str_neg=").append(fmtFraction(Fraction.getFraction("-5/10"))).append('\n');
+    sb.append("ctor.str_hex_4=").append(fmtFraction(Fraction.getFraction("0x1.0p2"))).append('\n');
+    sb.append("ctor.str_hex_neg=").append(fmtFraction(Fraction.getFraction("-0x1.8p1"))).append('\n');
+    sb.append("ctor.str_hex_upper=").append(fmtFraction(Fraction.getFraction("0X.8P2"))).append('\n');
+    sb.append("ctor.str_hex_dot=").append(fmtFraction(Fraction.getFraction("0x1.p0"))).append('\n');
+    sb.append("ctor.str_hex_d=").append(fmtFraction(Fraction.getFraction("0x1.0p2d"))).append('\n');
+    sb.append("ctor.str_hex_f=").append(fmtFraction(Fraction.getFraction("0x1.0p2F"))).append('\n');
+    sb.append("ctor.str_hex_ws=").append(fmtFraction(Fraction.getFraction(" 0x1.0p-1 "))).append('\n');
+    sb.append("ctor.str_hex_uflow=").append(fmtFraction(Fraction.getFraction("0x1.0p-2000"))).append('\n');
+    sb.append("ctor.str_dec_d=").append(fmtFraction(Fraction.getFraction("1.5d"))).append('\n');
+    sb.append("ctor.str_dec_f=").append(fmtFraction(Fraction.getFraction("1.5F"))).append('\n');
+    sb.append("ctor.str_dec_lead=").append(fmtFraction(Fraction.getFraction(".5"))).append('\n');
+    sb.append("ctor.str_dec_trail=").append(fmtFraction(Fraction.getFraction("5."))).append('\n');
 
     Fraction occ = Fraction.ZERO
         .add(Fraction.getFraction(1, 64))
@@ -230,6 +244,16 @@ public final class BundleApiOracle {
     sb.append("ex.sub_ovf=").append(captureEx(() -> Fraction.getFraction(Integer.MIN_VALUE, 1).subtract(Fraction.ONE))).append('\n');
     sb.append("ex.mul_ovf=").append(captureEx(() -> Fraction.getFraction(Integer.MAX_VALUE, 2).multiplyBy(Fraction.getFraction(3, 1)))).append('\n');
     sb.append("ex.add_null=").append(captureEx(() -> Fraction.ONE.add(null))).append('\n');
+    sb.append("ex.hex_ovf=").append(captureEx(() -> Fraction.getFraction("0x1.0p1000"))).append('\n');
+    sb.append("ex.hex_nodot=").append(captureEx(() -> Fraction.getFraction("0x1p2"))).append('\n');
+    sb.append("ex.hex_nodigits=").append(captureEx(() -> Fraction.getFraction("0x.p0"))).append('\n');
+    sb.append("ex.hex_noexp=").append(captureEx(() -> Fraction.getFraction("0x1.0p"))).append('\n');
+    sb.append("ex.dec_underscore=").append(captureEx(() -> Fraction.getFraction("1.0_0"))).append('\n');
+    sb.append("ex.cmp_null=").append(captureEx(() -> Fraction.ONE.compareTo(null))).append('\n');
+    @SuppressWarnings({"unchecked", "rawtypes"})
+    Comparable rawOne = Fraction.ONE;
+    sb.append("ex.cmp_str=").append(captureEx(() -> rawOne.compareTo("x"))).append('\n');
+    sb.append("ex.cmp_int=").append(captureEx(() -> rawOne.compareTo(42))).append('\n');
 
     sb.append("mth.mul_0=").append(Mth.mulAndTruncate(Fraction.ZERO, 12)).append('\n');
     sb.append("mth.mul_half=").append(Mth.mulAndTruncate(Fraction.ONE_HALF, 12)).append('\n');
@@ -322,6 +346,9 @@ public final class BundleApiOracle {
     inputs.put("08_bad_mult_type", """
         {"content":[],"size_multiplier":"four"}
         """);
+    inputs.put("09_mixed_partial", """
+        {"content":["minecraft:apple",{"id":"minecraft:diamond","count":0}],"size_multiplier":3}
+        """);
 
     for (var e : inputs.entrySet()) {
       DataResult<BundleLikeComponent> decoded =
@@ -340,9 +367,153 @@ public final class BundleApiOracle {
             .append(encodedJson)
             .append('\n');
       } else {
-        sb.append("case.").append(e.getKey()).append("=ERROR\n");
+        String errMsg = decoded.error().orElseThrow().message();
+        Optional<BundleLikeComponent> partial = decoded.resultOrPartial();
+        sb.append("case.")
+            .append(e.getKey())
+            .append("=ERROR|msg=")
+            .append(errMsg);
+        if (partial.isPresent()) {
+          BundleLikeComponent p = partial.get();
+          String partialJson = GSON.toJson(BundleLikeComponent.CODEC.encodeStart(ops, p).getOrThrow());
+          sb.append("|partial=size=")
+              .append(p.content().items().size())
+              .append("|mult=")
+              .append(p.sizeMultiplier())
+              .append("|json=")
+              .append(partialJson);
+        } else {
+          sb.append("|partial=NONE");
+        }
+        sb.append('\n');
       }
     }
+
+    // ItemStackTemplate.CODEC either-error and partial cases
+    Map<String, String> tplCases = new TreeMap<>();
+    tplCases.put("01_air_str", "\"minecraft:air\"");
+    tplCases.put("02_num", "42");
+    tplCases.put("03_unknown_item", "\"minecraft:not_an_item\"");
+    tplCases.put("04_empty_obj", "{}");
+    tplCases.put("05_non_str_id", "{\"id\":123}");
+    tplCases.put("06_air_and_bad_count", "{\"id\":\"minecraft:air\",\"count\":0}");
+    tplCases.put("07_bad_count_str", "{\"id\":\"minecraft:apple\",\"count\":\"two\"}");
+    for (var e : tplCases.entrySet()) {
+      DataResult<ItemStackTemplate> r =
+          ItemStackTemplate.CODEC.parse(ops, JsonParser.parseString(e.getValue()));
+      String errMsg = r.error().orElseThrow().message();
+      Optional<ItemStackTemplate> partial = r.resultOrPartial();
+      sb.append("tpl.").append(e.getKey()).append("=ERROR|msg=").append(errMsg);
+      if (partial.isPresent()) {
+        String partialJson = GSON.toJson(ItemStackTemplate.CODEC.encodeStart(ops, partial.get()).getOrThrow());
+        sb.append("|partial=").append(partialJson);
+      } else {
+        sb.append("|partial=NONE");
+      }
+      sb.append('\n');
+    }
+
+    // RecordCodecBuilder null-builder cases
+    Codec<Object> nullCreate = RecordCodecBuilder.create(i -> null);
+    MapCodec<Object> nullMap = RecordCodecBuilder.mapCodec(i -> null);
+    sb.append("nullbuilder.create_nonnull=").append(nullCreate != null).append('\n');
+    sb.append("nullbuilder.map_nonnull=").append(nullMap != null).append('\n');
+    sb.append("nullbuilder.create_str=").append(captureEx(nullCreate::toString)).append('\n');
+    sb.append("nullbuilder.map_str=").append(captureEx(nullMap::toString)).append('\n');
+    sb.append("nullbuilder.map_codec_str=").append(captureEx(() -> nullMap.codec().toString())).append('\n');
+    sb.append("nullbuilder.create_parse_obj=")
+        .append(captureEx(() -> nullCreate.parse(ops, JsonParser.parseString("{}"))))
+        .append('\n');
+    DataResult<Object> nonObj = nullCreate.parse(ops, JsonParser.parseString("1"));
+    sb.append("nullbuilder.create_parse_nonobj=ERROR|msg=")
+        .append(nonObj.error().orElseThrow().message())
+        .append('\n');
+    sb.append("nullbuilder.create_encode=")
+        .append(captureEx(() -> nullCreate.encodeStart(ops, "x")))
+        .append('\n');
+    sb.append("nullbuilder.map_codec_parse_obj=")
+        .append(captureEx(() -> nullMap.codec().parse(ops, JsonParser.parseString("{}"))))
+        .append('\n');
+    sb.append("nullbuilder.map_codec_encode=")
+        .append(captureEx(() -> nullMap.codec().encodeStart(ops, "x")))
+        .append('\n');
+
+    // Callback DataResult.error message preservation + partial propagation + list bounds
+    Codec<Integer> posFx =
+        Codec.INT.flatXmap(
+            n -> n > 0 ? DataResult.success(n) : DataResult.error(() -> "bad value: " + n),
+            n -> n > 0 ? DataResult.success(n) : DataResult.error(() -> "bad encode: " + n));
+    sb.append("fx.dec_err=")
+        .append(posFx.parse(ops, JsonParser.parseString("-3")).error().orElseThrow().message())
+        .append('\n');
+    sb.append("fx.enc_err=")
+        .append(posFx.encodeStart(ops, -3).error().orElseThrow().message())
+        .append('\n');
+    Codec<Integer> partialFx =
+        Codec.INT.flatXmap(
+            n -> n > 0 ? DataResult.success(n) : DataResult.error(() -> "clamped: " + n, 1),
+            DataResult::success);
+    DataResult<Integer> partialFxRes = partialFx.parse(ops, JsonParser.parseString("-3"));
+    sb.append("fx.partial=msg=")
+        .append(partialFxRes.error().orElseThrow().message())
+        .append("|partial=")
+        .append(partialFxRes.resultOrPartial().orElseThrow())
+        .append('\n');
+
+    DataResult<List<Integer>> listShort =
+        Codec.INT.listOf(2, 3).parse(ops, JsonParser.parseString("[1]"));
+    sb.append("list.short=msg=")
+        .append(listShort.error().orElseThrow().message())
+        .append("|partial=")
+        .append(listShort.resultOrPartial().map(Object::toString).orElse("NONE"))
+        .append('\n');
+    DataResult<List<Integer>> listLong =
+        Codec.INT.listOf(2, 3).parse(ops, JsonParser.parseString("[1,2,3,4]"));
+    sb.append("list.long=msg=")
+        .append(listLong.error().orElseThrow().message())
+        .append("|partial=")
+        .append(listLong.resultOrPartial().map(Object::toString).orElse("NONE"))
+        .append('\n');
+    DataResult<List<Integer>> listElemErr =
+        Codec.INT.listOf().parse(ops, JsonParser.parseString("[1,\"a\",3]"));
+    sb.append("list.elem_err=msg=")
+        .append(listElemErr.error().orElseThrow().message())
+        .append("|partial=")
+        .append(listElemErr.resultOrPartial().map(Object::toString).orElse("NONE"))
+        .append('\n');
+
+    // DataResult.map null-return / null-function semantics
+    DataResult<Object> mappedNull = DataResult.success(1).map(v -> null);
+    sb.append("dr.map_nullret_succ=").append(mappedNull.isSuccess()).append('\n');
+    sb.append("dr.map_nullret_get=").append(captureEx(mappedNull::getOrThrow)).append('\n');
+    sb.append("dr.map_nullret_result=").append(captureEx(mappedNull::result)).append('\n');
+    sb.append("dr.map_nullfn=").append(captureEx(() -> DataResult.success(1).map(null))).append('\n');
+    sb.append("dr.err_map_nullfn=")
+        .append(captureEx(() -> DataResult.error(() -> "e").map(null).isError()))
+        .append('\n');
+    sb.append("dr.err_partial_map_nullfn=")
+        .append(captureEx(() -> DataResult.error(() -> "e", 1).map(null)))
+        .append('\n');
+    sb.append("dr.err_partial_map_nullret_empty=")
+        .append(DataResult.error(() -> "e", 1).map(v -> null).resultOrPartial().isEmpty())
+        .append('\n');
+
+    // 4-arg optionalFieldOf(String, Lifecycle, A, Lifecycle)
+    MapCodec<Integer> opt4 =
+        Codec.INT.optionalFieldOf("x", Lifecycle.stable(), 7, Lifecycle.experimental());
+    sb.append("opt4.str=").append(opt4).append('\n');
+    sb.append("opt4.dec_missing=")
+        .append(opt4.codec().parse(ops, JsonParser.parseString("{}")).getOrThrow())
+        .append('\n');
+    sb.append("opt4.dec_present=")
+        .append(opt4.codec().parse(ops, JsonParser.parseString("{\"x\":9}")).getOrThrow())
+        .append('\n');
+    sb.append("opt4.enc_default=")
+        .append(GSON.toJson(opt4.codec().encodeStart(ops, 7).getOrThrow()))
+        .append('\n');
+    sb.append("opt4.enc_nondefault=")
+        .append(GSON.toJson(opt4.codec().encodeStart(ops, 9).getOrThrow()))
+        .append('\n');
     return sb.toString();
   }
 
@@ -449,6 +620,92 @@ public final class BundleApiOracle {
                   } finally {
                     b.release();
                   }
+                }))
+        .append('\n');
+
+    // Finding 1: ByteBufCodecs.stringUtf8 wrapping int*3 overflow
+    StreamCodec<ByteBuf, String> utf8Huge = ByteBufCodecs.stringUtf8(1_000_000_000);
+    StreamCodec<ByteBuf, String> utf8Neg = ByteBufCodecs.stringUtf8(-1);
+    sb.append("ex.utf8_huge_enc=")
+        .append(
+            captureEx(
+                () -> {
+                  ByteBuf b = Unpooled.buffer();
+                  try {
+                    utf8Huge.encode(b, "");
+                    return "ok";
+                  } finally {
+                    b.release();
+                  }
+                }))
+        .append('\n');
+    sb.append("ex.utf8_huge_dec=")
+        .append(
+            captureEx(
+                () -> {
+                  ByteBuf b = Unpooled.wrappedBuffer(new byte[] {0});
+                  try {
+                    return utf8Huge.decode(b);
+                  } finally {
+                    b.release();
+                  }
+                }))
+        .append('\n');
+    sb.append("ex.utf8_neg_enc=")
+        .append(
+            captureEx(
+                () -> {
+                  ByteBuf b = Unpooled.buffer();
+                  try {
+                    utf8Neg.encode(b, "");
+                    return "ok";
+                  } finally {
+                    b.release();
+                  }
+                }))
+        .append('\n');
+    sb.append("ex.utf8_neg_dec=")
+        .append(
+            captureEx(
+                () -> {
+                  ByteBuf b = Unpooled.wrappedBuffer(new byte[] {0});
+                  try {
+                    return utf8Neg.decode(b);
+                  } finally {
+                    b.release();
+                  }
+                }))
+        .append('\n');
+
+    // Finding 3: StreamCodec.unit value.equals(expected) & Java toString formatting
+    StreamCodec<ByteBuf, String> unitNull = StreamCodec.unit(null);
+    StreamCodec<ByteBuf, String> unitExp = StreamCodec.unit("expected");
+    StreamCodec<ByteBuf, Integer> unitOne = StreamCodec.unit(1);
+    record Named(String label) {
+      @Override
+      public String toString() {
+        return "Named(" + label + ")";
+      }
+    }
+    StreamCodec<ByteBuf, Named> unitNamed = StreamCodec.unit(new Named("exp"));
+    sb.append("ex.unit_null_actual=")
+        .append(captureEx(() -> { unitNull.encode(Unpooled.EMPTY_BUFFER, "actual"); return "ok"; }))
+        .append('\n');
+    sb.append("ex.unit_exp_null=")
+        .append(captureEx(() -> { unitExp.encode(Unpooled.EMPTY_BUFFER, null); return "ok"; }))
+        .append('\n');
+    sb.append("ex.unit_null_null=")
+        .append(captureEx(() -> { unitNull.encode(Unpooled.EMPTY_BUFFER, null); return "ok"; }))
+        .append('\n');
+    sb.append("ex.unit_int_mismatch=")
+        .append(captureEx(() -> { unitOne.encode(Unpooled.EMPTY_BUFFER, 2); return "ok"; }))
+        .append('\n');
+    sb.append("ex.unit_named_mismatch=")
+        .append(
+            captureEx(
+                () -> {
+                  unitNamed.encode(Unpooled.EMPTY_BUFFER, new Named("act"));
+                  return "ok";
                 }))
         .append('\n');
     return sb.toString();

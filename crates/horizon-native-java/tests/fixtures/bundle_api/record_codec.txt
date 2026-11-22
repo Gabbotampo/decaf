@@ -2,8 +2,44 @@ predicate.codec_nonnull=true
 case.01_empty_default=OK|size=0|mult=1|json={"content":[]}
 case.02_shorthand_mult4=OK|size=1|mult=4|json={"content":[{"id":"minecraft:apple"}],"size_multiplier":4}
 case.03_explicit_default_mult=OK|size=2|mult=1|json={"content":[{"id":"minecraft:diamond","count":16},{"id":"minecraft:iron_sword","components":{"minecraft:damage":5,"minecraft:custom_name":"Blade"}}]}
-case.04_missing_content=ERROR
-case.05_bad_count_zero=ERROR
-case.06_bad_count_100=ERROR
-case.07_air_item=ERROR
-case.08_bad_mult_type=ERROR
+case.04_missing_content=ERROR|msg=No key content in MapLike[{"size_multiplier":2}]|partial=NONE
+case.05_bad_count_zero=ERROR|msg=Value must be within range [1;99]: 0|partial=size=1|mult=1|json={"content":[{"id":"minecraft:apple"}]}
+case.06_bad_count_100=ERROR|msg=Value must be within range [1;99]: 100|partial=size=1|mult=1|json={"content":[{"id":"minecraft:apple"}]}
+case.07_air_item=ERROR|msg=Failed to parse either. First: Not a JSON object: "minecraft:air"; Second: Item must not be minecraft:air|partial=size=0|mult=1|json={"content":[]}
+case.08_bad_mult_type=ERROR|msg=Not a number: "four"|partial=size=0|mult=1|json={"content":[]}
+case.09_mixed_partial=ERROR|msg=Value must be within range [1;99]: 0|partial=size=2|mult=3|json={"content":[{"id":"minecraft:apple"},{"id":"minecraft:diamond"}],"size_multiplier":3}
+tpl.01_air_str=ERROR|msg=Failed to parse either. First: Not a JSON object: "minecraft:air"; Second: Item must not be minecraft:air|partial=NONE
+tpl.02_num=ERROR|msg=Failed to parse either. First: Not a JSON object: 42; Second: Not a string: 42|partial=NONE
+tpl.03_unknown_item=ERROR|msg=Failed to parse either. First: Not a JSON object: "minecraft:not_an_item"; Second: Unknown registry key in ResourceKey[minecraft:root / minecraft:item]: minecraft:not_an_item|partial=NONE
+tpl.04_empty_obj=ERROR|msg=Failed to parse either. First: No key id in MapLike[{}]; Second: Not a string: {}|partial=NONE
+tpl.05_non_str_id=ERROR|msg=Failed to parse either. First: Not a string: 123; Second: Not a string: {"id":123}|partial=NONE
+tpl.06_air_and_bad_count=ERROR|msg=Failed to parse either. First: Value must be within range [1;99]: 0; Item must not be minecraft:air; Second: Not a string: {"id":"minecraft:air","count":0}|partial=NONE
+tpl.07_bad_count_str=ERROR|msg=Not a number: "two"|partial={"id":"minecraft:apple"}
+nullbuilder.create_nonnull=true
+nullbuilder.map_nonnull=true
+nullbuilder.create_str=EX:java.lang.NullPointerException:Cannot read field "decoder" because "this.val$builder" is null
+nullbuilder.map_str=EX:java.lang.NullPointerException:Cannot read field "decoder" because "this.val$builder" is null
+nullbuilder.map_codec_str=EX:java.lang.NullPointerException:Cannot read field "decoder" because "this.val$builder" is null
+nullbuilder.create_parse_obj=EX:java.lang.NullPointerException:Cannot read field "decoder" because "this.val$builder" is null
+nullbuilder.create_parse_nonobj=ERROR|msg=Not a JSON object: 1
+nullbuilder.create_encode=EX:java.lang.NullPointerException:Cannot read field "encoder" because "this.val$builder" is null
+nullbuilder.map_codec_parse_obj=EX:java.lang.NullPointerException:Cannot read field "decoder" because "this.val$builder" is null
+nullbuilder.map_codec_encode=EX:java.lang.NullPointerException:Cannot read field "encoder" because "this.val$builder" is null
+fx.dec_err=bad value: -3
+fx.enc_err=bad encode: -3
+fx.partial=msg=clamped: -3|partial=1
+list.short=msg=List is too short: 1, expected range [2-3]|partial=NONE
+list.long=msg=List is too long: 4, expected range [2-3]|partial=[1, 2, 3]
+list.elem_err=msg=Not a number: "a"|partial=[1, 3]
+dr.map_nullret_succ=true
+dr.map_nullret_get=OK:null
+dr.map_nullret_result=EX:java.lang.NullPointerException:null
+dr.map_nullfn=EX:java.lang.NullPointerException:Cannot invoke "java.util.function.Function.apply(Object)" because "function" is null
+dr.err_map_nullfn=OK:true
+dr.err_partial_map_nullfn=EX:java.lang.NullPointerException:null
+dr.err_partial_map_nullret_empty=true
+opt4.str=OptionalFieldCodec[x: Int][flatXmapped]
+opt4.dec_missing=7
+opt4.dec_present=9
+opt4.enc_default={}
+opt4.enc_nondefault={"x":9}

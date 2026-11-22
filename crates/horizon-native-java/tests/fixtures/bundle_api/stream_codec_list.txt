@@ -14,3 +14,12 @@ rt.linked=hex=020a14|remaining=0|eq=true|val=[10, 20]
 ex.encode_max=EX:io.netty.handler.codec.EncoderException:4 elements exceeded max size of: 3
 ex.decode_max=EX:io.netty.handler.codec.DecoderException:4 elements exceeded max size of: 3
 ex.fixed_wrong_size=EX:io.netty.handler.codec.EncoderException:Invalid list size, expected 2, but got 1
+ex.utf8_huge_enc=EX:io.netty.handler.codec.EncoderException:String too big (was 0 bytes encoded, max -1294967296)
+ex.utf8_huge_dec=EX:io.netty.handler.codec.DecoderException:The received encoded string buffer length is longer than maximum allowed (0 > -1294967296)
+ex.utf8_neg_enc=EX:io.netty.handler.codec.EncoderException:String too big (was 0 characters, max -1)
+ex.utf8_neg_dec=EX:io.netty.handler.codec.DecoderException:The received encoded string buffer length is longer than maximum allowed (0 > -3)
+ex.unit_null_actual=EX:java.lang.IllegalStateException:Can't encode 'actual', expected 'null'
+ex.unit_exp_null=EX:java.lang.NullPointerException:Cannot invoke "Object.equals(Object)" because "value" is null
+ex.unit_null_null=EX:java.lang.NullPointerException:Cannot invoke "Object.equals(Object)" because "value" is null
+ex.unit_int_mismatch=EX:java.lang.IllegalStateException:Can't encode '2', expected '1'
+ex.unit_named_mismatch=EX:java.lang.IllegalStateException:Can't encode 'Named(act)', expected 'Named(exp)'

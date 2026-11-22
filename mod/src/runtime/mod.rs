@@ -23677,7 +23677,10 @@ impl NativeJar {
         self.with_persistent_runtime(host, std::slice::from_ref(codec), |runtime| {
             let res = dfu_codec::decode_value_json(runtime, codec, json)?;
             let rooted = match &res {
-                DfuCodecResult::Ok(v) => v.clone(),
+                DfuCodecResult::Ok(v)
+                | DfuCodecResult::Error {
+                    partial: Some(v), ..
+                } => v.clone(),
                 _ => Value::Void,
             };
             outcome = Some(res);
@@ -27410,6 +27413,11 @@ impl<H: Host> Runtime<'_, H> {
                 )? {
                     return Ok(Some(value));
                 }
+                if let Some(value) =
+                    dfu_codec::runtime_instance_call(self, &callback.target, None, &values)?
+                {
+                    return Ok(Some(value));
+                }
                 let token = self.mod_count_before(&callback.target, 0xb8, None, &values)?;
                 if let Some(answer) = token.as_ref().and_then(|token| token.answer.clone()) {
                     return Ok(Some(answer));
@@ -27603,6 +27611,16 @@ impl<H: Host> Runtime<'_, H> {
                 "callback",
             )? {
                 return Ok(Some(value));
+            }
+            if let Some(value) =
+                dfu_codec::runtime_instance_call(self, &callback.target, Some(&receiver), &rest)?
+            {
+                return Ok(Some(value));
+            }
+            if let Some(value) =
+                stream_codec::runtime_instance_call(self, &callback.target, Some(&receiver), &rest)
+            {
+                return value.map(Some);
             }
             // `list::add` moves the list's `modCount` as the call would.
             let token = self.mod_count_before(&callback.target, 0xb9, Some(&receiver), &rest)?;
