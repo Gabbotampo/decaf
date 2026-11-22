@@ -5837,9 +5837,15 @@ impl StdHost {
         self.placement_arrays.len()
     }
 
+    /// A placement handle serial that is never handed out twice by this host.
+    /// The space is `u64`, so exhaustion is unreachable in practice, but it is
+    /// a hard stop rather than a wrap: a wrapped serial would alias a context
+    /// a long-lived caller still holds.
     fn next_placement_serial(&mut self) -> u64 {
         let serial = self.next_placement_handle;
-        self.next_placement_handle = serial.wrapping_add(1);
+        self.next_placement_handle = serial
+            .checked_add(1)
+            .expect("placement handle serials exhausted; refusing to reuse one");
         serial
     }
 
