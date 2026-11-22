@@ -4382,6 +4382,21 @@ impl StdHost {
             .retain(|entry| !entry.ends_with(&suffix));
     }
 
+    /// Drop per-object Mixin fields and `<init>()V` records for `marker` and any
+    /// incarnated child markers starting with `{marker}/` (for example all incarnations
+    /// of a despawned `game/entity/<id>`).
+    pub fn forget_game_object_prefix(&mut self, marker: &str) {
+        let exact_field = format!("{marker}|");
+        let child_prefix = format!("{marker}/");
+        self.heap
+            .fields
+            .retain(|key, _| !key.starts_with(&exact_field) && !key.starts_with(&child_prefix));
+        let exact_init = format!("|{marker}");
+        let child_init = format!("|{marker}/");
+        self.initialized_game_mixins
+            .retain(|entry| !entry.ends_with(&exact_init) && !entry.contains(&child_init));
+    }
+
     /// Drop every game object's per-instance Mixin fields and `<init>()V`
     /// records (for example when a server world stops).
     pub fn forget_all_game_objects(&mut self) {
@@ -20028,13 +20043,19 @@ pub struct LinkedClassTable {
     resources: BTreeMap<String, (String, Vec<u8>)>,
     /// Per-jar `data/` resource layers with Fabric metadata for datapack recipe/tag ordering.
     data_layers: Vec<pack_order::JarDataLayer>,
-    /// Per-linked-jar Mixin configs, config sides, and declared class names, so
-    /// interface-injection Mixins from linked jars honour config gating.
-    mixin_configs: Vec<(
-        Vec<MixinConfig>,
-        BTreeMap<String, MixinSide>,
-        BTreeSet<String>,
-    )>,
+    /// Per-linked-jar Mixin configs, config sides, cached config plugins, and declared
+    /// class names, so interface-injection Mixins from linked jars honour the exact same
+    /// config, side, and plugin gating as primary jars.
+    mixin_configs: Vec<LinkedMixinConfigSet>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct LinkedMixinConfigSet {
+    pub(crate) configs: Vec<MixinConfig>,
+    pub(crate) config_sides: BTreeMap<String, MixinSide>,
+    pub(crate) classes: BTreeSet<String>,
+    pub(crate) server_plugins: mixin_plugins::ConfigPlugins,
+    pub(crate) client_plugins: mixin_plugins::ConfigPlugins,
 }
 
 impl LinkedClassTable {
@@ -20067,11 +20088,25 @@ impl LinkedClassTable {
         self.link_services(jar);
         let configs = jar.mixin_configs();
         if !configs.is_empty() {
-            self.mixin_configs.push((
+            let has_plugins = configs.iter().any(|c| c.plugin.is_some());
+            let (server_plugins, client_plugins) = if has_plugins {
+                (
+                    jar.cached_config_plugins(MixinSide::Server).clone(),
+                    jar.cached_config_plugins(MixinSide::Client).clone(),
+                )
+            } else {
+                (
+                    mixin_plugins::ConfigPlugins::default(),
+                    mixin_plugins::ConfigPlugins::default(),
+                )
+            };
+            self.mixin_configs.push(LinkedMixinConfigSet {
                 configs,
-                jar.mixin_config_sides(),
-                jar.classes.keys().cloned().collect(),
-            ));
+                config_sides: jar.mixin_config_sides(),
+                classes: jar.classes.keys().cloned().collect(),
+                server_plugins,
+                client_plugins,
+            });
         }
         Ok(added)
     }
@@ -20182,13 +20217,7 @@ impl LinkedClassTable {
         self.classes.get(name)
     }
 
-    pub(crate) fn mixin_config_sets(
-        &self,
-    ) -> &[(
-        Vec<MixinConfig>,
-        BTreeMap<String, MixinSide>,
-        BTreeSet<String>,
-    )] {
+    pub(crate) fn mixin_config_sets(&self) -> &[LinkedMixinConfigSet] {
         &self.mixin_configs
     }
 
@@ -20285,6 +20314,10 @@ pub struct NativeJar {
     /// skipped so one bad attribute cannot fail the whole jar. Exposed through
     /// [`Self::class_annotation_warnings`].
     class_annotation_warnings: Vec<String>,
+    /// Cached Mixin config-plugin sessions per physical side so runtime indexing
+    /// and game-hook dispatch share one gated evaluation without re-running plugins.
+    server_config_plugins: Arc<std::sync::OnceLock<mixin_plugins::ConfigPlugins>>,
+    client_config_plugins: Arc<std::sync::OnceLock<mixin_plugins::ConfigPlugins>>,
 }
 
 /// Zero-length array backing a host answer such as `Thread.getStackTrace`

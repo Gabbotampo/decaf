@@ -297,7 +297,11 @@ pub(crate) fn attack_target(state: &State, id: i32, kind: &str) -> Option<GameOb
         let listed = state.players.iter().find(|p| p.entity_id == Some(id))?;
         return player_of(listed, 0);
     }
-    Some(GameObject::entity(id, kind, false))
+    let mut entity = GameObject::entity(id, kind, false);
+    if let Some(incarnation) = state.entity_incarnation(id) {
+        entity = entity.with_entity_incarnation(incarnation);
+    }
+    Some(entity)
 }
 
 /// Count a firing of `site` that was not run because a player it hands over is not listed
@@ -337,6 +341,17 @@ pub(crate) fn forget(state: &mut State, object: &GameObject) {
     for loaded in &mut state.jars {
         loaded.hook_state.forget_object(&marker);
         loaded.host.forget_game_object(&marker);
+    }
+}
+
+/// Drop what every jar kept on a non-player entity `id` (both bare `game/entity/<id>` and
+/// any incarnated `game/entity/<id>/<inc>` marker) when it leaves a level or its join is
+/// cancelled, so a later entity reusing `id` starts with fresh Mixin fields.
+pub(crate) fn forget_entity(state: &mut State, id: i32) {
+    let prefix = format!("game/entity/{id}");
+    for loaded in &mut state.jars {
+        loaded.hook_state.forget_object_prefix(&prefix);
+        loaded.host.forget_game_object_prefix(&prefix);
     }
 }
 
@@ -440,6 +455,7 @@ pub(crate) fn fire(
 /// mobs and connections are gone, and the next world's are new Java objects (single player
 /// keeps the jars across worlds).
 pub(crate) fn forget_world(state: &mut State) {
+    state.entity_incarnations.clear();
     for loaded in &mut state.jars {
         loaded.hook_state = crate::runtime::GameHookState::default();
         loaded.host.forget_all_game_objects();

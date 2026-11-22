@@ -21,10 +21,12 @@
 //! refused loudly at runtime, never silently guessed.
 
 use std::cell::OnceCell;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::sync::OnceLock;
 
 use crate::runtime::checkcast::class_access;
 use crate::runtime::game_hooks::{MIXIN_SHADOW_DESCRIPTOR, member_annotations};
+use crate::runtime::hook_shapes::mixin_config_gate_with_plugins;
 use crate::runtime::jvm_dispatch::DefaultSelection;
 use crate::runtime::mixin_plugins::ConfigPlugins;
 use crate::runtime::{
@@ -190,19 +192,267 @@ pub(crate) struct RuntimeMixinIndex {
     meta: BTreeMap<String, MixinClassMeta>,
 }
 
+/// Non-private, non-static methods declared by `java/lang/Object`.
+const JAVA_OBJECT_METHODS: &[(&str, &str)] = &[
+    ("clone", "()Ljava/lang/Object;"),
+    ("equals", "(Ljava/lang/Object;)Z"),
+    ("finalize", "()V"),
+    ("getClass", "()Ljava/lang/Class;"),
+    ("hashCode", "()I"),
+    ("notify", "()V"),
+    ("notifyAll", "()V"),
+    ("toString", "()Ljava/lang/String;"),
+    ("wait", "()V"),
+    ("wait", "(J)V"),
+    ("wait", "(JI)V"),
+];
+
+const VANILLA_HOST_METHODS_TSV: &str = include_str!("vanilla_host_methods.tsv");
+
+#[derive(Default)]
+struct VanillaTypeInfo {
+    super_name: &'static str,
+    interfaces: Vec<&'static str>,
+    methods: BTreeSet<(&'static str, &'static str)>,
+}
+
+#[derive(Default)]
+struct VanillaHostMethods {
+    classes: BTreeMap<&'static str, VanillaTypeInfo>,
+    interfaces: BTreeMap<&'static str, VanillaTypeInfo>,
+}
+
+impl VanillaHostMethods {
+    fn parse(tsv: &'static str) -> Self {
+        let mut table = Self::default();
+        for line in tsv.lines() {
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let mut parts = line.split('\t');
+            match parts.next() {
+                Some("C") => {
+                    let (Some(name), Some(super_name), Some(ifaces)) =
+                        (parts.next(), parts.next(), parts.next())
+                    else {
+                        continue;
+                    };
+                    let interfaces = if ifaces.is_empty() {
+                        Vec::new()
+                    } else {
+                        ifaces.split(',').collect()
+                    };
+                    table.classes.insert(
+                        name,
+                        VanillaTypeInfo {
+                            super_name,
+                            interfaces,
+                            methods: BTreeSet::new(),
+                        },
+                    );
+                }
+                Some("I") => {
+                    let (Some(name), Some(_empty), Some(ifaces)) =
+                        (parts.next(), parts.next(), parts.next())
+                    else {
+                        continue;
+                    };
+                    let interfaces = if ifaces.is_empty() {
+                        Vec::new()
+                    } else {
+                        ifaces.split(',').collect()
+                    };
+                    table.interfaces.insert(
+                        name,
+                        VanillaTypeInfo {
+                            super_name: "",
+                            interfaces,
+                            methods: BTreeSet::new(),
+                        },
+                    );
+                }
+                Some("M") => {
+                    let (Some(owner), Some(name), Some(desc)) =
+                        (parts.next(), parts.next(), parts.next())
+                    else {
+                        continue;
+                    };
+                    if let Some(info) = table.classes.get_mut(owner) {
+                        info.methods.insert((name, desc));
+                    } else if let Some(info) = table.interfaces.get_mut(owner) {
+                        info.methods.insert((name, desc));
+                    }
+                }
+                _ => {}
+            }
+        }
+        table
+    }
+
+    /// Return the vanilla owner that already declares `(name, descriptor)` on a target
+    /// with declared hierarchy `declared`, blocking fallback to an injected interface's
+    /// `default` method under JVMS §5.4.3.3 ("classes win over interfaces").
+    ///
+    /// 1. Any non-private, non-static method declared on a class in `declared`'s vanilla
+    ///    superclass chain (or `java/lang/Object`) wins over every interface default.
+    /// 2. Any concrete `default` method on a vanilla interface implemented by that class
+    ///    hierarchy blocks an unrelated injected default (unless one of `injected_ifaces`
+    ///    is a strict subinterface of that vanilla interface).
+    fn declaring_owner(
+        &self,
+        declared: &[String],
+        name: &str,
+        descriptor: &str,
+        injected_ifaces: &[&str],
+        interface_extends: impl Fn(&str, &str) -> bool,
+    ) -> Option<&'static str> {
+        if JAVA_OBJECT_METHODS
+            .iter()
+            .any(|(m, d)| *m == name && *d == descriptor)
+        {
+            return Some("java/lang/Object");
+        }
+
+        // 1. Walk class hierarchy (most specific first) and collect direct vanilla interfaces.
+        let mut seen_classes: BTreeSet<&str> = BTreeSet::new();
+        let mut iface_queue: VecDeque<&'static str> = VecDeque::new();
+        for start in declared {
+            let mut cur = start.as_str();
+            for _ in 0..32 {
+                if cur.is_empty() || cur == "java/lang/Object" || !seen_classes.insert(cur) {
+                    break;
+                }
+                if let Some((&key, info)) = self.classes.get_key_value(cur) {
+                    if info.methods.contains(&(name, descriptor)) {
+                        return Some(key);
+                    }
+                    iface_queue.extend(info.interfaces.iter().copied());
+                    cur = info.super_name;
+                } else if let Some((&key, _)) = self.interfaces.get_key_value(cur) {
+                    iface_queue.push_back(key);
+                    break;
+                } else {
+                    break;
+                }
+            }
+        }
+
+        // 2. Walk the target's own vanilla interface closure for concrete default methods.
+        let mut seen_ifaces: BTreeSet<&'static str> = BTreeSet::new();
+        while let Some(iface) = iface_queue.pop_front() {
+            if !seen_ifaces.insert(iface) {
+                continue;
+            }
+            let Some((&key, info)) = self.interfaces.get_key_value(iface) else {
+                continue;
+            };
+            if info.methods.contains(&(name, descriptor)) {
+                let overridden_by_subinterface = injected_ifaces
+                    .iter()
+                    .any(|inj| *inj != key && interface_extends(inj, key));
+                if !overridden_by_subinterface {
+                    return Some(key);
+                }
+            }
+            iface_queue.extend(info.interfaces.iter().copied());
+        }
+
+        None
+    }
+}
+
+fn vanilla_host_methods() -> &'static VanillaHostMethods {
+    static TABLE: OnceLock<VanillaHostMethods> = OnceLock::new();
+    TABLE.get_or_init(|| VanillaHostMethods::parse(VANILLA_HOST_METHODS_TSV))
+}
+
+/// Resolve the owning target class for a `@Shadow` member on a `@Mixin` class given its
+/// declared targets and the actual receiver's vanilla class hierarchy.
+///
+/// - Single-target mixins resolve unambiguously to their sole target.
+/// - Multi-target mixins resolve to the unique target present in `receiver_hierarchy`.
+/// - Zero or multiple matching targets are ambiguous (`None`), so callers count/refuse
+///   instead of silently routing through `targets.first()`.
+pub(crate) fn resolve_shadow_target<'a>(
+    targets: &'a [String],
+    receiver_hierarchy: &[String],
+) -> Option<&'a str> {
+    if targets.len() == 1 {
+        return targets.first().map(String::as_str);
+    }
+    let mut matched: Option<&'a str> = None;
+    for target in targets {
+        if receiver_hierarchy.iter().any(|ty| ty == target) {
+            if matched.is_some() {
+                return None;
+            }
+            matched = Some(target.as_str());
+        }
+    }
+    matched
+}
+
+/// Active host-modelled targets of `@Mixin` `class` on `side`, filtered through the
+/// shared config, physical-side, `IMixinConfigPlugin`, and initialiser-soundness gate.
+///
+/// Used by `game_hooks::MixinModel::build` so game-hook `instanceof` and call dispatch
+/// obey the exact same gating as `RuntimeMixinIndex`.
+pub(crate) fn active_host_mixin_targets(
+    jar: &NativeJar,
+    configs: &[MixinConfig],
+    config_sides: &BTreeMap<String, MixinSide>,
+    plugins: &ConfigPlugins,
+    side: MixinSide,
+    class: &ClassFile,
+) -> Vec<String> {
+    let Some(details) = inspect_mixin_class(class, |name| jar.classes.get(name)) else {
+        return Vec::new();
+    };
+    let is_interface_injection = !details.is_interface && !details.interfaces.is_empty();
+    let mut active = Vec::new();
+    for target in details.targets {
+        if jar.classes.contains_key(&target) {
+            continue;
+        }
+        if configs.is_empty() {
+            continue;
+        }
+        if mixin_config_gate_with_plugins(
+            configs,
+            config_sides,
+            plugins,
+            &details.mixin,
+            &target,
+            side,
+        )
+        .is_err()
+        {
+            continue;
+        }
+        if is_interface_injection
+            && (details.unrunnable_initializer || !is_host_modelled_game_target(&target))
+        {
+            continue;
+        }
+        active.push(target);
+    }
+    active
+}
+
 /// Per-`Runtime` mixin configuration gate and lazy index.
 #[derive(Debug, Default)]
 pub(crate) struct RuntimeMixinState {
     configs: Vec<MixinConfig>,
     config_sides: BTreeMap<String, MixinSide>,
+    plugins: ConfigPlugins,
     side: Option<MixinSide>,
     require_config: bool,
     index: OnceCell<RuntimeMixinIndex>,
 }
 
 impl RuntimeMixinState {
-    /// Build state for a real `NativeJar` invocation, honouring the jar's mixin configs
-    /// and the host's physical side.
+    /// Build state for a real `NativeJar` invocation, honouring the jar's mixin configs,
+    /// config plugins, and the host's physical side.
     pub(crate) fn from_jar<H: Host>(jar: &NativeJar, host: &H) -> Self {
         Self::from_jar_side(jar, host.mixin_side())
     }
@@ -212,6 +462,7 @@ impl RuntimeMixinState {
         Self {
             configs: jar.mixin_configs(),
             config_sides: jar.mixin_config_sides(),
+            plugins: jar.cached_config_plugins(side).clone(),
             side: Some(side),
             require_config: true,
             index: OnceCell::new(),
@@ -225,18 +476,21 @@ impl RuntimeMixinState {
         Self {
             configs: Vec::new(),
             config_sides: BTreeMap::new(),
+            plugins: ConfigPlugins::default(),
             side: None,
             require_config: false,
             index: OnceCell::new(),
         }
     }
 
-    /// Whether `mixin` passes the primary jar's Mixin config and physical-side gate.
+    /// Whether `(mixin, target)` passes the primary jar's Mixin config, physical-side,
+    /// and `IMixinConfigPlugin` gate.
     ///
     /// Returns `true` when config gating is disabled (`unconfigured()` in synthetic unit
     /// tests) or when the jar has readable Mixin configs that list `mixin` for the active
-    /// side. A jar with no readable Mixin configs never passes this gate.
-    fn allows_config_gated(&self, mixin: &str) -> bool {
+    /// side and any config plugin allows `(mixin, target)`. A jar with no readable Mixin
+    /// configs never passes this gate.
+    fn allows_config_gated(&self, mixin: &str, target: &str) -> bool {
         if !self.require_config {
             return true;
         }
@@ -246,7 +500,15 @@ impl RuntimeMixinState {
         let Some(side) = self.side else {
             return false;
         };
-        mixin_config_gate(&self.configs, &self.config_sides, mixin, side).is_ok()
+        mixin_config_gate_with_plugins(
+            &self.configs,
+            &self.config_sides,
+            &self.plugins,
+            mixin,
+            target,
+            side,
+        )
+        .is_ok()
     }
 }
 
@@ -255,8 +517,6 @@ struct MixinRegistration {
     /// True for primary-jar classes (preserving the existing jar-local and non-host-game
     /// `by_target` scan), false for linked-jar classes.
     is_primary: bool,
-    /// True when the mixin passes config & side gating (or config gating is disabled).
-    config_active: bool,
     /// True when the primary jar has no readable Mixin config at all.
     primary_has_no_configs: bool,
 }
@@ -835,21 +1095,25 @@ impl<H: Host> Runtime<'_, H> {
                 }
                 let reg = MixinRegistration {
                     is_primary: true,
-                    config_active: self.mixin_index.allows_config_gated(&class.name),
                     primary_has_no_configs,
                 };
                 index.register_class(
                     class,
                     reg,
+                    |target| self.mixin_index.allows_config_gated(&class.name, target),
                     |target| self.classes.contains_key(target),
                     |name| self.class(name),
                 );
             }
 
-            // 2. Linked jar classes (gated by each linked jar's own mixin configs).
+            // 2. Linked jar classes (gated by each linked jar's own mixin configs and plugins).
             if let Some(side) = self.mixin_index.side {
-                for (configs, config_sides, jar_classes) in self.linked.mixin_config_sets() {
-                    for class_name in jar_classes {
+                for set in self.linked.mixin_config_sets() {
+                    let plugins = match side {
+                        MixinSide::Server => &set.server_plugins,
+                        MixinSide::Client => &set.client_plugins,
+                    };
+                    for class_name in &set.classes {
                         if !seen_mixins.insert(class_name.clone()) {
                             continue;
                         }
@@ -858,18 +1122,22 @@ impl<H: Host> Runtime<'_, H> {
                         };
                         let reg = MixinRegistration {
                             is_primary: false,
-                            config_active: mixin_config_gate(
-                                configs,
-                                config_sides,
-                                class_name,
-                                side,
-                            )
-                            .is_ok(),
                             primary_has_no_configs: false,
                         };
                         index.register_class(
                             class,
                             reg,
+                            |target| {
+                                mixin_config_gate_with_plugins(
+                                    &set.configs,
+                                    &set.config_sides,
+                                    plugins,
+                                    class_name,
+                                    target,
+                                    side,
+                                )
+                                .is_ok()
+                            },
                             |target| self.classes.contains_key(target),
                             |name| self.class(name),
                         );
@@ -888,12 +1156,13 @@ impl<H: Host> Runtime<'_, H> {
                 }
                 let reg = MixinRegistration {
                     is_primary: false,
-                    config_active: !self.mixin_index.require_config,
                     primary_has_no_configs: false,
                 };
+                let unconfigured = !self.mixin_index.require_config;
                 index.register_class(
                     class,
                     reg,
+                    |_target| unconfigured,
                     |target| self.classes.contains_key(target),
                     |name| self.class(name),
                 );
@@ -971,6 +1240,8 @@ impl<H: Host> Runtime<'_, H> {
             return Ok(None);
         }
 
+        let declared = self.game_handle_types(&handle_key);
+
         // 1. Direct call on a `@Mixin` class (e.g. `this.helper()` or `@Shadow` call).
         let direct_action = {
             let index = self.runtime_mixin_index();
@@ -978,25 +1249,37 @@ impl<H: Host> Runtime<'_, H> {
                 let is_shadow = meta
                     .shadow_methods
                     .contains(&(r.name.clone(), r.descriptor.clone()));
-                let first_target = meta.targets.first().cloned();
-                let active_on_handle = self
-                    .game_handle_types(&handle_key)
+                let shadow_target = if is_shadow {
+                    resolve_shadow_target(&meta.targets, &declared).map(str::to_owned)
+                } else {
+                    None
+                };
+                let active_on_handle = declared
                     .iter()
                     .any(|ty| meta.active_interface_targets.contains(ty.as_str()));
-                (is_shadow, first_target, active_on_handle)
+                (is_shadow, shadow_target, active_on_handle)
             })
         };
-        if let Some((is_shadow, first_target, active_on_handle)) = direct_action {
+        if let Some((is_shadow, shadow_target, active_on_handle)) = direct_action {
             if is_shadow {
-                let target_ref = MethodRef {
-                    owner: first_target.unwrap_or_else(|| r.owner.clone()),
-                    name: r.name.clone(),
-                    descriptor: r.descriptor.clone(),
+                return match shadow_target {
+                    Some(owner) => {
+                        let target_ref = MethodRef {
+                            owner,
+                            name: r.name.clone(),
+                            descriptor: r.descriptor.clone(),
+                        };
+                        self.host
+                            .invoke_instance(&target_ref, receiver, args)
+                            .map(Some)
+                    }
+                    // Ambiguous multi-target `@Shadow`: count/refuse loudly rather than
+                    // guessing `targets.first()`.
+                    None => {
+                        self.host.unknown_operand_call(r)?;
+                        Ok(Some(Value::default_for(return_desc(&r.descriptor))))
+                    }
                 };
-                return self
-                    .host
-                    .invoke_instance(&target_ref, receiver, args)
-                    .map(Some);
             }
             if active_on_handle
                 && self
@@ -1033,11 +1316,11 @@ impl<H: Host> Runtime<'_, H> {
 
         // 2. Virtual/interface call targeting an interface added by an active interface-injection
         //    mixin for one of this handle's declared vanilla types.
-        let declared = self.game_handle_types(&handle_key);
         enum Resolution {
             None,
             Mixin(String),
             Ambiguous,
+            TargetClassMethod(&'static str),
             InterfaceDefault(String),
             DefaultConflict(Vec<String>),
             UnimplementedInterface,
@@ -1048,6 +1331,7 @@ impl<H: Host> Runtime<'_, H> {
             let mut matching_mixins_by_level: Vec<Vec<String>> = Vec::new();
             let mut any_matching_mixin = false;
             let mut all_matching_mixins: Vec<String> = Vec::new();
+            let mut injected_ifaces: Vec<String> = Vec::new();
 
             for target_type in &declared {
                 let Some(mixins) = index.interface_by_target.get(target_type.as_str()) else {
@@ -1065,6 +1349,11 @@ impl<H: Host> Runtime<'_, H> {
                     any_matching_mixin = true;
                     if !all_matching_mixins.contains(&active.mixin) {
                         all_matching_mixins.push(active.mixin.clone());
+                    }
+                    for iface in &active.interfaces {
+                        if !injected_ifaces.contains(iface) {
+                            injected_ifaces.push(iface.clone());
+                        }
                     }
                     if active
                         .added_public_methods
@@ -1088,21 +1377,41 @@ impl<H: Host> Runtime<'_, H> {
                     Resolution::Mixin(top_level.into_iter().next().unwrap_or_default())
                 }
             } else {
-                // No mixin overrides the method: look for a maximally specific default
-                // method on the injected interfaces (and `r.owner`).
-                match self.maximally_specific_default(&all_matching_mixins, &r.name, &r.descriptor)
-                {
-                    DefaultSelection::Selected(iface) => Resolution::InterfaceDefault(iface),
-                    DefaultSelection::Conflict(owners) => Resolution::DefaultConflict(owners),
-                    DefaultSelection::None | DefaultSelection::Abstract => {
-                        if self
-                            .class(&r.owner)
-                            .and_then(|file| file.method(&r.name, &r.descriptor))
-                            .is_some_and(|m| !m.is_static() && m.code.is_some())
-                        {
-                            Resolution::InterfaceDefault(r.owner.clone())
-                        } else {
-                            Resolution::UnimplementedInterface
+                // JVMS §5.4.3.3 ("classes win over interfaces"): before falling back to an
+                // injected interface's `default` method, check whether the target's vanilla
+                // class hierarchy (or an unoverridden vanilla interface default on it)
+                // already declares `(name, descriptor)`. If so, dispatch through the host
+                // (which returns the modelled value or counts/refuses unmodelled methods)
+                // rather than letting the injected default shadow the class's method.
+                let iface_refs: Vec<&str> = injected_ifaces.iter().map(String::as_str).collect();
+                if let Some(target_owner) = vanilla_host_methods().declaring_owner(
+                    &declared,
+                    &r.name,
+                    &r.descriptor,
+                    &iface_refs,
+                    |a, b| self.interface_extends(a, b),
+                ) {
+                    Resolution::TargetClassMethod(target_owner)
+                } else {
+                    // No mixin overrides and no target class method exists: look for a
+                    // maximally specific default method on the injected interfaces.
+                    match self.maximally_specific_default(
+                        &all_matching_mixins,
+                        &r.name,
+                        &r.descriptor,
+                    ) {
+                        DefaultSelection::Selected(iface) => Resolution::InterfaceDefault(iface),
+                        DefaultSelection::Conflict(owners) => Resolution::DefaultConflict(owners),
+                        DefaultSelection::None | DefaultSelection::Abstract => {
+                            if self
+                                .class(&r.owner)
+                                .and_then(|file| file.method(&r.name, &r.descriptor))
+                                .is_some_and(|m| !m.is_static() && m.code.is_some())
+                            {
+                                Resolution::InterfaceDefault(r.owner.clone())
+                            } else {
+                                Resolution::UnimplementedInterface
+                            }
                         }
                     }
                 }
@@ -1119,6 +1428,16 @@ impl<H: Host> Runtime<'_, H> {
             Resolution::Ambiguous => {
                 self.host.unknown_operand_call(r)?;
                 Ok(Some(Value::default_for(return_desc(&r.descriptor))))
+            }
+            Resolution::TargetClassMethod(owner) => {
+                let target_ref = MethodRef {
+                    owner: owner.to_owned(),
+                    name: r.name.clone(),
+                    descriptor: r.descriptor.clone(),
+                };
+                self.host
+                    .invoke_instance(&target_ref, receiver, args)
+                    .map(Some)
             }
             Resolution::InterfaceDefault(iface) => self
                 .invoke(&iface, &r.name, &r.descriptor, Some(receiver.clone()), args)
@@ -1153,9 +1472,10 @@ impl<H: Host> Runtime<'_, H> {
         let Some(handle_key) = crate::runtime::game_object::handle_key(receiver).map(str::to_owned) else {
             return Ok(None);
         };
+        let declared = self.game_handle_types(&handle_key);
         enum Action {
             None,
-            Shadow(MethodRef),
+            Shadow(Option<MethodRef>),
             AddedMixinField,
         }
         let action = {
@@ -1167,19 +1487,17 @@ impl<H: Host> Runtime<'_, H> {
                         || (meta.extends_game_class
                             && !meta.declared_chain_fields.contains(&member))
                     {
-                        let target_owner = meta
-                            .targets
-                            .first()
-                            .cloned()
-                            .unwrap_or_else(|| r.owner.clone());
-                        Action::Shadow(MethodRef {
-                            owner: target_owner,
-                            name: r.name.clone(),
-                            descriptor: r.descriptor.clone(),
-                        })
+                        let target_ref =
+                            resolve_shadow_target(&meta.targets, &declared).map(|owner| {
+                                MethodRef {
+                                    owner: owner.to_owned(),
+                                    name: r.name.clone(),
+                                    descriptor: r.descriptor.clone(),
+                                }
+                            });
+                        Action::Shadow(target_ref)
                     } else if meta.added_instance_fields.contains(&member)
-                        && self
-                            .game_handle_types(&handle_key)
+                        && declared
                             .iter()
                             .any(|ty| meta.active_interface_targets.contains(ty.as_str()))
                     {
@@ -1193,7 +1511,7 @@ impl<H: Host> Runtime<'_, H> {
         };
         match action {
             Action::None => Ok(None),
-            Action::Shadow(target_ref) => {
+            Action::Shadow(Some(target_ref)) => {
                 // Under `GameHookHost`, pass the original mixin ref so its `@Shadow` error
                 // diagnostic names both the mixin field and `@Shadow`.
                 let query = if self.host.defers_game_field_write_check() {
@@ -1202,6 +1520,15 @@ impl<H: Host> Runtime<'_, H> {
                     &target_ref
                 };
                 self.host.get_field(receiver, query).map(Some)
+            }
+            Action::Shadow(None) => {
+                // Ambiguous multi-target `@Shadow`: count/refuse loudly.
+                if self.host.defers_game_field_write_check() {
+                    self.host.get_field(receiver, r).map(Some)
+                } else {
+                    self.host.unknown_operand_call(r)?;
+                    Ok(Some(Value::default_for(&r.descriptor)))
+                }
             }
             Action::AddedMixinField => {
                 self.ensure_game_mixin_initialized(&r.owner, receiver)?;
@@ -1225,6 +1552,7 @@ impl<H: Host> Runtime<'_, H> {
         let Some(handle_key) = crate::runtime::game_object::handle_key(receiver).map(str::to_owned) else {
             return Ok(GameFieldWrite::Fallthrough);
         };
+        let declared = self.game_handle_types(&handle_key);
         enum Action {
             Fallthrough,
             AddedMixinField,
@@ -1242,11 +1570,9 @@ impl<H: Host> Runtime<'_, H> {
                         if self.host.defers_game_field_write_check() {
                             Action::Fallthrough
                         } else {
-                            let target_owner = meta
-                                .targets
-                                .first()
-                                .cloned()
-                                .unwrap_or_else(|| r.owner.clone());
+                            let target_owner = resolve_shadow_target(&meta.targets, &declared)
+                                .unwrap_or(r.owner.as_str())
+                                .to_owned();
                             Action::UnmodelledGameField(MethodRef {
                                 owner: target_owner,
                                 name: r.name.clone(),
@@ -1254,8 +1580,7 @@ impl<H: Host> Runtime<'_, H> {
                             })
                         }
                     } else if meta.added_instance_fields.contains(&member)
-                        && self
-                            .game_handle_types(&handle_key)
+                        && declared
                             .iter()
                             .any(|ty| meta.active_interface_targets.contains(ty.as_str()))
                     {
@@ -1295,6 +1620,7 @@ impl RuntimeMixinIndex {
         &mut self,
         class: &ClassFile,
         reg: MixinRegistration,
+        config_active_for_target: impl Fn(&str) -> bool,
         is_jar_local: impl Fn(&str) -> bool,
         lookup: impl Fn(&str) -> Option<&'a ClassFile>,
     ) {
@@ -1306,17 +1632,18 @@ impl RuntimeMixinIndex {
         for target in &details.targets {
             let is_external_host_game_target =
                 !is_jar_local(target) && is_host_modelled_game_target(target);
+            let config_active = config_active_for_target(target);
             let (include_in_by_target, include_in_interface_dispatch) = if reg.is_primary {
                 if is_external_host_game_target && is_interface_injection {
                     // Host-game-object interface-injection Mixins are always strictly
-                    // config-gated and require a runnable no-arg initialiser.
-                    let active = reg.config_active && !details.unrunnable_initializer;
+                    // config-, side-, and plugin-gated and require a runnable no-arg initialiser.
+                    let active = config_active && !details.unrunnable_initializer;
                     (active, active)
                 } else if is_external_host_game_target {
                     // Accessor/invoker interfaces on host-modelled game targets keep the
                     // config-less probe scan when the jar has no Mixin configs, and obey
-                    // the config gate when it does.
-                    (reg.primary_has_no_configs || reg.config_active, false)
+                    // the config/plugin gate when it does.
+                    (reg.primary_has_no_configs || config_active, false)
                 } else {
                     // Jar-local woven classes (e.g. `demo/Woven$Target`) and non-host-game
                     // targets (e.g. `ArrayBackedEvent`) preserve the existing unconditional
@@ -1324,8 +1651,8 @@ impl RuntimeMixinIndex {
                     (true, false)
                 }
             } else {
-                // Linked-jar Mixins are always config-gated.
-                let active = reg.config_active && !details.unrunnable_initializer;
+                // Linked-jar Mixins are always config- and plugin-gated.
+                let active = config_active && !details.unrunnable_initializer;
                 (
                     active,
                     active && is_external_host_game_target && is_interface_injection,

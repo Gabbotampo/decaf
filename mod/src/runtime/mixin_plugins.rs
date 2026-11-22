@@ -148,7 +148,55 @@ fn binary_name(internal: &str) -> String {
     internal.replace('/', ".")
 }
 
+thread_local! {
+    static RUNNING_CONFIG_PLUGINS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+static EMPTY_CONFIG_PLUGINS: std::sync::OnceLock<ConfigPlugins> = std::sync::OnceLock::new();
+
+struct PluginRunGuard(bool);
+
+impl PluginRunGuard {
+    fn enter() -> Self {
+        let prev = RUNNING_CONFIG_PLUGINS.with(|flag| flag.replace(true));
+        Self(prev)
+    }
+}
+
+impl Drop for PluginRunGuard {
+    fn drop(&mut self) {
+        RUNNING_CONFIG_PLUGINS.with(|flag| flag.set(self.0));
+    }
+}
+
+pub(crate) fn running_config_plugins() -> bool {
+    RUNNING_CONFIG_PLUGINS.with(std::cell::Cell::get)
+}
+
 impl NativeJar {
+    /// Cached [`ConfigPlugins`] session results for `side`, computed once per jar
+    /// and shared across runtime indexing and game-hook dispatch.
+    ///
+    /// Returns an empty set while a config plugin is itself executing so plugin
+    /// bytecode cannot recursively re-enter plugin evaluation.
+    pub(crate) fn cached_config_plugins(&self, side: MixinSide) -> &ConfigPlugins {
+        if running_config_plugins() {
+            return EMPTY_CONFIG_PLUGINS.get_or_init(ConfigPlugins::default);
+        }
+        let slot = match side {
+            MixinSide::Server => &self.server_config_plugins,
+            MixinSide::Client => &self.client_config_plugins,
+        };
+        slot.get_or_init(|| {
+            let configs = self.mixin_configs();
+            if configs.iter().all(|c| c.plugin.is_none()) {
+                return ConfigPlugins::default();
+            }
+            let config_sides = self.mixin_config_sides();
+            self.run_config_plugins(&configs, &config_sides, side)
+        })
+    }
+
     /// Run every config plugin that loads on `side`, in config order, the way
     /// Mixin does (see the module documentation).
     ///
@@ -161,6 +209,7 @@ impl NativeJar {
         config_sides: &BTreeMap<String, MixinSide>,
         side: MixinSide,
     ) -> ConfigPlugins {
+        let _guard = PluginRunGuard::enter();
         let mut plugins = ConfigPlugins::default();
         let mut host: Option<StdHost> = None;
         for (index, config) in configs.iter().enumerate() {

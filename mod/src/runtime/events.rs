@@ -1460,6 +1460,10 @@ pub struct EventFacade {
     /// each client takes), shared between firings: the game rebuilds it only
     /// when one of them changes.
     pub server: Arc<ServerFacts>,
+    /// Live non-player entity id → monotonic incarnation counter so a later
+    /// entity reusing the same numeric id receives a fresh `game/entity/<id>/<inc>`
+    /// key and never inherits a despawned entity's Mixin fields.
+    pub entity_incarnations: BTreeMap<i32, u64>,
 }
 
 /// What this one firing is about.
@@ -1670,7 +1674,7 @@ fn facade(marker: &str) -> Option<Facade<'_>> {
         "player" => Facade::Player(crate::runtime::game_object::player_uuid(marker)?),
         "original-player" => Facade::OriginalPlayer(hex()?),
         "connection" => Facade::Connection(hex()?),
-        "entity" => Facade::Entity(id.parse().ok()?),
+        "entity" => Facade::Entity(id.split('/').next()?.parse().ok()?),
         _ => Facade::Opaque,
     })
 }
@@ -1701,6 +1705,15 @@ impl StdHost {
         {
             self.levels.retain(|level| level.id != id);
         }
+    }
+
+    /// Install or clear the active [`EventFiring`] snapshot for direct `invoke_method`
+    /// calls against server façade handles.
+    pub fn set_game_event_firing(&mut self, firing: Option<EventFiring>) {
+        if let Some(ref firing) = firing {
+            self.note_firing_levels(firing);
+        }
+        self.game_event = firing.map(Box::new);
     }
 
     /// Add one level to the ledger, replacing the facts an earlier firing gave

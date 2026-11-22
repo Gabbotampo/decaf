@@ -200,6 +200,18 @@ impl State {
         self.world_loaded
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_first_jar_mut<T>(
+        &mut self,
+        f: impl FnOnce(&NativeJar, &mut StdHost) -> T,
+    ) -> T {
+        let first = self
+            .jars
+            .first_mut()
+            .expect("at least one client jar loaded");
+        f(&first.jar, &mut first.host)
+    }
+
     pub(crate) fn report_rows(&self) -> impl Iterator<Item = serde_json::Value> + '_ {
         self.retired
             .iter()
@@ -214,6 +226,22 @@ impl State {
 
     pub(crate) fn level_unloaded(&mut self) {
         self.world_loaded = false;
+        for jar in &mut self.jars {
+            jar.host.forget_all_game_objects();
+        }
+    }
+
+    pub(crate) fn player_logged_out(&mut self) {
+        for jar in &mut self.jars {
+            jar.host.forget_all_game_objects();
+        }
+    }
+
+    pub(crate) fn player_cloned(&mut self) {
+        for jar in &mut self.jars {
+            jar.host
+                .forget_game_object_prefix(runtime::client_surface::PLAYER);
+        }
     }
 
     /// Drop resident hosts, listeners, and jar heaps at client shutdown. Rows stay available

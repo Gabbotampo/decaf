@@ -81,19 +81,19 @@ use attachments::Lifecycle;
 use game_hooks::Arg;
 use mod_api::{
     AttackEntityEvent, Authority, BlocksEvent, BreakBlockEvent, ClientHost, ClientLevelLoadEvent,
-    ClientLevelUnloadEvent, ClientSetupEvent, ClientStoppingEvent, Command, CommandArgumentValue,
-    CommandSource, ConfigFileError, ConfigPath, DamageContainer, DimensionKey, EntityInteractEvent,
-    EntityJoinLevelEvent, EntityLeaveLevelEvent, EntityRef, Flow, GameRuleChangedEvent, Hand,
-    HitHost, Hooks, Host, HostSide, HurtSource, InteractionResult, ItemsEvent, LeftClickBlockEvent,
-    LevelDimension, LevelLoadEvent, LevelRef, LevelTickPostEvent, LevelTickPreEvent,
-    LevelUnloadEvent, LivingDamagePostEvent, LivingDeathEvent, LivingDeathPostEvent,
-    LivingIncomingDamageEvent, PlayerChangedDimensionEvent, PlayerCloneEvent,
-    PlayerDestroyedBlockEvent, PlayerDiedEvent, PlayerLoggedInEvent, PlayerLoggedOutEvent,
-    PlayerRef, PlayerRespawnedEvent, PlayerTickPostEvent, PlayerTickPreEvent,
-    RegisterCommandsEvent, RegistrationContext, RightClickBlockEvent, RightClickItemEvent,
-    RunModCommandEvent, ServerAboutToStartEvent, ServerHost, ServerStartedEvent,
-    ServerStartingEvent, ServerStoppedEvent, ServerStoppingEvent, ServerTickEvent, ServerTickPhase,
-    Text,
+    ClientLevelUnloadEvent, ClientPlayerCloneEvent, ClientPlayerLoggingOutEvent, ClientSetupEvent,
+    ClientStoppingEvent, Command, CommandArgumentValue, CommandSource, ConfigFileError, ConfigPath,
+    DamageContainer, DimensionKey, EntityInteractEvent, EntityJoinLevelEvent,
+    EntityLeaveLevelEvent, EntityRef, Flow, GameRuleChangedEvent, Hand, HitHost, Hooks, Host,
+    HostSide, HurtSource, InteractionResult, ItemsEvent, LeftClickBlockEvent, LevelDimension,
+    LevelLoadEvent, LevelRef, LevelTickPostEvent, LevelTickPreEvent, LevelUnloadEvent,
+    LivingDamagePostEvent, LivingDeathEvent, LivingDeathPostEvent, LivingIncomingDamageEvent,
+    PlayerChangedDimensionEvent, PlayerCloneEvent, PlayerDestroyedBlockEvent, PlayerDiedEvent,
+    PlayerLoggedInEvent, PlayerLoggedOutEvent, PlayerRef, PlayerRespawnedEvent,
+    PlayerTickPostEvent, PlayerTickPreEvent, RegisterCommandsEvent, RegistrationContext,
+    RightClickBlockEvent, RightClickItemEvent, RunModCommandEvent, ServerAboutToStartEvent,
+    ServerHost, ServerStartedEvent, ServerStartingEvent, ServerStoppedEvent, ServerStoppingEvent,
+    ServerTickEvent, ServerTickPhase, Text,
 };
 use runtime::brigadier::{
     self, ArgumentKind, CommandInvocation as RuntimeInvocation, CommandMessage, CommandOutcome,
@@ -161,6 +161,11 @@ struct State {
     /// object by them (`FacadePlayer::session`/`life`, #156 P16b). A dimension change keeps the
     /// object, and the counts.
     lives: BTreeMap<u128, (u32, u32)>,
+    /// Live non-player entity id → monotonic incarnation counter so a later entity reusing
+    /// the same numeric id receives a fresh `game/entity/<id>/<incarnation>` key and never
+    /// inherits a despawned entity's Mixin fields.
+    entity_incarnations: BTreeMap<i32, u64>,
+    next_entity_incarnation: u64,
     /// The player leaving in the logout firing now running: their last entry, so the
     /// runtime hands out the object earlier firings did (`EventFacade::departed`).
     departed: Vec<FacadePlayer>,
@@ -1136,11 +1141,14 @@ impl Hooks for HorizonJava {
             |_| true,
         );
         // A mob removed for any reason (killed, despawned, unloaded, through a portal) is gone
-        // as a Java object: its Mixin state goes with it. A player leaving a level is a
+        // as a Java object: its Mixin state goes with it, and its incarnation is retired so a
+        // later entity reusing the same numeric id starts fresh. A player leaving a level is a
         // dimension change, and Java keeps that `ServerPlayer`.
         if event.kind != "minecraft:player" {
-            let mob = GameObject::entity(event.entity as i32, event.kind, true);
-            game_hooks::forget(&mut self.lock(), &mob);
+            let id = event.entity as i32;
+            let mut state = self.lock();
+            state.end_entity(id);
+            game_hooks::forget_entity(&mut state, id);
         }
     }
 
@@ -1425,10 +1433,11 @@ impl Hooks for HorizonJava {
             let damage = event.source.damage_type.to_owned();
             self.game_hooks(Some(host), "living_death", |state| {
                 let source = game_hooks::damage_source(state, &damage);
-                Some((
-                    Some(GameObject::entity(id, &kind, true)),
-                    vec![Arg::Object(source)],
-                ))
+                let mut mob = GameObject::entity(id, &kind, true);
+                if let Some(incarnation) = state.entity_incarnation(id) {
+                    mob = mob.with_entity_incarnation(incarnation);
+                }
+                Some((Some(mob), vec![Arg::Object(source)]))
             });
         }
         if fired.cancelled {
@@ -1476,10 +1485,14 @@ impl Hooks for HorizonJava {
         host: &mut dyn ServerHost,
         event: &mut EntityJoinLevelEvent<'_>,
     ) -> Flow {
+        let entity_id = event.entity as i32;
+        if event.kind != "minecraft:player" {
+            self.lock().begin_entity(entity_id);
+        }
         let context = EventContext {
             level: Some(event.dimension.to_owned()),
             entity: Some(FacadeEntity {
-                id: event.entity as i32,
+                id: entity_id,
                 kind: event.kind.to_owned(),
                 level: Some(event.dimension.to_owned()),
             }),
@@ -1495,6 +1508,11 @@ impl Hooks for HorizonJava {
             |_| true,
         );
         if fired.cancelled {
+            if event.kind != "minecraft:player" {
+                let mut state = self.lock();
+                state.end_entity(entity_id);
+                game_hooks::forget_entity(&mut state, entity_id);
+            }
             Flow::Cancel
         } else {
             Flow::Continue
@@ -1524,6 +1542,23 @@ impl Hooks for HorizonJava {
         _event: &mut ClientLevelUnloadEvent<'_>,
     ) {
         self.on_client_level_unload();
+    }
+
+    /// Sunrise's client player clone fires when a respawn or dimension change replaces
+    /// `LocalPlayer`: drop `client/player`'s per-instance Mixin fields so the new player starts
+    /// fresh.
+    fn client_player_clone(&self, _host: &mut dyn ClientHost, _event: &mut ClientPlayerCloneEvent) {
+        self.on_client_player_clone();
+    }
+
+    /// Sunrise's client player logout fires when leaving a server/world: drop all client game
+    /// object Mixin state before any later join.
+    fn client_player_logging_out(
+        &self,
+        _host: &mut dyn ClientHost,
+        _event: &mut ClientPlayerLoggingOutEvent,
+    ) {
+        self.on_client_player_logging_out();
     }
 
     /// Sunrise ClientStoppingEvent: once per orderly client process shutdown, after the current
@@ -1589,6 +1624,14 @@ impl HorizonJava {
 
     fn on_client_level_unload(&self) {
         self.lock_client().level_unloaded();
+    }
+
+    fn on_client_player_clone(&self) {
+        self.lock_client().player_cloned();
+    }
+
+    fn on_client_player_logging_out(&self) {
+        self.lock_client().player_logged_out();
     }
 
     fn on_client_stopping(&self, host: &mut dyn ClientHost) {
@@ -2517,6 +2560,24 @@ impl State {
         self.leavers.retain(|left| left.uuid != uuid);
     }
 
+    /// Assign a fresh non-reusable incarnation to a newly joined non-player entity `id`.
+    fn begin_entity(&mut self, id: i32) -> u64 {
+        self.next_entity_incarnation = self.next_entity_incarnation.wrapping_add(1);
+        let incarnation = self.next_entity_incarnation;
+        self.entity_incarnations.insert(id, incarnation);
+        incarnation
+    }
+
+    /// Current incarnation of a live non-player entity `id`, if tracked.
+    fn entity_incarnation(&self, id: i32) -> Option<u64> {
+        self.entity_incarnations.get(&id).copied()
+    }
+
+    /// Retire the incarnation of a non-player entity `id` that left the level.
+    fn end_entity(&mut self, id: i32) -> Option<u64> {
+        self.entity_incarnations.remove(&id)
+    }
+
     /// The server state every firing this mod starts exposes: the dedicated flag, the tick, the
     /// online players and the open levels.
     ///
@@ -2531,6 +2592,7 @@ impl State {
             departed: self.departed.clone(),
             levels: self.levels.clone(),
             server: Arc::clone(&self.server),
+            entity_incarnations: self.entity_incarnations.clone(),
             ..EventFacade::default()
         }
     }
@@ -3834,5 +3896,241 @@ mod tests {
         assert_eq!(context.amount, 0.0);
         assert!(!context.flag);
         assert_eq!(context.damage.as_deref(), Some("minecraft:player_attack"));
+    }
+
+    fn compile_client_mixin_fixture_jar() -> Vec<u8> {
+        use std::io::Write;
+        use std::process::Command;
+
+        let dir = std::env::temp_dir().join(format!(
+            "horizon-java-client-mixin-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let src = dir.join("src");
+        let classes = dir.join("classes");
+        std::fs::create_dir_all(&classes).unwrap();
+
+        let files: &[(&str, &str)] = &[
+            (
+                "org/spongepowered/asm/mixin/Mixin.java",
+                "package org.spongepowered.asm.mixin;\nimport java.lang.annotation.*;\n@Retention(RetentionPolicy.CLASS)\n@Target(ElementType.TYPE)\npublic @interface Mixin { Class<?>[] value() default {}; }\n",
+            ),
+            (
+                "org/spongepowered/asm/mixin/Unique.java",
+                "package org.spongepowered.asm.mixin;\nimport java.lang.annotation.*;\n@Retention(RetentionPolicy.CLASS)\n@Target({ElementType.FIELD, ElementType.METHOD})\npublic @interface Unique {}\n",
+            ),
+            (
+                "net/minecraft/world/entity/player/Player.java",
+                "package net.minecraft.world.entity.player;\npublic class Player {}\n",
+            ),
+            (
+                "net/minecraft/client/player/LocalPlayer.java",
+                "package net.minecraft.client.player;\nimport net.minecraft.world.entity.player.Player;\npublic class LocalPlayer extends Player {}\n",
+            ),
+            (
+                "net/minecraft/client/Minecraft.java",
+                "package net.minecraft.client;\nimport net.minecraft.client.player.LocalPlayer;\npublic class Minecraft { public LocalPlayer player; public static Minecraft getInstance() { return null; } }\n",
+            ),
+            (
+                "net/fabricmc/api/ClientModInitializer.java",
+                "package net.fabricmc.api;\npublic interface ClientModInitializer { void onInitializeClient(); }\n",
+            ),
+            (
+                "demo/ClientInit.java",
+                "package demo;\nimport net.fabricmc.api.ClientModInitializer;\npublic class ClientInit implements ClientModInitializer { @Override public void onInitializeClient() {} }\n",
+            ),
+            (
+                "demo/ClientTag.java",
+                "package demo;\npublic interface ClientTag { int getTag(); void setTag(int v); }\n",
+            ),
+            (
+                "demo/LocalPlayerMixin.java",
+                "package demo;\nimport net.minecraft.world.entity.player.Player;\nimport org.spongepowered.asm.mixin.Mixin;\nimport org.spongepowered.asm.mixin.Unique;\n@Mixin(Player.class)\npublic class LocalPlayerMixin implements ClientTag {\n    @Unique private int tag = 7;\n    @Override public int getTag() { return this.tag; }\n    @Override public void setTag(int v) { this.tag = v; }\n}\n",
+            ),
+            (
+                "demo/ClientProbe.java",
+                "package demo;\nimport net.minecraft.client.Minecraft;\npublic final class ClientProbe {\n    public static int read() { return ((ClientTag) (Object) Minecraft.getInstance().player).getTag(); }\n    public static void write(int v) { ((ClientTag) (Object) Minecraft.getInstance().player).setTag(v); }\n}\n",
+            ),
+        ];
+        let mut java_paths = Vec::new();
+        for (rel, body) in files {
+            let p = src.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, body).unwrap();
+            java_paths.push(p);
+        }
+        let javac = std::env::var_os("JAVA_HOME")
+            .map(|h| std::path::PathBuf::from(h).join("bin/javac"))
+            .unwrap_or_else(|| std::path::PathBuf::from("javac"));
+        let out = Command::new(javac)
+            .args(["--release", "17", "-d"])
+            .arg(&classes)
+            .args(&java_paths)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "javac failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        let excluded = [
+            "org/spongepowered/asm/mixin/Mixin.class",
+            "org/spongepowered/asm/mixin/Unique.class",
+            "net/minecraft/world/entity/player/Player.class",
+            "net/minecraft/client/player/LocalPlayer.class",
+            "net/minecraft/client/Minecraft.class",
+            "net/fabricmc/api/ClientModInitializer.class",
+        ];
+        let mut buf = std::io::Cursor::new(Vec::new());
+        {
+            let mut zip = zip::ZipWriter::new(&mut buf);
+            let opts = zip::write::SimpleFileOptions::default();
+            zip.start_file("fabric.mod.json", opts).unwrap();
+            zip.write_all(
+                br#"{"schemaVersion":1,"id":"clientmixin","version":"1.0","entrypoints":{"client":["demo.ClientInit"]},"mixins":["demo.mixins.json"]}"#,
+            )
+            .unwrap();
+            zip.start_file("demo.mixins.json", opts).unwrap();
+            zip.write_all(br#"{"required":true,"package":"demo","mixins":["LocalPlayerMixin"]}"#)
+                .unwrap();
+            let mut stack = vec![classes.clone()];
+            while let Some(cur) = stack.pop() {
+                for entry in std::fs::read_dir(cur).unwrap() {
+                    let path = entry.unwrap().path();
+                    if path.is_dir() {
+                        stack.push(path);
+                    } else {
+                        let rel = path
+                            .strip_prefix(&classes)
+                            .unwrap()
+                            .to_string_lossy()
+                            .replace('\\', "/");
+                        if excluded.contains(&rel.as_str()) {
+                            continue;
+                        }
+                        zip.start_file(rel, opts).unwrap();
+                        zip.write_all(&std::fs::read(path).unwrap()).unwrap();
+                    }
+                }
+            }
+            zip.finish().unwrap();
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        buf.into_inner()
+    }
+
+    #[test]
+    fn client_level_unload_logout_and_clone_reset_local_player_mixin_fields() {
+        let _serial = report_test_guard();
+        let java = HorizonJava::default();
+        java.lock_client().set_fixture_files(vec![(
+            "clientmixin.jar".into(),
+            compile_client_mixin_fixture_jar(),
+        )]);
+        java.on_client_setup();
+        java.on_client_level_load();
+
+        let snapshot = Arc::new(runtime::client_surface::ClientSnapshot {
+            level: Some(runtime::client_surface::ClientLevel {
+                dimension: "minecraft:overworld".into(),
+                ..runtime::client_surface::ClientLevel::default()
+            }),
+            player: Some(runtime::client_surface::ClientPlayer {
+                uuid: 42,
+                name: "Alex".into(),
+                entity_id: 9,
+                ..runtime::client_surface::ClientPlayer::default()
+            }),
+            ..runtime::client_surface::ClientSnapshot::default()
+        });
+        let read_tag = |java: &HorizonJava| -> i32 {
+            java.lock_client().with_first_jar_mut(|jar, host| {
+                host.begin_client_frame(Arc::clone(&snapshot), &[]);
+                let val = jar
+                    .invoke_method("demo.ClientProbe", "read", "()I", None, host)
+                    .unwrap();
+                host.end_client_frame();
+                match val {
+                    runtime::Value::Int(n) => n,
+                    other => panic!("expected int, got {other:?}"),
+                }
+            })
+        };
+        let write_tag = |java: &HorizonJava, next: i32| {
+            java.lock_client().with_first_jar_mut(|jar, host| {
+                host.begin_client_frame(Arc::clone(&snapshot), &[]);
+                jar.invoke_method_with_args(
+                    "demo.ClientProbe",
+                    "write",
+                    "(I)V",
+                    None,
+                    &[runtime::Value::Int(next)],
+                    host,
+                )
+                .unwrap();
+                host.end_client_frame();
+            })
+        };
+
+        // Initial LocalPlayer starts with constructor default 7, retains write 888 while in world.
+        assert_eq!(read_tag(&java), 7);
+        write_tag(&java, 888);
+        assert_eq!(read_tag(&java), 888);
+
+        // Rejoin across client_level_unload -> client_level_load resets to 7.
+        java.on_client_level_unload();
+        assert!(!java.lock_client().world_loaded());
+        java.on_client_level_load();
+        assert!(java.lock_client().world_loaded());
+        assert_eq!(
+            read_tag(&java),
+            7,
+            "new LocalPlayer after level unload/rejoin must have default Mixin fields"
+        );
+
+        // Client respawn (`client_player_clone`) resets to 7 even with same uuid & entity_id.
+        write_tag(&java, 999);
+        assert_eq!(read_tag(&java), 999);
+        java.on_client_player_clone();
+        assert_eq!(
+            read_tag(&java),
+            7,
+            "cloned LocalPlayer after respawn must have default Mixin fields"
+        );
+
+        // Client disconnect (`client_player_logging_out`) resets to 7.
+        write_tag(&java, 444);
+        assert_eq!(read_tag(&java), 444);
+        java.on_client_player_logging_out();
+        assert_eq!(
+            read_tag(&java),
+            7,
+            "LocalPlayer after client_player_logging_out must have default Mixin fields"
+        );
+    }
+
+    #[test]
+    fn entity_incarnations_advance_on_join_leave_and_world_reset() {
+        let mut state = State::default();
+        let first = state.begin_entity(42);
+        assert_eq!(state.entity_incarnation(42), Some(first));
+        assert_eq!(state.facade().entity_incarnations.get(&42), Some(&first));
+
+        // Leaving retires the incarnation and drops any entity Mixin state.
+        assert_eq!(state.end_entity(42), Some(first));
+        game_hooks::forget_entity(&mut state, 42);
+        assert_eq!(state.entity_incarnation(42), None);
+        assert!(!state.facade().entity_incarnations.contains_key(&42));
+
+        // A later entity reusing numeric id 42 gets a strictly newer incarnation.
+        let second = state.begin_entity(42);
+        assert!(second > first);
+        assert_eq!(state.entity_incarnation(42), Some(second));
+
+        // Stopping the server clears active entity incarnations too.
+        game_hooks::forget_world(&mut state);
+        assert_eq!(state.entity_incarnation(42), None);
     }
 }

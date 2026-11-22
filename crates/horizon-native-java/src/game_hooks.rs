@@ -118,6 +118,9 @@ pub struct GameObject {
     /// object each. `None` for a player the host does not count, whose key
     /// names no session (comparisons counted).
     pub incarnation: Option<(u32, u32)>,
+    /// Monotonic incarnation counter for a non-player entity so a later entity
+    /// reusing the same numeric id gets a distinct `game/entity/<id>/<inc>` key.
+    pub entity_incarnation: Option<u64>,
 }
 
 impl GameObject {
@@ -141,6 +144,7 @@ impl GameObject {
             main_hand: None,
             off_hand: None,
             incarnation: None,
+            entity_incarnation: None,
         }
     }
 
@@ -261,6 +265,13 @@ impl GameObject {
         self.incarnation = Some((session, life));
         self
     }
+
+    /// Monotonic incarnation counter for a non-player entity so a later entity
+    /// reusing the same numeric id never aliases its Mixin fields.
+    pub fn with_entity_incarnation(mut self, incarnation: u64) -> Self {
+        self.entity_incarnation = Some(incarnation);
+        self
+    }
     pub fn with_entity_id(mut self, id: i32) -> Self {
         self.entity_id = Some(id);
         self
@@ -320,7 +331,10 @@ impl GameObject {
                 (None, _) => format!("{GAME_OBJECT_PREFIX}player/{key}"),
             },
             GameObjectKind::Living | GameObjectKind::Entity | GameObjectKind::ItemEntity => {
-                format!("{GAME_OBJECT_PREFIX}entity/{key}")
+                match self.entity_incarnation {
+                    Some(incarnation) => format!("{GAME_OBJECT_PREFIX}entity/{key}/{incarnation}"),
+                    None => format!("{GAME_OBJECT_PREFIX}entity/{key}"),
+                }
             }
             GameObjectKind::ItemStack => format!("{GAME_OBJECT_PREFIX}stack/{key}"),
             GameObjectKind::Level => format!("{GAME_OBJECT_PREFIX}level/{key}"),
@@ -448,7 +462,7 @@ pub struct GameHookState {
     /// Game object markers forgotten via [`Self::forget_object`] since the last
     /// resident-host firing, so any mirrored copy on the host heap is also swept.
     forgotten: BTreeSet<String>,
-    model: Option<Arc<MixinModel>>,
+    model: Option<(MixinSide, Arc<MixinModel>)>,
 }
 
 impl GameHookState {
@@ -467,6 +481,38 @@ impl GameHookState {
         let suffix = format!("|{marker}");
         self.initialized.retain(|key| !key.ends_with(&suffix));
         self.forgotten.insert(marker.to_owned());
+    }
+
+    /// Drop everything kept on `marker` and any incarnated child markers starting
+    /// with `{marker}/` (for example all incarnations of a despawned entity id).
+    pub fn forget_object_prefix(&mut self, marker: &str) {
+        let exact_field = format!("{marker}|");
+        let child_prefix = format!("{marker}/");
+        let mut matched: BTreeSet<String> = BTreeSet::new();
+        matched.insert(marker.to_owned());
+        self.fields.retain(|key, _| {
+            if key.starts_with(&exact_field) || key.starts_with(&child_prefix) {
+                if let Some((obj, _)) = key.split_once('|') {
+                    matched.insert(obj.to_owned());
+                }
+                false
+            } else {
+                true
+            }
+        });
+        let exact_init = format!("|{marker}");
+        let child_init = format!("|{marker}/");
+        self.initialized.retain(|entry| {
+            if entry.ends_with(&exact_init) || entry.contains(&child_init) {
+                if let Some((_, obj)) = entry.split_once('|') {
+                    matched.insert(obj.to_owned());
+                }
+                false
+            } else {
+                true
+            }
+        });
+        self.forgotten.extend(matched);
     }
 }
 
@@ -523,7 +569,11 @@ impl MixinModel {
                 .is_some_and(|declared| !declared.contains(member))
     }
 
-    fn build(classes: &BTreeMap<String, ClassFile>) -> Self {
+    fn build(jar: &NativeJar, side: MixinSide) -> Self {
+        let classes = &jar.classes;
+        let configs = jar.mixin_configs();
+        let config_sides = jar.mixin_config_sides();
+        let plugins = jar.cached_config_plugins(side);
         let mut model = Self::default();
         for (name, class) in classes {
             let Some(mixin) = class
@@ -540,17 +590,40 @@ impl MixinModel {
             if targets.is_empty() {
                 continue;
             }
-            for target in &targets {
+            // Only active config-, side-, and plugin-gated targets enter `by_target`,
+            // matching `RuntimeMixinIndex` so unlisted/wrong-side/plugin-rejected mixins
+            // never pass `instanceof` or dispatch inside game hooks.
+            let active_targets = crate::interface_mixins::active_host_mixin_targets(
+                jar,
+                &configs,
+                &config_sides,
+                plugins,
+                side,
+                class,
+            );
+            for target in &active_targets {
                 model
                     .by_target
                     .entry(target.clone())
                     .or_default()
                     .push(name.clone());
             }
+            // Keep target/shadow/game-heir metadata for every `@Mixin` class so an
+            // inactive mixin can still never bypass `@Shadow` or game-field refusal.
             model.targets.insert(name.clone(), targets);
-            model
-                .interfaces
-                .insert(name.clone(), class.interface_names());
+            let mut iface_closure = Vec::new();
+            let mut queue: std::collections::VecDeque<String> =
+                class.interface_names().into_iter().collect();
+            while let Some(iface) = queue.pop_front() {
+                if iface_closure.contains(&iface) {
+                    continue;
+                }
+                if let Some(file) = classes.get(&iface) {
+                    queue.extend(file.interface_names());
+                }
+                iface_closure.push(iface);
+            }
+            model.interfaces.insert(name.clone(), iface_closure);
             // The fields this class's own chain declares, if that chain
             // leaves the jar at a game class.
             let mut declared = BTreeSet::new();
@@ -1886,7 +1959,7 @@ impl<H: Host> Host for GameHookHost<'_, H> {
     }
 
     fn mixin_side(&self) -> MixinSide {
-        MixinSide::Server
+        self.inner.mixin_side()
     }
 
     fn mark_game_mixin_initialized(&mut self, mixin: &str, object: &str) -> bool {
@@ -1909,16 +1982,23 @@ impl<H: Host> Host for GameHookHost<'_, H> {
         method: &Method,
         receiver: Option<&Value>,
     ) -> Option<JarCallRedirect> {
-        let shadow = self.model.targets.get(class).and_then(|targets| {
-            self.model
+        let receiver_hierarchy: Vec<String> = receiver
+            .and_then(Self::is_game_object)
+            .and_then(|marker| self.context.object(marker))
+            .map(|object| object.hierarchy().into_iter().map(str::to_owned).collect())
+            .unwrap_or_default();
+        if let Some(targets) = self.model.targets.get(class)
+            && self
+                .model
                 .shadow_methods
                 .contains(&format!("{class}|{}|{}", method.name, method.descriptor))
-                .then(|| targets.first().cloned())
-                .flatten()
-        });
-        if let Some(target) = shadow {
+        {
+            let owner =
+                crate::interface_mixins::resolve_shadow_target(targets, &receiver_hierarchy)
+                    .unwrap_or(class)
+                    .to_owned();
             return Some(JarCallRedirect::Host(MethodRef {
-                owner: target,
+                owner,
                 name: method.name.clone(),
                 descriptor: method.descriptor.clone(),
             }));
@@ -2092,11 +2172,15 @@ impl NativeJar {
             .map_err(|reason| game_hook_error(&reason))?;
             checked.push(self.game_hook_callback_values(entry, args)?);
         }
-        let model = Arc::clone(
-            state
-                .model
-                .get_or_insert_with(|| Arc::new(MixinModel::build(&self.classes))),
-        );
+        let side = host.mixin_side();
+        let model = match &state.model {
+            Some((cached_side, model)) if *cached_side == side => Arc::clone(model),
+            _ => {
+                let built = Arc::new(MixinModel::build(self, side));
+                state.model = Some((side, Arc::clone(&built)));
+                built
+            }
+        };
         let (persistent_static_fields, persistent_initialized_classes) =
             host.persistent_class_state();
         let (io_paths, io_files, io_file_bytes, io_dirs) = host.persistent_io_state();
@@ -2124,10 +2208,7 @@ impl NativeJar {
             let mut callback_infos = CallbackInfos::new();
             let mut runtime = Runtime {
                 classes: &self.classes,
-                mixin_index: crate::interface_mixins::RuntimeMixinState::from_jar_side(
-                    self,
-                    MixinSide::Server,
-                ),
+                mixin_index: crate::interface_mixins::RuntimeMixinState::from_jar_side(self, side),
                 linked,
                 host: &mut wrapped,
                 calls: 0,

@@ -8,7 +8,8 @@ mod scratch;
 use horizon_native_java::{
     ExecutionBudget, GameHookContext, GameHookState, GameObject, MixinSide, MixinSkipReason,
     NativeJar, StdHost, Value,
-    client_surface::{ClientPlayer, ClientSnapshot},
+    client_surface::{ClientLevel, ClientPlayer, ClientSnapshot},
+    events::{EventContext, EventFacade, EventFiring, FacadeEntity, FacadePlayer, GameEvent},
 };
 use std::{
     collections::BTreeMap,
@@ -25,6 +26,12 @@ fn javac() -> PathBuf {
     std::env::var_os("JAVA_HOME")
         .map(|home| PathBuf::from(home).join("bin/javac"))
         .unwrap_or_else(|| "javac".into())
+}
+
+fn java_bin() -> PathBuf {
+    std::env::var_os("JAVA_HOME")
+        .map(|home| PathBuf::from(home).join("bin/java"))
+        .unwrap_or_else(|| "java".into())
 }
 
 fn files_under(root: &Path) -> Vec<PathBuf> {
@@ -1840,5 +1847,1182 @@ public final class ConfiglessProbe {
     assert!(
         err.is_err(),
         "config-less jar must not apply interface-injection mixin onto host Player: {err:?}"
+    );
+}
+
+/// Review #2 with JDK 25 oracle: an injected interface's `default` method MUST NOT
+/// override a concrete method the target class hierarchy already declares.
+///
+/// - On JDK 25, `ConcretePlayer implements Duck` returns `42` for `getId()` and `123`
+///   for `getScore()` (not `Duck`'s default `7`), and `99` for `customDefault()`.
+/// - On Decaf, calling `((Duck) player).getId()` dispatches to `Entity#getId()I` (`42`,
+///   zero unknown calls); calling `((Duck) level).isClientSide()` dispatches to
+///   `Level#isClientSide()Z` (`false`, zero unknown calls); calling `((Duck) player).getScore()`
+///   (a real vanilla 26.3 `Player` concrete method that the host does not model) is
+///   counted on lenient hosts and refused on strict hosts / `GameHookHost`, never
+///   falling back to `Duck`'s default `7`; and calling `((Duck) player).customDefault()`
+///   (not declared on `Player`/`Entity`/`Object`) runs `Duck`'s default (`99`, zero unknown calls).
+#[test]
+fn injected_interface_default_does_not_override_concrete_target_method_matches_jdk25() {
+    // 1. Run the real JDK 25 oracle to pin JVM semantics (`ConcretePlayer implements Duck`).
+    let oracle_root = scratch::Scratch::new("interface-mixin-jdk25-default-oracle");
+    let oracle_src = oracle_root.join("src/demo/JdkOracle.java");
+    let oracle_classes = oracle_root.join("classes");
+    fs::create_dir_all(oracle_src.parent().unwrap()).unwrap();
+    fs::create_dir_all(&oracle_classes).unwrap();
+    fs::write(
+        &oracle_src,
+        r#"package demo;
+public final class JdkOracle {
+    public interface Duck {
+        default int getId() { return 7; }
+        default int getScore() { return 7; }
+        default int customDefault() { return 99; }
+    }
+    public static class ConcreteEntity {
+        public int getId() { return 42; }
+    }
+    public static class ConcretePlayer extends ConcreteEntity implements Duck {
+        public int getScore() { return 123; }
+    }
+    public static void main(String[] args) {
+        Duck d = new ConcretePlayer();
+        System.out.print(d.getId() + "," + d.getScore() + "," + d.customDefault());
+    }
+}
+"#,
+    )
+    .unwrap();
+    let compile = Command::new(javac())
+        .arg("--release")
+        .arg("17")
+        .arg("-d")
+        .arg(&oracle_classes)
+        .arg(&oracle_src)
+        .output()
+        .unwrap();
+    assert!(
+        compile.status.success(),
+        "javac oracle failed:\n{}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(java_bin())
+        .arg("-cp")
+        .arg(&oracle_classes)
+        .arg("demo.JdkOracle")
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "java oracle failed:\n{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&run.stdout), "42,123,99");
+
+    // 2. Build the Decaf fixture jar with `@Mixin(Player.class)` and `@Mixin(Level.class)`
+    //    implementing `Duck` without overriding `getId`, `getScore`, `isClientSide`, or `customDefault`.
+    let mut sources = mixin_stubs();
+    sources.insert(
+        "net/minecraft/client/player/AbstractClientPlayer.java",
+        "package net.minecraft.client.player;\nimport net.minecraft.world.entity.player.Player;\npublic class AbstractClientPlayer extends Player {}\n",
+    );
+    sources.insert(
+        "net/minecraft/client/player/LocalPlayer.java",
+        "package net.minecraft.client.player;\npublic class LocalPlayer extends AbstractClientPlayer {}\n",
+    );
+    sources.insert(
+        "net/minecraft/client/Minecraft.java",
+        "package net.minecraft.client;\nimport net.minecraft.client.player.LocalPlayer;\npublic class Minecraft { public LocalPlayer player; public static Minecraft getInstance() { return null; } }\n",
+    );
+    sources.insert(
+        "demo/Duck.java",
+        r#"package demo;
+public interface Duck {
+    default int getId() { return 7; }
+    default int getScore() { return 7; }
+    default boolean isClientSide() { return true; }
+    default int customDefault() { return 99; }
+}
+"#,
+    );
+    sources.insert(
+        "demo/PlayerDuckMixin.java",
+        r#"package demo;
+import net.minecraft.world.entity.player.Player;
+import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.injection.At;
+import org.spongepowered.asm.mixin.injection.Inject;
+import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
+
+@Mixin(Player.class)
+public class PlayerDuckMixin implements Duck {
+    @Inject(method = "tick()V", at = @At("HEAD"))
+    private void onTick(CallbackInfo ci) {
+        Duck self = (Duck) (Object) this;
+        DefaultProbe.hookObserved = self.getId() + "," + self.customDefault();
+        if (DefaultProbe.callScoreInHook) {
+            self.getScore();
+        }
+    }
+}
+"#,
+    );
+    sources.insert(
+        "demo/LevelDuckMixin.java",
+        r#"package demo;
+import net.minecraft.world.level.Level;
+import org.spongepowered.asm.mixin.Mixin;
+
+@Mixin(Level.class)
+public class LevelDuckMixin implements Duck {}
+"#,
+    );
+    sources.insert(
+        "demo/DefaultProbe.java",
+        r#"package demo;
+import net.minecraft.client.Minecraft;
+import net.minecraft.world.entity.player.Player;
+import net.minecraft.world.level.Level;
+
+public final class DefaultProbe {
+    public static String hookObserved = "";
+    public static boolean callScoreInHook = false;
+
+    public static void setCallScoreInHook(boolean v) {
+        callScoreInHook = v;
+    }
+
+    public static String probeModelled(Player p, Level l) {
+        Duck dp = (Duck) p;
+        Duck dl = (Duck) l;
+        return dp.getId() + "," + dl.isClientSide() + "," + dp.customDefault();
+    }
+
+    public static int probeUnmodelledScore(Player p) {
+        return ((Duck) p).getScore();
+    }
+
+    public static String probeClientModelled() {
+        Duck dp = (Duck) (Object) Minecraft.getInstance().player;
+        return dp.getId() + "," + dp.customDefault();
+    }
+
+    public static int probeClientUnmodelledScore() {
+        return ((Duck) (Object) Minecraft.getInstance().player).getScore();
+    }
+
+    public static String readHookObserved() {
+        return hookObserved;
+    }
+}
+"#,
+    );
+    let mut excluded = COMPILE_ONLY_STUBS.to_vec();
+    excluded.extend([
+        "net/minecraft/client/player/AbstractClientPlayer.class",
+        "net/minecraft/client/player/LocalPlayer.class",
+        "net/minecraft/client/Minecraft.class",
+    ]);
+    let jar_path = build_jar(
+        "default-vs-concrete",
+        sources,
+        &[
+            (
+                "fabric.mod.json",
+                r#"{"id":"defcheck","version":"1.0","mixins":["demo.mixins.json"]}"#,
+            ),
+            (
+                "demo.mixins.json",
+                r#"{"required":true,"package":"demo","mixins":["PlayerDuckMixin","LevelDuckMixin"]}"#,
+            ),
+        ],
+        &excluded,
+    );
+    let jar = NativeJar::from_path(&jar_path).unwrap();
+
+    // 2a. StdHost inside an active server EventFiring with entity_id=42.
+    let mut facade = EventFacade::default();
+    facade.players.push(FacadePlayer {
+        uuid: 1,
+        name: "Alice".into(),
+        level: Some("minecraft:overworld".into()),
+        entity_id: Some(42),
+        session: 1,
+        life: 0,
+    });
+    let player = server_player(1, "Alice", 1, 0, 42);
+    let level = GameObject::level("minecraft:overworld").value();
+
+    let mut host = StdHost::new().with_environment_type("SERVER");
+    host.set_game_event_firing(Some(EventFiring::new(
+        GameEvent::ServerTickEnd,
+        Arc::new(facade.clone()),
+        EventContext::default(),
+    )));
+    let modelled = jar
+        .invoke_method_with_args(
+            "demo.DefaultProbe",
+            "probeModelled",
+            "(Lnet/minecraft/world/entity/player/Player;Lnet/minecraft/world/level/Level;)Ljava/lang/String;",
+            None,
+            &[player.clone(), level],
+            &mut host,
+        )
+        .unwrap();
+    assert_eq!(
+        modelled,
+        Value::Ref(Some("42,false,99".into())),
+        "target concrete methods must beat Duck's default methods"
+    );
+    assert_eq!(host.unknown_host_call_count(), 0);
+
+    // - On a server player handle, StdHost's server façade refuses unmodelled Player#getScore()I loudly.
+    let firing_err = jar.invoke_method_with_args(
+        "demo.DefaultProbe",
+        "probeUnmodelledScore",
+        "(Lnet/minecraft/world/entity/player/Player;)I",
+        None,
+        std::slice::from_ref(&player),
+        &mut host,
+    );
+    assert!(
+        firing_err.is_err()
+            && firing_err
+                .as_ref()
+                .unwrap_err()
+                .to_string()
+                .contains("net/minecraft/world/entity/player/Player#getScore()I"),
+        "expected unmodelled Player#getScore()I refused on server player handle, got: {firing_err:?}"
+    );
+
+    // - Inside a client frame on `client/player`, modelled getId() returns 42 (not 7),
+    //   customDefault() returns 99, and unmodelled Player#getScore()I refuses loudly with
+    //   UnknownHostCall (matching `client_surface::an_unmodelled_member_refuses_only_inside_a_firing`),
+    //   never falling back to Duck's default 7!
+    let client_snap = Arc::new(ClientSnapshot {
+        level: Some(ClientLevel {
+            dimension: "minecraft:overworld".into(),
+            ..ClientLevel::default()
+        }),
+        player: Some(ClientPlayer {
+            uuid: 1,
+            name: "Alice".into(),
+            entity_id: 42,
+            ..ClientPlayer::default()
+        }),
+        ..ClientSnapshot::default()
+    });
+    let mut client_host = StdHost::new().with_environment_type("CLIENT");
+    client_host.begin_client_frame(Arc::clone(&client_snap), &[]);
+    let client_mod = jar
+        .invoke_method(
+            "demo.DefaultProbe",
+            "probeClientModelled",
+            "()Ljava/lang/String;",
+            None,
+            &mut client_host,
+        )
+        .unwrap();
+    assert_eq!(client_mod, Value::Ref(Some("42,99".into())));
+    assert_eq!(client_host.unknown_host_call_count(), 0);
+    let client_score_err = jar.invoke_method(
+        "demo.DefaultProbe",
+        "probeClientUnmodelledScore",
+        "()I",
+        None,
+        &mut client_host,
+    );
+    assert!(
+        client_score_err.is_err()
+            && client_score_err
+                .as_ref()
+                .unwrap_err()
+                .to_string()
+                .contains("net/minecraft/world/entity/player/Player#getScore()I"),
+        "unmodelled concrete target method inside client frame must refuse loudly instead of returning default 7: {client_score_err:?}"
+    );
+    client_host.end_client_frame();
+
+    // 2b. GameHookHost (`run_game_hook_in`) also resolves `getId()` -> `42` and
+    //     `customDefault()` -> `99`, and refuses unmodelled `Player#getScore()I` loudly
+    //     rather than falling back to Duck's default 7.
+    let weave = jar.plan_load_time_weave_with_game_hooks(MixinSide::Server);
+    let registrations = jar.register_game_hooks(&weave).unwrap();
+    let mut hook_host = StdHost::new().with_environment_type("SERVER");
+    let mut hook_state = GameHookState::default();
+    let mut ctx = GameHookContext::new();
+    let hook_player = ctx.insert(
+        GameObject::player(1, "Alice")
+            .with_incarnation(1, 0)
+            .with_entity_id(42),
+    );
+    jar.run_game_hook_in(
+        &registrations,
+        &mut hook_state,
+        &mut ctx,
+        "java_base_player_tick_head",
+        Some(hook_player),
+        &[],
+        &mut hook_host,
+        &ExecutionBudget::within(Duration::from_secs(5)),
+    )
+    .unwrap();
+    let observed = jar
+        .invoke_method(
+            "demo.DefaultProbe",
+            "readHookObserved",
+            "()Ljava/lang/String;",
+            None,
+            &mut hook_host,
+        )
+        .unwrap();
+    assert_eq!(observed, Value::Ref(Some("42,99".into())));
+    assert_eq!(hook_host.unknown_host_call_count(), 0);
+
+    // Calling unmodelled concrete Player#getScore()I inside the game hook refuses loudly.
+    jar.invoke_method_with_args(
+        "demo.DefaultProbe",
+        "setCallScoreInHook",
+        "(Z)V",
+        None,
+        &[Value::Int(1)],
+        &mut hook_host,
+    )
+    .unwrap();
+    let mut ctx2 = GameHookContext::new();
+    let hook_player2 = ctx2.insert(
+        GameObject::player(1, "Alice")
+            .with_incarnation(1, 0)
+            .with_entity_id(42),
+    );
+    let hook_score_err = jar.run_game_hook_in(
+        &registrations,
+        &mut hook_state,
+        &mut ctx2,
+        "java_base_player_tick_head",
+        Some(hook_player2),
+        &[],
+        &mut hook_host,
+        &ExecutionBudget::within(Duration::from_secs(5)),
+    );
+    assert!(
+        hook_score_err.is_err()
+            && hook_score_err
+                .as_ref()
+                .unwrap_err()
+                .to_string()
+                .contains("net/minecraft/world/entity/player/Player#getScore()I"),
+        "expected unmodelled Player#getScore()I refused in GameHookHost, got: {hook_score_err:?}"
+    );
+}
+
+/// Review #3: game-hook dispatch (`MixinModel::build`, `host_instance_of`,
+/// `redirect_jar_call`) uses the exact same config-, side-, and plugin-gated index as
+/// `RuntimeMixinIndex`, so unlisted, client-only, and plugin-declined mixins are inactive
+/// inside a server game hook.
+#[test]
+fn game_hook_dispatch_gates_unlisted_client_only_and_plugin_declined_mixins() {
+    let mut sources = mixin_stubs();
+    sources.insert(
+        "org/objectweb/asm/tree/ClassNode.java",
+        "package org.objectweb.asm.tree;\npublic class ClassNode {}\n",
+    );
+    sources.insert(
+        "org/spongepowered/asm/mixin/extensibility/IMixinInfo.java",
+        "package org.spongepowered.asm.mixin.extensibility;\npublic interface IMixinInfo {}\n",
+    );
+    sources.insert(
+        "org/spongepowered/asm/mixin/extensibility/IMixinConfigPlugin.java",
+        r#"package org.spongepowered.asm.mixin.extensibility;
+import java.util.List;
+import java.util.Set;
+import org.objectweb.asm.tree.ClassNode;
+public interface IMixinConfigPlugin {
+    void onLoad(String mixinPackage);
+    String getRefMapperConfig();
+    boolean shouldApplyMixin(String targetClassName, String mixinClassName);
+    void acceptTargets(Set<String> myTargets, Set<String> otherTargets);
+    List<String> getMixins();
+    void preApply(String targetClassName, ClassNode targetClass, String mixinClassName, IMixinInfo mixinInfo);
+    void postApply(String targetClassName, ClassNode targetClass, String mixinClassName, IMixinInfo mixinInfo);
+}
+"#,
+    );
+    sources.insert(
+        "demo/DemoPlugin.java",
+        r#"package demo;
+import java.util.List;
+import java.util.Set;
+import org.objectweb.asm.tree.ClassNode;
+import org.spongepowered.asm.mixin.extensibility.IMixinConfigPlugin;
+import org.spongepowered.asm.mixin.extensibility.IMixinInfo;
+
+public class DemoPlugin implements IMixinConfigPlugin {
+    @Override public void onLoad(String mixinPackage) {}
+    @Override public String getRefMapperConfig() { return null; }
+    @Override public boolean shouldApplyMixin(String targetClassName, String mixinClassName) {
+        return !mixinClassName.endsWith("PluginDeclinedMixin");
+    }
+    @Override public void acceptTargets(Set<String> myTargets, Set<String> otherTargets) {}
+    @Override public List<String> getMixins() { return null; }
+    @Override public void preApply(String targetClassName, ClassNode targetClass, String mixinClassName, IMixinInfo mixinInfo) {}
+    @Override public void postApply(String targetClassName, ClassNode targetClass, String mixinClassName, IMixinInfo mixinInfo) {}
+}
+"#,
+    );
+    sources.insert(
+        "demo/ActiveDuck.java",
+        "package demo;\npublic interface ActiveDuck { int activeVal(); }\n",
+    );
+    sources.insert(
+        "demo/UnlistedDuck.java",
+        "package demo;\npublic interface UnlistedDuck { int val(); }\n",
+    );
+    sources.insert(
+        "demo/ClientOnlyDuck.java",
+        "package demo;\npublic interface ClientOnlyDuck { int val(); }\n",
+    );
+    sources.insert(
+        "demo/PluginDeclinedDuck.java",
+        "package demo;\npublic interface PluginDeclinedDuck { int val(); }\n",
+    );
+    sources.insert(
+        "demo/ServerActiveMixin.java",
+        r#"package demo;
+import net.minecraft.world.entity.player.Player;
+import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.injection.At;
+import org.spongepowered.asm.mixin.injection.Inject;
+import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
+
+@Mixin(Player.class)
+public class ServerActiveMixin implements ActiveDuck {
+    @Override public int activeVal() { return 111; }
+
+    @Inject(method = "tick()V", at = @At("HEAD"))
+    private void onTick(CallbackInfo ci) {
+        Object self = this;
+        boolean a = self instanceof ActiveDuck;
+        boolean u = self instanceof UnlistedDuck;
+        boolean c = self instanceof ClientOnlyDuck;
+        boolean p = self instanceof PluginDeclinedDuck;
+        int av = ((ActiveDuck) self).activeVal();
+        HookGateProbe.report = a + "," + u + "," + c + "," + p + "," + av;
+        if (HookGateProbe.callMode == 1) {
+            ((UnlistedDuck) self).val();
+        } else if (HookGateProbe.callMode == 2) {
+            ((ClientOnlyDuck) self).val();
+        } else if (HookGateProbe.callMode == 3) {
+            ((PluginDeclinedDuck) self).val();
+        }
+    }
+}
+"#,
+    );
+    sources.insert(
+        "demo/UnlistedHookMixin.java",
+        r#"package demo;
+import net.minecraft.world.entity.player.Player;
+import org.spongepowered.asm.mixin.Mixin;
+
+@Mixin(Player.class)
+public class UnlistedHookMixin implements UnlistedDuck {
+    @Override public int val() { return 222; }
+}
+"#,
+    );
+    sources.insert(
+        "demo/ClientOnlyHookMixin.java",
+        r#"package demo;
+import net.minecraft.world.entity.player.Player;
+import org.spongepowered.asm.mixin.Mixin;
+
+@Mixin(Player.class)
+public class ClientOnlyHookMixin implements ClientOnlyDuck {
+    @Override public int val() { return 333; }
+}
+"#,
+    );
+    sources.insert(
+        "demo/PluginDeclinedMixin.java",
+        r#"package demo;
+import net.minecraft.world.entity.player.Player;
+import org.spongepowered.asm.mixin.Mixin;
+
+@Mixin(Player.class)
+public class PluginDeclinedMixin implements PluginDeclinedDuck {
+    @Override public int val() { return 444; }
+}
+"#,
+    );
+    sources.insert(
+        "demo/HookGateProbe.java",
+        r#"package demo;
+import net.minecraft.world.entity.player.Player;
+
+public final class HookGateProbe {
+    public static String report = "";
+    public static int callMode = 0;
+    public static void setCallMode(int mode) { callMode = mode; }
+    public static String readReport() { return report; }
+    public static boolean checkPluginDeclined(Player p) { return p instanceof PluginDeclinedDuck; }
+    public static int readActive(Player p) { return ((ActiveDuck) p).activeVal(); }
+}
+"#,
+    );
+
+    let mut excluded = COMPILE_ONLY_STUBS.to_vec();
+    excluded.extend([
+        "org/objectweb/asm/tree/ClassNode.class",
+        "org/spongepowered/asm/mixin/extensibility/IMixinInfo.class",
+        "org/spongepowered/asm/mixin/extensibility/IMixinConfigPlugin.class",
+    ]);
+    let jar_path = build_jar(
+        "game-hook-gating",
+        sources,
+        &[
+            (
+                "fabric.mod.json",
+                r#"{"id":"hookgate","version":"1.0","mixins":["demo.mixins.json"]}"#,
+            ),
+            (
+                "demo.mixins.json",
+                r#"{"required":true,"package":"demo","plugin":"demo.DemoPlugin","mixins":["ServerActiveMixin","PluginDeclinedMixin"],"client":["ClientOnlyHookMixin"]}"#,
+            ),
+        ],
+        &excluded,
+    );
+    let jar = NativeJar::from_path(&jar_path).unwrap();
+    let weave = jar.plan_load_time_weave_with_game_hooks(MixinSide::Server);
+    let registrations = jar.register_game_hooks(&weave).unwrap();
+    let mut host = StdHost::new().with_environment_type("SERVER");
+    let mut state = GameHookState::default();
+    let mut ctx = GameHookContext::new();
+    let player_val = ctx.insert(
+        GameObject::player(12, "HookTester")
+            .with_incarnation(1, 0)
+            .with_entity_id(5),
+    );
+    jar.run_game_hook_in(
+        &registrations,
+        &mut state,
+        &mut ctx,
+        "java_base_player_tick_head",
+        Some(player_val),
+        &[],
+        &mut host,
+        &ExecutionBudget::within(Duration::from_secs(5)),
+    )
+    .unwrap();
+    let report = jar
+        .invoke_method(
+            "demo.HookGateProbe",
+            "readReport",
+            "()Ljava/lang/String;",
+            None,
+            &mut host,
+        )
+        .unwrap();
+    assert_eq!(
+        report,
+        Value::Ref(Some("true,false,false,false,111".into())),
+        "unlisted, client-only, and plugin-declined mixins must be inactive in server game hooks"
+    );
+
+    // Calling any gated interface method inside the server hook must refuse loudly rather than
+    // dispatching to UnlistedHookMixin, ClientOnlyHookMixin, or PluginDeclinedMixin.
+    for (mode, expected_iface) in [
+        (1, "demo/UnlistedDuck#val()I"),
+        (2, "demo/ClientOnlyDuck#val()I"),
+        (3, "demo/PluginDeclinedDuck#val()I"),
+    ] {
+        jar.invoke_method_with_args(
+            "demo.HookGateProbe",
+            "setCallMode",
+            "(I)V",
+            None,
+            &[Value::Int(mode)],
+            &mut host,
+        )
+        .unwrap();
+        let mut ctx2 = GameHookContext::new();
+        let p2 = ctx2.insert(
+            GameObject::player(12, "HookTester")
+                .with_incarnation(1, 0)
+                .with_entity_id(5),
+        );
+        let err = jar.run_game_hook_in(
+            &registrations,
+            &mut state,
+            &mut ctx2,
+            "java_base_player_tick_head",
+            Some(p2),
+            &[],
+            &mut host,
+            &ExecutionBudget::within(Duration::from_secs(5)),
+        );
+        assert!(
+            err.is_err()
+                && err
+                    .as_ref()
+                    .unwrap_err()
+                    .to_string()
+                    .contains(expected_iface),
+            "expected gated mixin call mode={mode} to refuse loudly naming {expected_iface}, got: {err:?}"
+        );
+    }
+
+    // Same plugin gate applies on StdHost outside game hooks too.
+    let p = server_player(12, "HookTester", 1, 0, 5);
+    let active = jar
+        .invoke_method_with_args(
+            "demo.HookGateProbe",
+            "readActive",
+            "(Lnet/minecraft/world/entity/player/Player;)I",
+            None,
+            std::slice::from_ref(&p),
+            &mut host,
+        )
+        .unwrap();
+    assert_eq!(active, Value::Int(111));
+
+    let mut strict = StdHost::new()
+        .with_environment_type("SERVER")
+        .with_strict_unknown_host_calls();
+    let declined_err = jar.invoke_method_with_args(
+        "demo.HookGateProbe",
+        "checkPluginDeclined",
+        "(Lnet/minecraft/world/entity/player/Player;)Z",
+        None,
+        std::slice::from_ref(&p),
+        &mut strict,
+    );
+    assert!(
+        declined_err.is_err(),
+        "plugin-declined mixin must not pass instanceof on StdHost either: {declined_err:?}"
+    );
+}
+
+/// Review #4 & #5:
+/// - Non-player entity despawn + respawn with the SAME numeric id resets Mixin fields
+///   (both via explicit `forget_game_object_prefix` and via non-reusable incarnation keys
+///   `game/entity/<id>/<incarnation>`), while `Entity#getId()` still returns the numeric id.
+/// - Client `LocalPlayer` (`client/player`) resets its Mixin fields on world unload / rejoin
+///   and on respawn (`forget_game_object`), so a new `LocalPlayer` never inherits old state.
+#[test]
+fn entity_respawn_same_id_and_client_player_rejoin_reset_mixin_fields() {
+    let mut sources = mixin_stubs();
+    sources.insert(
+        "net/minecraft/client/player/AbstractClientPlayer.java",
+        "package net.minecraft.client.player;\nimport net.minecraft.world.entity.player.Player;\npublic class AbstractClientPlayer extends Player {}\n",
+    );
+    sources.insert(
+        "net/minecraft/client/player/LocalPlayer.java",
+        "package net.minecraft.client.player;\npublic class LocalPlayer extends AbstractClientPlayer {}\n",
+    );
+    sources.insert(
+        "net/minecraft/client/Minecraft.java",
+        "package net.minecraft.client;\nimport net.minecraft.client.player.LocalPlayer;\npublic class Minecraft { public LocalPlayer player; public static Minecraft getInstance() { return null; } }\n",
+    );
+    sources.insert(
+        "demo/EntityTag.java",
+        "package demo;\npublic interface EntityTag { int getCounter(); void setCounter(int v); int readId(); }\n",
+    );
+    sources.insert(
+        "demo/PlayerTag.java",
+        "package demo;\npublic interface PlayerTag { int getTag(); void setTag(int v); }\n",
+    );
+    sources.insert(
+        "demo/EntityTagMixin.java",
+        r#"package demo;
+import net.minecraft.world.entity.Entity;
+import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.Shadow;
+import org.spongepowered.asm.mixin.Unique;
+
+@Mixin(Entity.class)
+public abstract class EntityTagMixin implements EntityTag {
+    @Unique private int counter = 10;
+    @Shadow public abstract int getId();
+
+    @Override public int getCounter() { return this.counter; }
+    @Override public void setCounter(int v) { this.counter = v; }
+    @Override public int readId() { return this.getId(); }
+}
+"#,
+    );
+    sources.insert(
+        "demo/ClientPlayerTagMixin.java",
+        r#"package demo;
+import net.minecraft.world.entity.player.Player;
+import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.Unique;
+
+@Mixin(Player.class)
+public class ClientPlayerTagMixin implements PlayerTag {
+    @Unique private int tag = 7;
+    @Override public int getTag() { return this.tag; }
+    @Override public void setTag(int v) { this.tag = v; }
+}
+"#,
+    );
+    sources.insert(
+        "demo/LifetimeProbe.java",
+        r#"package demo;
+import net.minecraft.client.Minecraft;
+import net.minecraft.world.entity.Entity;
+
+public final class LifetimeProbe {
+    public static int readEntity(Entity e) { return ((EntityTag) e).getCounter(); }
+    public static void writeEntity(Entity e, int v) { ((EntityTag) e).setCounter(v); }
+    public static int readEntityId(Entity e) { return ((EntityTag) e).readId(); }
+    public static int readLocalPlayer() { return ((PlayerTag) (Object) Minecraft.getInstance().player).getTag(); }
+    public static void writeLocalPlayer(int v) { ((PlayerTag) (Object) Minecraft.getInstance().player).setTag(v); }
+}
+"#,
+    );
+    let mut excluded = COMPILE_ONLY_STUBS.to_vec();
+    excluded.extend([
+        "net/minecraft/client/player/AbstractClientPlayer.class",
+        "net/minecraft/client/player/LocalPlayer.class",
+        "net/minecraft/client/Minecraft.class",
+    ]);
+    let jar_path = build_jar(
+        "entity-and-client-lifetime",
+        sources,
+        &[
+            (
+                "fabric.mod.json",
+                r#"{"id":"lifetime","version":"1.0","mixins":["demo.mixins.json"]}"#,
+            ),
+            (
+                "demo.mixins.json",
+                r#"{"required":true,"package":"demo","mixins":["EntityTagMixin","ClientPlayerTagMixin"]}"#,
+            ),
+        ],
+        &excluded,
+    );
+    let jar = NativeJar::from_path(&jar_path).unwrap();
+
+    // 1. Server entity id=42 (incarnation 1) -> write 99 -> despawn + same id=42 (incarnation 2) -> resets to 10.
+    let mut host = StdHost::new().with_environment_type("SERVER");
+    let mut facade1 = EventFacade::default();
+    facade1.entity_incarnations.insert(42, 1);
+    host.set_game_event_firing(Some(EventFiring::new(
+        GameEvent::EntityLoad,
+        Arc::new(facade1),
+        EventContext {
+            entity: Some(FacadeEntity {
+                id: 42,
+                kind: "minecraft:zombie".into(),
+                level: Some("minecraft:overworld".into()),
+            }),
+            ..EventContext::default()
+        },
+    )));
+    let zombie1 = GameObject::entity(42, "minecraft:zombie", true)
+        .with_entity_incarnation(1)
+        .value();
+    assert_eq!(
+        jar.invoke_method_with_args(
+            "demo.LifetimeProbe",
+            "readEntity",
+            "(Lnet/minecraft/world/entity/Entity;)I",
+            None,
+            std::slice::from_ref(&zombie1),
+            &mut host,
+        )
+        .unwrap(),
+        Value::Int(10)
+    );
+    assert_eq!(
+        jar.invoke_method_with_args(
+            "demo.LifetimeProbe",
+            "readEntityId",
+            "(Lnet/minecraft/world/entity/Entity;)I",
+            None,
+            std::slice::from_ref(&zombie1),
+            &mut host,
+        )
+        .unwrap(),
+        Value::Int(42)
+    );
+    jar.invoke_method_with_args(
+        "demo.LifetimeProbe",
+        "writeEntity",
+        "(Lnet/minecraft/world/entity/Entity;I)V",
+        None,
+        &[zombie1.clone(), Value::Int(99)],
+        &mut host,
+    )
+    .unwrap();
+    assert_eq!(
+        jar.invoke_method_with_args(
+            "demo.LifetimeProbe",
+            "readEntity",
+            "(Lnet/minecraft/world/entity/Entity;)I",
+            None,
+            std::slice::from_ref(&zombie1),
+            &mut host,
+        )
+        .unwrap(),
+        Value::Int(99)
+    );
+
+    // Despawn entity 42 (forget prefix) and spawn a fresh entity reusing id=42 (incarnation 2).
+    host.forget_game_object_prefix("game/entity/42");
+    let mut facade2 = EventFacade::default();
+    facade2.entity_incarnations.insert(42, 2);
+    host.set_game_event_firing(Some(EventFiring::new(
+        GameEvent::EntityLoad,
+        Arc::new(facade2),
+        EventContext {
+            entity: Some(FacadeEntity {
+                id: 42,
+                kind: "minecraft:zombie".into(),
+                level: Some("minecraft:overworld".into()),
+            }),
+            ..EventContext::default()
+        },
+    )));
+    let zombie2 = GameObject::entity(42, "minecraft:zombie", true)
+        .with_entity_incarnation(2)
+        .value();
+    assert_eq!(
+        jar.invoke_method_with_args(
+            "demo.LifetimeProbe",
+            "readEntity",
+            "(Lnet/minecraft/world/entity/Entity;)I",
+            None,
+            std::slice::from_ref(&zombie2),
+            &mut host,
+        )
+        .unwrap(),
+        Value::Int(10),
+        "respawned entity with reused id=42 must start with fresh default fields"
+    );
+    assert_eq!(
+        jar.invoke_method_with_args(
+            "demo.LifetimeProbe",
+            "readEntityId",
+            "(Lnet/minecraft/world/entity/Entity;)I",
+            None,
+            std::slice::from_ref(&zombie2),
+            &mut host,
+        )
+        .unwrap(),
+        Value::Int(42),
+        "incarnated entity marker must still parse numeric Entity#getId()"
+    );
+    // Even without calling forget, a fresh incarnation 3 on id=42 cannot alias incarnation 2.
+    jar.invoke_method_with_args(
+        "demo.LifetimeProbe",
+        "writeEntity",
+        "(Lnet/minecraft/world/entity/Entity;I)V",
+        None,
+        &[zombie2, Value::Int(123)],
+        &mut host,
+    )
+    .unwrap();
+    let zombie3 = GameObject::entity(42, "minecraft:zombie", true)
+        .with_entity_incarnation(3)
+        .value();
+    assert_eq!(
+        jar.invoke_method_with_args(
+            "demo.LifetimeProbe",
+            "readEntity",
+            "(Lnet/minecraft/world/entity/Entity;)I",
+            None,
+            std::slice::from_ref(&zombie3),
+            &mut host,
+        )
+        .unwrap(),
+        Value::Int(10)
+    );
+    assert_eq!(host.unknown_host_call_count(), 0);
+
+    // 2. Client LocalPlayer (`client/player`) resets across level unload / rejoin and respawn.
+    let mut client = StdHost::new().with_environment_type("CLIENT");
+    let frame_with = |uuid: u128, entity_id: i32| {
+        Arc::new(ClientSnapshot {
+            level: Some(ClientLevel {
+                dimension: "minecraft:overworld".into(),
+                ..ClientLevel::default()
+            }),
+            player: Some(ClientPlayer {
+                uuid,
+                name: "ClientHero".into(),
+                entity_id,
+                ..ClientPlayer::default()
+            }),
+            ..ClientSnapshot::default()
+        })
+    };
+    let empty_frame = Arc::new(ClientSnapshot::default());
+
+    client.begin_client_frame(frame_with(7, 100), &[]);
+    assert_eq!(
+        jar.invoke_method(
+            "demo.LifetimeProbe",
+            "readLocalPlayer",
+            "()I",
+            None,
+            &mut client
+        )
+        .unwrap(),
+        Value::Int(7)
+    );
+    jar.invoke_method_with_args(
+        "demo.LifetimeProbe",
+        "writeLocalPlayer",
+        "(I)V",
+        None,
+        &[Value::Int(555)],
+        &mut client,
+    )
+    .unwrap();
+    client.end_client_frame();
+
+    // Same player in next frame keeps 555.
+    client.begin_client_frame(frame_with(7, 100), &[]);
+    assert_eq!(
+        jar.invoke_method(
+            "demo.LifetimeProbe",
+            "readLocalPlayer",
+            "()I",
+            None,
+            &mut client
+        )
+        .unwrap(),
+        Value::Int(555)
+    );
+    client.end_client_frame();
+
+    // Unload level (title screen / disconnect) then rejoin with same uuid & entity_id -> resets to 7!
+    client.begin_client_frame(empty_frame, &[]);
+    client.end_client_frame();
+    client.begin_client_frame(frame_with(7, 100), &[]);
+    assert_eq!(
+        jar.invoke_method(
+            "demo.LifetimeProbe",
+            "readLocalPlayer",
+            "()I",
+            None,
+            &mut client
+        )
+        .unwrap(),
+        Value::Int(7),
+        "rejoined LocalPlayer must start with default Mixin fields"
+    );
+    jar.invoke_method_with_args(
+        "demo.LifetimeProbe",
+        "writeLocalPlayer",
+        "(I)V",
+        None,
+        &[Value::Int(666)],
+        &mut client,
+    )
+    .unwrap();
+    client.end_client_frame();
+
+    // New entity_id on rejoin also resets to 7.
+    client.begin_client_frame(frame_with(7, 101), &[]);
+    assert_eq!(
+        jar.invoke_method(
+            "demo.LifetimeProbe",
+            "readLocalPlayer",
+            "()I",
+            None,
+            &mut client
+        )
+        .unwrap(),
+        Value::Int(7),
+        "LocalPlayer with new entity_id must start with default Mixin fields"
+    );
+    jar.invoke_method_with_args(
+        "demo.LifetimeProbe",
+        "writeLocalPlayer",
+        "(I)V",
+        None,
+        &[Value::Int(777)],
+        &mut client,
+    )
+    .unwrap();
+    client.end_client_frame();
+
+    // Explicit forget (e.g. client_player_clone respawn keeping same entity_id) resets to 7.
+    client.forget_game_object("client/player");
+    client.begin_client_frame(frame_with(7, 101), &[]);
+    assert_eq!(
+        jar.invoke_method(
+            "demo.LifetimeProbe",
+            "readLocalPlayer",
+            "()I",
+            None,
+            &mut client
+        )
+        .unwrap(),
+        Value::Int(7),
+        "respawned LocalPlayer after forget_game_object must start with default Mixin fields"
+    );
+    client.end_client_frame();
+    assert_eq!(client.unknown_host_call_count(), 0);
+}
+
+/// Review #6: multi-target `@Shadow` resolves against the actual receiver's target class
+/// (not `targets.first()`) and counts/refuses when multiple targets match `this`.
+#[test]
+fn multi_target_shadow_resolves_per_receiver_and_refuses_ambiguous() {
+    let mut sources = mixin_stubs();
+    sources.insert(
+        "demo/MultiDuck.java",
+        "package demo;\npublic interface MultiDuck { boolean checkClient(); int checkId(); }\n",
+    );
+    sources.insert(
+        "demo/AmbiguousDuck.java",
+        "package demo;\npublic interface AmbiguousDuck { int ambiguousId(); }\n",
+    );
+    sources.insert(
+        "demo/MultiShadowMixin.java",
+        r#"package demo;
+import net.minecraft.world.entity.player.Player;
+import net.minecraft.world.level.Level;
+import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.Shadow;
+
+@Mixin({Player.class, Level.class})
+public abstract class MultiShadowMixin implements MultiDuck {
+    @Shadow public abstract boolean isClientSide();
+    @Shadow public abstract int getId();
+
+    @Override public boolean checkClient() { return this.isClientSide(); }
+    @Override public int checkId() { return this.getId(); }
+}
+"#,
+    );
+    sources.insert(
+        "demo/AmbiguousShadowMixin.java",
+        r#"package demo;
+import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.world.entity.player.Player;
+import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.Shadow;
+
+@Mixin({ServerPlayer.class, Player.class})
+public abstract class AmbiguousShadowMixin implements AmbiguousDuck {
+    @Shadow public abstract int getId();
+    @Override public int ambiguousId() { return this.getId(); }
+}
+"#,
+    );
+    sources.insert(
+        "demo/ShadowProbe.java",
+        r#"package demo;
+import net.minecraft.world.entity.player.Player;
+import net.minecraft.world.level.Level;
+
+public final class ShadowProbe {
+    public static String checkBoth(Player p, Level l) {
+        return ((MultiDuck) p).checkId() + "," + ((MultiDuck) l).checkClient();
+    }
+    public static int checkAmbiguous(Player p) {
+        return ((AmbiguousDuck) p).ambiguousId();
+    }
+}
+"#,
+    );
+
+    let jar_path = build_jar(
+        "multi-target-shadow",
+        sources,
+        &[
+            (
+                "fabric.mod.json",
+                r#"{"id":"multishadow","version":"1.0","mixins":["demo.mixins.json"]}"#,
+            ),
+            (
+                "demo.mixins.json",
+                r#"{"required":true,"package":"demo","mixins":["MultiShadowMixin","AmbiguousShadowMixin"]}"#,
+            ),
+        ],
+        COMPILE_ONLY_STUBS,
+    );
+    let jar = NativeJar::from_path(&jar_path).unwrap();
+
+    let mut facade = EventFacade::default();
+    facade.players.push(FacadePlayer {
+        uuid: 1,
+        name: "Multi".into(),
+        level: Some("minecraft:overworld".into()),
+        entity_id: Some(42),
+        session: 1,
+        life: 0,
+    });
+    let player = server_player(1, "Multi", 1, 0, 42);
+    let level = GameObject::level("minecraft:overworld").value();
+
+    let mut host = StdHost::new().with_environment_type("SERVER");
+    host.set_game_event_firing(Some(EventFiring::new(
+        GameEvent::ServerTickEnd,
+        Arc::new(facade.clone()),
+        EventContext::default(),
+    )));
+    let both = jar
+        .invoke_method_with_args(
+            "demo.ShadowProbe",
+            "checkBoth",
+            "(Lnet/minecraft/world/entity/player/Player;Lnet/minecraft/world/level/Level;)Ljava/lang/String;",
+            None,
+            &[player.clone(), level],
+            &mut host,
+        )
+        .unwrap();
+    assert_eq!(both, Value::Ref(Some("42,false".into())));
+    assert_eq!(
+        host.unknown_host_call_count(),
+        0,
+        "multi-target @Shadow must resolve per receiver (Player -> Player#getId, Level -> Level#isClientSide): {:?}",
+        host.unknown_host_calls()
+    );
+
+    // Ambiguous multi-target `@Mixin({ServerPlayer.class, Player.class})` on a ServerPlayer
+    // must count on lenient host and refuse loudly on strict host instead of guessing targets.first().
+    let ambig = jar
+        .invoke_method_with_args(
+            "demo.ShadowProbe",
+            "checkAmbiguous",
+            "(Lnet/minecraft/world/entity/player/Player;)I",
+            None,
+            std::slice::from_ref(&player),
+            &mut host,
+        )
+        .unwrap();
+    assert_eq!(ambig, Value::Int(0));
+    assert_eq!(
+        host.unknown_host_call_count(),
+        1,
+        "ambiguous multi-target @Shadow must be counted: {:?}",
+        host.unknown_host_calls()
+    );
+
+    let mut strict = StdHost::new()
+        .with_environment_type("SERVER")
+        .with_strict_unknown_host_calls();
+    strict.set_game_event_firing(Some(EventFiring::new(
+        GameEvent::ServerTickEnd,
+        Arc::new(facade),
+        EventContext::default(),
+    )));
+    let err = jar.invoke_method_with_args(
+        "demo.ShadowProbe",
+        "checkAmbiguous",
+        "(Lnet/minecraft/world/entity/player/Player;)I",
+        None,
+        std::slice::from_ref(&player),
+        &mut strict,
+    );
+    assert!(
+        err.is_err(),
+        "ambiguous multi-target @Shadow must refuse loudly on strict host: {err:?}"
     );
 }
