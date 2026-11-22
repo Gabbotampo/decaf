@@ -169,6 +169,32 @@ fn fastutil_sorted_entry_set_leaves_the_rest_counted() {
             "LINKED.kept-put-existing",
             vec![iterator.clone()],
         ),
+        // A second iterator over one entry set: the host's copy hands out the same entry objects.
+        (
+            "keptTwoIterators",
+            "LINKED.kept-two-iterators",
+            vec![iterator.clone()],
+        ),
+        (
+            "entryIdentityTwoIterators",
+            "LINKED.entry-identity-two-iterators",
+            vec![iterator.clone()],
+        ),
+        (
+            "entryIdentityLoopTwice",
+            "LINKED.entry-identity-loop-twice",
+            vec![iterator.clone()],
+        ),
+        (
+            "entryIdentityGenericThenFast",
+            "LINKED.entry-identity-generic-then-fast",
+            vec![iterator.clone()],
+        ),
+        (
+            "entryIdentityFastThenGeneric",
+            "LINKED.entry-identity-fast-then-generic",
+            vec!["java/util/Set#iterator()Ljava/util/Iterator;".into()],
+        ),
         (
             "surrogateKeys",
             "KEYS.surrogate-pair-merged",

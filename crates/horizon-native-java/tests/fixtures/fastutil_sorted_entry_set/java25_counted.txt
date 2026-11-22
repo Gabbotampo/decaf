@@ -18,6 +18,11 @@ LINKED.kept-two-iterations	3|4
 LINKED.kept-after-iterator-remove	22
 LINKED.kept-put-remove	3
 LINKED.kept-put-existing	bananafalse;applefalse;cherrytrue;
+LINKED.kept-two-iterators	banana,apple,cherry|banana,apple,cherry
+LINKED.entry-identity-two-iterators	false
+LINKED.entry-identity-loop-twice	6
+LINKED.entry-identity-generic-then-fast	false
+LINKED.entry-identity-fast-then-generic	false
 KEYS.surrogate-pair-merged	2|1:55296=true;1:56320=false;
 KEYS.fffd-and-surrogate	2|1:65533=true;1:55296=false;
 KEYS.surrogate-removed	2|1:120=true;1:56320=true;

@@ -26,13 +26,21 @@ conditions, each of which the runtime checks and otherwise counts:
   entry in it must still read (an entry reads only while the map is unchanged since it was
   made). A set kept across a put, a remove, a clear, an iterator's `remove()`, a put and remove
   that restore the keys, or a put of a present key is counted;
+- no iterator was made from that entry set since its entries were last made: the host's copy of
+  the set holds one entry object per key, which every iterator over the copy returns, where each
+  `next()` of fastutil's makes a new one (`==`, an identity map tell them apart). A second
+  `iterator()` on the same set is counted, through the fastutil type or through a `Set`
+  reference, unless `object2BooleanEntrySet()` was called in between (it makes the copy's entries
+  anew). The map's own `object2BooleanEntrySet()` returns the same set object every time, as
+  Java's does;
 - the iterator's `hasNext`/`next`/`remove`, typed as `Iterator` or as
   `ObjectBidirectionalIterator`, are called while the map's key sequence is the one the iterator
   last saw (its own `remove` moves that sequence on).
 
 Rows: `iterator()` order (including the empty-string key, a re-put of a present key and keys of
 any length and code point that are no lone surrogate), an entry set kept while the map does not
-change and a fresh entry set per use after a put, typed
+change (one iterator, with `containsKey`/`size`/`getBoolean` in between) and a fresh entry set per
+use after a put, typed
 use through `getKey()` and `getBooleanValue()`, independent iterators, entries kept after the
 iteration, the bare `NoSuchElementException` past the end and on an empty map, the bare
 `IllegalStateException` for a `remove` with nothing to remove, and `remove` in the middle, at the
@@ -53,6 +61,10 @@ on a host of its own and checks it counts a call:
 - an entry set kept across a change of the map (a live view in Java): a put, a remove, a clear,
   an iterator's `remove()`, a put and remove that restore the keys, a put of a present key, a set
   made on an empty map;
+- a second iterator over one entry set (`LINKED.kept-two-iterators`), and the entries two
+  iterators over it would share (`LINKED.entry-identity-*`: `==` of the first entries of two
+  iterators, an `IdentityHashMap` filled by two loops, one iterator through the fastutil type and
+  one through a `Set` reference, in either order);
 - keys the host cannot tell apart (two lone surrogates, a lone surrogate and U+FFFD, a lone
   surrogate removed again, a genuine U+FFFD), a null value put through `Map.put`, and writes the
   runtime does not follow (`putAll`, `computeIfAbsent`, a `Collections.synchronizedMap` wrapper, a
@@ -67,7 +79,16 @@ Known and not fixed here (the same at the base commit, outside this change): the
 as `Set`/`Collection`/`Iterable`/`ObjectSortedSet` goes through the host's generic path (its
 iteration, `size`, `isEmpty`, `stream`, `contains` read the host's copy, not the live view); the
 host's put through `Map.put(k, null)` stores `false` and `put`/`size`/`containsKey` merge lone
-surrogate keys; a fastutil `BasicEntry` is not `equals` to a host entry.
+surrogate keys.
+
+Known and not fixed, and reachable from this change: a fastutil `BasicEntry` is not `equals` to a
+host entry in either direction, and their `hashCode`s differ. The runtime answers `false` (or
+`-1`, `null`) where Java answers `true` (or the index, the value) for
+`new BasicEntry<>("banana", true)` against an entry an answered `iterator()` returned, through
+`equals` both ways, `List.contains`/`indexOf`, `HashSet.contains` and `HashMap.get`. The same wrong answers exist at the base commit (two
+`BasicEntry` objects are not `equals` there either), but a program that got its entries from this
+iterator was counted at the base and is answered now. No cheap fix: it needs the entry
+equality and hash of fastutil's entry classes modelled.
 
 Not run, not claimed: `fastIterator(entry)`, `forEachRemaining` on the iterator, the entry set's
 `size`/`contains`/`remove`, `iterator()` of any other fastutil class.

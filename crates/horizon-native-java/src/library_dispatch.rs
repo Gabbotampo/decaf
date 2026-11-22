@@ -1150,6 +1150,15 @@ impl<H: Host> Runtime<'_, H> {
             if !self.is_linked_fastutil_entry_set(receiver) {
                 return Ok(None);
             }
+            // fastutil makes a new entry object for every `next()`; the host's copy of the
+            // entry set holds one per key, which every iterator over the copy returns. A
+            // second iterator over one entry set, with no `object2BooleanEntrySet()` call
+            // between (which makes the copy's entries anew), would hand out the entries of the
+            // first (`==`, an identity map and a set of entries tell them apart in Java):
+            // counted.
+            if self.host.note_fastutil_entry_set_iterated(receiver, true) {
+                return Ok(None);
+            }
             let iterator = self.host.invoke_instance(
                 &MethodRef {
                     owner: "java/util/Set".into(),
@@ -1238,10 +1247,12 @@ impl<H: Host> Runtime<'_, H> {
                 == "()Lit/unimi/dsi/fastutil/objects/Object2BooleanSortedMap$FastSortedEntrySet;"
                 || r.descriptor == "()Ljava/lang/Iterable;")
         {
-            return self
+            let set = self
                 .host
-                .invoke_instance(&java_map_entry_set(), &receiver, &[])
-                .map(Some);
+                .invoke_instance(&java_map_entry_set(), &receiver, &[])?;
+            // The host's copy of the set is made again, with new entry objects.
+            self.host.note_fastutil_entry_set_iterated(&set, false);
+            return Ok(Some(set));
         }
         let primitive = |descriptor: &str| descriptor.len() == 1 && descriptor != "V";
         if !parameters.iter().any(|parameter| primitive(parameter)) && !primitive(&result) {

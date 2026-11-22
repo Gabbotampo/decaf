@@ -276,7 +276,10 @@ public class Probe {
         line("LINKED.entry-set-kept-unchanged", of(() -> {
             Object2BooleanLinkedOpenHashMap<String> m = linked();
             Object2BooleanSortedMap.FastSortedEntrySet<String> es = m.object2BooleanEntrySet();
-            return keys(es.iterator()) + "|" + keys(es.iterator());
+            boolean has = m.containsKey("apple");
+            int size = m.size();
+            boolean value = m.getBoolean("banana");
+            return keys(es.iterator()) + "|" + size + "|" + has + "|" + value;
         }));
         line("LINKED.entry-set-fresh-per-use", of(() -> {
             Object2BooleanLinkedOpenHashMap<String> m = linked();
@@ -509,6 +512,59 @@ public class Probe {
             sb.append(e.getKey()).append(e.getBooleanValue()).append(';');
         }
         return sb.toString();
+    }
+
+    /**
+     * Two iterators over one entry set: the host's copy of the set holds one entry object per key
+     * and every iterator over it returns those, where each next() of fastutil's makes a new one.
+     */
+    static String keptTwoIteratorsBody() {
+        Object2BooleanSortedMap.FastSortedEntrySet<String> es = linked().object2BooleanEntrySet();
+        return keys(es.iterator()) + "|" + keys(es.iterator());
+    }
+
+    static String entryIdentityTwoIteratorsBody() {
+        Object2BooleanSortedMap.FastSortedEntrySet<String> es = linked().object2BooleanEntrySet();
+        Object a = es.iterator().next();
+        Object b = es.iterator().next();
+        return "" + (a == b);
+    }
+
+    static String entryIdentityLoopTwiceBody() {
+        Object2BooleanSortedMap.FastSortedEntrySet<String> es = linked().object2BooleanEntrySet();
+        Map<Object, Integer> identity = new java.util.IdentityHashMap<>();
+        for (Object2BooleanMap.Entry<String> e : es) {
+            identity.put(e, 1);
+        }
+        for (Object2BooleanMap.Entry<String> e : es) {
+            identity.put(e, 2);
+        }
+        return "" + identity.size();
+    }
+
+    /** The same entry set iterated through a `Set` reference and through its own type. */
+    static String entryIdentityGenericThenFastBody() {
+        Object2BooleanSortedMap.FastSortedEntrySet<String> es = linked().object2BooleanEntrySet();
+        java.util.Set<Object2BooleanMap.Entry<String>> generic = es;
+        Object first = null;
+        for (Object e : generic) {
+            first = e;
+            break;
+        }
+        Object second = es.iterator().next();
+        return "" + (first == second);
+    }
+
+    static String entryIdentityFastThenGenericBody() {
+        Object2BooleanSortedMap.FastSortedEntrySet<String> es = linked().object2BooleanEntrySet();
+        Object first = es.iterator().next();
+        java.util.Set<Object2BooleanMap.Entry<String>> generic = es;
+        Object second = null;
+        for (Object e : generic) {
+            second = e;
+            break;
+        }
+        return "" + (first == second);
     }
 
     /** Two keys that are lone surrogates: the host stores each as U+FFFD, so as one key. */
@@ -845,6 +901,31 @@ public class Probe {
     }
 
     /** Run on its own: the exception a counted call's neutral answer causes is caught as a row's is. */
+    public static String keptTwoIterators() {
+        return of(Probe::keptTwoIteratorsBody);
+    }
+
+    /** Run on its own: the exception a counted call's neutral answer causes is caught as a row's is. */
+    public static String entryIdentityTwoIterators() {
+        return of(Probe::entryIdentityTwoIteratorsBody);
+    }
+
+    /** Run on its own: the exception a counted call's neutral answer causes is caught as a row's is. */
+    public static String entryIdentityLoopTwice() {
+        return of(Probe::entryIdentityLoopTwiceBody);
+    }
+
+    /** Run on its own: the exception a counted call's neutral answer causes is caught as a row's is. */
+    public static String entryIdentityGenericThenFast() {
+        return of(Probe::entryIdentityGenericThenFastBody);
+    }
+
+    /** Run on its own: the exception a counted call's neutral answer causes is caught as a row's is. */
+    public static String entryIdentityFastThenGeneric() {
+        return of(Probe::entryIdentityFastThenGenericBody);
+    }
+
+    /** Run on its own: the exception a counted call's neutral answer causes is caught as a row's is. */
     public static String surrogateKeys() {
         return of(Probe::surrogateKeysBody);
     }
@@ -911,6 +992,11 @@ public class Probe {
         line("LINKED.kept-after-iterator-remove", keptAfterIteratorRemove());
         line("LINKED.kept-put-remove", keptPutRemove());
         line("LINKED.kept-put-existing", keptPutExisting());
+        line("LINKED.kept-two-iterators", keptTwoIterators());
+        line("LINKED.entry-identity-two-iterators", entryIdentityTwoIterators());
+        line("LINKED.entry-identity-loop-twice", entryIdentityLoopTwice());
+        line("LINKED.entry-identity-generic-then-fast", entryIdentityGenericThenFast());
+        line("LINKED.entry-identity-fast-then-generic", entryIdentityFastThenGeneric());
         line("KEYS.surrogate-pair-merged", surrogateKeys());
         line("KEYS.fffd-and-surrogate", fffdAndSurrogateKeys());
         line("KEYS.surrogate-removed", surrogateRemove());

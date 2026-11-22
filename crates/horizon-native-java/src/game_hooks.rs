@@ -1283,6 +1283,10 @@ impl<H: Host> Host for GameHookHost<'_, H> {
         self.inner.is_exact_fastutil_map(map)
     }
 
+    fn note_fastutil_entry_set_iterated(&mut self, set: &Value, iterated: bool) -> bool {
+        self.inner.note_fastutil_entry_set_iterated(set, iterated)
+    }
+
     fn synchronized_wrapped(&self, value: &Value) -> Option<Value> {
         self.inner.synchronized_wrapped(value)
     }

@@ -215,6 +215,15 @@ impl<H: Host> Runtime<'_, H> {
         }
         match (r.name.as_str(), r.descriptor.as_str()) {
             ("iterator", "()Ljava/util/Iterator;") => {
+                // The entry set of the linked fastutil map the model answers, typed as a
+                // `Set`: the entries of every iterator over one host copy are the same objects
+                // (`invoke_fastutil_entry_iterator`), so a second iterator counts, whichever
+                // type either was made through.
+                if self.is_linked_object2boolean_entry_view(receiver)
+                    && self.host.note_fastutil_entry_set_iterated(receiver, true)
+                {
+                    return self.host.unknown_operand_call(r).map(|_| None);
+                }
                 let Some((source, how)) = self.fail_fast_source(receiver) else {
                     return Ok(None);
                 };
@@ -365,6 +374,19 @@ impl<H: Host> Runtime<'_, H> {
             }
             _ => Ok(None),
         }
+    }
+
+    /// Whether `entry_set` is the host's entry-set view of an
+    /// `Object2BooleanLinkedOpenHashMap` (the class `is_linked_fastutil_entry_set` answers).
+    fn is_linked_object2boolean_entry_view(&self, entry_set: &Value) -> bool {
+        let Some(marker) = expect_ref(entry_set) else {
+            return false;
+        };
+        self.host.view_copy_kind(marker).as_deref() == Some("entrySet")
+            && self.host.view_copy_source(marker).is_some_and(|map| {
+                crate::jar_object::marker_class(&map)
+                    == Some(crate::library_dispatch::LINKED_OBJECT2BOOLEAN_MAP)
+            })
     }
 
     /// Whether `entry_set` is the entry set of a linked fastutil hash map

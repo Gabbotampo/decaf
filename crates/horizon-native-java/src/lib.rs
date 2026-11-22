@@ -3129,6 +3129,15 @@ pub trait Host {
         false
     }
 
+    /// Whether an iterator was already made from the fastutil entry set `set` since its entries
+    /// were last made, and record that one is now (`iterated`) or that its entries are new
+    /// (`!iterated`, which answers `false`). Every iterator over one host copy of the set hands
+    /// out the same entry objects, where each `next()` of fastutil's makes a new one
+    /// (`library_dispatch.rs`).
+    fn note_fastutil_entry_set_iterated(&mut self, _set: &Value, _iterated: bool) -> bool {
+        false
+    }
+
     /// The collection a `Collections.synchronized*` view wraps, when
     /// `value` is one (`synchronized_views.rs`).
     fn synchronized_wrapped(&self, _value: &Value) -> Option<Value> {
@@ -3911,6 +3920,8 @@ pub struct StdHost {
     /// The fastutil maps whose host table mirrors the Java map exactly: made by a no-arg
     /// constructor of a class whose key equality the table shares (`library_dispatch.rs`).
     exact_fastutil_maps: BTreeSet<String>,
+    /// The fastutil entry sets an iterator was already made from.
+    iterated_fastutil_entry_sets: BTreeSet<String>,
     /// Properties captured from each mod block's virtual state-definition hook.
     block_state_properties: BTreeMap<String, BTreeMap<String, StatePropertyInfo>>,
     state_definition_builders: BTreeMap<String, String>,
@@ -4313,6 +4324,7 @@ impl StdHost {
             block_property_builders: BTreeMap::new(),
             block_copied_properties: BTreeSet::new(),
             exact_fastutil_maps: BTreeSet::new(),
+            iterated_fastutil_entry_sets: BTreeSet::new(),
             block_state_properties: BTreeMap::new(),
             state_definition_builders: BTreeMap::new(),
             block_states: BTreeMap::new(),
@@ -8893,6 +8905,18 @@ impl Host for StdHost {
 
     fn is_exact_fastutil_map(&self, map: &Value) -> bool {
         expect_ref(map).is_some_and(|marker| self.exact_fastutil_maps.contains(marker))
+    }
+
+    fn note_fastutil_entry_set_iterated(&mut self, set: &Value, iterated: bool) -> bool {
+        let Some(marker) = expect_ref(set) else {
+            return false;
+        };
+        if iterated {
+            !self.iterated_fastutil_entry_sets.insert(marker.clone())
+        } else {
+            self.iterated_fastutil_entry_sets.remove(marker);
+            false
+        }
     }
 
     fn view_copies_of(&self, source: &str) -> Vec<String> {
