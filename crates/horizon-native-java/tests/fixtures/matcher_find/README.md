@@ -9,7 +9,7 @@ starts (empty matches, a miss that follows one, a lookahead that moves
 `Matcher.last`), and call sequences (`seq[pattern|input|ops]` rows) that run
 after an attempt that failed over a quantified pattern. `java25.txt` is the probe's raw output on the real JDK 25; the
 rows are one `name<TAB>result` line each, an exception printed as its class and
-message. The `rows()` part (320 lines) is what the runtime answers; the
+message. The `rows()` part is what the runtime answers; the
 `counted()` part after the `--counted--` line (37 lines) holds Java's answer to
 calls the runtime must not answer, and the test only checks they are counted.
 A `seq[...]` row runs its `ops` on a fresh matcher: `f` find(), `m` matches(),
@@ -86,8 +86,20 @@ rest:
   not promise, a pattern or input outside the engine's subset, and every other
   `Matcher` method (`lookingAt`, `region`, `usePattern`, `reset(CharSequence)`,
   `replaceAll`, `appendReplacement`, `results`, `group(String)`...). Calling a
-  state-changing one counts every later call on that matcher too.
+  state-changing one counts every later call on that matcher too, `matches()`
+  included: Java answers it over the region, pattern or input the call left,
+  not over the ones the handle holds (the `changed()` rows: `region(0,1)` then
+  `matches()` is `true` for `a` over `ab`, `usePattern(b)` then `matches()` is
+  `false` for `a` over `a`). A matcher whose `find()` was counted, or that
+  lost its position (the `false` past an empty match at the end of the input),
+  has kept its pattern, input and region, so `matches()` there is answered
+  (the `lost()` rows and the `x*`/`a*` rows at the end of `rows()`). A matcher
+  the table of followed matchers forgot (past 16,384 matchers) counts
+  everything, `matches()` included, since a changing call may have come before.
   `regex_matcher.rs` has unit tests for these.
+- `matches()` over a matcher on a `StringBuilder`'s text is answered from the
+  text copied when the matcher was made (existing behaviour, not changed
+  here): a later append shows in Java's matcher and not here.
 
 **Not claimed:** the oracle has no row with a lone surrogate. A `String`
 holding one (`"\ud800"`) is already U+FFFD inside the runtime, before any

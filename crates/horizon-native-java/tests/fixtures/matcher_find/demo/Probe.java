@@ -77,7 +77,8 @@ public final class Probe {
     /**
      * One call of a call sequence: `f` find(), `m` matches(), `g` group(), `h`
      * group(1), `s` start(), `e` end(), `r` reset(), `c` groupCount(), a digit
-     * `d` find(d).
+     * `d` find(d); `F` find(), `D` region(0, 1), `R` region(1, 2), `u`
+     * usePattern(b) and `z` reset("ab") print only their letter.
      */
     static String step(Matcher m, char op) {
         try {
@@ -90,6 +91,14 @@ public final class Probe {
                 case 'e': return "e=" + m.end();
                 case 'r': m.reset(); return "r";
                 case 'c': return "c=" + m.groupCount();
+                // Calls whose result is not printed: the runtime counts them
+                // (`F` is a find() it cannot answer there), and what follows
+                // them is what a row shows.
+                case 'F': m.find(); return "F";
+                case 'D': m.region(0, 1); return "D";
+                case 'R': m.region(1, 2); return "R";
+                case 'u': m.usePattern(Pattern.compile("b")); return "u";
+                case 'z': m.reset("ab"); return "z";
                 default: return op + "=" + m.find(op - '0');
             }
         } catch (Throwable e) {
@@ -526,6 +535,14 @@ public final class Probe {
             }
             sequence(c[0], c[1], "ffg");
         }
+        // After the `false` past an empty match at the end of the input the
+        // runtime no longer follows the matcher, but `matches()` reads nothing
+        // it lost.
+        sequence("x*", "", "ffm");
+        sequence("x*", "", "ffmm");
+        sequence("a*", "aa", "fffm");
+        sequence("a*", "ab", "ffffm");
+        sequence("a*", "b", "fffm");
         return out.toString();
     }
 
@@ -558,11 +575,64 @@ public final class Probe {
         return out.toString();
     }
 
+    /**
+     * Counted: `matches()` on a matcher a call changed (its region, its pattern
+     * or its input). Java answers over what the call left, so the answer is
+     * not the one over the matcher's first pattern and input; the rows hold
+     * Java's answer and the runtime must not give it. Each row ends in one
+     * counted `matches()` after one counted state-changing call.
+     */
+    static String changed() {
+        out = new StringBuilder();
+        sequence("a", "ab", "Dm");
+        sequence("a", "a", "um");
+        sequence("b", "ab", "Rm");
+        sequence("\\w{2}", "aab", "zm");
+        // Over a StringBuilder's text, whose `matches()` alone is answered.
+        out.append("builder[a|ab|Dm]\t");
+        try {
+            Matcher m = Pattern.compile("a").matcher(new StringBuilder("ab"));
+            out.append(step(m, 'D')).append(' ').append(step(m, 'm'));
+        } catch (Throwable e) {
+            out.append(e.getClass().getName()).append(": ").append(e.getMessage());
+        }
+        out.append('\n');
+        // The same call through a method reference.
+        out.append("mref[a|ab|Dm]\t");
+        try {
+            Matcher m = Pattern.compile("a").matcher("ab");
+            m.region(0, 1);
+            BooleanSupplier b = m::matches;
+            out.append("D m=").append(b.getAsBoolean());
+        } catch (Throwable e) {
+            out.append(e.getClass().getName()).append(": ").append(e.getMessage());
+        }
+        out.append('\n');
+        return out.toString();
+    }
+
+    /**
+     * Answered: `matches()` after a `find()` the runtime counted. The counted
+     * `find()` (`F`) prints nothing, so a row is Java's line whole; only the
+     * `matches()` after it is the runtime's answer, over the matcher's text.
+     */
+    static String lost() {
+        out = new StringBuilder();
+        for (String[] c : FAILED_MATCHES) {
+            sequence(c[0], c[1], "mFmm");
+        }
+        return out.toString();
+    }
+
     static Matcher keep;
 
     public static void main(String[] args) {
         System.out.print(rows());
         System.out.print("--counted--\n");
         System.out.print(counted());
+        System.out.print("--changed--\n");
+        System.out.print(changed());
+        System.out.print("--lost--\n");
+        System.out.print(lost());
     }
 }

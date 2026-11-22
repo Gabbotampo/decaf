@@ -8,17 +8,23 @@
 //! matcher has no entry. The table is process-wide because a handle outlives
 //! one invocation (a jar keeps a `Matcher` in a field) and a serial is unique
 //! for the process. It holds at most [`MAX_TRACKED`] matchers: past that it is
-//! emptied, and every matcher made before then is [`Tracked::Unknown`], like
-//! one this module cannot follow.
+//! emptied, and every matcher made before then is [`Tracked::Changed`]: it may
+//! have been changed before the table forgot it.
 //!
-//! A matcher this module cannot follow answers nothing more: its next calls
-//! are counted, never guessed. That is a matcher after a `find()` the engine
-//! refuses (an unsupported pattern or input, a budget), after the `find()`
-//! past an empty match at the end of the input
-//! (`java_regex::Found::NoThenUnmodelled`), one over a `StringBuilder`'s text
-//! (Java's would see later appends), and one a call changed in a way not
-//! modelled: `lookingAt`, `region`, `usePattern`, `reset(CharSequence)`,
-//! `replaceAll`, `appendReplacement`, `results` and the rest.
+//! A matcher this module cannot follow answers nothing more but `matches()`:
+//! its next calls are counted, never guessed. That is a matcher after a
+//! `find()` the engine refuses (an unsupported pattern or input, a budget),
+//! after the `find()` past an empty match at the end of the input
+//! (`java_regex::Found::NoThenUnmodelled`), and one over a `StringBuilder`'s
+//! text (Java's would see later appends). `matches()` reads neither the
+//! position nor anything a lost position stands for, so it is still answered
+//! from the pattern and input the handle holds.
+//!
+//! A matcher a call changed in a way not modelled (`lookingAt`, `region`,
+//! `usePattern`, `reset(CharSequence)`, `replaceAll`, `appendReplacement`,
+//! `results` and the rest; [`Tracked::Changed`]) answers nothing at all, not
+//! even `matches()`: the handle's pattern, input and region are no longer the
+//! matcher's. The mark is never taken back.
 //!
 //! A matcher whose last attempt failed over a pattern with a quantifier (or
 //! after a lookaround moved `last`) is followed less far: its `find()` is
@@ -49,8 +55,14 @@ const MAX_SUBJECT_CHARS: usize = 4 << 20;
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Tracked {
     Cursor(Cursor),
-    /// Not followed: a call that needs its position is counted.
+    /// Not followed: a call that needs its position is counted. The matcher
+    /// still searches the handle's pattern and input over the whole input, so
+    /// `matches()` is answered.
     Unknown,
+    /// A call changed the matcher (its region, pattern or input, or something
+    /// not modelled), or it may have: every call on it is counted, `matches()`
+    /// too. Never replaced by another state.
+    Changed,
 }
 
 #[derive(Debug)]
@@ -77,7 +89,8 @@ impl Table {
     fn load(&self, serial: u64) -> Tracked {
         match self.tracked.get(&serial) {
             Some(state) => state.clone(),
-            None if serial < self.forgotten_below => Tracked::Unknown,
+            // It may have been changed before the table forgot it.
+            None if serial < self.forgotten_below => Tracked::Changed,
             None => Tracked::Cursor(Cursor::default()),
         }
     }
@@ -203,16 +216,42 @@ pub(crate) fn invoke(
 }
 
 /// A call on a matcher that no model here answered and that reaches the host
-/// (which counts it): unless it only reads the matcher (`toString`,
-/// `group(String)`, `regionEnd`...), the matcher may have changed, so its
-/// position is no longer known and its later calls are counted too.
+/// (which counts it). Unless it only reads the matcher (`toString`,
+/// `group(String)`, `regionEnd`...) the matcher may have changed:
+/// - `find`, `find(int)`, `matches` and `reset()` are this module's own calls,
+///   which change the position and nothing else: a followed matcher is no
+///   longer followed (an unfollowed one already is, and a changed one stays
+///   changed);
+/// - any other call (`region`, `usePattern`, `reset(CharSequence)`,
+///   `lookingAt`, `replaceAll`...) may have changed what the matcher searches:
+///   it is [`Tracked::Changed`], and `matches()` is counted too.
 pub(crate) fn note_host_call(r: &MethodRef, receiver: &Value) {
     if r.owner != "java/util/regex/Matcher" || reads_only(r.name.as_str()) {
         return;
     }
-    if let Some((serial, true)) = matcher_identity(receiver) {
-        store(serial, Tracked::Unknown);
+    // Over a builder's text too: `matches()` is answered there from the
+    // handle's pattern and input, which `region` or `usePattern` made wrong.
+    let Some((serial, fixed)) = matcher_identity(receiver) else {
+        return;
+    };
+    if moves_position_only(r) {
+        if fixed && matches!(load(serial), Tracked::Cursor(_)) {
+            store(serial, Tracked::Unknown);
+        }
+        return;
     }
+    store(serial, Tracked::Changed);
+}
+
+/// The calls of this module that move a matcher's position and nothing else.
+fn moves_position_only(r: &MethodRef) -> bool {
+    matches!(
+        (r.name.as_str(), r.descriptor.as_str()),
+        ("find", "()Z")
+            | ("find", "(I)Z")
+            | ("matches", "()Z")
+            | ("reset", "()Ljava/util/regex/Matcher;")
+    )
 }
 
 /// `Matcher` methods that read the matcher and change nothing.
@@ -247,7 +286,7 @@ fn followed(id: Id) -> Option<Cursor> {
     }
     match load(id.serial) {
         Tracked::Cursor(cursor) => Some(cursor),
-        Tracked::Unknown => None,
+        Tracked::Unknown | Tracked::Changed => None,
     }
 }
 
@@ -292,8 +331,12 @@ fn find(id: Id, receiver: &Value, from: Option<i32>) -> Result<Option<Value>, Na
 }
 
 /// `matches()`: its answer needs no position, but it leaves one. A matcher
-/// that is not followed is answered from its text alone, as before.
+/// that lost its position, or whose input is a builder's, is answered from the
+/// handle's pattern and input; one a call changed is not answered at all.
 fn matches(id: Id, receiver: &Value) -> Result<Option<Value>, NativeError> {
+    if load(id.serial) == Tracked::Changed {
+        return Ok(None);
+    }
     let Some(mut cursor) = followed(id) else {
         return Ok(matcher_parts(receiver).and_then(|parts| {
             java_regex::matches(&parts.pattern, &parts.input)
@@ -395,6 +438,7 @@ mod tests {
         assert_eq!(find(&m), Some(Value::Int(1)));
         assert_eq!(call(&m, "lookingAt", "()Z", &[]), None);
         assert_eq!(find(&m), None);
+        assert_eq!(call(&m, "matches", "()Z", &[]), None);
         assert_eq!(group(&m), None);
         assert_eq!(call(&m, "groupCount", "()I", &[]), None);
         assert_eq!(call(&m, "reset", "()Ljava/util/regex/Matcher;", &[]), None);
@@ -481,6 +525,84 @@ mod tests {
         assert_eq!(find(&n), Some(Value::Int(1)));
         note_host_call(&reading, &n);
         assert_eq!(group(&n), Some(Value::Ref(Some("#111111".into()))));
+    }
+
+    #[test]
+    fn matches_is_counted_after_a_call_that_changed_the_matcher() {
+        // Java answers `matches()` over the region or pattern the call left,
+        // not over the handle's: region(0,1) on "ab" makes `a` match, and
+        // usePattern(b) makes `a` over "a" not.
+        let region = MethodRef {
+            owner: "java/util/regex/Matcher".into(),
+            name: "region".into(),
+            descriptor: "(II)Ljava/util/regex/Matcher;".into(),
+        };
+        let use_pattern = MethodRef {
+            owner: "java/util/regex/Matcher".into(),
+            name: "usePattern".into(),
+            descriptor: "(Ljava/util/regex/Pattern;)Ljava/util/regex/Matcher;".into(),
+        };
+        let reset_input = MethodRef {
+            owner: "java/util/regex/Matcher".into(),
+            name: "reset".into(),
+            descriptor: "(Ljava/lang/CharSequence;)Ljava/util/regex/Matcher;".into(),
+        };
+        for (changing, fixed) in [
+            (&region, true),
+            (&use_pattern, true),
+            (&reset_input, true),
+            (&region, false),
+        ] {
+            let m = matcher("a", "ab", fixed);
+            // What the host's counting does, as `invoke` does it.
+            assert_eq!(invoke(changing, Some(&m), &[]).ok(), Some(None));
+            assert_eq!(matches(&m), None, "{} {fixed}", changing.name);
+            assert_eq!(find(&m), None);
+            assert_eq!(group(&m), None);
+            assert_eq!(matches(&m), None, "never taken back");
+        }
+        // Nothing changed it: the builder's matcher still answers `matches()`.
+        let builder = matcher("a", "a", false);
+        assert_eq!(matches(&builder), Some(Value::Int(1)));
+    }
+
+    #[test]
+    fn a_changed_matcher_is_never_followed_again_by_a_position_loss() {
+        let m = matcher("a", "ab", true);
+        store(matcher_identity(&m).unwrap().0, Tracked::Changed);
+        assert_eq!(matches(&m), None);
+        assert_eq!(call(&m, "reset", "()Ljava/util/regex/Matcher;", &[]), None);
+        assert_eq!(find_from(&m, 0), None);
+    }
+
+    #[test]
+    fn a_find_the_host_counts_loses_the_position_not_the_text() {
+        // Java's `find()` here resumes from a `last` the engine does not know:
+        // it is counted, the host is told, and `matches()` is still answered
+        // from the handle's text (Java: false, the whole input is not `a?b`).
+        let m = matcher("a?b", "abab", true);
+        assert_eq!(matches(&m), Some(Value::Int(0)));
+        assert_eq!(find(&m), None);
+        let r = MethodRef {
+            owner: "java/util/regex/Matcher".into(),
+            name: "find".into(),
+            descriptor: "()Z".into(),
+        };
+        note_host_call(&r, &m);
+        assert_eq!(matches(&m), Some(Value::Int(0)));
+        assert_eq!(find(&m), None);
+        assert_eq!(group(&m), None);
+    }
+
+    #[test]
+    fn matches_is_still_answered_after_the_position_is_lost() {
+        // The `false` past an empty match at the end loses the position; the
+        // matcher still searches the handle's text, so `matches()` is Java's.
+        let m = matcher("x*", "", true);
+        assert_eq!(find(&m), Some(Value::Int(1)));
+        assert_eq!(find(&m), Some(Value::Int(0)));
+        assert_eq!(find(&m), None);
+        assert_eq!(matches(&m), Some(Value::Int(1)));
     }
 
     fn matches(receiver: &Value) -> Option<Value> {
@@ -610,8 +732,8 @@ mod tests {
         // A third matcher empties the table: 1 and 2 are forgotten, 3 stands,
         // and a matcher made since is fresh.
         table.store(3, moved.clone(), 2, 10);
-        assert_eq!(table.load(1), Tracked::Unknown);
-        assert_eq!(table.load(2), Tracked::Unknown);
+        assert_eq!(table.load(1), Tracked::Changed);
+        assert_eq!(table.load(2), Tracked::Changed);
         assert_eq!(table.load(3), moved);
         assert_eq!(table.load(10), followed);
         // A matcher back at its start needs no entry.

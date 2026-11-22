@@ -318,6 +318,11 @@ seq[(?<!a)b|aab|fs]	f=false s!java.lang.IllegalStateException:No match found
 seq[(?<!a)b|aab|f9]	f=false 9!java.lang.IndexOutOfBoundsException:Illegal start index
 seq[(?<!a)b|aab|fr]	f=false r
 seq[(?<!a)b|aab|ffg]	f=false f=false g!java.lang.IllegalStateException:No match found
+seq[x*||ffm]	f=true f=false m=true
+seq[x*||ffmm]	f=true f=false m=true m=true
+seq[a*|aa|fffm]	f=true f=true f=false m=true
+seq[a*|ab|ffffm]	f=true f=true f=true f=false m=false
+seq[a*|b|fffm]	f=true f=true f=false m=false
 --counted--
 seq[a?b|abab|mfg]	m=false f=true g=b
 seq[a{2}|aab|mfg]	m=false f=false g!java.lang.IllegalStateException:No match found
@@ -356,3 +361,30 @@ seq[x*|ab|fmfg]	f=true m=false f=true g=
 seq[#([0-9a-fA-F]{6})|#ff0000|fffg]	f=true f=false f=false g!java.lang.IllegalStateException:No match found
 seq[a.*?b|axbxab|ffffg]	f=true f=true f=false f=false g!java.lang.IllegalStateException:No match found
 seq[\[[^\[]*]$|foo[bar]|fffg]	f=true f=false f=false g!java.lang.IllegalStateException:No match found
+--changed--
+seq[a|ab|Dm]	D m=true
+seq[a|a|um]	u m=false
+seq[b|ab|Rm]	R m=true
+seq[\w{2}|aab|zm]	z m=true
+builder[a|ab|Dm]	D m=true
+mref[a|ab|Dm]	D m=true
+--lost--
+seq[a?b|abab|mFmm]	m=false F m=false m=false
+seq[a{2}|aab|mFmm]	m=false F m=false m=false
+seq[.?|aa|mFmm]	m=false F m=false m=false
+seq[b?(?=a)|ab|mFmm]	m=false F m=false m=false
+seq[a?$|aaa|mFmm]	m=false F m=false m=false
+seq[#([0-9a-fA-F]{6})|#ff0000 #00ff00|mFmm]	m=false F m=false m=false
+seq[a.*?b|aba\u0085|mFmm]	m=false F m=false m=false
+seq[a*+b|aabx|mFmm]	m=false F m=false m=false
+seq[(?:ab)*c|abab|mFmm]	m=false F m=false m=false
+seq[(a)*|aab|mFmm]	m=false F m=false m=false
+seq[[a-c]{2,3}|abcd|mFmm]	m=false F m=false m=false
+seq[\d{3}|12 345|mFmm]	m=false F m=false m=false
+seq[(a{2})+b|aaab|mFmm]	m=false F m=false m=false
+seq[a?b?c?|xyz|mFmm]	m=false F m=false m=false
+seq[(?i)a?B|aab|mFmm]	m=false F m=false m=false
+seq[a??b|abab|mFmm]	m=false F m=false m=false
+seq[a{2,}+|aaab|mFmm]	m=false F m=false m=false
+seq[(ab)?c|abab|mFmm]	m=false F m=false m=false
+seq[x*|ab|mFmm]	m=false F m=false m=false
