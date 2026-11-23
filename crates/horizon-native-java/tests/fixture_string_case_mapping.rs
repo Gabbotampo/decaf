@@ -14,6 +14,9 @@ mod javac_fixture;
 use horizon_native_java::{NativeError, StdHost, Value};
 
 const ORACLE: &str = include_str!("fixtures/string_case_mapping/java25.txt");
+/// The same probe with `-Duser.language=tr -Duser.country=TR`: the default
+/// locale the no-argument forms use.
+const ORACLE_TR: &str = include_str!("fixtures/string_case_mapping/java25_tr.txt");
 
 const SOURCES: &[(&str, &str)] = &[(
     "demo/Probe.java",
@@ -30,9 +33,17 @@ const ANSWERED: &[&str] = &[
     "asciiLowerLower",
     "asciiUpperUpper",
     "asciiUpperLower",
+    // No `Locale`, ASCII without the letter a tailored default locale maps
+    // differently (`I` lowercase, `i` uppercase).
+    "asciiCapIUpper",
+    "asciiSmallILower",
+    "asciiNoIUpper",
+    "asciiNoIILower",
     // The `Locale` overloads: ASCII with a non-tailored locale.
     "asciiRootLower",
     "asciiRootUpper",
+    "asciiCapIRootLower",
+    "asciiSmallIRootUpper",
     // `Character`: single code points, simple mapping.
     "charUpperSharp",
     "charLowerSharp",
@@ -60,6 +71,12 @@ const ANSWERED: &[&str] = &[
 /// Rows the runtime must not answer: each is recorded as an unknown host call
 /// and never compared against the oracle.
 const COUNTED: &[&str] = &[
+    // No `Locale`: ASCII with the letter a tailored default locale maps
+    // differently, which the runtime cannot know.
+    "asciiCapILower",
+    "asciiSmallIUpper",
+    "asciiTitleLower",
+    "asciiMiniUpper",
     // No `Locale`: anything outside ASCII.
     "l1EUpper",
     "l1ELower",
@@ -91,6 +108,8 @@ const COUNTED: &[&str] = &[
     // locale, and every non-ASCII receiver.
     "asciiTrLower",
     "asciiTrUpper",
+    "asciiCapITrLower",
+    "asciiSmallITrUpper",
     "idotRootLower",
     "idotTrLower",
     "idotlessRootUpper",
@@ -105,6 +124,8 @@ const COUNTED: &[&str] = &[
 const COUNTED_LOCALE: &[&str] = &[
     "asciiTrLower",
     "asciiTrUpper",
+    "asciiCapITrLower",
+    "asciiSmallITrUpper",
     "idotRootLower",
     "idotTrLower",
     "idotlessRootUpper",
@@ -229,4 +250,92 @@ fn every_oracle_row_is_accounted_for() {
         ORACLE.lines().filter(|line| !line.is_empty()).count(),
         "fixture rows and oracle rows differ in number"
     );
+}
+
+/// The no-argument forms use the process default locale, which the runtime
+/// does not know. Every row it answers has the same oracle line under the
+/// `it_IT` default and under a Turkish default; the ASCII rows it counts for
+/// that reason are exactly the ones whose oracle line differs.
+#[test]
+fn default_locale_rows_are_answered_only_where_the_default_cannot_matter() {
+    let line = |oracle: &'static str, method: &str| -> &'static str {
+        oracle
+            .lines()
+            .find_map(|line| line.strip_prefix(method)?.strip_prefix('='))
+            .unwrap_or_else(|| panic!("no oracle line for {method}"))
+    };
+    for method in ANSWERED {
+        assert_eq!(
+            line(ORACLE, method),
+            line(ORACLE_TR, method),
+            "{method} is answered but the default locale changes it"
+        );
+    }
+    let default_locale_ascii = [
+        "asciiCapILower",
+        "asciiSmallIUpper",
+        "asciiTitleLower",
+        "asciiMiniUpper",
+    ];
+    for method in default_locale_ascii {
+        assert_ne!(
+            line(ORACLE, method),
+            line(ORACLE_TR, method),
+            "{method} is counted but the default locale does not change it"
+        );
+        assert!(COUNTED.contains(&method), "{method} must be counted");
+    }
+}
+
+/// A receiver that is a jar-object marker (`String#n`: an unmodelled
+/// constructor left a reference instead of text) is not text: every case
+/// mapping of it is counted, never folded.
+#[test]
+fn case_mapping_of_a_marker_receiver_stays_counted() {
+    let source = r#"package demo;
+public final class Probe {
+    static String marker() {
+        // `new String(char[])` with a lone surrogate is not modelled: the
+        // constructor stays counted and the receiver is a marker.
+        return new String(new char[] {'A', '\uD83D', 'C'});
+    }
+    public static String lower() { return marker().toLowerCase(); }
+    public static String upper() { return marker().toUpperCase(); }
+    public static String lowerRoot() { return marker().toLowerCase(java.util.Locale.ROOT); }
+    public static String upperRoot() { return marker().toUpperCase(java.util.Locale.ROOT); }
+}"#;
+    let fixture =
+        javac_fixture::Fixture::build("string-case-marker", &[("demo/Probe.java", source)]);
+    for (method, key) in [
+        ("lower", "java/lang/String#toLowerCase()Ljava/lang/String;"),
+        ("upper", "java/lang/String#toUpperCase()Ljava/lang/String;"),
+        (
+            "lowerRoot",
+            "java/lang/String#toLowerCase(Ljava/util/Locale;)Ljava/lang/String;",
+        ),
+        (
+            "upperRoot",
+            "java/lang/String#toUpperCase(Ljava/util/Locale;)Ljava/lang/String;",
+        ),
+    ] {
+        // A counted call leaves a marker (or fails), never text.
+        let mut host = fixture.jar.seed_host(StdHost::new());
+        let result = fixture.jar.invoke_method_with_args(
+            "demo/Probe",
+            method,
+            "()Ljava/lang/String;",
+            None,
+            &[],
+            &mut host,
+        );
+        assert!(
+            !matches!(&result, Ok(Value::Ref(Some(_)))),
+            "{method}: answered {result:?} for a marker receiver"
+        );
+        let unknown = host.unknown_host_calls();
+        assert!(
+            unknown.iter().any(|(call, _)| call == key),
+            "{method}: expected {key} counted, got {unknown:#?}"
+        );
+    }
 }

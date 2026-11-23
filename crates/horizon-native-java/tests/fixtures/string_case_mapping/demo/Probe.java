@@ -80,6 +80,40 @@ public final class Probe {
     return row("ABC".toLowerCase());
   }
 
+  /* The default locale decides `I`/`i`: ASCII with neither letter is answered, any other is counted. */
+
+  public static String asciiCapIUpper() {
+    return row("ID".toUpperCase());
+  }
+
+  public static String asciiSmallILower() {
+    return row("id".toLowerCase());
+  }
+
+  public static String asciiNoIUpper() {
+    return row("Hello, World_42!".toUpperCase());
+  }
+
+  public static String asciiNoIILower() {
+    return row("Hello, World_42!".toLowerCase());
+  }
+
+  public static String asciiCapILower() {
+    return row("I".toLowerCase());
+  }
+
+  public static String asciiSmallIUpper() {
+    return row("i".toUpperCase());
+  }
+
+  public static String asciiTitleLower() {
+    return row("TITLE".toLowerCase());
+  }
+
+  public static String asciiMiniUpper() {
+    return row("Mini".toUpperCase());
+  }
+
   public static String l1EUpper() {
     return row("\u00E9".toUpperCase());
   }
@@ -200,6 +234,22 @@ public final class Probe {
 
   public static String asciiTrUpper() {
     return row("abc".toUpperCase(java.util.Locale.forLanguageTag("tr")));
+  }
+
+  public static String asciiCapIRootLower() {
+    return row("I".toLowerCase(java.util.Locale.ROOT));
+  }
+
+  public static String asciiSmallIRootUpper() {
+    return row("i".toUpperCase(java.util.Locale.ROOT));
+  }
+
+  public static String asciiCapITrLower() {
+    return row("I".toLowerCase(java.util.Locale.forLanguageTag("tr")));
+  }
+
+  public static String asciiSmallITrUpper() {
+    return row("i".toUpperCase(java.util.Locale.forLanguageTag("tr")));
   }
 
   public static String idotRootLower() {
@@ -325,6 +375,14 @@ public final class Probe {
     System.out.println("asciiLowerLower=" + asciiLowerLower());
     System.out.println("asciiUpperUpper=" + asciiUpperUpper());
     System.out.println("asciiUpperLower=" + asciiUpperLower());
+    System.out.println("asciiCapIUpper=" + asciiCapIUpper());
+    System.out.println("asciiSmallILower=" + asciiSmallILower());
+    System.out.println("asciiNoIUpper=" + asciiNoIUpper());
+    System.out.println("asciiNoIILower=" + asciiNoIILower());
+    System.out.println("asciiCapILower=" + asciiCapILower());
+    System.out.println("asciiSmallIUpper=" + asciiSmallIUpper());
+    System.out.println("asciiTitleLower=" + asciiTitleLower());
+    System.out.println("asciiMiniUpper=" + asciiMiniUpper());
     System.out.println("l1EUpper=" + l1EUpper());
     System.out.println("l1ELower=" + l1ELower());
     System.out.println("l1YenUpper=" + l1YenUpper());
@@ -355,6 +413,10 @@ public final class Probe {
     System.out.println("asciiRootUpper=" + asciiRootUpper());
     System.out.println("asciiTrLower=" + asciiTrLower());
     System.out.println("asciiTrUpper=" + asciiTrUpper());
+    System.out.println("asciiCapIRootLower=" + asciiCapIRootLower());
+    System.out.println("asciiSmallIRootUpper=" + asciiSmallIRootUpper());
+    System.out.println("asciiCapITrLower=" + asciiCapITrLower());
+    System.out.println("asciiSmallITrUpper=" + asciiSmallITrUpper());
     System.out.println("idotRootLower=" + idotRootLower());
     System.out.println("idotTrLower=" + idotTrLower());
     System.out.println("idotlessRootUpper=" + idotlessRootUpper());

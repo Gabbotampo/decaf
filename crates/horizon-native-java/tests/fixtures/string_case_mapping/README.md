@@ -8,6 +8,8 @@ Oracle probe: `demo/Probe.java` (package `demo`, class `Probe`), compiled with
 ```
 javac --release 21 -d classes demo/Probe.java
 timeout 120 java -Xmx512m -cp classes demo.Probe | head -c 2000000 > java25.txt
+timeout 120 java -Xmx512m -Duser.language=tr -Duser.country=TR -cp classes demo.Probe \
+  | head -c 2000000 > java25_tr.txt
 ```
 
 `java -version`:
@@ -19,14 +21,23 @@ OpenJDK 64-Bit Server VM (build 25.0.5.1, mixed mode, sharing)
 ```
 
 The first 62 rows were first recorded on Temurin 25.0.4.1 and were
-byte-identical on 25.0.5.1; the two null-`Locale` rows were added on 25.0.5.1.
+byte-identical on 25.0.5.1; the two null-`Locale` rows and the rows added for
+the default locale (`asciiCapI*`, `asciiSmallI*`, `asciiNoI*`, `asciiTitleLower`,
+`asciiMiniUpper`) were recorded on 25.0.5.1.
 
-The no-argument forms use the default locale. The oracle was run with the
-default locale `it_IT`; under a `tr`/`az`/`lt` default, `"I".toLowerCase()` and
-`"i".toUpperCase()` differ (run with `-Duser.language=tr`: `turkishIDotLower`
-changes from `0069 0307` to `0069`). The runtime answers an ASCII receiver on
-the no-argument forms as a non-tailored default locale would, as it did before
-this change; see the PR description.
+The no-argument forms use the process default locale, which the runtime does
+not know. `java25.txt` was run with the default locale `it_IT`; `java25_tr.txt`
+is the same probe under `-Duser.language=tr -Duser.country=TR` (both raw).
+They differ in exactly these rows: `asciiCapILower` (`0069` vs `0131`),
+`asciiSmallIUpper` (`0049` vs `0130`), `asciiTitleLower`, `asciiMiniUpper` and
+`turkishIDotLower` (`0069 0307` vs `0069`). The runtime therefore answers the
+no-argument forms only for an ASCII receiver without `I` (lowercase) or `i`
+(uppercase), the one letter per direction that a tailored default locale maps
+differently, and counts every other receiver. That `I`/`i` are the only ASCII
+letters any locale maps differently was checked on Java 25.0.5.1 over every
+ASCII character and `Locale.getAvailableLocales()` (1158 locales): the only
+differences from `Locale.ROOT` are `I` lowercase and `i` uppercase, in `tr` and
+`az`; `lt` differs only on combining accents, which ASCII lacks.
 
 `java25.txt` is the RAW output of that final probe, one `<row>=<value>` line
 per case. `<value>` is the result's length in UTF-16 units followed by each
@@ -41,7 +52,12 @@ and records no unknown host call):
 - `emptyUpper`, `emptyLower` — the empty string.
 - `asciiLowerUpper`, `asciiLowerLower`, `asciiUpperUpper`, `asciiUpperLower`
   — pure ASCII (`"abc"`, `"ABC"`), both directions.
-- `asciiRootLower`, `asciiRootUpper` — ASCII with `Locale.ROOT`.
+- `asciiCapIUpper`, `asciiSmallILower`, `asciiNoIUpper`, `asciiNoIILower` — ASCII
+  without the letter a tailored default locale maps differently (`"ID"`
+  uppercase, `"id"` lowercase, a text with no `i`/`I`); identical in both oracles.
+- `asciiRootLower`, `asciiRootUpper`, `asciiCapIRootLower`,
+  `asciiSmallIRootUpper` — ASCII with `Locale.ROOT` (the explicit locale
+  decides, so `I` and `i` are exact here).
 - `charUpperSharp`, `charLowerSharp`, `charUpperE`, `charLowerE`,
   `charUpperAMacron`, `charLowerAMacron`, `charLowerSigma`, `charUpperSigma`,
   `charUpperIDotless`, `charLowerIDot`, `charUpperIDot`, `charLowerIDotless`,
@@ -62,6 +78,9 @@ call as an unknown host call and never answers them):
   Extended (`\u0100`).
 - `greekSigmaLower`, `greekSigmaUpper` — context-sensitive final sigma
   (`"A\u03A3".toLowerCase()` == `"a\u03C2`).
+- `asciiCapILower`, `asciiSmallIUpper`, `asciiTitleLower`, `asciiMiniUpper` —
+  ASCII with `I` (lowercase) or `i` (uppercase) and the no-argument method:
+  the answer depends on the default locale (see above).
 - `turkishIDotUpper`, `turkishIDotLower`, `turkishIDotlessUpper`,
   `turkishIDotlessLower` — Turkish dotted/dotless I with the no-arg method
   (default locale).
@@ -70,7 +89,8 @@ call as an unknown host call and never answers them):
 - `deseretUpper`, `deseretLower` — supplementary `\uD800\uDC00` (U+10400).
 - `loneLowSurrogateUpper`, `loneLowSurrogateLower`, `loneHighSurrogateUpper`,
   `loneHighSurrogateLower` — a lone surrogate receiver.
-- `asciiTrLower`, `asciiTrUpper` — ASCII with the tailored `tr` locale
+- `asciiTrLower`, `asciiTrUpper`, `asciiCapITrLower`, `asciiSmallITrUpper` —
+  ASCII with the tailored `tr` locale
   (counted with all tailored locales).
 - `idotRootLower`, `idotTrLower`, `idotlessRootUpper`, `idotlessTrUpper`,
   `sharpRootUpper` — non-ASCII receivers with `Locale.ROOT` or `tr`.
@@ -79,5 +99,9 @@ call as an unknown host call and never answers them):
   catches it so the other rows still print). Only a `Locale` the runtime holds
   is answered; a null or unknown value is counted.
 
-Every oracle line (64 rows) is covered by one of the two groups above; the
+A receiver that is a jar-object marker (`String#n`) or a host handle is not
+text: all four case-mapping overloads count it (a test builds one with an
+unmodelled `new String(char[])`; it has no oracle row).
+
+Every oracle line (76 rows) is covered by one of the two groups above; the
 fixture asserts that.
