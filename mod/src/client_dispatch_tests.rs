@@ -145,6 +145,8 @@ struct CreativeTabEditorState {
 struct TestClientHost {
     fake: mod_api::testing::FakeHost,
     editor: RefCell<CreativeTabEditorState>,
+    /// Every `ClientHost::play_local_sound` the bridge made, with its `after` ticks.
+    local_sounds: RefCell<Vec<(mod_api::SoundPlay, u32)>>,
 }
 
 impl TestClientHost {
@@ -160,6 +162,7 @@ impl TestClientHost {
         Self {
             fake,
             editor: RefCell::new(CreativeTabEditorState::default()),
+            local_sounds: RefCell::default(),
         }
     }
 
@@ -199,7 +202,20 @@ impl Host for TestClientHost {
 mod_api::impl_host_areas!(TestClientHost, except(config, items, text));
 
 impl ClientHost for TestClientHost {}
-mod_api::impl_client_host_areas!(TestClientHost);
+mod_api::impl_client_host_areas!(TestClientHost, except(effects));
+
+impl mod_api::prelude::EffectsClientHost for TestClientHost {
+    fn play_local_sound(
+        &self,
+        sound: &mod_api::SoundPlay,
+        after: u32,
+    ) -> Option<mod_api::SoundRef> {
+        self.local_sounds.borrow_mut().push((sound.clone(), after));
+        Some(mod_api::__private::game::sound_ref(
+            self.local_sounds.borrow().len() as u64,
+        ))
+    }
+}
 
 impl Backend for TestClientHost {}
 mod_api::impl_backend_areas!(TestClientHost, except(items, keys));
@@ -2330,6 +2346,204 @@ fn creative_tab_dedupes_tooltip_display_hidden_components_as_set_matching_jdk25(
             );
             assert_eq!(report_row(&java)["unknown_host_call_count"], 0);
 
+            Ok::<_, ()>(())
+        })
+        .unwrap();
+    });
+}
+
+/// Extra stubs for a client jar that plays level sounds.
+const CLIENT_SOUND_STUBS: &[(&str, &str)] = &[
+    (
+        "net/minecraft/sounds/SoundEvent.java",
+        "package net.minecraft.sounds; import net.minecraft.resources.Identifier; public final class SoundEvent { public static SoundEvent createVariableRangeEvent(Identifier id) { throw new AssertionError(); } }",
+    ),
+    (
+        "net/minecraft/sounds/SoundSource.java",
+        "package net.minecraft.sounds; public enum SoundSource { MASTER, MUSIC, RECORDS, WEATHER, BLOCKS, HOSTILE, NEUTRAL, PLAYERS, AMBIENT, VOICE, UI }",
+    ),
+    (
+        "net/minecraft/world/entity/Entity.java",
+        "package net.minecraft.world.entity; public class Entity {}",
+    ),
+    (
+        "net/minecraft/world/level/Level.java",
+        "package net.minecraft.world.level; import net.minecraft.sounds.SoundEvent; import net.minecraft.sounds.SoundSource; import net.minecraft.world.entity.Entity; public abstract class Level { public void playLocalSound(double x, double y, double z, SoundEvent s, SoundSource src, float v, float p, boolean delay) {} public void playSeededSound(Entity except, double x, double y, double z, SoundEvent s, SoundSource src, float v, float p, long seed) {} }",
+    ),
+    (
+        "net/minecraft/client/multiplayer/ClientLevel.java",
+        "package net.minecraft.client.multiplayer; import net.minecraft.world.level.Level; public class ClientLevel extends Level {}",
+    ),
+];
+
+const SOUND_TOOLTIP_MOD: &str = r#"package demo;
+import java.util.function.Consumer;
+import net.fabricmc.api.ModInitializer;
+import net.minecraft.client.multiplayer.ClientLevel;
+import net.minecraft.core.Registry;
+import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.network.chat.Component;
+import net.minecraft.resources.Identifier;
+import net.minecraft.sounds.SoundEvent;
+import net.minecraft.sounds.SoundSource;
+import net.minecraft.world.item.Item;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.TooltipFlag;
+import net.minecraft.world.item.component.TooltipDisplay;
+
+public final class SoundTooltipMod implements ModInitializer {
+    public static final class ChimeItem extends Item {
+        private ClientLevel level;
+
+        public ChimeItem(Properties props) {
+            super(props);
+        }
+
+        // No client callback hands a jar a `ClientLevel` yet (outside a frame
+        // `Minecraft.level` is null), so the test gives the item one directly.
+        public void hold(ClientLevel level) {
+            this.level = level;
+        }
+
+        @Override
+        public void appendHoverText(
+            ItemStack stack,
+            TooltipContext context,
+            TooltipDisplay display,
+            Consumer<Component> out,
+            TooltipFlag flag
+        ) {
+            SoundEvent chime = SoundEvent.createVariableRangeEvent(
+                Identifier.fromNamespaceAndPath("demo", "chime"));
+            // Draws `Level.random` at the call.
+            level.playLocalSound(1.0, 2.0, 3.0, chime, SoundSource.BLOCKS, 0.5f, 1.5f, false);
+            // `except == minecraft.player` (both null): plays with an explicit seed.
+            level.playSeededSound(null, 4.0, 5.0, 6.0, chime, SoundSource.BLOCKS, 1.0f, 1.0f, 99L);
+            out.accept(Component.literal("chimed"));
+        }
+    }
+
+    @Override
+    public void onInitialize() {
+        Registry.register(
+            BuiltInRegistries.ITEM,
+            Identifier.fromNamespaceAndPath("demo", "chime_item"),
+            new ChimeItem(new Item.Properties())
+        );
+    }
+}
+"#;
+
+/// Client sounds a jar's Java code records during a client callback reach Sunrise's
+/// `ClientHost::play_local_sound` through the real hook dispatch, or are counted on the jar:
+/// never recorded and dropped.
+#[test]
+fn item_tooltip_drains_recorded_client_sounds_into_play_local_sound() {
+    let mut sources = CLIENT_DISPATCH_STUBS.to_vec();
+    sources.extend_from_slice(CLIENT_SOUND_STUBS);
+    sources.push(("demo/SoundTooltipMod.java", SOUND_TOOLTIP_MOD));
+    let jar_bytes = build_javac_jar(
+        "client-tooltip-sounds",
+        r#"{"schemaVersion":1,"id":"demo","version":"1.0","entrypoints":{"main":["demo.SoundTooltipMod"]}}"#,
+        &sources,
+    );
+
+    let java = Arc::new(HorizonJava::default());
+    java.lock_client()
+        .set_fixture_files(vec![("demo-sounds.jar".to_owned(), jar_bytes)]);
+
+    let mods = vec![ModEntry::new(
+        "horizon_java",
+        Box::new(SharedHorizonJava(Arc::clone(&java))),
+    )];
+    mod_api::testing::with_mods(mods.into(), || {
+        mod_api::testing::rebuild_parts(|| {
+            let host = {
+                let mut host = TestClientHost::new(&["demo:chime_item"]);
+                mod_api::dispatch_client_setup(&mut host);
+                host
+            };
+            assert_eq!(report_row(&java)["unknown_host_call_count"], 0);
+            {
+                let mut client = java.lock_client();
+                let (jar, runtime) = client.resident(0);
+                let item = runtime
+                    .observed_registry_entry("minecraft:item", "demo:chime_item")
+                    .expect("chime item registered")
+                    .value
+                    .clone();
+                jar.invoke_virtual_with_args(
+                    "demo/SoundTooltipMod$ChimeItem",
+                    "hold",
+                    "(Lnet/minecraft/client/multiplayer/ClientLevel;)V",
+                    item,
+                    &[crate::runtime::StdHost::client_level_handle()],
+                    runtime,
+                )
+                .expect("hand the item a client level");
+            }
+            let tooltip = |host: &TestClientHost| {
+                let stack = host.stack("demo:chime_item");
+                let display = TooltipDisplay::for_stack(&stack);
+                let mut lines = vec![(Text::literal("Chime"), 0xFFFF_FFFF)];
+                mod_api::dispatch_item_tooltip(
+                    host,
+                    mod_api::__private::ItemTooltipCall {
+                        player: 0,
+                        player_entity_id: 1,
+                        stack: &stack,
+                        display: &display,
+                        advanced: false,
+                        creative: false,
+                        lines: &mut lines,
+                    },
+                );
+                lines
+            };
+
+            // 1. As the client owner runs: no client draw is deferred to Sunrise, whose
+            //    `play_local_sound` draws its seed later and from another stream. The
+            //    `playLocalSound` counts at the call (its `Level.random` draw is one Decaf
+            //    cannot make); the explicit-seed sound is recorded, drained, and counted.
+            let lines = tooltip(&host);
+            assert_eq!(lines[1], (Text::literal("chimed"), u32::MAX));
+            assert!(host.local_sounds.borrow().is_empty());
+            assert_eq!(report_row(&java)["unknown_host_call_count"], 2);
+            {
+                let mut client = java.lock_client();
+                let (_, runtime) = client.resident(0);
+                assert!(
+                    runtime.played_sounds().is_empty(),
+                    "drained, not left behind"
+                );
+                assert!(!runtime.sound_stream_known("client/level#random"));
+            }
+
+            // 2. A new client level starts fresh streams; with the draw deferred to Sunrise
+            //    (as a host that could take it would), the local sound reaches
+            //    `play_local_sound` through the tooltip hook.
+            java.lock_client().level_loaded();
+            java.lock_client()
+                .resident(0)
+                .1
+                .set_host_deferred_client_sound_seeds(true);
+            let lines = tooltip(&host);
+            assert_eq!(lines[1], (Text::literal("chimed"), u32::MAX));
+            assert_eq!(
+                *host.local_sounds.borrow(),
+                vec![(
+                    mod_api::SoundPlay::at(
+                        "demo:chime",
+                        mod_api::SoundSource::Blocks,
+                        [1.0, 2.0, 3.0]
+                    )
+                    .with_volume(0.5)
+                    .with_pitch(1.5),
+                    0,
+                )]
+            );
+            // The explicit seed is counted again.
+            assert_eq!(report_row(&java)["unknown_host_call_count"], 3);
             Ok::<_, ()>(())
         })
         .unwrap();
