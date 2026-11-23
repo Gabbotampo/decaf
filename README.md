@@ -139,7 +139,7 @@ Minecraft/loader install skip when the corresponding files or environment variab
 `mod/` is a Horizon **native mod** (`docs/mod-plan.md`): the first way this runtime runs inside the
 game instead of in the probe. It implements the game's typed `Hooks` from the mod API on
 [sunrise-org/sunrise](https://github.com/sunrise-org/sunrise) (crate `sunrise-mod-api`, library
-`mod_api`), pinned to build `a2dac1ee7526d80cf355722962d0195c16f79bd2` (the newest build with a
+`mod_api`), pinned to build `d404b5f02f69f4684f6b4d4fbb8cea6a98565b91` (the newest build with a
 published SDK) in `mod/sunrise-mod.toml`; `cargo sunrise-mod` fetches that build's signed SDK into `mod/.sunrise/sdk/`.
 
 What it does today:
@@ -161,7 +161,11 @@ What it does today:
   `word`/`text` and `integer` nodes only: anything else is refused by name and logged.
 
 A native mod is one flat crate, so the runtime is copied into `mod/src/runtime/` by
-`tools/vendor.py` (which rewrites `crate::` to `crate::runtime::`). The copy is committed, so a
+`tools/vendor.py` (which rewrites `crate::` to `crate::runtime::`). A Sunrise package carries only
+the `.rs` and `.toml` files under `src/`, and the native build compiles only what it carries, so a
+data file the runtime embeds with `include_str!`/`include_bytes!` (a `.txt` table, a test oracle's
+JSON) is vendored as Rust source holding its exact bytes, and the vendored call becomes `include!`
+(Sunrise's "Embedded data" rule). The copy is committed, so a
 clean clone builds, and every commit that changes the runtime re-vendors it in the same commit.
 `python3 tools/vendor.py --check` regenerates the copy and compares it byte for byte, so it fails on a
 hand edit to `mod/src/runtime/` and on a runtime change that was not re-vendored; CI runs it on every

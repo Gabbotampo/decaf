@@ -199,6 +199,13 @@ impl State {
         self.world_loaded
     }
 
+    /// A resident jar and its host, for tests that set up state a client callback then reads.
+    #[cfg(test)]
+    pub(crate) fn resident(&mut self, index: usize) -> (&NativeJar, &mut StdHost) {
+        let loaded = &mut self.jars[index];
+        (&*loaded.jar, &mut loaded.host)
+    }
+
     pub(crate) fn report_rows(&self) -> impl Iterator<Item = serde_json::Value> + '_ {
         self.retired
             .iter()
@@ -209,10 +216,48 @@ impl State {
 
     pub(crate) fn level_loaded(&mut self) {
         self.world_loaded = true;
+        self.forget_client_sound_streams();
     }
 
     pub(crate) fn level_unloaded(&mut self) {
         self.world_loaded = false;
+        self.forget_client_sound_streams();
+    }
+
+    /// A client level comes with a fresh `random` and `soundSeedGenerator`: no stream position
+    /// the last level left unknown carries over.
+    fn forget_client_sound_streams(&mut self) {
+        for loaded in &mut self.jars {
+            loaded.host.forget_unknown_client_sound_streams();
+        }
+    }
+
+    /// Deliver the client sounds the resident jars' Java code recorded to Sunrise
+    /// (`sound::apply_client_sounds`), so each is played or counted on its jar, never dropped.
+    ///
+    /// Runs after every client path that executes Java code: client setup (entrypoints and
+    /// loading stages), creative-tab builds and item tooltips. The client owner opens no
+    /// `ClientSnapshot` frame, so a jar's client sounds land in its host's standalone record.
+    /// The level sound streams any jar left unknown are shared with every jar afterwards. They
+    /// are gathered after the Java code ran, so a stream one call left unknown also counts that
+    /// callback's earlier deferred sounds: conservative, and moot while the client defers none.
+    pub(crate) fn drain_client_sounds<H: crate::sound::LocalSounds + ?Sized>(&mut self, host: &H) {
+        let mut streams =
+            crate::sound::sync_unknown_sound_streams(&mut self.jars, |jar| &mut jar.host);
+        for loaded in &mut self.jars {
+            let sounds = loaded.host.take_played_sounds();
+            if sounds.is_empty() {
+                continue;
+            }
+            crate::sound::apply_client_sounds(host, &sounds, &mut streams, |reason| {
+                loaded.host.note_unknown_game_hook(reason);
+            });
+            loaded.row.unknown_host_calls = loaded.host.unknown_host_call_count();
+        }
+        crate::sound::share_unknown_sound_streams(
+            self.jars.iter_mut().map(|jar| &mut jar.host),
+            &streams,
+        );
     }
 
     /// Dispatch Java Fabric creative-tab output into the build-scoped Sunrise edit.  Each jar's
@@ -248,8 +293,16 @@ impl State {
                 loaded.row.unknown_host_calls = loaded.host.unknown_host_call_count();
                 continue;
             };
-            let seeded_parent = seed_creative_stacks(host, &mut loaded.host, &parent_entries);
-            let seeded_search = seed_creative_stacks(host, &mut loaded.host, &search_entries);
+            // A stack whose item the host cannot name has no Java form: the tab's contents
+            // would be incomplete, so the jar's build is counted like unreadable entries.
+            let (Some(seeded_parent), Some(seeded_search)) = (
+                seed_creative_stacks(host, &mut loaded.host, &parent_entries),
+                seed_creative_stacks(host, &mut loaded.host, &search_entries),
+            ) else {
+                loaded.host.note_unknown_game_hook("creative tab entries");
+                loaded.row.unknown_host_calls = loaded.host.unknown_host_call_count();
+                continue;
+            };
             let context = runtime::CreativeTabBuildContext {
                 enabled_features,
                 has_permissions: permissions,
@@ -287,6 +340,7 @@ impl State {
             loaded.row.unsupported = registered.unsupported;
             loaded.row.unknown_host_calls = loaded.host.unknown_host_call_count();
         }
+        self.drain_client_sounds(host);
     }
 
     /// Run each resident jar's Item appendHoverText implementation for the item in a Sunrise
@@ -300,16 +354,58 @@ impl State {
         if self.jars.is_empty() || !event.display.name_visible(event.creative) {
             return;
         }
-        let id = event.stack.item().id(host);
-        let mut additions = Vec::new();
-        for loaded in &mut self.jars {
+        // `None` when the host has no name for the item's slot. Then this bridge cannot tell which
+        // jar's item it is, yet any jar that registered an item may own it and would run its
+        // `appendHoverText` in Java: each such jar counts the tooltip it could not run, as a
+        // creative tab counts a stack it cannot name, instead of the tooltip skipping it silently.
+        let Some(id) = event.stack.item().id(host).map(str::to_owned) else {
+            for loaded in &mut self.jars {
+                let registers_items = loaded
+                    .host
+                    .registrations()
+                    .iter()
+                    .any(|entry| entry.registry == "minecraft:item");
+                if registers_items {
+                    loaded
+                        .host
+                        .note_unknown_game_hook("tooltip item has no registry id");
+                    loaded.row.unknown_host_calls = loaded.host.unknown_host_call_count();
+                }
+            }
+            return;
+        };
+        // The hovered stack is lent as a view and copied out once, for the first jar that owns
+        // its item (`ItemStackView::project`); `None` inside means it has no owned form.
+        let mut projected: Option<Option<mod_api::ItemStack>> = None;
+        // Each line with the jar that produced it, so a line Sunrise refuses is counted there.
+        let mut additions: Vec<(usize, mod_api::Text)> = Vec::new();
+        for (index, loaded) in self.jars.iter_mut().enumerate() {
             let Some(entry) = loaded.host.observed_registry_entry("minecraft:item", &id) else {
                 continue;
             };
             let item = entry.value.clone();
-            let stack =
-                runtime_stack_from_api(host, &mut loaded.host, Some(item.clone()), event.stack);
-            let (display, malformed_display) = build_tooltip_display(&mut loaded.host, event);
+            let Some(api_stack) = projected
+                .get_or_insert_with(|| event.stack.project())
+                .as_ref()
+            else {
+                // Java's `appendHoverText` would see this stack; without it the call is counted.
+                loaded
+                    .host
+                    .note_unknown_game_hook("tooltip stack has no owned form");
+                loaded.row.unknown_host_calls = loaded.host.unknown_host_call_count();
+                continue;
+            };
+            let Some(stack) =
+                runtime_stack_from_api(host, &mut loaded.host, Some(item.clone()), api_stack)
+            else {
+                loaded
+                    .host
+                    .note_unknown_game_hook("tooltip stack item has no registry id");
+                loaded.row.unknown_host_calls = loaded.host.unknown_host_call_count();
+                continue;
+            };
+            let (display, malformed_display) =
+                build_tooltip_display(&mut loaded.host, event, api_stack);
             if malformed_display {
                 loaded
                     .host
@@ -342,14 +438,28 @@ impl State {
                         .host
                         .note_unknown_game_hook("tooltip component conversion");
                 } else if let Some(text) = converted {
-                    additions.push((text, u32::MAX));
+                    additions.push((index, text));
                 }
             }
             loaded.row.unknown_host_calls = loaded.host.unknown_host_call_count();
         }
         // The first line is the item's name. Java appendHoverText runs immediately after it.
-        let at = event.lines.len().min(1);
-        event.lines.splice(at..at, additions);
+        // `TooltipLines` validates each line on its own: one Sunrise refuses is left out and
+        // counted on its jar, and the rest still go in, in order.
+        let mut at = event.lines.len().min(1);
+        for (index, text) in additions {
+            match event.lines.insert(at, text, u32::MAX) {
+                Ok(_) => at += 1,
+                Err(_) => {
+                    let loaded = &mut self.jars[index];
+                    loaded
+                        .host
+                        .note_unknown_game_hook("tooltip line refused by Sunrise");
+                    loaded.row.unknown_host_calls = loaded.host.unknown_host_call_count();
+                }
+            }
+        }
+        self.drain_client_sounds(host);
     }
 
     /// Drop resident hosts, listeners, and jar heaps at client shutdown. Rows stay available
@@ -365,16 +475,17 @@ impl State {
     }
 }
 
+/// Every entry as its runtime stack, or `None` if any entry's item has no name on the host.
 pub(crate) fn seed_creative_stacks(
     host: &dyn mod_api::Host,
     runtime_host: &mut StdHost,
     entries: &[mod_api::ItemStack],
-) -> Vec<(Value, mod_api::ItemStack)> {
+) -> Option<Vec<(Value, mod_api::ItemStack)>> {
     entries
         .iter()
         .map(|stack| {
-            let value = runtime_stack_from_api(host, runtime_host, None, stack);
-            (value, stack.clone())
+            let value = runtime_stack_from_api(host, runtime_host, None, stack)?;
+            Some((value, stack.clone()))
         })
         .collect()
 }
@@ -423,13 +534,14 @@ fn parse_tooltip_display_tag(tag: &mod_api::Tag) -> Option<(bool, Vec<String>)> 
 fn build_tooltip_display(
     runtime_host: &mut StdHost,
     event: &mod_api::ItemTooltipEvent<'_>,
+    stack: &mod_api::ItemStack,
 ) -> (Value, bool) {
     let hide_tooltip = !event.display.name_visible(false);
     let mut hidden = Vec::new();
     let mut hidden_known = true;
     let mut malformed = false;
 
-    let stack_td = event.stack.components().and_then(|components| {
+    let stack_td = stack.components().and_then(|components| {
         components
             .as_nbt()
             .iter()
@@ -574,13 +686,15 @@ fn nbt_component_to_json(tag: &mod_api::Tag) -> Option<String> {
     serde_json::to_string(&val).ok()
 }
 
-fn runtime_stack_from_api(
+pub(crate) fn runtime_stack_from_api(
     host: &dyn mod_api::Host,
     runtime_host: &mut StdHost,
     item_override: Option<Value>,
     stack: &mod_api::ItemStack,
-) -> Value {
-    let id = stack.item().id(host);
+) -> Option<Value> {
+    // `None` when the host has no name for the item's slot: no Java stack can stand for it, so
+    // the caller counts the call instead of handing Java a made-up item.
+    let id = stack.item().id(host)?.to_owned();
     let count = stack.count().min(i32::MAX as u32) as i32;
     let mut patch: Vec<(String, Option<runtime::RuntimeComponentValue>)> = Vec::new();
     let mut opaque_keys: Vec<String> = Vec::new();
@@ -673,14 +787,14 @@ fn runtime_stack_from_api(
         }
     }
 
-    runtime_host.make_host_item_stack_with_components(
+    Some(runtime_host.make_host_item_stack_with_components(
         item_override,
         &id,
         count,
         patch,
         opaque_components,
         opaque_keys,
-    )
+    ))
 }
 
 pub(crate) fn api_stack(

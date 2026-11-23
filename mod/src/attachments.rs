@@ -16,12 +16,13 @@
 //! the runtime. Values are stored with `sync: false` (D5) and the per-type compound the codec
 //! wrote as `encoded`, which the game saves under `horizon:attachments.<ns>.<path>.value` (D1).
 
-use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Arc, Mutex};
 
 use mod_api::{
-    AttachmentForm, AttachmentPolicy, AttachmentStore, AttachmentWrite, Compound, Holder,
-    OriginalPlayerRef, ServerHost, Tag,
+    AttachmentCodec, AttachmentError, AttachmentForm, AttachmentPolicy, AttachmentStore,
+    AttachmentType, AttachmentWrite, Compound, Holder, OriginalPlayer, ServerHost, Tag,
 };
 
 use crate::runtime::neoforge_attachments::{StoreEntry, StoreWrite, StoreWriteKind};
@@ -39,14 +40,14 @@ pub(crate) struct JavaAttachment {
 }
 
 /// A lifecycle step the runtime must take inside a batch, before the listeners run.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Lifecycle {
+#[derive(Clone, Copy)]
+pub(crate) enum Lifecycle<'a> {
     None,
     /// A player joined: saved values decode now (D3) and the initial self-sync is counted.
     Joined(u128),
     /// A player's data was copied to their new player; `true` for a death. The old player the
     /// game lends for the hook is read into the batch before the copy step (`getOriginal`).
-    Cloned(u128, bool, OriginalPlayerRef),
+    Cloned(u128, bool, &'a dyn OriginalEntries),
     /// A player respawned or changed dimension: NeoForge re-syncs the player to itself.
     Resynced(u128),
     /// A player left: the runtime's objects for them are dropped after the batch.
@@ -180,12 +181,134 @@ fn holder_entries(
         .collect()
 }
 
-/// The game's store holder of a clone's old player (`Holder::OriginalPlayer`, valid during the
-/// hook). The handle's token has no public accessor, so it is read through the API's own field
-/// view.
-fn original_holder(original: OriginalPlayerRef) -> Holder {
-    use mod_api::__private::game::Fields;
-    Holder::OriginalPlayer(original.fields())
+/// The old player `player_clone` lends (`PlayerEvent.Clone.getOriginal`), read by each jar's batch
+/// as it opens. `Lifecycle` stays `Copy` by holding this as a shared reference; the loan itself is
+/// a `RefCell` because the old player's reads take `&mut`.
+pub(crate) trait OriginalEntries {
+    /// The old player's entries for `ids`, as [`holder_entries`] reads a live player's.
+    fn entries(&self, jar: &str, ids: &[String]) -> Result<BTreeMap<String, StoreEntry>, String>;
+}
+
+impl OriginalEntries for RefCell<&mut OriginalPlayer<'_>> {
+    fn entries(&self, jar: &str, ids: &[String]) -> Result<BTreeMap<String, StoreEntry>, String> {
+        original_entries(&mut self.borrow_mut(), jar, ids)
+    }
+}
+
+/// The old player's entries for `ids`: the same `Ours`/`Foreign`/`Raw`/`Absent` answers
+/// [`holder_entries`] gives for a live player, from the old player's own store.
+///
+/// Since d404b5f02f the game lends that store only through [`OriginalPlayer`]'s typed
+/// `AttachmentType<T>` reads (`Holder::OriginalPlayer` on the server's store is gone), so each id
+/// is read with two keys of this bridge's value type, neither of which writes anything:
+///
+/// 1. `with_decoded_attachment` borrows a decoded value. A [`JavaAttachment`] is ours or another
+///    jar's, as before. An error is the store's answer for the whole holder, as before.
+/// 2. Otherwise `existing_attachment` with a probe codec: a value decoded as another Rust type
+///    answers `TypeMismatch` (another mod's value: `Foreign`); a saved compound reaches the
+///    probe's `decode`, which copies it out and fails, so nothing is decoded or cached (`Raw`);
+///    nothing at all is `Ok(None)` (`Absent`). Any other error is the saved read's
+///    (`Unreadable`), as `store.saved` failing was before.
+fn original_entries(
+    original: &mut OriginalPlayer<'_>,
+    jar: &str,
+    ids: &[String],
+) -> Result<BTreeMap<String, StoreEntry>, String> {
+    ids.iter()
+        .map(|id| {
+            let (namespace, name) = split_id(id);
+            let (namespace, name) = (interned(namespace), interned(name));
+            let decoded = AttachmentType::<JavaAttachment> {
+                namespace,
+                name,
+                default: unread_default,
+                codec: None,
+                copy_on_death: false,
+                sync: false,
+            };
+            let ours = |value: &JavaAttachment| {
+                if value.jar == jar {
+                    StoreEntry::Ours(value.token)
+                } else {
+                    StoreEntry::Foreign
+                }
+            };
+            match original.with_decoded_attachment(&decoded, |value| value.map(ours)) {
+                Err(error) => return Err(format!("the game's store answered {error:?}")),
+                Ok(Some(entry)) => return Ok((id.clone(), entry)),
+                Ok(None) => {}
+            }
+            let probe = AttachmentType::<JavaAttachment> {
+                namespace,
+                name,
+                default: unread_default,
+                codec: Some(AttachmentCodec {
+                    encode: probe_encode,
+                    decode: probe_decode,
+                }),
+                copy_on_death: false,
+                sync: false,
+            };
+            SAVED_PROBE.with(|slot| slot.borrow_mut().take());
+            let answer = original.existing_attachment(&probe);
+            let saved = SAVED_PROBE.with(|slot| slot.borrow_mut().take());
+            let entry = match (saved, answer) {
+                (Some(saved), _) => match to_runtime(&saved) {
+                    Ok(saved) => StoreEntry::Raw(saved),
+                    Err(why) => StoreEntry::Unreadable(why),
+                },
+                (None, Ok(None)) => StoreEntry::Absent,
+                // A decoded `JavaAttachment` step 1 already answered; kept for completeness.
+                (None, Ok(Some(value))) => ours(&value),
+                (None, Err(AttachmentError::TypeMismatch)) => StoreEntry::Foreign,
+                (None, Err(error)) => {
+                    StoreEntry::Unreadable(format!("the saved entry could not be read: {error:?}"))
+                }
+            };
+            Ok((id.clone(), entry))
+        })
+        .collect()
+}
+
+thread_local! {
+    /// The saved compound [`probe_decode`] was handed, for [`original_entries`] on this thread.
+    static SAVED_PROBE: RefCell<Option<Compound>> = const { RefCell::new(None) };
+}
+
+/// The probe key's decoder: copies the saved compound out and refuses, so the store keeps the
+/// entry saved (`AttachmentType::get_existing` stores only a value that decoded).
+fn probe_decode(saved: &Compound) -> Result<JavaAttachment, AttachmentError> {
+    SAVED_PROBE.with(|slot| *slot.borrow_mut() = Some(saved.clone()));
+    Err(AttachmentError::Decode)
+}
+
+/// The probe key's encoder. Only a store calls it, and the probe never stores.
+fn probe_encode(_: &JavaAttachment) -> Result<Compound, AttachmentError> {
+    Err(AttachmentError::Encode)
+}
+
+/// The reading keys' default. Neither read inserts a default, so nothing ever sees it.
+fn unread_default() -> JavaAttachment {
+    JavaAttachment {
+        jar: String::new(),
+        token: 0,
+    }
+}
+
+/// `AttachmentType` names a key with `&'static str`; a jar's attachment ids are known only at
+/// run time. Each distinct namespace and path is leaked once and reused, so the leak is bounded
+/// by the attachment types the loaded jars registered.
+fn interned(text: &str) -> &'static str {
+    static NAMES: Mutex<BTreeSet<&'static str>> = Mutex::new(BTreeSet::new());
+    let mut names = NAMES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(name) = names.get(text) {
+        return name;
+    }
+    let name: &'static str = Box::leak(text.to_owned().into_boxed_str());
+    names.insert(name);
+    name
 }
 
 /// Applies the runtime's journal to the game's store, in order, and answers a line for each
@@ -248,7 +371,7 @@ pub(crate) fn open(
     id: &str,
     jar: &NativeJar,
     host: &mut StdHost,
-    lifecycle: Lifecycle,
+    lifecycle: Lifecycle<'_>,
 ) -> Option<usize> {
     let ids = host.attachment_store_ids();
     if ids.is_empty() {
@@ -272,8 +395,7 @@ pub(crate) fn open(
     match lifecycle {
         Lifecycle::Joined(player) => jar.attachment_player_joined(host, &budget, player),
         Lifecycle::Cloned(player, was_death, original) => {
-            let entries = holder_entries(server.attachments(), id, &ids, original_holder(original));
-            host.open_original_attachments(player, entries);
+            host.open_original_attachments(player, original.entries(id, &ids));
             jar.attachment_player_cloned(host, &budget, player, was_death)
         }
         Lifecycle::Resynced(player) => host.count_attachment_initial_sync(player),
@@ -290,7 +412,7 @@ pub(crate) fn close(
     jar: &NativeJar,
     host: &mut StdHost,
     before: Option<usize>,
-    lifecycle: Lifecycle,
+    lifecycle: Lifecycle<'_>,
 ) {
     if let Some(before) = before {
         let batch_unknown = host.unknown_host_call_count().saturating_sub(before);
@@ -530,7 +652,8 @@ mod tests {
         let copy = run.store.copy_on_death().unwrap();
         run.store.replace_contents(copy);
         let (kept, has_data) = run.batch(
-            Lifecycle::Cloned(P, true, mod_api::__private::game::original_player_ref(1)),
+            // The harness takes the copy step only; the old player's own reads have their tests.
+            Lifecycle::Cloned(P, true, &NoOriginal),
             |run| {
                 (
                     run.call("get", KEPT).unwrap(),
@@ -579,38 +702,141 @@ mod tests {
         );
     }
 
+    /// A `Lifecycle::Cloned` reader for the harness, which never asks it.
+    struct NoOriginal;
+    impl OriginalEntries for NoOriginal {
+        fn entries(&self, _: &str, _: &[String]) -> Result<BTreeMap<String, StoreEntry>, String> {
+            Ok(BTreeMap::new())
+        }
+    }
+
+    /// The old player `player_clone` lends, as the game builds it: only its own attachment store
+    /// matters to the bridge.
+    struct Lent {
+        old: Attachments,
+    }
+    impl mod_api::OriginalPlayerAccess for Lent {
+        fn uuid(&self) -> u128 {
+            P
+        }
+        fn position(&self) -> [f64; 3] {
+            [0.0; 3]
+        }
+        fn dimension(&self) -> &str {
+            "minecraft:overworld"
+        }
+        fn level(&self) -> Option<mod_api::LevelRef> {
+            None
+        }
+        fn health(&self) -> f32 {
+            0.0
+        }
+        fn experience(&self) -> mod_api::PlayerExperience {
+            mod_api::__private::built::PlayerExperience {
+                level: 0,
+                progress: 0.0,
+                total: 0,
+            }
+            .into()
+        }
+        fn effects(&self) -> &[mod_api::ActiveEffect] {
+            &[]
+        }
+        fn with_inventory(&self, read: &mut dyn for<'a> FnMut(mod_api::InventoryView<'a>)) {
+            read(mod_api::InventoryView::new(0..0, &|_| None, &|_, _| None));
+        }
+        fn persistent_data(&self) -> Option<&Compound> {
+            None
+        }
+        fn attachments(&mut self) -> &mut dyn AttachmentStore {
+            &mut self.old
+        }
+    }
+
+    /// Every answer [`original_entries`] gives, from the old player's own store: this jar's value,
+    /// another jar's, another mod's Rust type, a saved compound (which it must leave saved, not
+    /// decode or cache), and nothing.
+    #[test]
+    fn the_original_players_entries_are_read_without_writing() {
+        let key = |name: &'static str| AttachmentType::<JavaAttachment> {
+            namespace: "demo",
+            name,
+            default: unread_default,
+            codec: None,
+            copy_on_death: false,
+            sync: false,
+        };
+        let other_type = AttachmentType::<i32> {
+            namespace: "demo",
+            name: "other_type",
+            default: || 0,
+            codec: None,
+            copy_on_death: false,
+            sync: false,
+        };
+        let saved = Compound::from([("n".into(), Tag::Int(5))]);
+        let mut old = Attachments::from_nbt(Compound::from([(
+            "demo".into(),
+            Tag::Compound(Compound::from([(
+                "raw".into(),
+                Tag::Compound(envelope(saved.clone())),
+            )])),
+        )]));
+        let value = |jar: &str, token| JavaAttachment {
+            jar: jar.into(),
+            token,
+        };
+        key("ours")
+            .set(&mut old, Holder::Level, value("demo", 9))
+            .unwrap();
+        key("theirs")
+            .set(&mut old, Holder::Level, value("other", 4))
+            .unwrap();
+        other_type.set(&mut old, Holder::Level, 3).unwrap();
+        let mut lent = Lent { old };
+        let ids: Vec<String> = ["ours", "theirs", "other_type", "raw", "absent"]
+            .iter()
+            .map(|name| format!("demo:{name}"))
+            .collect();
+        // The loan ends with this block, as the game's does with the hook.
+        let entries = {
+            let mut original = mod_api::OriginalPlayer::new(&mut lent);
+            let reader = RefCell::new(&mut original);
+            OriginalEntries::entries(&reader, "demo", &ids).unwrap()
+        };
+        assert_eq!(
+            entries,
+            BTreeMap::from([
+                ("demo:ours".to_owned(), StoreEntry::Ours(9)),
+                ("demo:theirs".to_owned(), StoreEntry::Foreign),
+                ("demo:other_type".to_owned(), StoreEntry::Foreign),
+                (
+                    "demo:raw".to_owned(),
+                    StoreEntry::Raw(to_runtime(&saved).unwrap())
+                ),
+                ("demo:absent".to_owned(), StoreEntry::Absent),
+            ])
+        );
+        // The saved entry is still only saved: nothing decoded it, cached it or inserted a default.
+        assert!(
+            AttachmentStore::decoded(&mut lent.old, Holder::Level, "demo", "raw")
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            AttachmentStore::saved(&mut lent.old, Holder::Level, "demo", "raw").unwrap(),
+            Some(saved)
+        );
+        assert!(!AttachmentStore::holds(&mut lent.old, Holder::Level, "demo", "absent").unwrap());
+    }
+
     /// `getOriginal().getData(...)` on a death: the game lends the old player's own store
-    /// (`Holder::OriginalPlayer`), which still holds carryon's non-`copyOnDeath` value as this
-    /// jar's object, while the new player's store has only the death copy. The bridge reads the
-    /// original's entries from that holder, so the old player answers the very object it held and
+    /// (`OriginalPlayer`), which still holds carryon's non-`copyOnDeath` value as this jar's
+    /// object, while the new player's store has only the death copy. The bridge reads the
+    /// original's entries from that store, so the old player answers the very object it held and
     /// the new one has nothing.
     #[test]
     fn the_original_player_answers_its_own_pre_death_object() {
-        struct Lent {
-            new: Attachments,
-            old: Attachments,
-        }
-        impl mod_api::AttachmentHost for Lent {
-            fn validate_attachment(
-                &self,
-                _: &str,
-                _: &str,
-                _: bool,
-            ) -> Result<(), AttachmentError> {
-                Ok(())
-            }
-            fn attachments(
-                &mut self,
-                holder: Holder,
-                _: mod_api::AttachmentAccess,
-            ) -> Result<&mut Attachments, AttachmentError> {
-                match holder {
-                    Holder::OriginalPlayer(7) => Ok(&mut self.old),
-                    Holder::Player(P) => Ok(&mut self.new),
-                    _ => Err(AttachmentError::MissingHolder),
-                }
-            }
-        }
         let mut run = Run::new();
         let carried = run.batch(Lifecycle::None, |run| {
             let carried = run.call("get", DATA).unwrap();
@@ -622,13 +848,15 @@ mod tests {
         let copy = old.copy_on_death().unwrap();
         let mut new = Attachments::default();
         new.replace_contents(copy);
-        let mut game = Lent { new, old };
+        let mut lent = Lent { old };
+        let mut original = mod_api::OriginalPlayer::new(&mut lent);
+        let original = RefCell::new(&mut original);
 
         let ids = run.host.attachment_store_ids();
-        let view = snapshot(&mut game, "demo", &ids, &[P]);
+        let view = snapshot(&mut new, "demo", &ids, &[P]);
         run.host.open_attachment_batch(view);
-        let original = original_holder(mod_api::__private::game::original_player_ref(7));
-        let entries = holder_entries(&mut game, "demo", &ids, original);
+        // What `open` hands the runtime for `Lifecycle::Cloned`.
+        let entries = OriginalEntries::entries(&original, "demo", &ids);
         run.host.open_original_attachments(P, entries);
         let budget = ExecutionBudget::within(Duration::from_secs(20));
         run.jar

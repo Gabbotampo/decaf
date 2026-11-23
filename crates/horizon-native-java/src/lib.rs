@@ -35,6 +35,12 @@ mod attachment_codec;
 mod bigdecimal_slice;
 mod block_entity_types;
 mod block_item_id;
+mod block_use;
+pub use block_use::{
+    BlockHitData, BlockUseContext, BlockUseOutcome, BlockUsePlayerData, BlockUseSide,
+    InteractionItemContext, InteractionResultValue, MenuCloseOutcome, MenuEffect, OpenMenuEffect,
+    PlayerContainer, SwingSource,
+};
 mod boxed;
 pub mod brigadier;
 mod callback_marker;
@@ -193,11 +199,16 @@ mod jdk_text_oracle;
 mod jvm_dispatch;
 mod kotlin_stdlib;
 mod lambda_boxing;
+pub mod level_sound;
 mod library_dispatch;
 mod linked_resources;
 mod list_equality;
+mod live_menu;
 mod map_compute;
 mod menu_models;
+pub use live_menu::{
+    ContainerInput, LiveMenuEffect, LiveMenuOutcome, MenuClick, MenuPlayerFacts, Prediction,
+};
 mod method_handles;
 mod mixin_extras;
 mod mixin_plugins;
@@ -281,6 +292,7 @@ mod vanilla_block_items;
 mod vanilla_block_shapes;
 mod vanilla_block_state_definers;
 mod vanilla_block_state_properties;
+mod vanilla_block_use_methods;
 mod vanilla_blocks;
 mod vanilla_entity_types;
 mod vanilla_holders;
@@ -330,6 +342,10 @@ pub(crate) use host_optional::{
 pub(crate) use host_path::{path_text, path_value, unix_normal};
 pub use host_ref::{HostKind, HostRef};
 pub use java_nbt::{MAX_DEPTH as NBT_MAX_DEPTH, Nbt, NbtCompound};
+pub use level_sound::{
+    EntitySoundFacts, LevelSoundEffect, SoundHolderKind, SoundSeed, SoundSide, SoundSource,
+    SoundTarget,
+};
 pub use mixin_extras::{GameHookShape, MixinExtrasKind, MixinExtrasPlan};
 pub use mixin_plugins::ConfigPluginReport;
 use mixin_plugins::ConfigPlugins;
@@ -3368,6 +3384,47 @@ pub trait Host {
         None
     }
 
+    /// Registry id of a registered `SoundEvent` value (`MappedRegistry.wrapAsHolder`),
+    /// or `None` when unregistered (`Holder.direct`).
+    fn registered_sound_id(&self, _sound: &Value) -> Option<String> {
+        None
+    }
+
+    /// Unwrap a `Holder<SoundEvent>` handle into `(sound_event_value, bound_registry_id)`
+    /// or an `IllegalStateException` if it is an unbound `Holder$Reference`.
+    fn unwrap_sound_holder(
+        &mut self,
+        _value: &Value,
+    ) -> Option<Result<(Value, Option<String>), NativeError>> {
+        None
+    }
+
+    /// Handle for `Level.random` (`Level.getRandom()`) of `level_marker`.
+    fn level_random_handle(&mut self, _level_marker: &str) -> Option<Value> {
+        None
+    }
+
+    /// Draw `Level.soundSeedGenerator.nextLong()` for `level_marker` (or return
+    /// [`level_sound::SoundSeed::HostDeferred`] when a live host owns the seed stream).
+    fn draw_level_sound_seed(
+        &mut self,
+        _level_marker: &str,
+        _server_side: bool,
+    ) -> Option<level_sound::SoundSeed> {
+        None
+    }
+
+    /// Mark a level sound stream unknown (see `level_sound.rs`): Java drew, or
+    /// may have drawn, from it where Decaf did not, so every later draw from
+    /// it counts. A host that models no sound streams keeps the default: its
+    /// draws already count.
+    fn mark_sound_stream_unknown(&mut self, _stream: &str) {}
+
+    /// Construct a `SoundEvent` record handle from `new SoundEvent(Identifier, Optional<Float>)`.
+    fn construct_sound_event(&mut self, _r: &MethodRef, _args: &[Value]) -> Option<Value> {
+        None
+    }
+
     /// Record the message of a throwable the interpreter caught and is about
     /// to deliver to a Java handler.
     ///
@@ -3782,11 +3839,31 @@ pub struct StdHost {
     resource_generation: u64,
     /// Per-call container stack clamp resolved virtually for `SimpleContainer.setItem`.
     pending_container_clamp: Option<menu_models::ContainerClamp>,
-    /// Host-owned snapshots handed to a jar's `BlockPlaceContext` override.
+    /// Host-owned snapshots handed to a jar's `BlockPlaceContext` override,
+    /// by handle key (`placement-context/<serial>`).
     /// The context is deliberately a value object: it has no guessed world
     /// state and every accessor is answered from the placement snapshot.
+    ///
+    /// A row lives only while the placement it was made for runs:
+    /// [`NativeJar::block_state_for_placement`] registers it on entry and
+    /// releases it when the invocation returns, fails or unwinds
+    /// (`PlacementScope`), so a placement keeps nothing once it ends (#635:
+    /// every row used to stay, rooting its player, level and item for the
+    /// server's life). While a row is here it is a root of the heap's
+    /// collections (`heap.rs`); a handle the jar kept past its placement
+    /// finds no row and every accessor on it is counted, as a tooltip sink
+    /// is once its `appendHoverText` returns.
     placement_contexts: BTreeMap<String, BlockPlaceContextData>,
-    placement_arrays: BTreeMap<String, Vec<Value>>,
+    /// The `Direction[]`s `getNearestLookingDirections` answered, by handle
+    /// key (`placement-array/<serial>`), each with the key of the context it
+    /// came from. The runtime copies one into a jar array as soon as the call
+    /// returns (`Runtime::materialize_host_array`), so the jar never holds
+    /// this row: it is a hand-off, released with its context.
+    placement_arrays: BTreeMap<String, (String, Vec<Value>)>,
+    /// The serial of the next placement context or array key. Never reused:
+    /// a key handed out again after a release would make a context the jar
+    /// kept answer for a different placement.
+    next_placement_handle: u64,
     resource_streams: BTreeMap<String, (Vec<u8>, usize)>,
     resource_marks: BTreeMap<String, usize>,
     /// Explicitly seeded class names exposed through `ClassLoader.loadClass`.
@@ -4154,6 +4231,8 @@ pub struct StdHost {
     menu_states: menu_models::States,
     next_menu_object: u64,
     freed_menu_objects: heap::FreedObjects,
+    block_use: block_use::BlockUseHostState,
+    pub(crate) level_sound: level_sound::LevelSoundState,
 }
 
 /// Who placed the block for a [`BlockPlaceContextData`] snapshot.
@@ -4194,6 +4273,64 @@ pub struct BlockPlaceContextData {
     pub placer: Placer,
     pub item_in_hand: Value,
     pub level: Value,
+}
+
+/// The key prefix of a `BlockPlaceContext` handle
+/// (`StdHost::new_block_place_context`).
+const PLACEMENT_CONTEXT_PREFIX: &str = "placement-context/";
+
+/// The `BlockPlaceContext` accessors `StdHost` answers from a placement
+/// snapshot. One list, so a registered context and a released one (#635)
+/// claim exactly the same calls: the first answers them, the second counts
+/// them, and every other call takes the ordinary host path either way.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PlacementAccessor {
+    ClickedPos,
+    ClickedFace,
+    ClickLocation,
+    Inside,
+    ItemInHand,
+    Level,
+    CanPlace,
+    ReplacingClickedOnBlock,
+    Player,
+    HorizontalDirection,
+    SecondaryUseActive,
+    Rotation,
+    NearestLookingDirection,
+    NearestLookingVerticalDirection,
+    NearestLookingDirections,
+}
+
+impl PlacementAccessor {
+    fn of(r: &MethodRef) -> Option<Self> {
+        Some(match (r.name.as_str(), r.descriptor.as_str()) {
+            ("getClickedPos", "()Lnet/minecraft/core/BlockPos;") => Self::ClickedPos,
+            ("getClickedFace", "()Lnet/minecraft/core/Direction;") => Self::ClickedFace,
+            ("getClickLocation", "()Lnet/minecraft/world/phys/Vec3;") => Self::ClickLocation,
+            ("isInside", "()Z") => Self::Inside,
+            ("getItemInHand", "()Lnet/minecraft/world/item/ItemStack;") => Self::ItemInHand,
+            ("getLevel", "()Lnet/minecraft/world/level/Level;") => Self::Level,
+            ("canPlace", "()Z") => Self::CanPlace,
+            ("replacingClickedOnBlock", "()Z") => Self::ReplacingClickedOnBlock,
+            ("getPlayer", "()Lnet/minecraft/world/entity/player/Player;") => Self::Player,
+            ("getHorizontalDirection", "()Lnet/minecraft/core/Direction;") => {
+                Self::HorizontalDirection
+            }
+            ("isSecondaryUseActive", "()Z") => Self::SecondaryUseActive,
+            ("getRotation", "()F") => Self::Rotation,
+            ("getNearestLookingDirection", "()Lnet/minecraft/core/Direction;") => {
+                Self::NearestLookingDirection
+            }
+            ("getNearestLookingVerticalDirection", "()Lnet/minecraft/core/Direction;") => {
+                Self::NearestLookingVerticalDirection
+            }
+            ("getNearestLookingDirections", "()[Lnet/minecraft/core/Direction;") => {
+                Self::NearestLookingDirections
+            }
+            _ => return None,
+        })
+    }
 }
 
 fn opposite(direction: &str) -> &'static str {
@@ -4254,6 +4391,7 @@ impl StdHost {
             pending_container_clamp: None,
             placement_contexts: BTreeMap::new(),
             placement_arrays: BTreeMap::new(),
+            next_placement_handle: 0,
             resource_streams: BTreeMap::new(),
             resource_marks: BTreeMap::new(),
             classes: BTreeMap::new(),
@@ -4413,6 +4551,8 @@ impl StdHost {
             menu_states: BTreeMap::new(),
             next_menu_object: 0,
             freed_menu_objects: heap::FreedObjects::default(),
+            block_use: block_use::BlockUseHostState::default(),
+            level_sound: level_sound::LevelSoundState::default(),
         }
     }
 
@@ -5715,26 +5855,64 @@ impl StdHost {
     }
 
     /// Register a vanilla-shaped `BlockPlaceContext` snapshot for a virtual
-    /// block call. The returned handle is rooted by the caller for the
-    /// duration of the invocation and may be reused by nested calls.
+    /// block call, until [`Self::release_block_place_context`].
+    ///
+    /// [`NativeJar::block_state_for_placement`] does both around its
+    /// invocation; a caller that passes the handle to an invocation of its own
+    /// releases it once that invocation (and any nested call reusing the
+    /// handle) is done. While registered, the snapshot is a root of the
+    /// heap's collections; once released, every accessor on a handle the jar
+    /// kept is counted, never answered from the old snapshot.
     pub fn new_block_place_context(&mut self, data: BlockPlaceContextData) -> Value {
-        let key = format!("placement-context#{}", self.placement_contexts.len());
+        let key = format!("{PLACEMENT_CONTEXT_PREFIX}{}", self.next_placement_serial());
         self.placement_contexts.insert(key.clone(), data);
         Value::Host(HostRef::new(HostKind::GameTransient, key))
+    }
+
+    /// Drop a snapshot [`Self::new_block_place_context`] registered, with
+    /// every `Direction[]` its `getNearestLookingDirections` answered (the jar
+    /// already holds its own copy of each). Releasing a value that is not a
+    /// registered context, or one already released, does nothing.
+    pub fn release_block_place_context(&mut self, context: &Value) {
+        let Value::Host(handle) = context else {
+            return;
+        };
+        if handle.kind() != HostKind::GameTransient
+            || self.placement_contexts.remove(handle.key()).is_none()
+        {
+            return;
+        }
+        self.placement_arrays
+            .retain(|_, (owner, _)| owner.as_str() != handle.key());
+    }
+
+    /// How many `BlockPlaceContext` snapshots are registered now: zero
+    /// between placements, however many ran.
+    pub fn block_place_context_count(&self) -> usize {
+        self.placement_contexts.len()
+    }
+
+    /// How many `getNearestLookingDirections` hand-off arrays the host holds
+    /// now: zero between placements, however many ran.
+    pub fn placement_array_count(&self) -> usize {
+        self.placement_arrays.len()
+    }
+
+    /// A placement handle serial that is never handed out twice by this host.
+    /// The space is `u64`, so exhaustion is unreachable in practice, but it is
+    /// a hard stop rather than a wrap: a wrapped serial would alias a context
+    /// a long-lived caller still holds.
+    fn next_placement_serial(&mut self) -> u64 {
+        let serial = self.next_placement_handle;
+        self.next_placement_handle = serial
+            .checked_add(1)
+            .expect("placement handle serials exhausted; refusing to reuse one");
+        serial
     }
 
     /// The canonical empty `ItemStack` used by vanilla contexts with no hand item.
     pub fn empty_item_stack() -> Value {
         menu_models::empty_stack()
-    }
-
-    fn placement_context(&self, value: &Value) -> Option<&BlockPlaceContextData> {
-        let Value::Host(handle) = value else {
-            return None;
-        };
-        (handle.kind() == HostKind::GameTransient)
-            .then(|| self.placement_contexts.get(handle.key()))
-            .flatten()
     }
 
     fn placement_direction(name: &str) -> Value {
@@ -5847,22 +6025,46 @@ impl StdHost {
         }
     }
 
-    fn store_placement_direction_array(&mut self, names: [&'static str; 6]) -> Value {
+    /// Hand `names` to the runtime as a fresh `Direction[]`, owned by the
+    /// context `owner` (its key), which releases it.
+    fn store_placement_direction_array(&mut self, owner: &str, names: [&'static str; 6]) -> Value {
         let values = names
             .into_iter()
             .map(Self::placement_direction)
             .collect::<Vec<_>>();
-        let key = format!("placement-array/{}", self.placement_arrays.len());
-        self.placement_arrays.insert(key.clone(), values);
+        let key = format!("placement-array/{}", self.next_placement_serial());
+        self.placement_arrays
+            .insert(key.clone(), (owner.to_owned(), values));
         Value::Host(HostRef::new(HostKind::GameTransient, key))
     }
 
+    /// A `BlockPlaceContext` accessor on a handle
+    /// [`Self::new_block_place_context`] made. `None` leaves every other call
+    /// (and every other receiver) on the ordinary host path, for a released
+    /// handle exactly as for a registered one.
     fn placement_context_call(
         &mut self,
         r: &MethodRef,
         receiver: &Value,
     ) -> Option<Result<Value, NativeError>> {
-        let context = self.placement_context(receiver)?.clone();
+        let Value::Host(handle) = receiver else {
+            return None;
+        };
+        if handle.kind() != HostKind::GameTransient
+            || !handle.key().starts_with(PLACEMENT_CONTEXT_PREFIX)
+        {
+            return None;
+        }
+        let accessor = PlacementAccessor::of(r)?;
+        let Some(context) = self.placement_contexts.get(handle.key()).cloned() else {
+            // The jar kept the context past the placement it was made for
+            // (#635). Most accessors read the player or the world as they are
+            // now (`canPlace`, the rotation family, `isSecondaryUseActive`),
+            // which the old snapshot no longer is, so each is counted rather
+            // than answered stale.
+            return Some(self.unknown_host_call(r));
+        };
+        let owner = handle.key().to_owned();
         let direction = |name| Ok(Self::placement_direction(name));
         let pos = || {
             Ok(crate::game_object::server_value(format!(
@@ -5870,50 +6072,46 @@ impl StdHost {
                 context.clicked_pos[0], context.clicked_pos[1], context.clicked_pos[2]
             )))
         };
-        let result = match (r.name.as_str(), r.descriptor.as_str()) {
-            ("getClickedPos", "()Lnet/minecraft/core/BlockPos;") => pos(),
-            ("getClickedFace", "()Lnet/minecraft/core/Direction;") => Ok(context.clicked_face),
-            ("getClickLocation", "()Lnet/minecraft/world/phys/Vec3;") => {
-                Ok(crate::game_object::client_value(format!(
-                    "client/vec3/{},{},{}",
-                    context.click_location[0], context.click_location[1], context.click_location[2]
-                )))
-            }
-            ("isInside", "()Z") => Ok(Value::Int(i32::from(context.inside))),
-            ("getItemInHand", "()Lnet/minecraft/world/item/ItemStack;") => Ok(context.item_in_hand),
-            ("getLevel", "()Lnet/minecraft/world/level/Level;") => Ok(context.level),
-            ("canPlace", "()Z") => Ok(Value::Int(i32::from(context.can_place))),
-            ("replacingClickedOnBlock", "()Z") => match context.placer {
+        let result = match accessor {
+            PlacementAccessor::ClickedPos => pos(),
+            PlacementAccessor::ClickedFace => Ok(context.clicked_face),
+            PlacementAccessor::ClickLocation => Ok(crate::game_object::client_value(format!(
+                "client/vec3/{},{},{}",
+                context.click_location[0], context.click_location[1], context.click_location[2]
+            ))),
+            PlacementAccessor::Inside => Ok(Value::Int(i32::from(context.inside))),
+            PlacementAccessor::ItemInHand => Ok(context.item_in_hand),
+            PlacementAccessor::Level => Ok(context.level),
+            PlacementAccessor::CanPlace => Ok(Value::Int(i32::from(context.can_place))),
+            PlacementAccessor::ReplacingClickedOnBlock => match context.placer {
                 Placer::None { direction: Some(_) } => Ok(Value::Int(i32::from(context.can_place))),
                 Placer::Player { .. } | Placer::None { direction: None } | Placer::Unknown => {
                     Ok(Value::Int(i32::from(context.replacing_clicked_on_block)))
                 }
             },
-            ("getPlayer", "()Lnet/minecraft/world/entity/player/Player;") => match context.placer {
+            PlacementAccessor::Player => match context.placer {
                 Placer::Player { player, .. } => Ok(player),
                 Placer::None { .. } => Ok(Value::Ref(None)),
                 Placer::Unknown => self.unknown_host_call(r),
             },
-            ("getHorizontalDirection", "()Lnet/minecraft/core/Direction;") => {
-                match context.placer {
-                    Placer::Player { yaw, .. } => direction(Self::placement_yaw_direction(yaw)),
-                    Placer::None { direction: None } => direction("NORTH"),
-                    Placer::None {
-                        direction: Some(ref dir),
-                    } => match Self::direction_name(dir) {
-                        Some("DOWN" | "UP") => direction("NORTH"),
-                        Some(name) => direction(name),
-                        None => self.unknown_host_call(r),
-                    },
-                    Placer::Unknown => self.unknown_host_call(r),
-                }
-            }
-            ("isSecondaryUseActive", "()Z") => match context.placer {
+            PlacementAccessor::HorizontalDirection => match context.placer {
+                Placer::Player { yaw, .. } => direction(Self::placement_yaw_direction(yaw)),
+                Placer::None { direction: None } => direction("NORTH"),
+                Placer::None {
+                    direction: Some(ref dir),
+                } => match Self::direction_name(dir) {
+                    Some("DOWN" | "UP") => direction("NORTH"),
+                    Some(name) => direction(name),
+                    None => self.unknown_host_call(r),
+                },
+                Placer::Unknown => self.unknown_host_call(r),
+            },
+            PlacementAccessor::SecondaryUseActive => match context.placer {
                 Placer::Player { secondary_use, .. } => Ok(Value::Int(i32::from(secondary_use))),
                 Placer::None { .. } => Ok(Value::Int(0)),
                 Placer::Unknown => self.unknown_host_call(r),
             },
-            ("getRotation", "()F") => match context.placer {
+            PlacementAccessor::Rotation => match context.placer {
                 Placer::Player { yaw, .. } => Ok(Value::Float(f64::from(yaw))),
                 Placer::None { direction: None } => Ok(Value::Float(0.0)),
                 Placer::None {
@@ -5924,60 +6122,51 @@ impl StdHost {
                 },
                 Placer::Unknown => self.unknown_host_call(r),
             },
-            ("getNearestLookingDirection", "()Lnet/minecraft/core/Direction;") => {
-                match context.placer {
-                    Placer::Player { yaw, pitch, .. } => {
-                        direction(Self::placement_ordered_directions(yaw, pitch)[0])
-                    }
-                    Placer::None { direction: Some(_) } => direction("DOWN"),
-                    Placer::None { direction: None } => Err(Self::null_entity_view_xrot_npe()),
-                    Placer::Unknown => self.unknown_host_call(r),
+            PlacementAccessor::NearestLookingDirection => match context.placer {
+                Placer::Player { yaw, pitch, .. } => {
+                    direction(Self::placement_ordered_directions(yaw, pitch)[0])
                 }
-            }
-            ("getNearestLookingVerticalDirection", "()Lnet/minecraft/core/Direction;") => {
-                match context.placer {
-                    Placer::Player { pitch, .. } => {
-                        direction(if pitch < 0.0 { "UP" } else { "DOWN" })
-                    }
-                    Placer::None { .. } => Err(Self::null_entity_view_xrot_npe()),
-                    Placer::Unknown => self.unknown_host_call(r),
-                }
-            }
-            ("getNearestLookingDirections", "()[Lnet/minecraft/core/Direction;") => {
-                match context.placer {
-                    Placer::Player { yaw, pitch, .. } => {
-                        let mut names = Self::placement_ordered_directions(yaw, pitch);
-                        if !context.replacing_clicked_on_block {
-                            let Some(clicked) = Self::direction_name(&context.clicked_face) else {
-                                return Some(self.unknown_host_call(r));
-                            };
-                            let clicked_opp = opposite(clicked);
-                            if let Some(index) = names.iter().position(|name| *name == clicked_opp)
-                                && index > 0
-                            {
-                                for i in (0..index).rev() {
-                                    names[i + 1] = names[i];
-                                }
-                                names[0] = clicked_opp;
-                            }
-                        }
-                        Ok(self.store_placement_direction_array(names))
-                    }
-                    Placer::None {
-                        direction: Some(ref dir),
-                    } => {
-                        let Some(names) = Self::direction_name(dir)
-                            .and_then(Self::directional_nearest_looking_directions)
-                        else {
+                Placer::None { direction: Some(_) } => direction("DOWN"),
+                Placer::None { direction: None } => Err(Self::null_entity_view_xrot_npe()),
+                Placer::Unknown => self.unknown_host_call(r),
+            },
+            PlacementAccessor::NearestLookingVerticalDirection => match context.placer {
+                Placer::Player { pitch, .. } => direction(if pitch < 0.0 { "UP" } else { "DOWN" }),
+                Placer::None { .. } => Err(Self::null_entity_view_xrot_npe()),
+                Placer::Unknown => self.unknown_host_call(r),
+            },
+            PlacementAccessor::NearestLookingDirections => match context.placer {
+                Placer::Player { yaw, pitch, .. } => {
+                    let mut names = Self::placement_ordered_directions(yaw, pitch);
+                    if !context.replacing_clicked_on_block {
+                        let Some(clicked) = Self::direction_name(&context.clicked_face) else {
                             return Some(self.unknown_host_call(r));
                         };
-                        Ok(self.store_placement_direction_array(names))
+                        let clicked_opp = opposite(clicked);
+                        if let Some(index) = names.iter().position(|name| *name == clicked_opp)
+                            && index > 0
+                        {
+                            for i in (0..index).rev() {
+                                names[i + 1] = names[i];
+                            }
+                            names[0] = clicked_opp;
+                        }
                     }
-                    Placer::None { direction: None } => Err(Self::null_entity_view_xrot_npe()),
-                    Placer::Unknown => self.unknown_host_call(r),
+                    Ok(self.store_placement_direction_array(&owner, names))
                 }
-            }
-            _ => return None,
+                Placer::None {
+                    direction: Some(ref dir),
+                } => {
+                    let Some(names) = Self::direction_name(dir)
+                        .and_then(Self::directional_nearest_looking_directions)
+                    else {
+                        return Some(self.unknown_host_call(r));
+                    };
+                    Ok(self.store_placement_direction_array(&owner, names))
+                }
+                Placer::None { direction: None } => Err(Self::null_entity_view_xrot_npe()),
+                Placer::Unknown => self.unknown_host_call(r),
+            },
         };
         Some(result)
     }
@@ -7445,6 +7634,22 @@ impl StdHost {
                     }
                     return Ok(None);
                 }
+                // 26.3 `TypedInstance.is(T)` (the erased `is(Object)` javac picks for a
+                // `Block` argument) offsets 0-20: `typeHolder().value() == value`, where a
+                // state's `typeHolder()` is `getBlock().builtInRegistryHolder()`: the
+                // registered block itself, compared by identity.
+                ("is", "(Ljava/lang/Object;)Z") if jar_object::parse_key(&block).is_some() => {
+                    match args.first() {
+                        Some(Value::Ref(None)) => return Ok(Some(Value::Int(0))),
+                        Some(other) => {
+                            if let Some(other) = jar_object::object_key(other) {
+                                return Ok(Some(Value::Int(i32::from(other == block))));
+                            }
+                        }
+                        None => {}
+                    }
+                    return Ok(None);
+                }
                 (
                     "hasProperty",
                     "(Lnet/minecraft/world/level/block/state/properties/Property;)Z",
@@ -8073,8 +8278,7 @@ impl Host for StdHost {
             .then(|| {
                 self.placement_arrays
                     .get(handle.key())
-                    .cloned()
-                    .map(|values| ("[Lnet/minecraft/core/Direction;", values))
+                    .map(|(_, values)| ("[Lnet/minecraft/core/Direction;", values.clone()))
             })
             .flatten()
     }
@@ -9303,6 +9507,37 @@ impl Host for StdHost {
         self.throwable_messages.get(marker).cloned()
     }
 
+    fn registered_sound_id(&self, sound: &Value) -> Option<String> {
+        self.registered_sound_id_impl(sound)
+    }
+
+    fn unwrap_sound_holder(
+        &mut self,
+        value: &Value,
+    ) -> Option<Result<(Value, Option<String>), NativeError>> {
+        host_registry_holder::unwrap_sound_holder(self, value)
+    }
+
+    fn level_random_handle(&mut self, level_marker: &str) -> Option<Value> {
+        self.level_random_handle_impl(level_marker)
+    }
+
+    fn draw_level_sound_seed(
+        &mut self,
+        level_marker: &str,
+        server_side: bool,
+    ) -> Option<level_sound::SoundSeed> {
+        self.draw_level_sound_seed_impl(level_marker, server_side)
+    }
+
+    fn mark_sound_stream_unknown(&mut self, stream: &str) {
+        StdHost::mark_sound_stream_unknown(self, stream);
+    }
+
+    fn construct_sound_event(&mut self, r: &MethodRef, args: &[Value]) -> Option<Value> {
+        sound_event::construct_record(self, r, args)
+    }
+
     fn record_throwable(&mut self, marker: &str, message: Option<String>) {
         // A throw the runtime raised carries no cause (its `getCause()` is
         // `null`), except the initializer error that wraps the `<clinit>`
@@ -9410,6 +9645,9 @@ impl Host for StdHost {
         }
         if let Some(value) = voxel_shape::static_field(self, r) {
             return value;
+        }
+        if let Some(value) = block_use::static_field(r) {
+            return Ok(value);
         }
         if r.owner == "net/minecraft/core/BlockPos"
             && r.name == "ZERO"
@@ -9711,6 +9949,7 @@ impl Host for StdHost {
     fn random_new(&mut self, class: &str) -> Option<Value> {
         recipe_models::random_new(self, class)
             .or_else(|| vanilla_values::random_new(self, class))
+            .or_else(|| block_use::random_new(self, class))
             .or_else(|| StdHost::random_new(self, class))
     }
 
@@ -9842,6 +10081,9 @@ impl Host for StdHost {
     }
 
     fn invoke(&mut self, r: &MethodRef, args: &[Value]) -> Result<Value, NativeError> {
+        if let Some(value) = block_use::static_call(self, r, args) {
+            return value;
+        }
         if menu_models::is_menu_class(&r.owner)
             && let Some(value) =
                 menu_models::static_call(&mut self.menu_states, &mut self.next_menu_object, r, args)
@@ -10425,7 +10667,16 @@ impl Host for StdHost {
                 Ok(uuid_value(&random_uuid())?)
             }
             ("java/util/UUID", "fromString", "(Ljava/lang/String;)Ljava/util/UUID;") => {
-                Ok(uuid_value(expect_string(Self::argument(r, args, 0)?))?)
+                // A null name throws a NullPointerException whose helpful message names the
+                // JDK's own code: counted, not answered.
+                let Some(text) = expect_ref(Self::argument(r, args, 0)?) else {
+                    return self.unknown_host_call(r);
+                };
+                match uuid_from_string(text) {
+                    Some(Ok(uuid)) => Ok(host_jdk_value::uuid(&uuid)),
+                    Some(Err(thrown)) => Err(thrown),
+                    None => self.unknown_host_call(r),
+                }
             }
             (
                 "java/net/URLEncoder",
@@ -10767,13 +11018,39 @@ impl Host for StdHost {
                 }
                 let fallback = Self::argument(r, args, 1)?;
                 if matches!(fallback, Value::Ref(None)) {
+                    // `Objects.requireNonNullElse(null, null)` throws an NPE
+                    // whose message is `defaultObj`, not a message-less one.
                     return Err(NativeError::UncaughtException {
                         class: "java/lang/NullPointerException".into(),
-                        message: None,
+                        message: Some("defaultObj".into()),
                         frame: None,
                     });
                 }
                 Ok(fallback.clone())
+            }
+            (
+                "java/util/Objects",
+                "requireNonNullElseGet",
+                "(Ljava/lang/Object;Ljava/util/function/Supplier;)Ljava/lang/Object;",
+            ) => {
+                let value = Self::argument(r, args, 0)?;
+                if !matches!(&value, Value::Ref(None)) {
+                    return Ok(value.clone());
+                }
+                let supplier = Self::argument(r, args, 1)?;
+                if matches!(supplier, Value::Ref(None)) {
+                    // `requireNonNullElseGet(null, null)` fails on the null
+                    // supplier itself, with message `supplier`.
+                    return Err(NativeError::UncaughtException {
+                        class: "java/lang/NullPointerException".into(),
+                        message: Some("supplier".into()),
+                        frame: None,
+                    });
+                }
+                // A live supplier's `get()` needs the interpreter to run it:
+                // keep the call counted instead of fabricating a value or a
+                // message.
+                self.unknown_host_call(r)
             }
             // `Objects.isNull`/`nonNull` are predicates a mod passes as a
             // method reference (`filter(Objects::nonNull)`).
@@ -10788,32 +11065,88 @@ impl Host for StdHost {
                     && descriptor.ends_with(")Ljava/lang/Object;") =>
             {
                 let value = Self::argument(r, args, 0)?;
-                if matches!(&value, Value::Ref(None)) {
-                    // A mod's `try { Objects.requireNonNull(x) } catch
-                    // (NullPointerException ignored)` is real control flow, so
-                    // this raises the NPE the JVM would raise; the interpreter
-                    // delivers it to the caller's handler and only reports an
-                    // uncaught throw when the frame has none.
-                    let message = if descriptor
-                        == "(Ljava/lang/Object;Ljava/lang/String;)Ljava/lang/Object;"
-                    {
-                        args.get(1).and_then(expect_ref).cloned()
-                    } else {
-                        None
-                    };
-                    return Err(NativeError::UncaughtException {
-                        class: "java/lang/NullPointerException".into(),
-                        message,
-                        frame: None,
-                    });
+                if !matches!(&value, Value::Ref(None)) {
+                    return Ok(value.clone());
                 }
-                Ok(value.clone())
+                // A mod's `try { Objects.requireNonNull(x) } catch
+                // (NullPointerException ignored)` is real control flow, so
+                // this raises the NPE the JVM would raise; the interpreter
+                // delivers it to the caller's handler and only reports an
+                // uncaught throw when the frame has none.
+                let message = match descriptor {
+                    "(Ljava/lang/Object;Ljava/lang/String;)Ljava/lang/Object;" => {
+                        args.get(1).and_then(expect_ref).cloned()
+                    }
+                    // A live supplier's `get()` supplies the message and
+                    // needs the interpreter to run it: stay counted. A null
+                    // supplier is never called, so the message stays null.
+                    "(Ljava/lang/Object;Ljava/util/function/Supplier;)Ljava/lang/Object;"
+                        if !matches!(args.get(1), Some(Value::Ref(None))) =>
+                    {
+                        return self.unknown_host_call(r);
+                    }
+                    _ => None,
+                };
+                Err(NativeError::UncaughtException {
+                    class: "java/lang/NullPointerException".into(),
+                    message,
+                    frame: None,
+                })
             }
             ("java/util/Objects", "toString", "(Ljava/lang/Object;)Ljava/lang/String;") => {
                 // A model object prints its own `toString`, not its marker.
                 let value = Self::argument(r, args, 0)?;
                 let text = self.modelled_to_string_checked(value)?;
                 Ok(Value::Ref(Some(text.unwrap_or_else(|| value_text(value)))))
+            }
+            (
+                "java/util/Objects",
+                method @ ("checkIndex" | "checkFromToIndex" | "checkFromIndexSize"),
+                descriptor @ ("(II)I" | "(JJ)J" | "(III)I" | "(JJJ)J"),
+            ) if (method == "checkIndex") == (descriptor.len() == 5) => {
+                // `(index, length)`, `(from, to, length)` or `(from, size,
+                // length)`, as `int`s or `long`s; the result is the first
+                // operand.
+                let wide = descriptor.starts_with("(J");
+                let mut operands = [0_i64; 3];
+                for (position, operand) in
+                    operands.iter_mut().enumerate().take(descriptor.len() - 3)
+                {
+                    let value = Self::argument(r, args, position)?;
+                    *operand = if wide {
+                        expect_long(r, value)?
+                    } else {
+                        i64::from(expect_int(r, value)?)
+                    };
+                }
+                let [first, second, third] = operands;
+                let message = match method {
+                    "checkIndex" => (first < 0 || first >= second)
+                        .then(|| format!("Index {first} out of bounds for length {second}")),
+                    "checkFromToIndex" => ((first | second | third) < 0
+                        || first > second
+                        || second > third)
+                        .then(|| {
+                            format!("Range [{first}, {second}) out of bounds for length {third}")
+                        }),
+                    _ => ((first | second | third) < 0 || second > third - first).then(|| {
+                        format!(
+                            "Range [{first}, {first} + {second}) out of bounds for length {third}"
+                        )
+                    }),
+                };
+                if let Some(message) = message {
+                    return Err(NativeError::UncaughtException {
+                        class: "java/lang/IndexOutOfBoundsException".into(),
+                        message: Some(message),
+                        frame: None,
+                    });
+                }
+                Ok(if wide {
+                    long_value(first)
+                } else {
+                    Value::Int(first as i32)
+                })
             }
             ("java/lang/Math", "abs", "(I)I") => {
                 let value = expect_int(r, Self::argument(r, args, 0)?)?;
@@ -11410,6 +11743,9 @@ impl Host for StdHost {
         if let Some(result) = voxel_shape::direction_instance_call(r, receiver) {
             return result;
         }
+        if let Some(result) = block_use::instance_call(self, r, receiver, args) {
+            return result;
+        }
         if let Value::Host(handle) = receiver
             && handle.kind() == host_ref::HostKind::GameValue
             && let Some([x, y, z]) = server_values::block_pos(handle.key())
@@ -11701,6 +12037,9 @@ impl Host for StdHost {
         // A client stand-in (`client/...`), a mod's `KeyMapping`, or a client
         // registration event answers the client surface first.
         if let Some(answer) = self.client_call(r, receiver, args) {
+            return answer;
+        }
+        if let Some(answer) = level_sound::standalone_client_sound_call(self, receiver, r, args) {
             return answer;
         }
         // A game-event façade marker (server, level, player, event object)
@@ -13545,6 +13884,33 @@ impl Host for StdHost {
             ("java/nio/file/Path", "isAbsolute", "()Z") => {
                 Ok(Value::Int(i32::from(path_text(receiver).starts_with('/'))))
             }
+            // `UnixPath.startsWith`: the same root-ness and the argument's names
+            // are the receiver's leading names (`host_path::starts_with`, checked
+            // against a Java 25 run in `fixture_path_starts_with`). A null
+            // argument (NPE), text `getPath` refuses (NUL: `InvalidPathException`),
+            // text that is not ASCII (`sun.jnu.encoding`) and anything that is no
+            // modelled `Path` are counted.
+            ("java/nio/file/Path", "startsWith", "(Ljava/lang/String;)Z")
+            | ("java/nio/file/Path", "startsWith", "(Ljava/nio/file/Path;)Z") => {
+                let this = path_text(receiver);
+                let prefix = match Self::argument(r, args, 0)? {
+                    Value::Ref(Some(text)) if r.descriptor.starts_with("(Ljava/lang/String;") => {
+                        Some(host_path::unix_normal(text))
+                    }
+                    other => host_path::path_key(other).map(str::to_owned),
+                };
+                match prefix {
+                    Some(prefix)
+                        if host_path::encodable(this)
+                            && host_path::encodable(&prefix)
+                            && !this.contains('\0')
+                            && !prefix.contains('\0') =>
+                    {
+                        Ok(Value::Int(i32::from(host_path::starts_with(this, &prefix))))
+                    }
+                    _ => self.unknown_host_call(r),
+                }
+            }
             ("java/nio/file/Path", "toAbsolutePath", "()Ljava/nio/file/Path;") => Ok(path_value(
                 &host_path::sandbox_absolute(path_text(receiver)),
             )),
@@ -14444,40 +14810,82 @@ impl Host for StdHost {
             }
             // The `char` overloads take a code unit, so a scanner walking
             // `indexOf('.', from)` must see the character, not a default.
+            // A code point outside `0..=0x10FFFF` never matches; a surrogate
+            // is one UTF-16 unit, a supplementary code point a pair.
+            // A haystack that is a jar-object marker (an unmodelled constructor
+            // left a `String#n` reference) or that holds U+FFFD (a possible
+            // lost lone surrogate) cannot be answered exactly.
             ("java/lang/String", "indexOf", "(I)I") => {
-                let needle = string_from_char_code(expect_int(r, Self::argument(r, args, 0)?)?);
-                Ok(Value::Int(utf16_index_of(
-                    expect_string(receiver),
-                    &needle,
-                    0,
-                )))
+                let is_marker =
+                    jar_object::spells_key(receiver) || matches!(receiver, Value::Host(_));
+                if is_marker {
+                    return self.unknown_host_call(r);
+                }
+                let haystack = expect_string(receiver);
+                if haystack.contains('\u{FFFD}') {
+                    return self.unknown_host_call(r);
+                }
+                let Some(needle) = code_point_needle(expect_int(r, Self::argument(r, args, 0)?)?)
+                else {
+                    return Ok(Value::Int(-1));
+                };
+                Ok(Value::Int(code_point_index_of(haystack, &needle, 0)))
             }
             ("java/lang/String", "indexOf", "(II)I") => {
-                let needle = string_from_char_code(expect_int(r, Self::argument(r, args, 0)?)?);
+                let is_marker =
+                    jar_object::spells_key(receiver) || matches!(receiver, Value::Host(_));
+                if is_marker {
+                    return self.unknown_host_call(r);
+                }
+                let haystack = expect_string(receiver);
+                if haystack.contains('\u{FFFD}') {
+                    return self.unknown_host_call(r);
+                }
+                let Some(needle) = code_point_needle(expect_int(r, Self::argument(r, args, 0)?)?)
+                else {
+                    return Ok(Value::Int(-1));
+                };
                 let start = expect_int(r, Self::argument(r, args, 1)?)?;
-                Ok(Value::Int(utf16_index_of(
-                    expect_string(receiver),
-                    &needle,
-                    start,
-                )))
+                Ok(Value::Int(code_point_index_of(haystack, &needle, start)))
             }
             ("java/lang/String", "lastIndexOf", "(I)I") => {
-                let needle = string_from_char_code(expect_int(r, Self::argument(r, args, 0)?)?);
-                Ok(Value::Int(utf16_last_index_of(
-                    expect_string(receiver),
+                let is_marker =
+                    jar_object::spells_key(receiver) || matches!(receiver, Value::Host(_));
+                if is_marker {
+                    return self.unknown_host_call(r);
+                }
+                let haystack = expect_string(receiver);
+                if haystack.contains('\u{FFFD}') {
+                    return self.unknown_host_call(r);
+                }
+                let Some(needle) = code_point_needle(expect_int(r, Self::argument(r, args, 0)?)?)
+                else {
+                    return Ok(Value::Int(-1));
+                };
+                Ok(Value::Int(code_point_last_index_of(
+                    haystack,
                     &needle,
+                    i32::MAX,
                 )))
             }
             ("java/lang/String", "lastIndexOf", "(II)I") => {
-                let needle = string_from_char_code(expect_int(r, Self::argument(r, args, 0)?)?);
+                let is_marker =
+                    jar_object::spells_key(receiver) || matches!(receiver, Value::Host(_));
+                if is_marker {
+                    return self.unknown_host_call(r);
+                }
+                let haystack = expect_string(receiver);
+                if haystack.contains('\u{FFFD}') {
+                    return self.unknown_host_call(r);
+                }
+                let Some(needle) = code_point_needle(expect_int(r, Self::argument(r, args, 0)?)?)
+                else {
+                    return Ok(Value::Int(-1));
+                };
                 let from = expect_int(r, Self::argument(r, args, 1)?)?;
-                let value = expect_string(receiver);
-                let units = value.encode_utf16().collect::<Vec<_>>();
-                let end = usize::try_from(from)
-                    .map(|from| (from + needle.encode_utf16().count()).min(units.len()))
-                    .unwrap_or(0);
-                let prefix = String::from_utf16_lossy(&units[..end]);
-                Ok(Value::Int(utf16_last_index_of(&prefix, &needle)))
+                Ok(Value::Int(code_point_last_index_of(
+                    haystack, &needle, from,
+                )))
             }
             ("java/lang/String", "lastIndexOf", "(Ljava/lang/String;)I") => {
                 Ok(Value::Int(utf16_last_index_of(
@@ -14513,12 +14921,43 @@ impl Host for StdHost {
                     .trim_matches(|c: char| c <= '\u{0020}')
                     .to_owned(),
             ))),
+            // `strip`, `stripLeading`, `stripTrailing` and `isBlank` use
+            // `Character.isWhitespace` (not U+00A0, U+2007 or U+202F). A
+            // receiver that is a jar-object marker (an unmodelled constructor
+            // left a `String#n` reference) has no text to strip: counted.
+            (
+                "java/lang/String",
+                "strip" | "stripLeading" | "stripTrailing",
+                "()Ljava/lang/String;",
+            )
+            | ("java/lang/String", "isBlank", "()Z")
+                if jar_object::spells_key(receiver) || matches!(receiver, Value::Host(_)) =>
+            {
+                self.unknown_host_call(r)
+            }
             ("java/lang/String", "strip", "()Ljava/lang/String;") => {
-                Ok(Value::Ref(Some(expect_string(receiver).trim().to_owned())))
+                let text = expect_string(receiver);
+                let (start, end) = jdk_character::strip_bounds(text);
+                // All-whitespace text has `start > end`: clamp so the slice is
+                // empty instead of panicking.
+                Ok(Value::Ref(Some(text[start..end.max(start)].to_owned())))
             }
-            ("java/lang/String", "isBlank", "()Z") => {
-                Ok(Value::Int(expect_string(receiver).trim().is_empty() as i32))
+            ("java/lang/String", "stripLeading", "()Ljava/lang/String;") => {
+                let text = expect_string(receiver);
+                let (start, _) = jdk_character::strip_bounds(text);
+                Ok(Value::Ref(Some(text[start..].to_owned())))
             }
+            ("java/lang/String", "stripTrailing", "()Ljava/lang/String;") => {
+                let text = expect_string(receiver);
+                let (_, end) = jdk_character::strip_bounds(text);
+                Ok(Value::Ref(Some(text[..end].to_owned())))
+            }
+            ("java/lang/String", "isBlank", "()Z") => Ok(Value::Int(
+                expect_string(receiver)
+                    .chars()
+                    .all(|ch| jdk_character::is_whitespace(ch as u32 as i32))
+                    as i32,
+            )),
             ("java/lang/String", "substring", "(I)Ljava/lang/String;") => {
                 let start = expect_int(r, Self::argument(r, args, 0)?)?;
                 let value = expect_string(receiver);
@@ -16510,44 +16949,112 @@ fn random_uuid() -> String {
 }
 
 fn uuid_value(text: &str) -> Result<Value, NativeError> {
-    Ok(host_jdk_value::uuid(&canonical_uuid(text)?))
-}
-
-fn canonical_uuid(text: &str) -> Result<String, NativeError> {
-    let bytes = text.as_bytes();
-    if bytes.len() != 36
-        || ![8, 13, 18, 23].iter().all(|&index| bytes[index] == b'-')
-        || bytes
-            .iter()
-            .enumerate()
-            .any(|(index, byte)| ![8, 13, 18, 23].contains(&index) && !byte.is_ascii_hexdigit())
-    {
-        return legacy_uuid(text)
-            .ok_or_else(|| NativeError::Metadata(format!("invalid UUID string {text:?}")));
+    match uuid_from_string(text) {
+        Some(Ok(uuid)) => Ok(host_jdk_value::uuid(&uuid)),
+        _ => Err(NativeError::Metadata(format!(
+            "invalid UUID string {text:?}"
+        ))),
     }
-    Ok(text.to_ascii_lowercase())
 }
 
-/// `UUID.fromString1` (Java 25), the form other than the canonical 36 characters: five
-/// dash-separated hex fields of any width, each `Long.parseLong(.., 16)` masked to its field
-/// (`1-2-3-4-5` is `00000001-0002-0003-0004-000000000005`). `None` where Java throws, or a
-/// field has a sign this model does not read.
-fn legacy_uuid(text: &str) -> Option<String> {
-    let fields: Vec<&str> = text.split('-').collect();
-    if text.len() > 36 || fields.len() != 5 {
+/// `UUID.fromString(text)` on Java 25: the canonical text of the UUID it answers, or the exception
+/// it throws, class and message (`tests/fixtures/uuid_from_string/java25.txt` is the captured
+/// oracle). `None` where this model cannot tell: once the length and dash checks pass, text with a
+/// non-ASCII character, since Java reads each field with `Character.digit`, which takes every
+/// Unicode decimal digit and the fullwidth letters.
+///
+/// Java's order: text longer than 36 UTF-16 units is "too large"; the canonical 36 characters
+/// (dashes at 8, 13, 18 and 23, hex digits elsewhere, either case) are read directly; any other
+/// text needs exactly four dashes, and each of the five fields between them is read as
+/// `Long.parseLong(.., 16)` reads a part of a string, then masked to its field's width
+/// (`1-2-3-4-5` is `00000001-0002-0003-0004-000000000005`).
+fn uuid_from_string(text: &str) -> Option<Result<String, NativeError>> {
+    let thrown = |class: &str, message: String| NativeError::UncaughtException {
+        class: class.into(),
+        message: Some(message),
+        frame: None,
+    };
+    if text.encode_utf16().count() > 36 {
+        return Some(Err(thrown(
+            "java/lang/IllegalArgumentException",
+            "UUID string too large".into(),
+        )));
+    }
+    let bytes = text.as_bytes();
+    let dash = |index: usize| [8, 13, 18, 23].contains(&index);
+    if bytes.len() == 36
+        && bytes.iter().enumerate().all(|(index, byte)| {
+            if dash(index) {
+                *byte == b'-'
+            } else {
+                byte.is_ascii_hexdigit()
+            }
+        })
+    {
+        return Some(Ok(text.to_ascii_lowercase()));
+    }
+    if text.matches('-').count() != 4 {
+        return Some(Err(thrown(
+            "java/lang/IllegalArgumentException",
+            format!("Invalid UUID string: {text}"),
+        )));
+    }
+    if !text.is_ascii() {
         return None;
     }
     let mut values = [0_i64; 5];
-    for (value, field) in values.iter_mut().zip(&fields) {
-        if field.is_empty() || !field.bytes().all(|b| b.is_ascii_hexdigit()) {
-            return None;
+    for (value, field) in values.iter_mut().zip(text.split('-')) {
+        match uuid_field(field) {
+            Ok(parsed) => *value = parsed,
+            Err(message) => return Some(Err(thrown("java/lang/NumberFormatException", message))),
         }
-        *value = i64::from_str_radix(field, 16).ok()?;
     }
     let msb =
         ((values[0] & 0xffff_ffff) << 32) | ((values[1] & 0xffff) << 16) | (values[2] & 0xffff);
     let lsb = ((values[3] & 0xffff) << 48) | (values[4] & 0xffff_ffff_ffff);
-    Some(host_jdk_value::uuid_text_of(msb, lsb))
+    Some(Ok(host_jdk_value::uuid_text_of(msb, lsb)))
+}
+
+/// One field of a non-canonical [`uuid_from_string`] text, ASCII and without a dash, read as
+/// Java 25's `Long.parseLong(CharSequence, begin, end, 16)` reads it: an optional `+`, then hex
+/// digits, accumulated negatively so the overflow check is on the digit that overflows. The
+/// error is that call's `NumberFormatException` message, with the index counted from the
+/// field's start.
+fn uuid_field(field: &str) -> Result<i64, String> {
+    let bytes = field.as_bytes();
+    let error_at = |index: usize| format!("Error at index {index} in: \"{field}\"");
+    let Some(&first) = bytes.first() else {
+        return Err("For input string: \"\" under radix 16".into());
+    };
+    let mut index = 0;
+    if first < b'0' {
+        // A field never holds a `-`: the text was split at its dashes.
+        if first != b'+' {
+            return Err(error_at(0));
+        }
+        if bytes.len() == 1 {
+            return Err(error_at(1));
+        }
+        index = 1;
+    }
+    const LIMIT: i64 = -i64::MAX;
+    const MULTMIN: i64 = LIMIT / 16;
+    let mut result = 0_i64;
+    while index < bytes.len() {
+        let Some(digit) = char::from(bytes[index]).to_digit(16).map(i64::from) else {
+            return Err(error_at(index));
+        };
+        if result < MULTMIN {
+            return Err(error_at(index));
+        }
+        result *= 16;
+        if result < LIMIT + digit {
+            return Err(error_at(index));
+        }
+        result -= digit;
+        index += 1;
+    }
+    Ok(-result)
 }
 
 fn enum_name(value: &Value) -> &str {
@@ -17029,6 +17536,21 @@ fn game_enum_constants(owner: &str) -> Option<&'static [&'static str]> {
         "net/minecraft/core/Direction$Axis" => &["X", "Y", "Z"],
         "net/minecraft/core/Direction$AxisDirection" => &["POSITIVE", "NEGATIVE"],
         "net/minecraft/world/InteractionHand" => &["MAIN_HAND", "OFF_HAND"],
+        // `server-26.3.jar` `ContainerInput.<clinit>` offsets 0-97 (the click types).
+        "net/minecraft/world/inventory/ContainerInput" => &[
+            "PICKUP",
+            "QUICK_MOVE",
+            "SWAP",
+            "CLONE",
+            "THROW",
+            "QUICK_CRAFT",
+            "PICKUP_ALL",
+        ],
+        "net/minecraft/world/inventory/ClickAction" => &["PRIMARY", "SECONDARY"],
+        "net/minecraft/util/Prediction" => &["PREDICTED", "SERVER_ONLY"],
+        "net/minecraft/world/InteractionResult$SwingSource" => {
+            &["NONE", "PREDICTED", "SERVER_ONLY"]
+        }
         // `CreativeModeTab$TabVisibility` (`server-26.3.jar` `<clinit>` offsets 0..45).
         "net/minecraft/world/item/CreativeModeTab$TabVisibility" => &[
             "PARENT_AND_SEARCH_TABS",
@@ -17129,6 +17651,11 @@ fn jdk_exception_superclass(owner: &str) -> Option<&'static str> {
         // Mixin's, which a `cancel()` on a callback info that is not
         // cancellable throws (sponge-mixin 0.17.5, `host_mixin.rs`).
         host_mixin::CANCELLATION_EXCEPTION => "java/lang/RuntimeException",
+        // gson-2.14.0's, which `Gson.fromJson` and `JsonParser` throw for a
+        // malformed document (`gson_tree/parse.rs`).
+        gson_tree::parse::JSON_SYNTAX_EXCEPTION => "com/google/gson/JsonParseException",
+        "com/google/gson/JsonParseException" => "java/lang/RuntimeException",
+        gson_tree::parse::MALFORMED_JSON_EXCEPTION => "java/io/IOException",
         "java/lang/NumberFormatException"
         | "java/nio/charset/UnsupportedCharsetException"
         | "java/nio/charset/IllegalCharsetNameException" => "java/lang/IllegalArgumentException",
@@ -17418,6 +17945,16 @@ impl host_ref::Nested for HostNested<'_> {
             .voxel_shapes
             .get(key)
             .map(|s| s.to_java_string())
+    }
+
+    fn interaction_result_success(&mut self, key: &str) -> Option<(Value, Value)> {
+        let host = self.0.as_deref()?;
+        block_use::success_parts_in_host(host, key)
+    }
+
+    fn interaction_item_context(&mut self, key: &str) -> Option<(bool, Value)> {
+        let host = self.0.as_deref()?;
+        block_use::item_context_parts_in_host(host, key)
     }
 
     fn uuid_bits(&mut self, value: &Value) -> Option<(i64, i64)> {
@@ -18270,9 +18807,66 @@ fn is_always_loaded_mod(id: &str) -> bool {
     )
 }
 
-/// The one-character string a `String` char index names.
-fn string_from_char_code(code: i32) -> String {
-    char::from_u32(code as u32).map_or_else(String::new, String::from)
+/// The UTF-16 units of a code point for `String.indexOf(int)`/`lastIndexOf(int)`:
+/// a lone surrogate is one unit, a supplementary code point a pair.
+/// Returns `None` when the code point is outside `0..=0x10FFFF` and never matches.
+fn code_point_needle(code: i32) -> Option<Vec<u16>> {
+    let unit = code as u32;
+    if unit > 0x10FFFF {
+        return None;
+    }
+    if (0xD800..=0xDFFF).contains(&unit) {
+        // A lone surrogate: one UTF-16 code unit.
+        return Some(vec![unit as u16]);
+    }
+    let mut buf = [0_u16; 2];
+    let units = char::from_u32(unit)
+        .map(|c| c.encode_utf16(&mut buf))
+        .unwrap_or_default();
+    Some(units.to_vec())
+}
+
+/// `indexOf` for a code-point needle: values outside `0..=0x10FFFF` never
+/// match; a supplementary code point matches its surrogate pair. A negative
+/// `from` is clamped to zero; a `from` beyond the length yields `-1`.
+fn code_point_index_of(haystack: &str, needle: &[u16], from: i32) -> i32 {
+    if needle.is_empty() {
+        return -1;
+    }
+    let haystack = haystack.encode_utf16().collect::<Vec<_>>();
+    let start = from.max(0) as usize;
+    if start >= haystack.len() {
+        return -1;
+    }
+    haystack
+        .get(start..)
+        .and_then(|tail| {
+            tail.windows(needle.len())
+                .position(|window| window == needle)
+        })
+        .map_or(-1, |index| (start + index) as i32)
+}
+
+/// `lastIndexOf` for a code-point needle: values outside `0..=0x10FFFF` never
+/// match; a supplementary code point matches its surrogate pair. A negative
+/// `from` yields `-1`; a `from` beyond the length is clamped to the end.
+fn code_point_last_index_of(haystack: &str, needle: &[u16], from: i32) -> i32 {
+    if needle.is_empty() {
+        return -1;
+    }
+    if from < 0 {
+        return -1;
+    }
+    let haystack = haystack.encode_utf16().collect::<Vec<_>>();
+    // A match may start at `from` itself, so the window reaches `needle.len()` units past it.
+    let end = (from as usize)
+        .saturating_add(needle.len())
+        .min(haystack.len());
+    let prefix = &haystack[..end];
+    prefix
+        .windows(needle.len())
+        .rposition(|window| window == needle)
+        .map_or(-1, |index| index as i32)
 }
 
 /// The physical lines of a `.properties` text, without their terminators: like JDK 25's
@@ -21063,26 +21657,57 @@ fn mixin_accessor_label(kind: MixinAccessorKind) -> &'static str {
     }
 }
 
+/// One placement's `BlockPlaceContext` snapshot, registered on `host` for as
+/// long as this scope lives. Dropping it releases the snapshot (and the
+/// arrays it answered), so the release runs however the invocation ends:
+/// a return, an error, or an unwind (#635).
+struct PlacementScope<'h, H: Host> {
+    host: &'h mut H,
+    context: Value,
+}
+
+impl<'h, H: Host> PlacementScope<'h, H> {
+    /// Register `data` on `host`, which must be (or wrap) a [`StdHost`].
+    fn open(host: &'h mut H, data: BlockPlaceContextData) -> Result<Self, NativeError> {
+        let context = host
+            .as_std_host_mut()
+            .ok_or_else(|| NativeError::Metadata("placement requires a standard host".into()))?
+            .new_block_place_context(data);
+        Ok(Self { host, context })
+    }
+}
+
+impl<H: Host> Drop for PlacementScope<'_, H> {
+    fn drop(&mut self) {
+        if let Some(host) = self.host.as_std_host_mut() {
+            host.release_block_place_context(&self.context);
+        }
+    }
+}
+
 impl NativeJar {
     /// Run a block's `getStateForPlacement(BlockPlaceContext)` override with
     /// the supplied vanilla context. A `null` answer is vanilla's refusal.
+    ///
+    /// The context snapshot is the host's only while this call runs: it is
+    /// released when the override returns, throws or unwinds, so a
+    /// placement leaves nothing on the host (#635). A context the jar keeps
+    /// (a static, a field, a collection) stays the same object to Java, and
+    /// each accessor called on it later is counted.
     pub fn block_state_for_placement<H: Host>(
         &self,
         block: Value,
         context: BlockPlaceContextData,
         host: &mut H,
     ) -> Result<Option<Value>, NativeError> {
-        let context_value = host
-            .as_std_host_mut()
-            .ok_or_else(|| NativeError::Metadata("placement requires a standard host".into()))?
-            .new_block_place_context(context);
+        let scope = PlacementScope::open(host, context)?;
         let value = self.invoke_virtual_with_args(
             "net/minecraft/world/level/block/Block",
             "getStateForPlacement",
             "(Lnet/minecraft/world/item/context/BlockPlaceContext;)Lnet/minecraft/world/level/block/state/BlockState;",
             block,
-            &[context_value],
-            host,
+            std::slice::from_ref(&scope.context),
+            &mut *scope.host,
         )?;
         Ok((value != Value::Ref(None)).then_some(value))
     }
@@ -24198,6 +24823,16 @@ impl NativeJar {
         roots: &[Value],
         action: impl FnOnce(&mut Runtime<'_, H>) -> Result<Value, NativeError>,
     ) -> Result<Value, NativeError> {
+        self.with_persistent_runtime_with_budget(host, roots, &ExecutionBudget::UNBOUNDED, action)
+    }
+
+    fn with_persistent_runtime_with_budget<H: Host>(
+        &self,
+        host: &mut H,
+        roots: &[Value],
+        budget: &ExecutionBudget,
+        action: impl FnOnce(&mut Runtime<'_, H>) -> Result<Value, NativeError>,
+    ) -> Result<Value, NativeError> {
         let (static_fields, initialized_classes) = host.persistent_class_state();
         let (io_paths, io_files, io_file_bytes, io_dirs) = host.persistent_io_state();
         let mut callback_infos = CallbackInfos::new();
@@ -24256,7 +24891,7 @@ impl NativeJar {
             next_frame_id: 0,
             shape_extraction: None,
             check_shape_probes: false,
-            budget: &ExecutionBudget::UNBOUNDED,
+            budget,
         };
         let resident = runtime.adopt_resident_heap();
         let mut crossing = roots.to_vec();
@@ -30918,6 +31553,12 @@ impl<H: Host> Runtime<'_, H> {
                 return self.host.voxel_shape_or_array(r, first, &others).map(Some);
             }
         }
+        if let Some(value) = block_use::invoke_runtime_helper(self, r, receiver, args)? {
+            return Ok(Some(value));
+        }
+        if let Some(value) = live_menu::invoke_helper(self, r, receiver, args)? {
+            return Ok(Some(value));
+        }
         // `BlockStateBase.getShape(BlockGetter, BlockPos[, CollisionContext])`: dispatches to the
         // block's `getShape` (MC 26.3 `BlockBehaviour$BlockStateBase.getShape`).
         if matches!(
@@ -34360,7 +35001,13 @@ impl<H: Host> Runtime<'_, H> {
         receiver: &Value,
         args: &[Value],
     ) -> Result<Value, NativeError> {
-        let value = self.host.invoke_instance(r, receiver, args)?;
+        let value = if level_sound::needs_block_pos_resolution(r, args) {
+            let mut resolved_args = args.to_vec();
+            level_sound::resolve_block_pos_arg(self, r, &mut resolved_args);
+            self.host.invoke_instance(r, receiver, &resolved_args)?
+        } else {
+            self.host.invoke_instance(r, receiver, args)?
+        };
         Ok(self.materialize_host_array(value))
     }
 
@@ -34783,6 +35430,12 @@ impl<H: Host> Runtime<'_, H> {
             receiver,
             args,
         )? {
+            return Ok(Some(value));
+        }
+
+        // The live server menu's vanilla bodies (`live_menu.rs`): clicks, slots, containers
+        // and the player's inventory, for the menus whose state Decaf holds.
+        if let Some(value) = live_menu::invoke(self, &effective_owner, r, op, receiver, args)? {
             return Ok(Some(value));
         }
 
@@ -35696,6 +36349,75 @@ impl<H: Host> Runtime<'_, H> {
                             &supplier_args,
                         )?
                     }
+                }
+                menu_models::MenuAction::MenuConstructor {
+                    constructor,
+                    container_id,
+                    inventory,
+                    player,
+                } => {
+                    let ctor_args = [container_id, inventory, player];
+                    if let Some(menu) = self.invoke_callback(&constructor, &ctor_args)? {
+                        menu
+                    } else {
+                        self.call_virtual(
+                            jdk_call::Site::Interface,
+                            menu_models::MENU_CONSTRUCTOR,
+                            "createMenu",
+                            "(ILnet/minecraft/world/entity/player/Inventory;Lnet/minecraft/world/entity/player/Player;)Lnet/minecraft/world/inventory/AbstractContainerMenu;",
+                            &constructor,
+                            &ctor_args,
+                        )?
+                    }
+                }
+                menu_models::MenuAction::AccessEvaluate {
+                    function,
+                    level,
+                    pos,
+                    default,
+                } => {
+                    let fn_args = [level, pos];
+                    let applied = if let Some(v) = self.invoke_callback(&function, &fn_args)? {
+                        v
+                    } else {
+                        self.call_virtual(
+                            jdk_call::Site::Interface,
+                            "java/util/function/BiFunction",
+                            "apply",
+                            "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+                            &function,
+                            &fn_args,
+                        )?
+                    };
+                    if applied == Value::Ref(None) {
+                        return Err(NativeError::UncaughtException {
+                            class: "java/lang/NullPointerException".into(),
+                            message: None,
+                            frame: None,
+                        });
+                    }
+                    match default {
+                        Some(_) => applied,
+                        None => host_optional::optional_wrap(applied),
+                    }
+                }
+                menu_models::MenuAction::AccessExecute {
+                    consumer,
+                    level,
+                    pos,
+                } => {
+                    let fn_args = [level, pos];
+                    if self.invoke_callback(&consumer, &fn_args)?.is_none() {
+                        let _ = self.call_virtual(
+                            jdk_call::Site::Interface,
+                            "java/util/function/BiConsumer",
+                            "accept",
+                            "(Ljava/lang/Object;Ljava/lang/Object;)V",
+                            &consumer,
+                            &fn_args,
+                        )?;
+                    }
+                    Value::Void
                 }
             };
         }
@@ -36701,6 +37423,29 @@ impl<H: Host> Runtime<'_, H> {
             }
         }
         Ok((return_desc(descriptor) != "V").then_some(Value::Ref(Some(joined))))
+    }
+
+    #[inline(never)]
+    fn invoke_sound_event_init(
+        &mut self,
+        r: &MethodRef,
+        receiver: Option<&Value>,
+        args: &[Value],
+        stack: &mut [Value],
+        locals: &mut [Value],
+    ) -> Option<Value> {
+        if r.owner != "net/minecraft/sounds/SoundEvent" || r.name != "<init>" {
+            return None;
+        }
+        let built = self.host.construct_sound_event(r, args)?;
+        if let Some(marker) = receiver.filter(|value| jar_object::is_object(value)) {
+            for slot in stack.iter_mut().chain(locals.iter_mut()) {
+                if slot == marker {
+                    *slot = built.clone();
+                }
+            }
+        }
+        Some(Value::Void)
     }
 
     fn invoke_frame(
@@ -38771,6 +39516,17 @@ impl<H: Host> Runtime<'_, H> {
                             }
                             Value::Void
                         });
+                    }
+                    if dispatched.is_none()
+                        && let Some(value) = self.invoke_sound_event_init(
+                            &r,
+                            receiver.as_ref(),
+                            &args,
+                            &mut stack,
+                            &mut locals,
+                        )
+                    {
+                        dispatched = Some(value);
                     }
                     if dispatched.is_none()
                         && let Some(value) = invoke_or_catch!(
@@ -48263,6 +49019,29 @@ mandatory = true
                 .unwrap(),
             Value::Int(1)
         );
+        // A jar-object marker (`String#n`) has no text to strip: every one of
+        // the four methods stays counted, none answers from the marker's text.
+        let marker = Value::Ref(Some("java/lang/String#3".into()));
+        for (name, descriptor) in [
+            ("strip", "()Ljava/lang/String;"),
+            ("stripLeading", "()Ljava/lang/String;"),
+            ("stripTrailing", "()Ljava/lang/String;"),
+            ("isBlank", "()Z"),
+        ] {
+            let call = MethodRef {
+                owner: "java/lang/String".into(),
+                name: name.into(),
+                descriptor: descriptor.into(),
+            };
+            assert!(host.invoke_instance(&call, &marker, &[]).is_ok(), "{name}");
+            assert!(
+                host.unknown_host_calls()
+                    .iter()
+                    .any(|(counted, _)| *counted == format!("java/lang/String#{name}{descriptor}")),
+                "{name}: {:?}",
+                host.unknown_host_calls()
+            );
+        }
     }
 
     #[test]

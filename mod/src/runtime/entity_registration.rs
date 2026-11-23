@@ -565,7 +565,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n")
             + "\n";
-        assert_eq!(captured, include_str!("vanilla_entity_data_subclass.txt"));
+        assert_eq!(captured, crate::runtime::vendored_vanilla_entity_data_subclass_txt::VENDORED_DATA);
     }
 
     #[test]

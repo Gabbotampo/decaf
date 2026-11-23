@@ -13,7 +13,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicPtr, Ordering};
-use std::sync::{Arc, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use mod_api::ServerHost;
 
@@ -168,7 +168,10 @@ pub(crate) fn matches_method(
 }
 
 struct ActiveFrame {
-    owner: *const HorizonJava,
+    /// Whose state the frame holds: the address of the owner's `state` mutex. Each
+    /// `HorizonJava` has exactly one, and a [`StateHandle`] shares it, so a command executor
+    /// finds the same frame its owner's hooks do. Compared only, never dereferenced.
+    owner: *const Mutex<State>,
     state: std::cell::UnsafeCell<State>,
     nested_entries: std::cell::Cell<u32>,
     refused_reentries: std::cell::Cell<u32>,
@@ -228,7 +231,35 @@ impl DerefMut for StateGuard<'_> {
 }
 
 pub(crate) fn lock_state(owner: &HorizonJava) -> StateGuard<'_> {
-    let owner_ptr = owner as *const HorizonJava;
+    lock_parts(&owner.state, &owner.dispatch_gate)
+}
+
+/// The mod's state as a `'static` callback reaches it: a server command executor
+/// (`Command::executes`) outlives any `&HorizonJava` borrow, so it holds the owner's state and
+/// gate themselves and locks them exactly as [`lock_state`] does.
+#[derive(Clone)]
+pub(crate) struct StateHandle {
+    state: Arc<Mutex<State>>,
+    gate: Arc<Mutex<()>>,
+}
+
+impl StateHandle {
+    pub(crate) fn new(owner: &HorizonJava) -> Self {
+        Self {
+            state: Arc::clone(&owner.state),
+            gate: Arc::clone(&owner.dispatch_gate),
+        }
+    }
+
+    pub(crate) fn lock(&self) -> StateGuard<'_> {
+        lock_parts(&self.state, &self.gate)
+    }
+}
+
+/// The active frame's state if this thread is inside a dispatch for this state, else the gate
+/// then the state mutex.
+fn lock_parts<'a>(state: &'a Arc<Mutex<State>>, gate: &'a Mutex<()>) -> StateGuard<'a> {
+    let owner_ptr = Arc::as_ptr(state);
     let active = ACTIVE_FRAMES.with(|frames| {
         let frames = frames.borrow();
         let frame = frames.last().filter(|frame| frame.0.owner == owner_ptr)?;
@@ -244,12 +275,8 @@ pub(crate) fn lock_state(owner: &HorizonJava) -> StateGuard<'_> {
             _marker: std::marker::PhantomData,
         };
     }
-    let gate = owner
-        .dispatch_gate
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let state = owner
-        .state
+    let gate = gate.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let state = state
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     StateGuard::Locked { _gate: gate, state }
@@ -294,7 +321,7 @@ impl HorizonJava {
         if !self.plan_bits.maybe_contains(dispatch.method.0) {
             return Ok(DispatchAnswer::default());
         }
-        let owner = self as *const HorizonJava;
+        let owner = Arc::as_ptr(&self.state);
         let refused = ACTIVE_FRAMES.with(|frames| {
             let frames = frames.borrow();
             let Some(frame) = frames.last().filter(|frame| frame.0.owner == owner) else {
@@ -421,8 +448,17 @@ fn dispatch_state(
     // this comparator, so the BTreeMap cannot silently reorder callbacks.
     targets.sort_by_key(|target| (target.priority, target.jar, target.order));
     let mut answer = DispatchAnswer::default();
+    // The level sound streams any jar found unknown. Each target's sounds are delivered in call
+    // order against the streams as they stood before it ran (`sound.rs`).
+    let mut sound_streams =
+        crate::sound::sync_unknown_sound_streams(&mut state.jars, |jar| &mut jar.host);
     for target in targets {
+        // Also what an earlier target, or a dispatch nested in one, left unknown on any jar.
+        sound_streams.extend(crate::sound::gather_unknown_sound_streams(
+            state.jars.iter().map(|jar| &jar.host),
+        ));
         let loaded = &mut state.jars[target.jar];
+        crate::sound::share_unknown_sound_streams([&mut loaded.host], &sound_streams);
         let registrations = loaded.hooks.for_anchor(&target.hook, anchor);
         if registrations.is_empty() {
             continue;
@@ -433,7 +469,9 @@ fn dispatch_state(
         let receiver = dispatch
             .receiver
             .clone()
+            .map(|object| crate::sound::enrich_game_object(dispatch.host, object))
             .map(|object| context.insert(object));
+        loaded.host.set_host_deferred_server_sound_seeds(true);
         let result = crate::caught(
             &format!("{} game hook {}", loaded.row.id, target.hook),
             || {
@@ -467,14 +505,17 @@ fn dispatch_state(
                 })
             },
         );
+        loaded.host.set_host_deferred_server_sound_seeds(false);
         let run = match result {
             Ok(Ok(run)) => run,
             Ok(Err(error)) => {
                 loaded.row.game_hooks.failed += 1;
+                drop_failed_callback_sounds(&mut context, &mut loaded.host, &mut sound_streams);
                 return Err(DispatchError::from_error(error));
             }
             Err(panic) => {
                 loaded.row.game_hooks.failed += 1;
+                drop_failed_callback_sounds(&mut context, &mut loaded.host, &mut sound_streams);
                 return Err(DispatchError::from_error(format!("panicked: {panic}")));
             }
         };
@@ -485,22 +526,61 @@ fn dispatch_state(
             answer.returned = run.returned;
         }
         for effect in context.take_effects() {
-            apply_effect(dispatch.host, effect);
+            apply_effect(dispatch.host, &mut loaded.host, effect, &mut sound_streams);
         }
+        // What this target's calls, or the delivery of its sounds, left unknown: kept on its
+        // host, and lent to the next target's.
+        sound_streams.extend(loaded.host.unknown_sound_streams().iter().cloned());
+        crate::sound::share_unknown_sound_streams([&mut loaded.host], &sound_streams);
         if run.cancelled {
             break;
         }
     }
     Ok(answer)
 }
-fn apply_effect(host: &mut dyn ServerHost, effect: GameHookEffect) {
+fn apply_effect(
+    host: &mut dyn ServerHost,
+    runtime_host: &mut crate::runtime::StdHost,
+    effect: GameHookEffect,
+    sound_streams: &mut std::collections::BTreeSet<String>,
+) {
     match effect {
         GameHookEffect::SystemMessage { player, text } => {
             if let Some(target) = host.player(player) {
                 let _ = target.tell(host, mod_api::Text::literal(text));
             }
         }
+        GameHookEffect::PlaySound(effect) => {
+            crate::sound::apply_server_sounds(host, &[effect], sound_streams, |reason| {
+                runtime_host.note_unknown_game_hook(reason);
+            });
+        }
     }
+}
+
+/// A failed callback's effects are not applied. Its recorded sounds are counted instead, and a
+/// sound whose seed was deferred to Sunrise leaves its stream unknown: Java drew that seed before
+/// the failure, and Sunrise never will.
+fn drop_failed_callback_sounds(
+    context: &mut GameHookContext,
+    runtime_host: &mut crate::runtime::StdHost,
+    sound_streams: &mut std::collections::BTreeSet<String>,
+) {
+    let sounds: Vec<_> = context
+        .take_effects()
+        .into_iter()
+        .filter_map(|effect| match effect {
+            GameHookEffect::PlaySound(sound) => Some(sound),
+            GameHookEffect::SystemMessage { .. } => None,
+        })
+        .collect();
+    crate::sound::count_undelivered_sounds(
+        &sounds,
+        sound_streams,
+        |reason| runtime_host.note_unknown_game_hook(reason),
+        "level sound from a failed game hook callback",
+    );
+    crate::sound::share_unknown_sound_streams([runtime_host], sound_streams);
 }
 impl From<NativeError> for DispatchError {
     fn from(error: NativeError) -> Self {
@@ -962,7 +1042,7 @@ mod tests {
             let mut locked = java.lock();
             std::mem::take(&mut *locked)
         };
-        let owner = &java as *const HorizonJava;
+        let owner = Arc::as_ptr(&java.state);
         ACTIVE_FRAMES.with(|frames| {
             frames
                 .borrow_mut()
@@ -1017,7 +1097,7 @@ mod tests {
             let mut locked = java.lock();
             std::mem::take(&mut *locked)
         };
-        let owner = &java as *const HorizonJava;
+        let owner = Arc::as_ptr(&java.state);
         ACTIVE_FRAMES.with(|frames| {
             frames
                 .borrow_mut()

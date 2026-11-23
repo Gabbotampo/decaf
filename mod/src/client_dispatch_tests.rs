@@ -14,11 +14,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use mod_api::__private::game::BackendRefOf;
 use mod_api::text::{TextContent, TextStyle};
 use mod_api::{
-    Backend, BackendRef, BuildCreativeModeTabContentsEvent, ClientHost, ClientSetupEvent,
-    CreativeTabChange, CreativeTabEdit, CreativeTabEditError, CreativeTabList,
-    CreativeTabPermissions, CreativeTabPlacement, CreativeTabVisibility, Dist, HookId, Hooks, Host,
-    HostSide, Identifier, ItemKey, ItemStack, ItemTooltipEvent, Listener, ModEntry, Tag, Text,
-    TextFormError, TooltipDisplay,
+    Backend, BackendRef, BuildCreativeModeTabContentsEvent, ClientHost, ClientReloadHost,
+    ClientSetupContext, ClientSetupEvent, CreativeTabChange, CreativeTabEdit, CreativeTabEditError,
+    CreativeTabList, CreativeTabPermissions, CreativeTabPlacement, CreativeTabVisibility, Dist,
+    HookId, Hooks, Host, HostSide, Identifier, ItemKey, ItemStack, ItemStackView, ItemTooltipEvent,
+    Listener, ModEntry, ReloadContext, Tag, Text, TextFormError, TooltipDisplay, TooltipLines,
+    TooltipLinesAccess,
 };
 use zip::write::SimpleFileOptions;
 
@@ -117,8 +118,8 @@ impl Hooks for SharedHorizonJava {
     fn listeners(&self) -> &'static [Listener] {
         self.0.listeners()
     }
-    fn client_setup(&self, host: &mut dyn ClientHost, event: &mut ClientSetupEvent) {
-        self.0.client_setup(host, event);
+    fn client_setup(&self, context: &mut dyn ClientSetupContext, event: &mut ClientSetupEvent) {
+        self.0.client_setup(context, event);
     }
     fn build_creative_mode_tab_contents(
         &self,
@@ -144,7 +145,11 @@ struct CreativeTabEditorState {
 /// Sunrise's `native_text_json` component codec), and `ConfigHost::game_version`.
 struct TestClientHost {
     fake: mod_api::testing::FakeHost,
+    /// While set, `KeysBackend::item_key_id` names no item, as a host with no name for a slot.
+    hide_item_names: std::cell::Cell<bool>,
     editor: RefCell<CreativeTabEditorState>,
+    /// Every `ClientHost::play_local_sound` the bridge made, with its `after` ticks.
+    local_sounds: RefCell<Vec<(mod_api::SoundPlay, u32)>>,
 }
 
 impl TestClientHost {
@@ -159,7 +164,9 @@ impl TestClientHost {
             .expect("resolve test items");
         Self {
             fake,
+            hide_item_names: std::cell::Cell::new(false),
             editor: RefCell::new(CreativeTabEditorState::default()),
+            local_sounds: RefCell::default(),
         }
     }
 
@@ -186,7 +193,10 @@ impl TestClientHost {
         };
         entries
             .iter()
-            .map(|stack| (stack.item().id(self), stack.count()))
+            .map(|stack| {
+                let id = stack.item().id(self).expect("a test item has a name");
+                (id.to_owned(), stack.count())
+            })
             .collect()
     }
 }
@@ -199,7 +209,107 @@ impl Host for TestClientHost {
 mod_api::impl_host_areas!(TestClientHost, except(config, items, text));
 
 impl ClientHost for TestClientHost {}
-mod_api::impl_client_host_areas!(TestClientHost);
+mod_api::impl_client_host_areas!(TestClientHost, except(effects));
+
+impl mod_api::prelude::EffectsClientHost for TestClientHost {
+    fn play_local_sound(
+        &self,
+        sound: &mod_api::SoundPlay,
+        after: u32,
+    ) -> Option<mod_api::SoundRef> {
+        self.local_sounds.borrow_mut().push((sound.clone(), after));
+        Some(mod_api::__private::game::sound_ref(
+            self.local_sounds.borrow().len() as u64,
+        ))
+    }
+}
+
+/// `client_setup`'s context (since d404b5f02f it is not a `ClientHost`): the same test host,
+/// with the version the game reports and the same local-sound recorder.
+impl ReloadContext for TestClientHost {
+    fn dist(&self) -> Dist {
+        Dist::Client
+    }
+    fn game_version(&self) -> &'static str {
+        "26.3"
+    }
+}
+impl ClientReloadHost for TestClientHost {}
+impl ClientSetupContext for TestClientHost {
+    fn play_local_sound(
+        &self,
+        sound: &mod_api::SoundPlay,
+        after: u32,
+    ) -> Option<mod_api::SoundRef> {
+        mod_api::prelude::EffectsClientHost::play_local_sound(self, sound, after)
+    }
+}
+
+/// The engine's live tooltip line list over a plain vector, as `item_tooltip` lends it since
+/// d404b5f02f (`TooltipLines`): each written line is validated, as the game's list does.
+struct VecLines<'v>(&'v mut Vec<(Text, u32)>);
+
+impl TooltipLinesAccess for VecLines<'_> {
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+    fn color(&self, index: usize) -> Option<u32> {
+        self.0.get(index).map(|line| line.1)
+    }
+    fn get(&self, index: usize) -> Option<Result<(Text, u32), TextFormError>> {
+        self.0.get(index).cloned().map(Ok)
+    }
+    fn push(&mut self, text: Text, color: u32) -> Result<(), TextFormError> {
+        text.validate()?;
+        self.0.push((text, color));
+        Ok(())
+    }
+    fn insert(&mut self, index: usize, text: Text, color: u32) -> Result<bool, TextFormError> {
+        if index > self.0.len() {
+            return Ok(false);
+        }
+        text.validate()?;
+        self.0.insert(index, (text, color));
+        Ok(true)
+    }
+    fn set(&mut self, index: usize, text: Text, color: u32) -> Result<bool, TextFormError> {
+        if index >= self.0.len() {
+            return Ok(false);
+        }
+        text.validate()?;
+        self.0[index] = (text, color);
+        Ok(true)
+    }
+    fn set_color(&mut self, index: usize, color: u32) -> bool {
+        match self.0.get_mut(index) {
+            Some(line) => {
+                line.1 = color;
+                true
+            }
+            None => false,
+        }
+    }
+    fn remove(&mut self, index: usize) -> Option<Result<(Text, u32), TextFormError>> {
+        (index < self.0.len()).then(|| Ok(self.0.remove(index)))
+    }
+    fn pop(&mut self) -> Option<Result<(Text, u32), TextFormError>> {
+        self.0.pop().map(Ok)
+    }
+    fn clear(&mut self) {
+        self.0.clear();
+    }
+    fn truncate(&mut self, len: usize) {
+        self.0.truncate(len);
+    }
+    fn swap(&mut self, a: usize, b: usize) -> bool {
+        if a < self.0.len() && b < self.0.len() {
+            self.0.swap(a, b);
+            true
+        } else {
+            false
+        }
+    }
+}
 
 impl Backend for TestClientHost {}
 mod_api::impl_backend_areas!(TestClientHost, except(items, keys));
@@ -223,7 +333,10 @@ impl mod_api::prelude::ItemsHost for TestClientHost {
 }
 
 impl mod_api::prelude::KeysBackend for TestClientHost {
-    fn item_key_id(&self, key: ItemKey) -> String {
+    fn item_key_id(&self, key: ItemKey) -> Option<&str> {
+        if self.hide_item_names.get() {
+            return None;
+        }
         mod_api::prelude::KeysBackend::item_key_id(&self.fake, key)
     }
 }
@@ -952,11 +1065,11 @@ fn javac_fixture_creative_tab_anchors_visibility_flags_and_tooltip_bridge() {
                 mod_api::__private::ItemTooltipCall {
                     player: 0,
                     player_entity_id: 1,
-                    stack: &tooltip_stack,
+                    stack: ItemStackView::from_stack(&tooltip_stack),
                     display: &display,
                     advanced: true,
                     creative: false,
-                    lines: &mut lines,
+                    lines: TooltipLines::new(&mut VecLines(&mut lines)),
                 },
             );
             let mut expected_style = TextStyle::default();
@@ -998,11 +1111,11 @@ fn javac_fixture_creative_tab_anchors_visibility_flags_and_tooltip_bridge() {
                 mod_api::__private::ItemTooltipCall {
                     player: 0,
                     player_entity_id: 1,
-                    stack: &hidden_stack,
+                    stack: ItemStackView::from_stack(&hidden_stack),
                     display: &hidden_display,
                     advanced: false,
                     creative: false,
-                    lines: &mut hidden_lines,
+                    lines: TooltipLines::new(&mut VecLines(&mut hidden_lines)),
                 },
             );
             assert!(hidden_lines.is_empty());
@@ -1014,11 +1127,11 @@ fn javac_fixture_creative_tab_anchors_visibility_flags_and_tooltip_bridge() {
                 mod_api::__private::ItemTooltipCall {
                     player: 0,
                     player_entity_id: 1,
-                    stack: &hidden_stack,
+                    stack: ItemStackView::from_stack(&hidden_stack),
                     display: &hidden_display,
                     advanced: false,
                     creative: true,
-                    lines: &mut creative_lines,
+                    lines: TooltipLines::new(&mut VecLines(&mut creative_lines)),
                 },
             );
             assert_eq!(
@@ -1029,6 +1142,34 @@ fn javac_fixture_creative_tab_anchors_visibility_flags_and_tooltip_bridge() {
                 ]
             );
             assert_eq!(report_row(&java)["unknown_host_call_count"], 3);
+
+            // 7) A hovered item the host cannot name: this jar registers items, so its
+            //    `appendHoverText` may be the one that would run. It is counted on the jar
+            //    (3 -> 4), and the tooltip keeps exactly what Sunrise built, no guessed lines.
+            host.hide_item_names.set(true);
+            let mut unnamed_lines = vec![(Text::literal("Demo Tooltip Item"), 0xFFFF_FFFF)];
+            mod_api::dispatch_item_tooltip(
+                &host,
+                mod_api::__private::ItemTooltipCall {
+                    player: 0,
+                    player_entity_id: 1,
+                    stack: ItemStackView::from_stack(&tooltip_stack),
+                    display: &display,
+                    advanced: true,
+                    creative: false,
+                    lines: TooltipLines::new(&mut VecLines(&mut unnamed_lines)),
+                },
+            );
+            host.hide_item_names.set(false);
+            assert_eq!(
+                unnamed_lines,
+                vec![(Text::literal("Demo Tooltip Item"), 0xFFFF_FFFF)]
+            );
+            assert_eq!(
+                report_row(&java)["unknown_host_call_count"],
+                4,
+                "an unnameable hovered item must be counted on the jar, not skipped silently"
+            );
 
             Ok::<_, ()>(())
         })
@@ -1181,11 +1322,11 @@ fn run_real_runes_bridge_test(path: &Path) {
                 mod_api::__private::ItemTooltipCall {
                     player: 0,
                     player_entity_id: 1,
-                    stack: &altar,
+                    stack: ItemStackView::from_stack(&altar),
                     display: &display,
                     advanced: false,
                     creative: false,
-                    lines: &mut lines,
+                    lines: TooltipLines::new(&mut VecLines(&mut lines)),
                 },
             );
             let mut expected_style = TextStyle::default();
@@ -1591,15 +1732,15 @@ fn creative_tab_preserves_custom_components_and_skips_unrepresentable_stacks() {
             assert_eq!(editor.parent.len(), 7, "parent entries: {:?}", editor.parent);
             assert_eq!(editor.search.len(), 7, "search entries: {:?}", editor.search);
             for list in [&editor.parent, &editor.search] {
-                assert_eq!(list[0].item().id(&host), "minecraft:stone");
-                assert_eq!(list[1].item().id(&host), "minecraft:diamond_sword");
+                assert_eq!(list[0].item().id(&host), Some("minecraft:stone"));
+                assert_eq!(list[1].item().id(&host), Some("minecraft:diamond_sword"));
                 assert_eq!(list[1].damage_component(), None);
                 assert!(list[1].components().is_none());
 
-                assert_eq!(list[2].item().id(&host), "minecraft:diamond_sword");
+                assert_eq!(list[2].item().id(&host), Some("minecraft:diamond_sword"));
                 assert_eq!(list[2].damage_component(), Some(12));
 
-                assert_eq!(list[3].item().id(&host), "minecraft:diamond_sword");
+                assert_eq!(list[3].item().id(&host), Some("minecraft:diamond_sword"));
                 assert!(
                     list[3]
                         .components()
@@ -1609,7 +1750,7 @@ fn creative_tab_preserves_custom_components_and_skips_unrepresentable_stacks() {
                 );
                 assert!(!list[3].is_stackable_with(&list[1]));
 
-                assert_eq!(list[4].item().id(&host), "minecraft:diamond_sword");
+                assert_eq!(list[4].item().id(&host), Some("minecraft:diamond_sword"));
                 assert_eq!(
                     list[4]
                         .components()
@@ -1618,7 +1759,7 @@ fn creative_tab_preserves_custom_components_and_skips_unrepresentable_stacks() {
                     Some(&Tag::Int(3))
                 );
 
-                assert_eq!(list[5].item().id(&host), "minecraft:diamond_sword");
+                assert_eq!(list[5].item().id(&host), Some("minecraft:diamond_sword"));
                 assert_eq!(
                     list[5]
                         .components()
@@ -1626,7 +1767,7 @@ fn creative_tab_preserves_custom_components_and_skips_unrepresentable_stacks() {
                     Some(&Tag::Compound(mod_api::Compound::new()))
                 );
 
-                assert_eq!(list[6].item().id(&host), "minecraft:diamond_sword");
+                assert_eq!(list[6].item().id(&host), Some("minecraft:diamond_sword"));
                 assert_eq!(
                     list[6]
                         .components()
@@ -1818,11 +1959,11 @@ fn item_tooltip_passes_real_stack_components_and_tooltip_display() {
                 mod_api::__private::ItemTooltipCall {
                     player: 0,
                     player_entity_id: 1,
-                    stack: &rich,
+                    stack: ItemStackView::from_stack(&rich),
                     display: &rich_display,
                     advanced: false,
                     creative: false,
-                    lines: &mut lines,
+                    lines: TooltipLines::new(&mut VecLines(&mut lines)),
                 },
             );
             assert_eq!(
@@ -1846,11 +1987,11 @@ fn item_tooltip_passes_real_stack_components_and_tooltip_display() {
                 mod_api::__private::ItemTooltipCall {
                     player: 0,
                     player_entity_id: 1,
-                    stack: &plain,
+                    stack: ItemStackView::from_stack(&plain),
                     display: &ominous_display,
                     advanced: false,
                     creative: false,
-                    lines: &mut ominous_lines,
+                    lines: TooltipLines::new(&mut VecLines(&mut ominous_lines)),
                 },
             );
             assert_eq!(
@@ -1884,11 +2025,11 @@ fn item_tooltip_passes_real_stack_components_and_tooltip_display() {
                 mod_api::__private::ItemTooltipCall {
                     player: 0,
                     player_entity_id: 1,
-                    stack: &hidden,
+                    stack: ItemStackView::from_stack(&hidden),
                     display: &hidden_display,
                     advanced: false,
                     creative: true,
-                    lines: &mut hidden_lines,
+                    lines: TooltipLines::new(&mut VecLines(&mut hidden_lines)),
                 },
             );
             assert_eq!(
@@ -1931,11 +2072,11 @@ fn item_tooltip_passes_real_stack_components_and_tooltip_display() {
                 mod_api::__private::ItemTooltipCall {
                     player: 0,
                     player_entity_id: 1,
-                    stack: &opaque_stack,
+                    stack: ItemStackView::from_stack(&opaque_stack),
                     display: &opaque_display,
                     advanced: false,
                     creative: false,
-                    lines: &mut opaque_lines,
+                    lines: TooltipLines::new(&mut VecLines(&mut opaque_lines)),
                 },
             );
             assert_eq!(
@@ -1970,11 +2111,11 @@ fn item_tooltip_passes_real_stack_components_and_tooltip_display() {
                 mod_api::__private::ItemTooltipCall {
                     player: 0,
                     player_entity_id: 1,
-                    stack: &bad_td_stack,
+                    stack: ItemStackView::from_stack(&bad_td_stack),
                     display: &bad_td_display,
                     advanced: false,
                     creative: false,
-                    lines: &mut bad_td_lines,
+                    lines: TooltipLines::new(&mut VecLines(&mut bad_td_lines)),
                 },
             );
             assert!(
@@ -2263,8 +2404,8 @@ fn creative_tab_dedupes_tooltip_display_hidden_components_as_set_matching_jdk25(
                         2,
                         "reordered TooltipDisplay stacks must dedupe to one entry: {list:?}"
                     );
-                    assert_eq!(list[0].item().id(&host), "minecraft:stone");
-                    assert_eq!(list[1].item().id(&host), "minecraft:diamond_sword");
+                    assert_eq!(list[0].item().id(&host), Some("minecraft:stone"));
+                    assert_eq!(list[1].item().id(&host), Some("minecraft:diamond_sword"));
                     assert_eq!(
                         list[1]
                             .components()
@@ -2330,6 +2471,204 @@ fn creative_tab_dedupes_tooltip_display_hidden_components_as_set_matching_jdk25(
             );
             assert_eq!(report_row(&java)["unknown_host_call_count"], 0);
 
+            Ok::<_, ()>(())
+        })
+        .unwrap();
+    });
+}
+
+/// Extra stubs for a client jar that plays level sounds.
+const CLIENT_SOUND_STUBS: &[(&str, &str)] = &[
+    (
+        "net/minecraft/sounds/SoundEvent.java",
+        "package net.minecraft.sounds; import net.minecraft.resources.Identifier; public final class SoundEvent { public static SoundEvent createVariableRangeEvent(Identifier id) { throw new AssertionError(); } }",
+    ),
+    (
+        "net/minecraft/sounds/SoundSource.java",
+        "package net.minecraft.sounds; public enum SoundSource { MASTER, MUSIC, RECORDS, WEATHER, BLOCKS, HOSTILE, NEUTRAL, PLAYERS, AMBIENT, VOICE, UI }",
+    ),
+    (
+        "net/minecraft/world/entity/Entity.java",
+        "package net.minecraft.world.entity; public class Entity {}",
+    ),
+    (
+        "net/minecraft/world/level/Level.java",
+        "package net.minecraft.world.level; import net.minecraft.sounds.SoundEvent; import net.minecraft.sounds.SoundSource; import net.minecraft.world.entity.Entity; public abstract class Level { public void playLocalSound(double x, double y, double z, SoundEvent s, SoundSource src, float v, float p, boolean delay) {} public void playSeededSound(Entity except, double x, double y, double z, SoundEvent s, SoundSource src, float v, float p, long seed) {} }",
+    ),
+    (
+        "net/minecraft/client/multiplayer/ClientLevel.java",
+        "package net.minecraft.client.multiplayer; import net.minecraft.world.level.Level; public class ClientLevel extends Level {}",
+    ),
+];
+
+const SOUND_TOOLTIP_MOD: &str = r#"package demo;
+import java.util.function.Consumer;
+import net.fabricmc.api.ModInitializer;
+import net.minecraft.client.multiplayer.ClientLevel;
+import net.minecraft.core.Registry;
+import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.network.chat.Component;
+import net.minecraft.resources.Identifier;
+import net.minecraft.sounds.SoundEvent;
+import net.minecraft.sounds.SoundSource;
+import net.minecraft.world.item.Item;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.TooltipFlag;
+import net.minecraft.world.item.component.TooltipDisplay;
+
+public final class SoundTooltipMod implements ModInitializer {
+    public static final class ChimeItem extends Item {
+        private ClientLevel level;
+
+        public ChimeItem(Properties props) {
+            super(props);
+        }
+
+        // No client callback hands a jar a `ClientLevel` yet (outside a frame
+        // `Minecraft.level` is null), so the test gives the item one directly.
+        public void hold(ClientLevel level) {
+            this.level = level;
+        }
+
+        @Override
+        public void appendHoverText(
+            ItemStack stack,
+            TooltipContext context,
+            TooltipDisplay display,
+            Consumer<Component> out,
+            TooltipFlag flag
+        ) {
+            SoundEvent chime = SoundEvent.createVariableRangeEvent(
+                Identifier.fromNamespaceAndPath("demo", "chime"));
+            // Draws `Level.random` at the call.
+            level.playLocalSound(1.0, 2.0, 3.0, chime, SoundSource.BLOCKS, 0.5f, 1.5f, false);
+            // `except == minecraft.player` (both null): plays with an explicit seed.
+            level.playSeededSound(null, 4.0, 5.0, 6.0, chime, SoundSource.BLOCKS, 1.0f, 1.0f, 99L);
+            out.accept(Component.literal("chimed"));
+        }
+    }
+
+    @Override
+    public void onInitialize() {
+        Registry.register(
+            BuiltInRegistries.ITEM,
+            Identifier.fromNamespaceAndPath("demo", "chime_item"),
+            new ChimeItem(new Item.Properties())
+        );
+    }
+}
+"#;
+
+/// Client sounds a jar's Java code records during a client callback reach Sunrise's
+/// `ClientHost::play_local_sound` through the real hook dispatch, or are counted on the jar:
+/// never recorded and dropped.
+#[test]
+fn item_tooltip_drains_recorded_client_sounds_into_play_local_sound() {
+    let mut sources = CLIENT_DISPATCH_STUBS.to_vec();
+    sources.extend_from_slice(CLIENT_SOUND_STUBS);
+    sources.push(("demo/SoundTooltipMod.java", SOUND_TOOLTIP_MOD));
+    let jar_bytes = build_javac_jar(
+        "client-tooltip-sounds",
+        r#"{"schemaVersion":1,"id":"demo","version":"1.0","entrypoints":{"main":["demo.SoundTooltipMod"]}}"#,
+        &sources,
+    );
+
+    let java = Arc::new(HorizonJava::default());
+    java.lock_client()
+        .set_fixture_files(vec![("demo-sounds.jar".to_owned(), jar_bytes)]);
+
+    let mods = vec![ModEntry::new(
+        "horizon_java",
+        Box::new(SharedHorizonJava(Arc::clone(&java))),
+    )];
+    mod_api::testing::with_mods(mods.into(), || {
+        mod_api::testing::rebuild_parts(|| {
+            let host = {
+                let mut host = TestClientHost::new(&["demo:chime_item"]);
+                mod_api::dispatch_client_setup(&mut host);
+                host
+            };
+            assert_eq!(report_row(&java)["unknown_host_call_count"], 0);
+            {
+                let mut client = java.lock_client();
+                let (jar, runtime) = client.resident(0);
+                let item = runtime
+                    .observed_registry_entry("minecraft:item", "demo:chime_item")
+                    .expect("chime item registered")
+                    .value
+                    .clone();
+                jar.invoke_virtual_with_args(
+                    "demo/SoundTooltipMod$ChimeItem",
+                    "hold",
+                    "(Lnet/minecraft/client/multiplayer/ClientLevel;)V",
+                    item,
+                    &[crate::runtime::StdHost::client_level_handle()],
+                    runtime,
+                )
+                .expect("hand the item a client level");
+            }
+            let tooltip = |host: &TestClientHost| {
+                let stack = host.stack("demo:chime_item");
+                let display = TooltipDisplay::for_stack(&stack);
+                let mut lines = vec![(Text::literal("Chime"), 0xFFFF_FFFF)];
+                mod_api::dispatch_item_tooltip(
+                    host,
+                    mod_api::__private::ItemTooltipCall {
+                        player: 0,
+                        player_entity_id: 1,
+                        stack: ItemStackView::from_stack(&stack),
+                        display: &display,
+                        advanced: false,
+                        creative: false,
+                        lines: TooltipLines::new(&mut VecLines(&mut lines)),
+                    },
+                );
+                lines
+            };
+
+            // 1. As the client owner runs: no client draw is deferred to Sunrise, whose
+            //    `play_local_sound` draws its seed later and from another stream. The
+            //    `playLocalSound` counts at the call (its `Level.random` draw is one Decaf
+            //    cannot make); the explicit-seed sound is recorded, drained, and counted.
+            let lines = tooltip(&host);
+            assert_eq!(lines[1], (Text::literal("chimed"), u32::MAX));
+            assert!(host.local_sounds.borrow().is_empty());
+            assert_eq!(report_row(&java)["unknown_host_call_count"], 2);
+            {
+                let mut client = java.lock_client();
+                let (_, runtime) = client.resident(0);
+                assert!(
+                    runtime.played_sounds().is_empty(),
+                    "drained, not left behind"
+                );
+                assert!(!runtime.sound_stream_known("client/level#random"));
+            }
+
+            // 2. A new client level starts fresh streams; with the draw deferred to Sunrise
+            //    (as a host that could take it would), the local sound reaches
+            //    `play_local_sound` through the tooltip hook.
+            java.lock_client().level_loaded();
+            java.lock_client()
+                .resident(0)
+                .1
+                .set_host_deferred_client_sound_seeds(true);
+            let lines = tooltip(&host);
+            assert_eq!(lines[1], (Text::literal("chimed"), u32::MAX));
+            assert_eq!(
+                *host.local_sounds.borrow(),
+                vec![(
+                    mod_api::SoundPlay::at(
+                        "demo:chime",
+                        mod_api::SoundSource::Blocks,
+                        [1.0, 2.0, 3.0]
+                    )
+                    .with_volume(0.5)
+                    .with_pitch(1.5),
+                    0,
+                )]
+            );
+            // The explicit seed is counted again.
+            assert_eq!(report_row(&java)["unknown_host_call_count"], 3);
             Ok::<_, ()>(())
         })
         .unwrap();
