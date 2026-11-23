@@ -484,7 +484,7 @@ fn dispatch_state(
         if run.returned.is_some() {
             answer.returned = run.returned;
         }
-        for effect in context.take_effects() {
+        for effect in crate::game_hooks::deliverable_effects(context, &mut loaded.host) {
             apply_effect(dispatch.host, effect);
         }
         if run.cancelled {
@@ -500,6 +500,8 @@ fn apply_effect(host: &mut dyn ServerHost, effect: GameHookEffect) {
                 let _ = target.tell(host, mod_api::Text::literal(text));
             }
         }
+        // `deliverable_effects` never lets a level sound through; it is counted there.
+        GameHookEffect::PlaySound(_) => {}
     }
 }
 impl From<NativeError> for DispatchError {

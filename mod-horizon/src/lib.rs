@@ -1865,7 +1865,10 @@ impl HorizonJava {
         };
         if let Some(host) = host {
             for effect in fired.effects {
-                let GameHookEffect::SystemMessage { player, text } = effect;
+                // A level sound never gets here (`game_hooks::deliverable_effects`).
+                let GameHookEffect::SystemMessage { player, text } = effect else {
+                    continue;
+                };
                 if let Some(target) = host.player(player) {
                     let _ = target.tell(host, Text::literal(text));
                 }

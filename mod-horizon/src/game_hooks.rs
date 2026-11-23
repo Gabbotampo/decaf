@@ -427,12 +427,32 @@ pub(crate) fn fire(
             Ok(Err(error)) => note_failure(row, site, &error.to_string()),
             Err(panic) => note_failure(row, site, &format!("panicked: {panic}")),
         }
-        fired.effects.extend(context.take_effects());
+        fired.effects.extend(deliverable_effects(context, host));
         if fired.cancelled {
             break;
         }
     }
     fired
+}
+
+/// The effects of one jar's callbacks that this build delivers. A level sound is not one of them:
+/// the official Horizon's mod API has no bridge for it here (the Sunrise build's `mod/src/sound.rs`
+/// is not ported), so it is counted as an unknown host call on the jar's host, never played and
+/// never silently dropped.
+pub(crate) fn deliverable_effects(
+    mut context: GameHookContext,
+    host: &mut crate::runtime::StdHost,
+) -> Vec<GameHookEffect> {
+    let mut effects = Vec::new();
+    for effect in context.take_effects() {
+        match effect {
+            GameHookEffect::PlaySound(_) => {
+                host.note_unknown_game_hook("level sound has no bridge on the official Horizon");
+            }
+            other => effects.push(other),
+        }
+    }
+    effects
 }
 
 /// Drop every object's Mixin state: the server stopped, so its levels, player list, players,
@@ -1152,5 +1172,48 @@ pub(crate) mod tests {
         assert!(stdout(&mut state, 0).is_empty());
         assert_eq!(tally(&state.jars[1]), (0, 1, 1));
         assert_eq!(stdout(&mut state, 1), ["died"]);
+    }
+
+    /// A level sound a callback records is counted on the jar's host and never reaches the
+    /// effects this build applies; a system message still does.
+    #[test]
+    fn a_level_sound_is_counted_unbridged_and_a_message_still_goes_out() {
+        use crate::runtime::level_sound::{
+            LevelSoundEffect, SoundSeed, SoundSide, SoundSource, SoundTarget,
+        };
+        let mut context = GameHookContext::new();
+        context.push_effect(GameHookEffect::PlaySound(LevelSoundEffect {
+            side: SoundSide::Server,
+            dimension: Some("minecraft:overworld".into()),
+            sound_id: "minecraft:block.note_block.harp".into(),
+            fixed_range: None,
+            holder: None,
+            target: SoundTarget::Position([0.5, 64.0, 0.5]),
+            source: SoundSource::Blocks,
+            volume: 1.0,
+            pitch: 1.0,
+            except_player: None,
+            seed: SoundSeed::HostDeferred,
+            distance_delay: false,
+            delay_ticks: 0,
+        }));
+        context.push_effect(GameHookEffect::SystemMessage {
+            player: 0xa1,
+            text: "hello".into(),
+        });
+        let mut host = crate::runtime::StdHost::new();
+        let effects = deliverable_effects(context, &mut host);
+        assert_eq!(effects.len(), 1);
+        assert!(matches!(
+            &effects[0],
+            GameHookEffect::SystemMessage { player: 0xa1, text } if text == "hello"
+        ));
+        assert_eq!(
+            host.unknown_host_calls(),
+            [(
+                "game-hook re-entry: level sound has no bridge on the official Horizon".to_owned(),
+                1
+            )]
+        );
     }
 }
