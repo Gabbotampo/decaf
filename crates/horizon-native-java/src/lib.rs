@@ -14810,40 +14810,82 @@ impl Host for StdHost {
             }
             // The `char` overloads take a code unit, so a scanner walking
             // `indexOf('.', from)` must see the character, not a default.
+            // A code point outside `0..=0x10FFFF` never matches; a surrogate
+            // is one UTF-16 unit, a supplementary code point a pair.
+            // A haystack that is a jar-object marker (an unmodelled constructor
+            // left a `String#n` reference) or that holds U+FFFD (a possible
+            // lost lone surrogate) cannot be answered exactly.
             ("java/lang/String", "indexOf", "(I)I") => {
-                let needle = string_from_char_code(expect_int(r, Self::argument(r, args, 0)?)?);
-                Ok(Value::Int(utf16_index_of(
-                    expect_string(receiver),
-                    &needle,
-                    0,
-                )))
+                let is_marker =
+                    jar_object::spells_key(receiver) || matches!(receiver, Value::Host(_));
+                if is_marker {
+                    return self.unknown_host_call(r);
+                }
+                let haystack = expect_string(receiver);
+                if haystack.contains('\u{FFFD}') {
+                    return self.unknown_host_call(r);
+                }
+                let Some(needle) = code_point_needle(expect_int(r, Self::argument(r, args, 0)?)?)
+                else {
+                    return Ok(Value::Int(-1));
+                };
+                Ok(Value::Int(code_point_index_of(haystack, &needle, 0)))
             }
             ("java/lang/String", "indexOf", "(II)I") => {
-                let needle = string_from_char_code(expect_int(r, Self::argument(r, args, 0)?)?);
+                let is_marker =
+                    jar_object::spells_key(receiver) || matches!(receiver, Value::Host(_));
+                if is_marker {
+                    return self.unknown_host_call(r);
+                }
+                let haystack = expect_string(receiver);
+                if haystack.contains('\u{FFFD}') {
+                    return self.unknown_host_call(r);
+                }
+                let Some(needle) = code_point_needle(expect_int(r, Self::argument(r, args, 0)?)?)
+                else {
+                    return Ok(Value::Int(-1));
+                };
                 let start = expect_int(r, Self::argument(r, args, 1)?)?;
-                Ok(Value::Int(utf16_index_of(
-                    expect_string(receiver),
-                    &needle,
-                    start,
-                )))
+                Ok(Value::Int(code_point_index_of(haystack, &needle, start)))
             }
             ("java/lang/String", "lastIndexOf", "(I)I") => {
-                let needle = string_from_char_code(expect_int(r, Self::argument(r, args, 0)?)?);
-                Ok(Value::Int(utf16_last_index_of(
-                    expect_string(receiver),
+                let is_marker =
+                    jar_object::spells_key(receiver) || matches!(receiver, Value::Host(_));
+                if is_marker {
+                    return self.unknown_host_call(r);
+                }
+                let haystack = expect_string(receiver);
+                if haystack.contains('\u{FFFD}') {
+                    return self.unknown_host_call(r);
+                }
+                let Some(needle) = code_point_needle(expect_int(r, Self::argument(r, args, 0)?)?)
+                else {
+                    return Ok(Value::Int(-1));
+                };
+                Ok(Value::Int(code_point_last_index_of(
+                    haystack,
                     &needle,
+                    i32::MAX,
                 )))
             }
             ("java/lang/String", "lastIndexOf", "(II)I") => {
-                let needle = string_from_char_code(expect_int(r, Self::argument(r, args, 0)?)?);
+                let is_marker =
+                    jar_object::spells_key(receiver) || matches!(receiver, Value::Host(_));
+                if is_marker {
+                    return self.unknown_host_call(r);
+                }
+                let haystack = expect_string(receiver);
+                if haystack.contains('\u{FFFD}') {
+                    return self.unknown_host_call(r);
+                }
+                let Some(needle) = code_point_needle(expect_int(r, Self::argument(r, args, 0)?)?)
+                else {
+                    return Ok(Value::Int(-1));
+                };
                 let from = expect_int(r, Self::argument(r, args, 1)?)?;
-                let value = expect_string(receiver);
-                let units = value.encode_utf16().collect::<Vec<_>>();
-                let end = usize::try_from(from)
-                    .map(|from| (from + needle.encode_utf16().count()).min(units.len()))
-                    .unwrap_or(0);
-                let prefix = String::from_utf16_lossy(&units[..end]);
-                Ok(Value::Int(utf16_last_index_of(&prefix, &needle)))
+                Ok(Value::Int(code_point_last_index_of(
+                    haystack, &needle, from,
+                )))
             }
             ("java/lang/String", "lastIndexOf", "(Ljava/lang/String;)I") => {
                 Ok(Value::Int(utf16_last_index_of(
@@ -18765,9 +18807,66 @@ fn is_always_loaded_mod(id: &str) -> bool {
     )
 }
 
-/// The one-character string a `String` char index names.
-fn string_from_char_code(code: i32) -> String {
-    char::from_u32(code as u32).map_or_else(String::new, String::from)
+/// The UTF-16 units of a code point for `String.indexOf(int)`/`lastIndexOf(int)`:
+/// a lone surrogate is one unit, a supplementary code point a pair.
+/// Returns `None` when the code point is outside `0..=0x10FFFF` and never matches.
+fn code_point_needle(code: i32) -> Option<Vec<u16>> {
+    let unit = code as u32;
+    if unit > 0x10FFFF {
+        return None;
+    }
+    if (0xD800..=0xDFFF).contains(&unit) {
+        // A lone surrogate: one UTF-16 code unit.
+        return Some(vec![unit as u16]);
+    }
+    let mut buf = [0_u16; 2];
+    let units = char::from_u32(unit)
+        .map(|c| c.encode_utf16(&mut buf))
+        .unwrap_or_default();
+    Some(units.to_vec())
+}
+
+/// `indexOf` for a code-point needle: values outside `0..=0x10FFFF` never
+/// match; a supplementary code point matches its surrogate pair. A negative
+/// `from` is clamped to zero; a `from` beyond the length yields `-1`.
+fn code_point_index_of(haystack: &str, needle: &[u16], from: i32) -> i32 {
+    if needle.is_empty() {
+        return -1;
+    }
+    let haystack = haystack.encode_utf16().collect::<Vec<_>>();
+    let start = from.max(0) as usize;
+    if start >= haystack.len() {
+        return -1;
+    }
+    haystack
+        .get(start..)
+        .and_then(|tail| {
+            tail.windows(needle.len())
+                .position(|window| window == needle)
+        })
+        .map_or(-1, |index| (start + index) as i32)
+}
+
+/// `lastIndexOf` for a code-point needle: values outside `0..=0x10FFFF` never
+/// match; a supplementary code point matches its surrogate pair. A negative
+/// `from` yields `-1`; a `from` beyond the length is clamped to the end.
+fn code_point_last_index_of(haystack: &str, needle: &[u16], from: i32) -> i32 {
+    if needle.is_empty() {
+        return -1;
+    }
+    if from < 0 {
+        return -1;
+    }
+    let haystack = haystack.encode_utf16().collect::<Vec<_>>();
+    // A match may start at `from` itself, so the window reaches `needle.len()` units past it.
+    let end = (from as usize)
+        .saturating_add(needle.len())
+        .min(haystack.len());
+    let prefix = &haystack[..end];
+    prefix
+        .windows(needle.len())
+        .rposition(|window| window == needle)
+        .map_or(-1, |index| index as i32)
 }
 
 /// The physical lines of a `.properties` text, without their terminators: like JDK 25's
