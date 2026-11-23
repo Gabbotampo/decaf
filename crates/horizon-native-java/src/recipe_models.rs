@@ -1989,9 +1989,13 @@ fn stack_instance_call_empty(
             Some(Ok(Value::Void))
         }
         ("copy", "()Lnet/minecraft/world/item/ItemStack;")
-        | ("copyWithCount", "(I)Lnet/minecraft/world/item/ItemStack;") => {
+        | ("copyWithCount", "(I)Lnet/minecraft/world/item/ItemStack;")
+        | ("split", "(I)Lnet/minecraft/world/item/ItemStack;")
+        | ("copyAndClear", "()Lnet/minecraft/world/item/ItemStack;") => {
             Some(Ok(crate::menu_models::empty_stack()))
         }
+        // `getMaxStackSize()` is 1, so `isStackable()` is false.
+        ("isStackable", "()Z") => Some(Ok(Value::Int(0))),
         _ => None,
     }
 }
@@ -2415,13 +2419,86 @@ fn live_stack_instance_call(
                 Ok(c) => c,
                 Err(e) => return Some(Err(e)),
             };
-            if live.is_empty() || count <= 0 {
+            // 26.3 `copyWithCount` offsets 0-22: `isEmpty() ? EMPTY : copy()` with `setCount`,
+            // so a non-empty stack copies even to a count of 0 or less (an empty stack that is
+            // not `EMPTY` itself).
+            if live.is_empty() {
                 Some(Ok(crate::menu_models::empty_stack()))
             } else {
                 let mut cloned = live;
                 cloned.count = count;
                 Some(Ok(host.recipes.alloc_stack(cloned)))
             }
+        }
+        // 26.3 `split(int)` offsets 0-21: `int n = Math.min(amount, getCount()); ItemStack
+        // part = copyWithCount(n); shrink(n); return part`.
+        ("split", "(I)Lnet/minecraft/world/item/ItemStack;") => {
+            let amount = match expect_int(r, args.first()?) {
+                Ok(c) => c,
+                Err(e) => return Some(Err(e)),
+            };
+            let taken = amount.min(live.effective_count());
+            let part = if live.is_empty() {
+                crate::menu_models::empty_stack()
+            } else {
+                let mut cloned = live.clone();
+                cloned.count = taken;
+                host.recipes.alloc_stack(cloned)
+            };
+            let slot = host.recipes.stacks.get_mut(&key)?;
+            slot.count = slot.effective_count().wrapping_sub(taken);
+            Some(Ok(part))
+        }
+        // 26.3 `copyAndClear()` offsets 0-22: `isEmpty() ? EMPTY : copy()`, then `setCount(0)`.
+        ("copyAndClear", "()Lnet/minecraft/world/item/ItemStack;") => {
+            if live.is_empty() {
+                return Some(Ok(crate::menu_models::empty_stack()));
+            }
+            let copy = host.recipes.alloc_stack(live);
+            host.recipes.stacks.get_mut(&key)?.count = 0;
+            Some(Ok(copy))
+        }
+        // 26.3 `isStackable()` offsets 0-27: `getMaxStackSize() > 1 && (!isDamageableItem() ||
+        // !isDamaged())`.
+        ("isStackable", "()Z") => {
+            let max = live_stack_instance_call(
+                host,
+                handle,
+                &MethodRef {
+                    owner: ITEM_STACK.into(),
+                    name: "getMaxStackSize".into(),
+                    descriptor: "()I".into(),
+                },
+                &[],
+            )?;
+            let max = match max {
+                Ok(Value::Int(max)) => max,
+                Ok(_) => return None,
+                Err(e) => return Some(Err(e)),
+            };
+            if max <= 1 {
+                return Some(Ok(Value::Int(0)));
+            }
+            for name in ["isDamageableItem", "isDamaged"] {
+                let answer = live_stack_instance_call(
+                    host,
+                    handle,
+                    &MethodRef {
+                        owner: ITEM_STACK.into(),
+                        name: name.into(),
+                        descriptor: "()Z".into(),
+                    },
+                    &[],
+                )?;
+                match answer {
+                    // Not damageable, or damageable and not damaged: stackable.
+                    Ok(Value::Int(0)) => return Some(Ok(Value::Int(1))),
+                    Ok(Value::Int(_)) => {}
+                    Ok(_) => return None,
+                    Err(e) => return Some(Err(e)),
+                }
+            }
+            Some(Ok(Value::Int(0)))
         }
         _ => None,
     }
@@ -3688,12 +3765,17 @@ fn find_matching_recipe<H: Host>(
         return Ok(None);
     }
 
-    let candidates: Vec<LoadedRecipe> = runtime
+    let mut candidates: Vec<LoadedRecipe> = runtime
         .host
         .as_std_host()
         .and_then(|h| h.recipes.loaded.as_ref())
         .map(|c| c.recipes.clone())
         .unwrap_or_default();
+    // 26.3's `RecipeMap.byType` keeps the recipe registry's order, which
+    // `ResourceManagerRegistryLoadTask` (offsets 0-30) registers sorted by the resource file's
+    // `Identifier` (`Map.Entry.comparingByKey()`): `Identifier.compareTo` compares the path
+    // (`recipe/<id path>.json`) before the namespace.
+    candidates.sort_by(|a, b| vanilla_recipe_order(&a.id, &b.id));
 
     // Exact MC 26.3 `RecipeManager.getRecipeFor(type, input, level, ResourceKey)`:
     // resolves `byKeyTyped(type, lastKey)` (checking registry `minecraft:recipe` and `getType()`)
@@ -3767,6 +3849,18 @@ fn find_matching_recipe<H: Host>(
         }
     }
     Ok(Some(crate::empty_optional()))
+}
+
+/// The order 26.3 registers recipes in (see `find_matching_recipe`): the file `Identifier`
+/// `<namespace>:recipe/<path>.json`, path first, namespace second.
+fn vanilla_recipe_order(a: &str, b: &str) -> std::cmp::Ordering {
+    let split = |id: &str| -> (String, String) {
+        match id.split_once(':') {
+            Some((namespace, path)) => (format!("recipe/{path}.json"), namespace.to_owned()),
+            None => (format!("recipe/{id}.json"), "minecraft".to_owned()),
+        }
+    };
+    split(a).cmp(&split(b))
 }
 
 pub(crate) fn item_stack_template_illegal_state(message: &str) -> NativeError {

@@ -111,7 +111,8 @@ fn run_runes_crafting_altar_test(jar_path: &str) {
     );
 
     // A second click while the window shows menu 1 closes it first: `ItemCombinerMenu.removed`
-    // (which hands the inputs back) is counted, then menu 2 is built.
+    // hands the inputs back, exactly (`live_menu.rs`; they are empty here), then menu 2 is
+    // built. Without the player's facts `initMenu` stays the one counted call.
     let mut showing = server_ctx.clone();
     showing.player.container = PlayerContainer::Open(1);
     let again = jar
@@ -121,11 +122,9 @@ fn run_runes_crafting_altar_test(jar_path: &str) {
         again.menu_effects.as_slice(),
         [MenuEffect::Closed { container_id: 1 }, MenuEffect::Opened(open)] if open.container_id == 2
     ));
-    assert!(
-        again
-            .unknown_host_calls
-            .keys()
-            .any(|k| k.contains("#removed")),
+    assert_eq!(
+        again.unknown_host_calls,
+        BTreeMap::from([(INIT_MENU.to_owned(), 1)]),
         "{:?}",
         again.unknown_host_calls
     );

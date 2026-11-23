@@ -79,6 +79,9 @@ pub enum LastSlot {
     ClientStack(crate::client_surface::ClientStack),
     /// Any other non-empty stack value whose full contents/components are not modelled.
     Other(Value),
+    /// The `ItemStack.copy()` of a server stack `broadcastChanges` stored (`live_menu.rs`),
+    /// whose contents the live-stack model knows.
+    Stack(Value),
 }
 
 #[derive(Clone, Debug)]
@@ -133,6 +136,33 @@ pub(crate) struct Slot {
     kind: ScreenSlotKind,
 }
 
+impl Slot {
+    /// `Slot.container`.
+    pub(crate) fn container(&self) -> &Value {
+        &self.container
+    }
+
+    /// `Slot.index`: the menu index `addSlot` gave it.
+    pub(crate) fn index(&self) -> i32 {
+        self.index
+    }
+
+    /// The `ItemCombinerMenuSlotDefinition$SlotDefinition.mayPlace()` predicate of a combiner
+    /// input slot Decaf built.
+    pub(crate) fn may_place(&self) -> Option<&Value> {
+        self.may_place.as_ref()
+    }
+}
+
+/// What a `DataSlot` Decaf built reads and writes: `DataSlot.forContainer`'s `DataSlot$1`
+/// (`containerData.get/set(dataId)`) or `DataSlot.standalone()`'s `DataSlot$3` (its own
+/// `value`, 0 at first).
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum DataSlotKind {
+    Container { data: Value, index: i32 },
+    Standalone { value: i32 },
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct CombinerState {
     pub input: String,
@@ -151,6 +181,110 @@ pub(crate) struct MenuState {
     pub(crate) container_listeners: Vec<Value>,
     pub(crate) combiner: Option<CombinerState>,
     pub(crate) seq: u64,
+    /// The rest of 26.3 `AbstractContainerMenu`'s own state, which the live-menu bodies
+    /// (`live_menu.rs`) read and write: `carried`, the quick-craft (drag) fields, `stateId`, the
+    /// data slots, the synchronizer and its remote slots.
+    pub(crate) live: LiveState,
+}
+
+/// One entry of 26.3 `AbstractContainerMenu.remoteSlots` (or `remoteCarried`).
+///
+/// `RemoteSlot.PLACEHOLDER` until a synchronizer is set, then the synchronizer's
+/// `RemoteSlot.Synchronized`. Decaf's synchronizer only ever `force`s a slot (it does not take
+/// the client's `HashedStack` predictions, `live_menu.rs`), so a synchronized slot is the stack
+/// copy its last `force` stored, `None` before any.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) enum RemoteSlot {
+    #[default]
+    Placeholder,
+    Synchronized(Option<Value>),
+}
+
+/// A 26.3 `DataSlot` added through `addDataSlot` / `addDataSlots`: the object itself (a jar
+/// `DataSlot` subclass, or Decaf's `DataSlot.forContainer` / `standalone` model).
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct DataSlotEntry {
+    pub(crate) slot: Value,
+}
+
+/// 26.3 `AbstractContainerMenu` fields beyond `slots`/`lastSlots`/`containerListeners`
+/// (`<init>` offsets 0-86 give the initial values below).
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct LiveState {
+    /// `carried` (offset 29: `ItemStack.EMPTY`).
+    pub(crate) carried: Value,
+    /// `quickcraftType` (offset 59: `-1`).
+    pub(crate) quickcraft_type: i32,
+    /// `quickcraftStatus` (`0`).
+    pub(crate) quickcraft_status: i32,
+    /// `quickcraftSlots`, a `HashSet<Slot>` (offset 63), in insertion order. Java iterates it
+    /// in identity-hash order, which no one can predict: `live_menu.rs` counts the drag end
+    /// whenever that order could be observed.
+    pub(crate) quickcraft_slots: Vec<Value>,
+    /// `stateId` (`0`).
+    pub(crate) state_id: i32,
+    /// `stateId` stays exact only while Decaf's synchronizer is the only thing that moved it;
+    /// a click whose client predictions Decaf did not take (`setRemoteSlotUnsafe`) makes it
+    /// unknown, and a jar read of it then counts.
+    pub(crate) state_id_known: bool,
+    /// `suppressRemoteUpdates`.
+    pub(crate) suppress_remote_updates: bool,
+    /// `dataSlots`, and `remoteDataSlots` beside them (each added as `0`).
+    pub(crate) data_slots: Vec<DataSlotEntry>,
+    pub(crate) remote_data_slots: Vec<i32>,
+    /// `synchronizer`: `None` until `setSynchronizer`. Decaf only models the server player's
+    /// own (`ServerPlayer$1`), whose sends it records as effects.
+    pub(crate) synchronizer: Option<Value>,
+    /// `remoteSlots`, one per slot (`addSlot` offsets 31-60).
+    pub(crate) remote_slots: Vec<RemoteSlot>,
+    /// `remoteCarried` (offset 51: `RemoteSlot.PLACEHOLDER`).
+    pub(crate) remote_carried: RemoteSlot,
+}
+
+impl Default for LiveState {
+    fn default() -> Self {
+        Self {
+            carried: empty_stack(),
+            quickcraft_type: -1,
+            quickcraft_status: 0,
+            quickcraft_slots: Vec::new(),
+            state_id: 0,
+            state_id_known: true,
+            suppress_remote_updates: false,
+            data_slots: Vec::new(),
+            remote_data_slots: Vec::new(),
+            synchronizer: None,
+            remote_slots: Vec::new(),
+            remote_carried: RemoteSlot::Placeholder,
+        }
+    }
+}
+
+/// The contents of a 26.3 `Inventory`: `items` (36 stacks), `selected`, and the
+/// `EntityEquipment` stacks `EQUIPMENT_SLOT_MAPPING` reads for slots 36-42 (FEET, LEGS, CHEST,
+/// HEAD, OFFHAND, BODY, SADDLE). `None` equipment: an `Inventory` built around an
+/// `EntityEquipment` Decaf does not model (or `null`), whose slots 36-42 count.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct InventoryContents {
+    pub(crate) items: Vec<Value>,
+    pub(crate) equipment: Option<Vec<Value>>,
+    pub(crate) selected: i32,
+}
+
+/// `Inventory.INVENTORY_SIZE`.
+pub(crate) const INVENTORY_ITEMS: usize = 36;
+/// `Inventory.EQUIPMENT_SLOT_MAPPING.size()` (slots 36-42).
+pub(crate) const INVENTORY_EQUIPMENT: usize = 7;
+
+impl InventoryContents {
+    /// `new Inventory(player, equipment)`: 36 `EMPTY` items, `selected` 0.
+    pub(crate) fn new(equipment: Option<Vec<Value>>) -> Self {
+        Self {
+            items: vec![empty_stack(); INVENTORY_ITEMS],
+            equipment,
+            selected: 0,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -232,6 +366,9 @@ pub(crate) enum Object {
     Screen(ScreenState),
     Inventory {
         player: Value,
+        /// `None`: an inventory whose contents Decaf does not know (a block use whose embedder
+        /// gave none), whose item reads count.
+        contents: Option<InventoryContents>,
     },
     Builder {
         inputs: Vec<SlotDef>,
@@ -252,6 +389,12 @@ pub(crate) enum Object {
     },
     Predicate(bool),
     Pending(MenuAction),
+    /// 26.3 `DataSlot` state: `prevValue` (`checkAndClearUpdateFlag`) for any `DataSlot`,
+    /// a jar subclass's filed under its object key, and the body of the two Decaf builds.
+    DataSlot {
+        kind: Option<DataSlotKind>,
+        prev_value: i32,
+    },
 }
 
 pub(crate) type States = BTreeMap<String, Object>;
@@ -407,7 +550,13 @@ pub(crate) fn alloc_simple_menu_provider(next_id: &mut u64) -> Value {
 
 pub(crate) fn allocate_inventory(states: &mut States, next_id: &mut u64, player: Value) -> Value {
     let key = next_key(next_id, INVENTORY);
-    states.insert(key.clone(), Object::Inventory { player });
+    states.insert(
+        key.clone(),
+        Object::Inventory {
+            player,
+            contents: None,
+        },
+    );
     marker(key)
 }
 
@@ -584,6 +733,7 @@ pub(crate) fn register_combiner_menu(
                 player,
             }),
             seq,
+            live: LiveState::default(),
         }),
     );
     Some(init)
@@ -712,6 +862,66 @@ fn next_menu_seq(states: &States) -> u64 {
         })
         .max()
         .map_or(0, |seq| seq.saturating_add(1))
+}
+
+/// The handle of a model object filed under `key` (`marker`).
+pub(crate) fn marker_of(key: &str) -> Value {
+    marker(key.to_owned())
+}
+
+/// A new `DataSlot$1` / `DataSlot$3` (`class`) object of `kind`.
+pub(crate) fn new_data_slot(
+    states: &mut States,
+    next_id: &mut u64,
+    class: &str,
+    kind: DataSlotKind,
+) -> Value {
+    let key = next_key(next_id, class);
+    states.insert(
+        key.clone(),
+        Object::DataSlot {
+            kind: Some(kind),
+            prev_value: 0,
+        },
+    );
+    marker(key)
+}
+
+/// The body kind of a `DataSlot` Decaf built.
+pub(crate) fn data_slot_kind(states: &States, key: &str) -> Option<DataSlotKind> {
+    match states.get(key) {
+        Some(Object::DataSlot { kind, .. }) => kind.clone(),
+        _ => None,
+    }
+}
+
+/// `DataSlot.checkAndClearUpdateFlag()`'s `prevValue` swap: store `value`, answer the old one
+/// (0 for a `DataSlot` seen the first time, the field's default).
+pub(crate) fn data_slot_prev_value(states: &mut States, key: &str, value: i32) -> i32 {
+    match states.get_mut(key) {
+        Some(Object::DataSlot { prev_value, .. }) => std::mem::replace(prev_value, value),
+        _ => {
+            states.insert(
+                key.to_owned(),
+                Object::DataSlot {
+                    kind: None,
+                    prev_value: value,
+                },
+            );
+            0
+        }
+    }
+}
+
+/// `DataSlot$3.set(value)`.
+pub(crate) fn set_standalone_data_slot(states: &mut States, key: &str, new_value: i32) {
+    if let Some(Object::DataSlot {
+        kind: Some(DataSlotKind::Standalone { value }),
+        ..
+    }) = states.get_mut(key)
+    {
+        *value = new_value;
+    }
 }
 
 fn slot_kind_for_container(states: &States, container: &Value) -> ScreenSlotKind {
@@ -855,7 +1065,7 @@ pub(crate) fn field(states: &States, receiver: &Value, r: &MethodRef) -> Option<
             .as_ref()
             .map(|c| Value::Int(c.definition.inputs.len() as i32)),
         (
-            Object::Inventory { player },
+            Object::Inventory { player, .. },
             INVENTORY,
             "player",
             "Lnet/minecraft/world/entity/player/Player;",
@@ -1270,6 +1480,14 @@ fn add_slot_to_menu(states: &mut States, menu_key: &str, slot_key: &str) -> Opti
     }
     if let Some(Object::Menu(state)) = states.get_mut(menu_key) {
         state.last_slots.push(LastSlot::Empty);
+        // Offsets 31-60: `remoteSlots.add(synchronizer != null ? synchronizer.createSlot()
+        // : RemoteSlot.PLACEHOLDER)`.
+        let remote = if state.live.synchronizer.is_some() {
+            RemoteSlot::Synchronized(None)
+        } else {
+            RemoteSlot::Placeholder
+        };
+        state.live.remote_slots.push(remote);
     }
     Some(())
 }
@@ -1858,6 +2076,7 @@ pub(crate) fn call_with_stacks_and_client_player(
                 container_listeners: Vec::new(),
                 combiner: None,
                 seq,
+                live: LiveState::default(),
             }),
         );
         return Some(Ok(Value::Void));
@@ -1889,7 +2108,7 @@ pub(crate) fn call_with_stacks_and_client_player(
             client_player?
         } else {
             match expect_ref(&inventory).and_then(|inv| states.get(inv)) {
-                Some(Object::Inventory { player }) => player.clone(),
+                Some(Object::Inventory { player, .. }) => player.clone(),
                 _ => return None,
             }
         };
@@ -2016,6 +2235,10 @@ pub(crate) fn call_with_stacks_and_client_player(
                     player,
                 }),
                 seq,
+                live: LiveState {
+                    remote_slots: vec![RemoteSlot::Placeholder; slot_count],
+                    ..LiveState::default()
+                },
             }),
         );
         return Some(Ok(Value::Void));
@@ -2053,10 +2276,14 @@ pub(crate) fn call_with_stacks_and_client_player(
         && r.descriptor
             == "(Lnet/minecraft/world/entity/player/Player;Lnet/minecraft/world/entity/EntityEquipment;)V"
     {
+        // 26.3 `Inventory.<init>(Player, EntityEquipment)` offsets 0-46: `items` is 36 `EMPTY`
+        // stacks, `selected` 0. The equipment object is kept only when it is Decaf's own
+        // `EntityEquipment` model, which this file does not have: slots 36-42 count.
         states.insert(
             key,
             Object::Inventory {
                 player: args.first()?.clone(),
+                contents: Some(InventoryContents::new(None)),
             },
         );
         return Some(Ok(Value::Void));
@@ -2459,7 +2686,11 @@ pub(crate) fn call_with_stacks_and_client_player(
                 Ok(Value::Void)
             }
             "clearContent" => {
-                items.clear();
+                // `NonNullList.clear()` on a `withSize` list sets every element back to its
+                // default (`ItemStack.EMPTY`); it does not shrink the list.
+                for item in items.iter_mut() {
+                    *item = empty_stack();
+                }
                 if !*result && let Some(menu) = owner.as_ref() {
                     pending_action = Some(MenuAction::SlotsChanged {
                         menu: marker(menu.clone()),
@@ -2983,7 +3214,10 @@ mod tests {
         let player = Value::Ref(Some("demo/Player#5".into()));
         states.insert(
             "net/minecraft/world/entity/player/Inventory#4".into(),
-            Object::Inventory { player },
+            Object::Inventory {
+                player,
+                contents: None,
+            },
         );
         call(
             &mut states,
