@@ -211,6 +211,13 @@ impl State {
         f(&first.jar, &mut first.host)
     }
 
+    /// A resident jar and its host, for tests that set up state a client callback then reads.
+    #[cfg(test)]
+    pub(crate) fn resident(&mut self, index: usize) -> (&NativeJar, &mut StdHost) {
+        let loaded = &mut self.jars[index];
+        (&*loaded.jar, &mut loaded.host)
+    }
+
     pub(crate) fn report_rows(&self) -> impl Iterator<Item = serde_json::Value> + '_ {
         self.retired
             .iter()
@@ -221,6 +228,7 @@ impl State {
 
     pub(crate) fn level_loaded(&mut self) {
         self.world_loaded = true;
+        self.forget_client_sound_streams();
     }
 
     pub(crate) fn level_unloaded(&mut self) {
@@ -228,6 +236,7 @@ impl State {
         for jar in &mut self.jars {
             jar.host.forget_all_game_objects();
         }
+        self.forget_client_sound_streams();
     }
 
     pub(crate) fn player_logged_out(&mut self) {
@@ -241,6 +250,42 @@ impl State {
             jar.host
                 .forget_game_object_prefix(runtime::client_surface::PLAYER);
         }
+    }
+
+    /// A client level comes with a fresh `random` and `soundSeedGenerator`: no stream position
+    /// the last level left unknown carries over.
+    fn forget_client_sound_streams(&mut self) {
+        for loaded in &mut self.jars {
+            loaded.host.forget_unknown_client_sound_streams();
+        }
+    }
+
+    /// Deliver the client sounds the resident jars' Java code recorded to Sunrise
+    /// (`sound::apply_client_sounds`), so each is played or counted on its jar, never dropped.
+    ///
+    /// Runs after every client path that executes Java code: client setup (entrypoints and
+    /// loading stages), creative-tab builds and item tooltips. The client owner opens no
+    /// `ClientSnapshot` frame, so a jar's client sounds land in its host's standalone record.
+    /// The level sound streams any jar left unknown are shared with every jar afterwards. They
+    /// are gathered after the Java code ran, so a stream one call left unknown also counts that
+    /// callback's earlier deferred sounds: conservative, and moot while the client defers none.
+    pub(crate) fn drain_client_sounds(&mut self, host: &dyn mod_api::ClientHost) {
+        let mut streams =
+            crate::sound::sync_unknown_sound_streams(&mut self.jars, |jar| &mut jar.host);
+        for loaded in &mut self.jars {
+            let sounds = loaded.host.take_played_sounds();
+            if sounds.is_empty() {
+                continue;
+            }
+            crate::sound::apply_client_sounds(host, &sounds, &mut streams, |reason| {
+                loaded.host.note_unknown_game_hook(reason);
+            });
+            loaded.row.unknown_host_calls = loaded.host.unknown_host_call_count();
+        }
+        crate::sound::share_unknown_sound_streams(
+            self.jars.iter_mut().map(|jar| &mut jar.host),
+            &streams,
+        );
     }
 
     /// Dispatch Java Fabric creative-tab output into the build-scoped Sunrise edit.  Each jar's
@@ -315,6 +360,7 @@ impl State {
             loaded.row.unsupported = registered.unsupported;
             loaded.row.unknown_host_calls = loaded.host.unknown_host_call_count();
         }
+        self.drain_client_sounds(host);
     }
 
     /// Run each resident jar's Item appendHoverText implementation for the item in a Sunrise
@@ -378,6 +424,7 @@ impl State {
         // The first line is the item's name. Java appendHoverText runs immediately after it.
         let at = event.lines.len().min(1);
         event.lines.splice(at..at, additions);
+        self.drain_client_sounds(host);
     }
 
     /// Drop resident hosts, listeners, and jar heaps at client shutdown. Rows stay available

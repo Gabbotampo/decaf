@@ -562,6 +562,8 @@ pub struct ClientPlayer {
     pub using_item: Option<bool>,
     /// `LocalPlayer.isSleeping`, filled by the game for a frame.
     pub sleeping: Option<bool>,
+    /// `Entity.isSilent`, filled by the game for a frame (`None` refuses).
+    pub silent: Option<bool>,
     pub sprinting: bool,
     pub on_ground: bool,
     /// `isFallFlying`: gliding with elytra.
@@ -846,6 +848,8 @@ pub struct ClientFrameOutput {
     /// A tooltip firing's lines after its listeners, when the frame had a
     /// tooltip; a line that is not text (null, another object) is dropped.
     pub tooltip: Option<Vec<ClientText>>,
+    /// Client-side level/local-player sounds recorded during this frame, in call order.
+    pub sounds: Vec<crate::level_sound::LevelSoundEffect>,
 }
 
 /// How a `KeyMapping` was constructed.
@@ -897,6 +901,7 @@ pub(crate) struct ClientState {
     /// A built stack's object marker → its slot.
     made_aliases: BTreeMap<String, StackSlot>,
     tasks: Vec<Value>,
+    pub(crate) sounds: Vec<crate::level_sound::LevelSoundEffect>,
     /// Currently open client screen (reused across `open_client_screen` ->
     /// `draw_client_screen_bg`, and closed via virtual `removed()` before opening
     /// a different screen so slot listeners never leak).
@@ -1475,6 +1480,7 @@ impl StdHost {
         state.made.clear();
         state.made_aliases.clear();
         state.tasks.clear();
+        state.sounds.clear();
         let lines = state.frame.as_ref().and_then(|f| {
             f.tooltip_stack.as_ref()?;
             Some(
@@ -1536,6 +1542,7 @@ impl StdHost {
                     .take(MAX_TOOLTIP_LINES)
                     .collect()
             }),
+            sounds: std::mem::take(&mut self.client.sounds),
         }
     }
 
@@ -2049,6 +2056,9 @@ impl StdHost {
                 Some(answer) => answer,
                 None => Err(self.refuse_client_call(r)),
             });
+        }
+        if let Some(answer) = crate::level_sound::client_frame_call(self, &text, &frame, r, args) {
+            return Some(answer);
         }
         let answer = self.client_answer(&text, &frame, r, args);
         Some(match answer {
