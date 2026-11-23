@@ -203,8 +203,12 @@ pub mod level_sound;
 mod library_dispatch;
 mod linked_resources;
 mod list_equality;
+mod live_menu;
 mod map_compute;
 mod menu_models;
+pub use live_menu::{
+    ContainerInput, LiveMenuEffect, LiveMenuOutcome, MenuClick, MenuPlayerFacts, Prediction,
+};
 mod method_handles;
 mod mixin_extras;
 mod mixin_plugins;
@@ -7630,6 +7634,22 @@ impl StdHost {
                     }
                     return Ok(None);
                 }
+                // 26.3 `TypedInstance.is(T)` (the erased `is(Object)` javac picks for a
+                // `Block` argument) offsets 0-20: `typeHolder().value() == value`, where a
+                // state's `typeHolder()` is `getBlock().builtInRegistryHolder()`: the
+                // registered block itself, compared by identity.
+                ("is", "(Ljava/lang/Object;)Z") if jar_object::parse_key(&block).is_some() => {
+                    match args.first() {
+                        Some(Value::Ref(None)) => return Ok(Some(Value::Int(0))),
+                        Some(other) => {
+                            if let Some(other) = jar_object::object_key(other) {
+                                return Ok(Some(Value::Int(i32::from(other == block))));
+                            }
+                        }
+                        None => {}
+                    }
+                    return Ok(None);
+                }
                 (
                     "hasProperty",
                     "(Lnet/minecraft/world/level/block/state/properties/Property;)Z",
@@ -10647,7 +10667,16 @@ impl Host for StdHost {
                 Ok(uuid_value(&random_uuid())?)
             }
             ("java/util/UUID", "fromString", "(Ljava/lang/String;)Ljava/util/UUID;") => {
-                Ok(uuid_value(expect_string(Self::argument(r, args, 0)?))?)
+                // A null name throws a NullPointerException whose helpful message names the
+                // JDK's own code: counted, not answered.
+                let Some(text) = expect_ref(Self::argument(r, args, 0)?) else {
+                    return self.unknown_host_call(r);
+                };
+                match uuid_from_string(text) {
+                    Some(Ok(uuid)) => Ok(host_jdk_value::uuid(&uuid)),
+                    Some(Err(thrown)) => Err(thrown),
+                    None => self.unknown_host_call(r),
+                }
             }
             (
                 "java/net/URLEncoder",
@@ -10989,13 +11018,39 @@ impl Host for StdHost {
                 }
                 let fallback = Self::argument(r, args, 1)?;
                 if matches!(fallback, Value::Ref(None)) {
+                    // `Objects.requireNonNullElse(null, null)` throws an NPE
+                    // whose message is `defaultObj`, not a message-less one.
                     return Err(NativeError::UncaughtException {
                         class: "java/lang/NullPointerException".into(),
-                        message: None,
+                        message: Some("defaultObj".into()),
                         frame: None,
                     });
                 }
                 Ok(fallback.clone())
+            }
+            (
+                "java/util/Objects",
+                "requireNonNullElseGet",
+                "(Ljava/lang/Object;Ljava/util/function/Supplier;)Ljava/lang/Object;",
+            ) => {
+                let value = Self::argument(r, args, 0)?;
+                if !matches!(&value, Value::Ref(None)) {
+                    return Ok(value.clone());
+                }
+                let supplier = Self::argument(r, args, 1)?;
+                if matches!(supplier, Value::Ref(None)) {
+                    // `requireNonNullElseGet(null, null)` fails on the null
+                    // supplier itself, with message `supplier`.
+                    return Err(NativeError::UncaughtException {
+                        class: "java/lang/NullPointerException".into(),
+                        message: Some("supplier".into()),
+                        frame: None,
+                    });
+                }
+                // A live supplier's `get()` needs the interpreter to run it:
+                // keep the call counted instead of fabricating a value or a
+                // message.
+                self.unknown_host_call(r)
             }
             // `Objects.isNull`/`nonNull` are predicates a mod passes as a
             // method reference (`filter(Objects::nonNull)`).
@@ -11010,32 +11065,88 @@ impl Host for StdHost {
                     && descriptor.ends_with(")Ljava/lang/Object;") =>
             {
                 let value = Self::argument(r, args, 0)?;
-                if matches!(&value, Value::Ref(None)) {
-                    // A mod's `try { Objects.requireNonNull(x) } catch
-                    // (NullPointerException ignored)` is real control flow, so
-                    // this raises the NPE the JVM would raise; the interpreter
-                    // delivers it to the caller's handler and only reports an
-                    // uncaught throw when the frame has none.
-                    let message = if descriptor
-                        == "(Ljava/lang/Object;Ljava/lang/String;)Ljava/lang/Object;"
-                    {
-                        args.get(1).and_then(expect_ref).cloned()
-                    } else {
-                        None
-                    };
-                    return Err(NativeError::UncaughtException {
-                        class: "java/lang/NullPointerException".into(),
-                        message,
-                        frame: None,
-                    });
+                if !matches!(&value, Value::Ref(None)) {
+                    return Ok(value.clone());
                 }
-                Ok(value.clone())
+                // A mod's `try { Objects.requireNonNull(x) } catch
+                // (NullPointerException ignored)` is real control flow, so
+                // this raises the NPE the JVM would raise; the interpreter
+                // delivers it to the caller's handler and only reports an
+                // uncaught throw when the frame has none.
+                let message = match descriptor {
+                    "(Ljava/lang/Object;Ljava/lang/String;)Ljava/lang/Object;" => {
+                        args.get(1).and_then(expect_ref).cloned()
+                    }
+                    // A live supplier's `get()` supplies the message and
+                    // needs the interpreter to run it: stay counted. A null
+                    // supplier is never called, so the message stays null.
+                    "(Ljava/lang/Object;Ljava/util/function/Supplier;)Ljava/lang/Object;"
+                        if !matches!(args.get(1), Some(Value::Ref(None))) =>
+                    {
+                        return self.unknown_host_call(r);
+                    }
+                    _ => None,
+                };
+                Err(NativeError::UncaughtException {
+                    class: "java/lang/NullPointerException".into(),
+                    message,
+                    frame: None,
+                })
             }
             ("java/util/Objects", "toString", "(Ljava/lang/Object;)Ljava/lang/String;") => {
                 // A model object prints its own `toString`, not its marker.
                 let value = Self::argument(r, args, 0)?;
                 let text = self.modelled_to_string_checked(value)?;
                 Ok(Value::Ref(Some(text.unwrap_or_else(|| value_text(value)))))
+            }
+            (
+                "java/util/Objects",
+                method @ ("checkIndex" | "checkFromToIndex" | "checkFromIndexSize"),
+                descriptor @ ("(II)I" | "(JJ)J" | "(III)I" | "(JJJ)J"),
+            ) if (method == "checkIndex") == (descriptor.len() == 5) => {
+                // `(index, length)`, `(from, to, length)` or `(from, size,
+                // length)`, as `int`s or `long`s; the result is the first
+                // operand.
+                let wide = descriptor.starts_with("(J");
+                let mut operands = [0_i64; 3];
+                for (position, operand) in
+                    operands.iter_mut().enumerate().take(descriptor.len() - 3)
+                {
+                    let value = Self::argument(r, args, position)?;
+                    *operand = if wide {
+                        expect_long(r, value)?
+                    } else {
+                        i64::from(expect_int(r, value)?)
+                    };
+                }
+                let [first, second, third] = operands;
+                let message = match method {
+                    "checkIndex" => (first < 0 || first >= second)
+                        .then(|| format!("Index {first} out of bounds for length {second}")),
+                    "checkFromToIndex" => ((first | second | third) < 0
+                        || first > second
+                        || second > third)
+                        .then(|| {
+                            format!("Range [{first}, {second}) out of bounds for length {third}")
+                        }),
+                    _ => ((first | second | third) < 0 || second > third - first).then(|| {
+                        format!(
+                            "Range [{first}, {first} + {second}) out of bounds for length {third}"
+                        )
+                    }),
+                };
+                if let Some(message) = message {
+                    return Err(NativeError::UncaughtException {
+                        class: "java/lang/IndexOutOfBoundsException".into(),
+                        message: Some(message),
+                        frame: None,
+                    });
+                }
+                Ok(if wide {
+                    long_value(first)
+                } else {
+                    Value::Int(first as i32)
+                })
             }
             ("java/lang/Math", "abs", "(I)I") => {
                 let value = expect_int(r, Self::argument(r, args, 0)?)?;
@@ -13773,6 +13884,33 @@ impl Host for StdHost {
             ("java/nio/file/Path", "isAbsolute", "()Z") => {
                 Ok(Value::Int(i32::from(path_text(receiver).starts_with('/'))))
             }
+            // `UnixPath.startsWith`: the same root-ness and the argument's names
+            // are the receiver's leading names (`host_path::starts_with`, checked
+            // against a Java 25 run in `fixture_path_starts_with`). A null
+            // argument (NPE), text `getPath` refuses (NUL: `InvalidPathException`),
+            // text that is not ASCII (`sun.jnu.encoding`) and anything that is no
+            // modelled `Path` are counted.
+            ("java/nio/file/Path", "startsWith", "(Ljava/lang/String;)Z")
+            | ("java/nio/file/Path", "startsWith", "(Ljava/nio/file/Path;)Z") => {
+                let this = path_text(receiver);
+                let prefix = match Self::argument(r, args, 0)? {
+                    Value::Ref(Some(text)) if r.descriptor.starts_with("(Ljava/lang/String;") => {
+                        Some(host_path::unix_normal(text))
+                    }
+                    other => host_path::path_key(other).map(str::to_owned),
+                };
+                match prefix {
+                    Some(prefix)
+                        if host_path::encodable(this)
+                            && host_path::encodable(&prefix)
+                            && !this.contains('\0')
+                            && !prefix.contains('\0') =>
+                    {
+                        Ok(Value::Int(i32::from(host_path::starts_with(this, &prefix))))
+                    }
+                    _ => self.unknown_host_call(r),
+                }
+            }
             ("java/nio/file/Path", "toAbsolutePath", "()Ljava/nio/file/Path;") => Ok(path_value(
                 &host_path::sandbox_absolute(path_text(receiver)),
             )),
@@ -14672,40 +14810,82 @@ impl Host for StdHost {
             }
             // The `char` overloads take a code unit, so a scanner walking
             // `indexOf('.', from)` must see the character, not a default.
+            // A code point outside `0..=0x10FFFF` never matches; a surrogate
+            // is one UTF-16 unit, a supplementary code point a pair.
+            // A haystack that is a jar-object marker (an unmodelled constructor
+            // left a `String#n` reference) or that holds U+FFFD (a possible
+            // lost lone surrogate) cannot be answered exactly.
             ("java/lang/String", "indexOf", "(I)I") => {
-                let needle = string_from_char_code(expect_int(r, Self::argument(r, args, 0)?)?);
-                Ok(Value::Int(utf16_index_of(
-                    expect_string(receiver),
-                    &needle,
-                    0,
-                )))
+                let is_marker =
+                    jar_object::spells_key(receiver) || matches!(receiver, Value::Host(_));
+                if is_marker {
+                    return self.unknown_host_call(r);
+                }
+                let haystack = expect_string(receiver);
+                if haystack.contains('\u{FFFD}') {
+                    return self.unknown_host_call(r);
+                }
+                let Some(needle) = code_point_needle(expect_int(r, Self::argument(r, args, 0)?)?)
+                else {
+                    return Ok(Value::Int(-1));
+                };
+                Ok(Value::Int(code_point_index_of(haystack, &needle, 0)))
             }
             ("java/lang/String", "indexOf", "(II)I") => {
-                let needle = string_from_char_code(expect_int(r, Self::argument(r, args, 0)?)?);
+                let is_marker =
+                    jar_object::spells_key(receiver) || matches!(receiver, Value::Host(_));
+                if is_marker {
+                    return self.unknown_host_call(r);
+                }
+                let haystack = expect_string(receiver);
+                if haystack.contains('\u{FFFD}') {
+                    return self.unknown_host_call(r);
+                }
+                let Some(needle) = code_point_needle(expect_int(r, Self::argument(r, args, 0)?)?)
+                else {
+                    return Ok(Value::Int(-1));
+                };
                 let start = expect_int(r, Self::argument(r, args, 1)?)?;
-                Ok(Value::Int(utf16_index_of(
-                    expect_string(receiver),
-                    &needle,
-                    start,
-                )))
+                Ok(Value::Int(code_point_index_of(haystack, &needle, start)))
             }
             ("java/lang/String", "lastIndexOf", "(I)I") => {
-                let needle = string_from_char_code(expect_int(r, Self::argument(r, args, 0)?)?);
-                Ok(Value::Int(utf16_last_index_of(
-                    expect_string(receiver),
+                let is_marker =
+                    jar_object::spells_key(receiver) || matches!(receiver, Value::Host(_));
+                if is_marker {
+                    return self.unknown_host_call(r);
+                }
+                let haystack = expect_string(receiver);
+                if haystack.contains('\u{FFFD}') {
+                    return self.unknown_host_call(r);
+                }
+                let Some(needle) = code_point_needle(expect_int(r, Self::argument(r, args, 0)?)?)
+                else {
+                    return Ok(Value::Int(-1));
+                };
+                Ok(Value::Int(code_point_last_index_of(
+                    haystack,
                     &needle,
+                    i32::MAX,
                 )))
             }
             ("java/lang/String", "lastIndexOf", "(II)I") => {
-                let needle = string_from_char_code(expect_int(r, Self::argument(r, args, 0)?)?);
+                let is_marker =
+                    jar_object::spells_key(receiver) || matches!(receiver, Value::Host(_));
+                if is_marker {
+                    return self.unknown_host_call(r);
+                }
+                let haystack = expect_string(receiver);
+                if haystack.contains('\u{FFFD}') {
+                    return self.unknown_host_call(r);
+                }
+                let Some(needle) = code_point_needle(expect_int(r, Self::argument(r, args, 0)?)?)
+                else {
+                    return Ok(Value::Int(-1));
+                };
                 let from = expect_int(r, Self::argument(r, args, 1)?)?;
-                let value = expect_string(receiver);
-                let units = value.encode_utf16().collect::<Vec<_>>();
-                let end = usize::try_from(from)
-                    .map(|from| (from + needle.encode_utf16().count()).min(units.len()))
-                    .unwrap_or(0);
-                let prefix = String::from_utf16_lossy(&units[..end]);
-                Ok(Value::Int(utf16_last_index_of(&prefix, &needle)))
+                Ok(Value::Int(code_point_last_index_of(
+                    haystack, &needle, from,
+                )))
             }
             ("java/lang/String", "lastIndexOf", "(Ljava/lang/String;)I") => {
                 Ok(Value::Int(utf16_last_index_of(
@@ -14741,12 +14921,43 @@ impl Host for StdHost {
                     .trim_matches(|c: char| c <= '\u{0020}')
                     .to_owned(),
             ))),
+            // `strip`, `stripLeading`, `stripTrailing` and `isBlank` use
+            // `Character.isWhitespace` (not U+00A0, U+2007 or U+202F). A
+            // receiver that is a jar-object marker (an unmodelled constructor
+            // left a `String#n` reference) has no text to strip: counted.
+            (
+                "java/lang/String",
+                "strip" | "stripLeading" | "stripTrailing",
+                "()Ljava/lang/String;",
+            )
+            | ("java/lang/String", "isBlank", "()Z")
+                if jar_object::spells_key(receiver) || matches!(receiver, Value::Host(_)) =>
+            {
+                self.unknown_host_call(r)
+            }
             ("java/lang/String", "strip", "()Ljava/lang/String;") => {
-                Ok(Value::Ref(Some(expect_string(receiver).trim().to_owned())))
+                let text = expect_string(receiver);
+                let (start, end) = jdk_character::strip_bounds(text);
+                // All-whitespace text has `start > end`: clamp so the slice is
+                // empty instead of panicking.
+                Ok(Value::Ref(Some(text[start..end.max(start)].to_owned())))
             }
-            ("java/lang/String", "isBlank", "()Z") => {
-                Ok(Value::Int(expect_string(receiver).trim().is_empty() as i32))
+            ("java/lang/String", "stripLeading", "()Ljava/lang/String;") => {
+                let text = expect_string(receiver);
+                let (start, _) = jdk_character::strip_bounds(text);
+                Ok(Value::Ref(Some(text[start..].to_owned())))
             }
+            ("java/lang/String", "stripTrailing", "()Ljava/lang/String;") => {
+                let text = expect_string(receiver);
+                let (_, end) = jdk_character::strip_bounds(text);
+                Ok(Value::Ref(Some(text[..end].to_owned())))
+            }
+            ("java/lang/String", "isBlank", "()Z") => Ok(Value::Int(
+                expect_string(receiver)
+                    .chars()
+                    .all(|ch| jdk_character::is_whitespace(ch as u32 as i32))
+                    as i32,
+            )),
             ("java/lang/String", "substring", "(I)Ljava/lang/String;") => {
                 let start = expect_int(r, Self::argument(r, args, 0)?)?;
                 let value = expect_string(receiver);
@@ -16738,44 +16949,112 @@ fn random_uuid() -> String {
 }
 
 fn uuid_value(text: &str) -> Result<Value, NativeError> {
-    Ok(host_jdk_value::uuid(&canonical_uuid(text)?))
-}
-
-fn canonical_uuid(text: &str) -> Result<String, NativeError> {
-    let bytes = text.as_bytes();
-    if bytes.len() != 36
-        || ![8, 13, 18, 23].iter().all(|&index| bytes[index] == b'-')
-        || bytes
-            .iter()
-            .enumerate()
-            .any(|(index, byte)| ![8, 13, 18, 23].contains(&index) && !byte.is_ascii_hexdigit())
-    {
-        return legacy_uuid(text)
-            .ok_or_else(|| NativeError::Metadata(format!("invalid UUID string {text:?}")));
+    match uuid_from_string(text) {
+        Some(Ok(uuid)) => Ok(host_jdk_value::uuid(&uuid)),
+        _ => Err(NativeError::Metadata(format!(
+            "invalid UUID string {text:?}"
+        ))),
     }
-    Ok(text.to_ascii_lowercase())
 }
 
-/// `UUID.fromString1` (Java 25), the form other than the canonical 36 characters: five
-/// dash-separated hex fields of any width, each `Long.parseLong(.., 16)` masked to its field
-/// (`1-2-3-4-5` is `00000001-0002-0003-0004-000000000005`). `None` where Java throws, or a
-/// field has a sign this model does not read.
-fn legacy_uuid(text: &str) -> Option<String> {
-    let fields: Vec<&str> = text.split('-').collect();
-    if text.len() > 36 || fields.len() != 5 {
+/// `UUID.fromString(text)` on Java 25: the canonical text of the UUID it answers, or the exception
+/// it throws, class and message (`tests/fixtures/uuid_from_string/java25.txt` is the captured
+/// oracle). `None` where this model cannot tell: once the length and dash checks pass, text with a
+/// non-ASCII character, since Java reads each field with `Character.digit`, which takes every
+/// Unicode decimal digit and the fullwidth letters.
+///
+/// Java's order: text longer than 36 UTF-16 units is "too large"; the canonical 36 characters
+/// (dashes at 8, 13, 18 and 23, hex digits elsewhere, either case) are read directly; any other
+/// text needs exactly four dashes, and each of the five fields between them is read as
+/// `Long.parseLong(.., 16)` reads a part of a string, then masked to its field's width
+/// (`1-2-3-4-5` is `00000001-0002-0003-0004-000000000005`).
+fn uuid_from_string(text: &str) -> Option<Result<String, NativeError>> {
+    let thrown = |class: &str, message: String| NativeError::UncaughtException {
+        class: class.into(),
+        message: Some(message),
+        frame: None,
+    };
+    if text.encode_utf16().count() > 36 {
+        return Some(Err(thrown(
+            "java/lang/IllegalArgumentException",
+            "UUID string too large".into(),
+        )));
+    }
+    let bytes = text.as_bytes();
+    let dash = |index: usize| [8, 13, 18, 23].contains(&index);
+    if bytes.len() == 36
+        && bytes.iter().enumerate().all(|(index, byte)| {
+            if dash(index) {
+                *byte == b'-'
+            } else {
+                byte.is_ascii_hexdigit()
+            }
+        })
+    {
+        return Some(Ok(text.to_ascii_lowercase()));
+    }
+    if text.matches('-').count() != 4 {
+        return Some(Err(thrown(
+            "java/lang/IllegalArgumentException",
+            format!("Invalid UUID string: {text}"),
+        )));
+    }
+    if !text.is_ascii() {
         return None;
     }
     let mut values = [0_i64; 5];
-    for (value, field) in values.iter_mut().zip(&fields) {
-        if field.is_empty() || !field.bytes().all(|b| b.is_ascii_hexdigit()) {
-            return None;
+    for (value, field) in values.iter_mut().zip(text.split('-')) {
+        match uuid_field(field) {
+            Ok(parsed) => *value = parsed,
+            Err(message) => return Some(Err(thrown("java/lang/NumberFormatException", message))),
         }
-        *value = i64::from_str_radix(field, 16).ok()?;
     }
     let msb =
         ((values[0] & 0xffff_ffff) << 32) | ((values[1] & 0xffff) << 16) | (values[2] & 0xffff);
     let lsb = ((values[3] & 0xffff) << 48) | (values[4] & 0xffff_ffff_ffff);
-    Some(host_jdk_value::uuid_text_of(msb, lsb))
+    Some(Ok(host_jdk_value::uuid_text_of(msb, lsb)))
+}
+
+/// One field of a non-canonical [`uuid_from_string`] text, ASCII and without a dash, read as
+/// Java 25's `Long.parseLong(CharSequence, begin, end, 16)` reads it: an optional `+`, then hex
+/// digits, accumulated negatively so the overflow check is on the digit that overflows. The
+/// error is that call's `NumberFormatException` message, with the index counted from the
+/// field's start.
+fn uuid_field(field: &str) -> Result<i64, String> {
+    let bytes = field.as_bytes();
+    let error_at = |index: usize| format!("Error at index {index} in: \"{field}\"");
+    let Some(&first) = bytes.first() else {
+        return Err("For input string: \"\" under radix 16".into());
+    };
+    let mut index = 0;
+    if first < b'0' {
+        // A field never holds a `-`: the text was split at its dashes.
+        if first != b'+' {
+            return Err(error_at(0));
+        }
+        if bytes.len() == 1 {
+            return Err(error_at(1));
+        }
+        index = 1;
+    }
+    const LIMIT: i64 = -i64::MAX;
+    const MULTMIN: i64 = LIMIT / 16;
+    let mut result = 0_i64;
+    while index < bytes.len() {
+        let Some(digit) = char::from(bytes[index]).to_digit(16).map(i64::from) else {
+            return Err(error_at(index));
+        };
+        if result < MULTMIN {
+            return Err(error_at(index));
+        }
+        result *= 16;
+        if result < LIMIT + digit {
+            return Err(error_at(index));
+        }
+        result -= digit;
+        index += 1;
+    }
+    Ok(-result)
 }
 
 fn enum_name(value: &Value) -> &str {
@@ -17257,6 +17536,18 @@ fn game_enum_constants(owner: &str) -> Option<&'static [&'static str]> {
         "net/minecraft/core/Direction$Axis" => &["X", "Y", "Z"],
         "net/minecraft/core/Direction$AxisDirection" => &["POSITIVE", "NEGATIVE"],
         "net/minecraft/world/InteractionHand" => &["MAIN_HAND", "OFF_HAND"],
+        // `server-26.3.jar` `ContainerInput.<clinit>` offsets 0-97 (the click types).
+        "net/minecraft/world/inventory/ContainerInput" => &[
+            "PICKUP",
+            "QUICK_MOVE",
+            "SWAP",
+            "CLONE",
+            "THROW",
+            "QUICK_CRAFT",
+            "PICKUP_ALL",
+        ],
+        "net/minecraft/world/inventory/ClickAction" => &["PRIMARY", "SECONDARY"],
+        "net/minecraft/util/Prediction" => &["PREDICTED", "SERVER_ONLY"],
         "net/minecraft/world/InteractionResult$SwingSource" => {
             &["NONE", "PREDICTED", "SERVER_ONLY"]
         }
@@ -17360,6 +17651,11 @@ fn jdk_exception_superclass(owner: &str) -> Option<&'static str> {
         // Mixin's, which a `cancel()` on a callback info that is not
         // cancellable throws (sponge-mixin 0.17.5, `host_mixin.rs`).
         host_mixin::CANCELLATION_EXCEPTION => "java/lang/RuntimeException",
+        // gson-2.14.0's, which `Gson.fromJson` and `JsonParser` throw for a
+        // malformed document (`gson_tree/parse.rs`).
+        gson_tree::parse::JSON_SYNTAX_EXCEPTION => "com/google/gson/JsonParseException",
+        "com/google/gson/JsonParseException" => "java/lang/RuntimeException",
+        gson_tree::parse::MALFORMED_JSON_EXCEPTION => "java/io/IOException",
         "java/lang/NumberFormatException"
         | "java/nio/charset/UnsupportedCharsetException"
         | "java/nio/charset/IllegalCharsetNameException" => "java/lang/IllegalArgumentException",
@@ -18511,9 +18807,66 @@ fn is_always_loaded_mod(id: &str) -> bool {
     )
 }
 
-/// The one-character string a `String` char index names.
-fn string_from_char_code(code: i32) -> String {
-    char::from_u32(code as u32).map_or_else(String::new, String::from)
+/// The UTF-16 units of a code point for `String.indexOf(int)`/`lastIndexOf(int)`:
+/// a lone surrogate is one unit, a supplementary code point a pair.
+/// Returns `None` when the code point is outside `0..=0x10FFFF` and never matches.
+fn code_point_needle(code: i32) -> Option<Vec<u16>> {
+    let unit = code as u32;
+    if unit > 0x10FFFF {
+        return None;
+    }
+    if (0xD800..=0xDFFF).contains(&unit) {
+        // A lone surrogate: one UTF-16 code unit.
+        return Some(vec![unit as u16]);
+    }
+    let mut buf = [0_u16; 2];
+    let units = char::from_u32(unit)
+        .map(|c| c.encode_utf16(&mut buf))
+        .unwrap_or_default();
+    Some(units.to_vec())
+}
+
+/// `indexOf` for a code-point needle: values outside `0..=0x10FFFF` never
+/// match; a supplementary code point matches its surrogate pair. A negative
+/// `from` is clamped to zero; a `from` beyond the length yields `-1`.
+fn code_point_index_of(haystack: &str, needle: &[u16], from: i32) -> i32 {
+    if needle.is_empty() {
+        return -1;
+    }
+    let haystack = haystack.encode_utf16().collect::<Vec<_>>();
+    let start = from.max(0) as usize;
+    if start >= haystack.len() {
+        return -1;
+    }
+    haystack
+        .get(start..)
+        .and_then(|tail| {
+            tail.windows(needle.len())
+                .position(|window| window == needle)
+        })
+        .map_or(-1, |index| (start + index) as i32)
+}
+
+/// `lastIndexOf` for a code-point needle: values outside `0..=0x10FFFF` never
+/// match; a supplementary code point matches its surrogate pair. A negative
+/// `from` yields `-1`; a `from` beyond the length is clamped to the end.
+fn code_point_last_index_of(haystack: &str, needle: &[u16], from: i32) -> i32 {
+    if needle.is_empty() {
+        return -1;
+    }
+    if from < 0 {
+        return -1;
+    }
+    let haystack = haystack.encode_utf16().collect::<Vec<_>>();
+    // A match may start at `from` itself, so the window reaches `needle.len()` units past it.
+    let end = (from as usize)
+        .saturating_add(needle.len())
+        .min(haystack.len());
+    let prefix = &haystack[..end];
+    prefix
+        .windows(needle.len())
+        .rposition(|window| window == needle)
+        .map_or(-1, |index| index as i32)
 }
 
 /// The physical lines of a `.properties` text, without their terminators: like JDK 25's
@@ -31203,6 +31556,9 @@ impl<H: Host> Runtime<'_, H> {
         if let Some(value) = block_use::invoke_runtime_helper(self, r, receiver, args)? {
             return Ok(Some(value));
         }
+        if let Some(value) = live_menu::invoke_helper(self, r, receiver, args)? {
+            return Ok(Some(value));
+        }
         // `BlockStateBase.getShape(BlockGetter, BlockPos[, CollisionContext])`: dispatches to the
         // block's `getShape` (MC 26.3 `BlockBehaviour$BlockStateBase.getShape`).
         if matches!(
@@ -35074,6 +35430,12 @@ impl<H: Host> Runtime<'_, H> {
             receiver,
             args,
         )? {
+            return Ok(Some(value));
+        }
+
+        // The live server menu's vanilla bodies (`live_menu.rs`): clicks, slots, containers
+        // and the player's inventory, for the menus whose state Decaf holds.
+        if let Some(value) = live_menu::invoke(self, &effective_owner, r, op, receiver, args)? {
             return Ok(Some(value));
         }
 
@@ -48657,6 +49019,29 @@ mandatory = true
                 .unwrap(),
             Value::Int(1)
         );
+        // A jar-object marker (`String#n`) has no text to strip: every one of
+        // the four methods stays counted, none answers from the marker's text.
+        let marker = Value::Ref(Some("java/lang/String#3".into()));
+        for (name, descriptor) in [
+            ("strip", "()Ljava/lang/String;"),
+            ("stripLeading", "()Ljava/lang/String;"),
+            ("stripTrailing", "()Ljava/lang/String;"),
+            ("isBlank", "()Z"),
+        ] {
+            let call = MethodRef {
+                owner: "java/lang/String".into(),
+                name: name.into(),
+                descriptor: descriptor.into(),
+            };
+            assert!(host.invoke_instance(&call, &marker, &[]).is_ok(), "{name}");
+            assert!(
+                host.unknown_host_calls()
+                    .iter()
+                    .any(|(counted, _)| *counted == format!("java/lang/String#{name}{descriptor}")),
+                "{name}: {:?}",
+                host.unknown_host_calls()
+            );
+        }
     }
 
     #[test]

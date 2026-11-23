@@ -115,6 +115,25 @@ pub(crate) fn encodable(text: &str) -> bool {
     text.is_ascii()
 }
 
+/// A path's name elements as `UnixPath` counts them: the text between separators
+/// (repeated and trailing ones ignored); the empty path is one empty name and the
+/// root alone has none.
+fn names(text: &str) -> Vec<&str> {
+    if text.is_empty() {
+        return vec![""];
+    }
+    text.split('/').filter(|name| !name.is_empty()).collect()
+}
+
+/// `UnixPath.startsWith(Path)` for two ASCII paths with no NUL: both absolute or
+/// both relative, and the prefix's names are the leading names of `path`
+/// (whole names: `a/bc` does not start with `a/b`; the empty path is the one
+/// empty name, so only the empty path starts with it). Purely lexical (no
+/// filesystem, no `..` resolution).
+pub(crate) fn starts_with(path: &str, prefix: &str) -> bool {
+    path.starts_with('/') == prefix.starts_with('/') && names(path).starts_with(&names(prefix))
+}
+
 /// `Path.of(text)`: a new path object.
 pub(crate) fn path_value(text: &str) -> Value {
     Value::Host(HostRef::new(HostKind::Path, unix_normal(text)))
