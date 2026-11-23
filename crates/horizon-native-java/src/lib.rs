@@ -453,6 +453,10 @@ pub struct MethodRef {
 pub struct Annotation {
     pub descriptor: String,
     pub values: BTreeMap<String, AnnotationValue>,
+    /// The element names in the order the class file lists them, which
+    /// `values` (sorted by name) does not keep. Reflection prints explicit
+    /// elements in this order; a hand-built annotation may leave it empty.
+    pub order: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -42009,11 +42013,20 @@ fn read_annotation_at(
     let descriptor = utf8(pool, r.u2()?)?;
     let pair_count = r.u2()? as usize;
     let mut values = BTreeMap::new();
+    let mut order = Vec::new();
     for _ in 0..pair_count {
         let name = utf8(pool, r.u2()?)?;
-        values.insert(name, read_annotation_value_at(r, pool, depth + 1)?);
+        let value = read_annotation_value_at(r, pool, depth + 1)?;
+        // A repeated element keeps its first position, as the JDK's map does.
+        if values.insert(name.clone(), value).is_none() {
+            order.push(name);
+        }
     }
-    Ok(Annotation { descriptor, values })
+    Ok(Annotation {
+        descriptor,
+        values,
+        order,
+    })
 }
 
 fn read_annotation_value(r: &mut Reader<'_>, pool: &[Cp]) -> Result<AnnotationValue, NativeError> {
@@ -55639,6 +55652,7 @@ mandatory = true
             class.annotations,
             vec![Annotation {
                 descriptor: "Ldemo/Visible;".into(),
+                order: Vec::new(),
                 values: BTreeMap::new(),
             }]
         );
@@ -56732,6 +56746,7 @@ mandatory = true
     fn inject_annotation(method: &str, anchor: &str, cancellable: bool) -> Annotation {
         Annotation {
             descriptor: "Lorg/spongepowered/asm/mixin/injection/Inject;".into(),
+            order: Vec::new(),
             values: BTreeMap::from([
                 ("method".into(), string_array(&[method])),
                 (
@@ -56739,6 +56754,7 @@ mandatory = true
                     AnnotationValue::Array(vec![AnnotationValue::Annotation(Box::new(
                         Annotation {
                             descriptor: "Lorg/spongepowered/asm/mixin/injection/At;".into(),
+                            order: Vec::new(),
                             values: BTreeMap::from([(
                                 "value".into(),
                                 AnnotationValue::String(anchor.into()),
@@ -56824,6 +56840,7 @@ mandatory = true
             )],
             annotations: vec![Annotation {
                 descriptor: "Lorg/spongepowered/asm/mixin/Mixin;".into(),
+                order: Vec::new(),
                 values: BTreeMap::from([("targets".into(), string_array(&["Ldemo/Target;"]))]),
             }],
             raw: Vec::new(),
@@ -57239,6 +57256,7 @@ mandatory = true
             )],
             annotations: vec![Annotation {
                 descriptor: "Lorg/spongepowered/asm/mixin/Mixin;".into(),
+                order: Vec::new(),
                 values: BTreeMap::from([("targets".into(), string_array(&["Ldemo/Target;"]))]),
             }],
             raw: Vec::new(),
@@ -57373,6 +57391,7 @@ mandatory = true
             )],
             annotations: vec![Annotation {
                 descriptor: "Lorg/spongepowered/asm/mixin/Mixin;".into(),
+                order: Vec::new(),
                 values: BTreeMap::from([("targets".into(), string_array(&["Ldemo/Target;"]))]),
             }],
             raw: Vec::new(),
@@ -57494,6 +57513,7 @@ mandatory = true
             )],
             annotations: vec![Annotation {
                 descriptor: "Lorg/spongepowered/asm/mixin/Mixin;".into(),
+                order: Vec::new(),
                 values: BTreeMap::from([("targets".into(), string_array(&["Ldemo/Target;"]))]),
             }],
             raw: Vec::new(),
@@ -57812,6 +57832,7 @@ mandatory = true
         }
         Annotation {
             descriptor: "Lorg/spongepowered/asm/mixin/injection/Inject;".into(),
+            order: Vec::new(),
             values: BTreeMap::from([
                 ("method".into(), string_array(&[method])),
                 (
@@ -57819,6 +57840,7 @@ mandatory = true
                     AnnotationValue::Array(vec![AnnotationValue::Annotation(Box::new(
                         Annotation {
                             descriptor: "Lorg/spongepowered/asm/mixin/injection/At;".into(),
+                            order: Vec::new(),
                             values: at_values,
                         },
                     ))]),
@@ -57843,6 +57865,7 @@ mandatory = true
             )],
             annotations: vec![Annotation {
                 descriptor: "Lorg/spongepowered/asm/mixin/Mixin;".into(),
+                order: Vec::new(),
                 values: BTreeMap::from([("targets".into(), string_array(&["Ldemo/Target;"]))]),
             }],
             raw: Vec::new(),
