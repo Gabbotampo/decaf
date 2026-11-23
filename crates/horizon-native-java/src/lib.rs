@@ -11021,7 +11021,7 @@ impl Host for StdHost {
                 // A live supplier's `get()` needs the interpreter to run it:
                 // keep the call counted instead of fabricating a value or a
                 // message.
-                return self.unknown_host_call(r);
+                self.unknown_host_call(r)
             }
             // `Objects.isNull`/`nonNull` are predicates a mod passes as a
             // method reference (`filter(Objects::nonNull)`).
