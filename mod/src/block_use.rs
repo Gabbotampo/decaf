@@ -421,44 +421,107 @@ pub(crate) enum MenuApplied {
     Shown(PlayerContainer),
 }
 
-/// Carry a use's menu effects out on Sunrise, in order, without the state lock. A close
-/// followed by an open needs nothing of its own: the open's [`MenuReplace::CloseFirst`] closes
-/// the window as `ServerPlayer.closeContainer` would have. A close with no open after it closes
-/// the window (`MenuRef::close_container`).
+/// Carry a use's menu effects out on Sunrise, in order, without the state lock.
 pub(crate) fn apply_menu_effects(
     host: &mut dyn ServerHost,
     player_uuid: u128,
     effects: &[MenuEffect],
 ) -> Vec<MenuApplied> {
+    deliver_menu_effects(
+        &mut SunriseMenus {
+            host,
+            player: player_uuid,
+        },
+        effects,
+    )
+}
+
+/// Where a call's menu effects go: Sunrise ([`SunriseMenus`]), or a test's recorder.
+pub(crate) trait MenuSink {
+    /// Open Java's menu as a Sunrise mod menu, replacing the open one
+    /// ([`MenuReplace::CloseFirst`]: its close, then the open, as vanilla's packets go).
+    fn open(&mut self, effect: &OpenMenuEffect) -> SunriseMenuAttempt;
+    /// Close window `container_id`, if it is the one shown.
+    fn close(&mut self, container_id: i32) -> bool;
+    /// The window shown now.
+    fn shown(&mut self) -> PlayerContainer;
+}
+
+/// The player's menus on Sunrise.
+struct SunriseMenus<'a> {
+    host: &'a mut dyn ServerHost,
+    player: u128,
+}
+
+impl MenuSink for SunriseMenus<'_> {
+    fn open(&mut self, effect: &OpenMenuEffect) -> SunriseMenuAttempt {
+        try_open_sunrise_menu(self.host, self.player, effect)
+    }
+
+    fn close(&mut self, container_id: i32) -> bool {
+        let host = &mut *self.host;
+        let window = host
+            .player(self.player)
+            .and_then(|player| player.container_menu(&*host))
+            .filter(|menu| menu.container_id(&*host) == Some(container_id));
+        // Sunrise refuses this during the player's own action (a block use is one): the
+        // caller then counts the window it couldn't close.
+        window.is_some_and(|menu| menu.close_container(host))
+    }
+
+    fn shown(&mut self) -> PlayerContainer {
+        let player = self.host.player(self.player);
+        player_container(&*self.host, player)
+    }
+}
+
+/// The delivery order. Java's `closeContainer` sends its close packet before anything of the
+/// next open is built, unconditionally, so every [`MenuEffect::Closed`] closes its window:
+/// - followed by an open Sunrise carries out, the open's [`MenuReplace::CloseFirst`] does it,
+///   in one call that sends the close before the open, as vanilla's packets go; closing first
+///   ourselves instead isn't possible inside a use (Sunrise refuses `close_container` for the
+///   acting player) and would double the close;
+/// - followed by an open Sunrise refuses or a mod cancels (which leaves Sunrise's old window
+///   as it was), it is closed right after that attempt, which itself changed nothing;
+/// - followed by no open, it is closed then.
+fn deliver_menu_effects(sink: &mut dyn MenuSink, effects: &[MenuEffect]) -> Vec<MenuApplied> {
     let mut applied = Vec::new();
     for (index, effect) in effects.iter().enumerate() {
         match effect {
-            MenuEffect::Opened(open) => applied.push(MenuApplied::Opened {
-                container_id: open.container_id,
-                attempt: try_open_sunrise_menu(host, player_uuid, open),
-            }),
+            MenuEffect::Opened(open) => {
+                let attempt = sink.open(open);
+                let replaced = matches!(attempt, SunriseMenuAttempt::Opened(_));
+                applied.push(MenuApplied::Opened {
+                    container_id: open.container_id,
+                    attempt,
+                });
+                if !replaced
+                    && let Some(MenuEffect::Closed { container_id }) =
+                        index.checked_sub(1).and_then(|before| effects.get(before))
+                {
+                    applied.push(MenuApplied::Closed {
+                        container_id: *container_id,
+                        closed: sink.close(*container_id),
+                    });
+                }
+            }
             MenuEffect::Orphaned { container_id } => applied.push(MenuApplied::Orphaned {
                 container_id: *container_id,
             }),
             MenuEffect::Closed { container_id } => {
+                // Carried out by (or after) the open that follows.
                 if matches!(effects.get(index + 1), Some(MenuEffect::Opened(_))) {
                     continue;
                 }
-                let window = host
-                    .player(player_uuid)
-                    .and_then(|player| player.container_menu(&*host))
-                    .filter(|menu| menu.container_id(&*host) == Some(*container_id));
-                let closed = window.is_some_and(|menu| menu.close_container(host));
                 applied.push(MenuApplied::Closed {
                     container_id: *container_id,
-                    closed,
+                    closed: sink.close(*container_id),
                 });
             }
         }
     }
     if !effects.is_empty() {
-        let player = host.player(player_uuid);
-        applied.push(MenuApplied::Shown(player_container(&*host, player)));
+        applied.push(MenuApplied::Shown(sink.shown()));
     }
     applied
 }
@@ -1079,6 +1142,126 @@ mod tests {
             ]
         );
         assert!(apply_menu_effects(&mut host, uuid, &[]).is_empty());
+    }
+
+    /// A Sunrise stand-in that records each call and opens or refuses as told.
+    struct RecordingSink {
+        calls: Vec<String>,
+        accept: bool,
+        shown: PlayerContainer,
+    }
+
+    impl MenuSink for RecordingSink {
+        fn open(&mut self, effect: &OpenMenuEffect) -> SunriseMenuAttempt {
+            self.calls.push(format!("open {}", effect.container_id));
+            if self.accept {
+                // `CloseFirst`: the shown window closes, then this one opens.
+                self.shown = PlayerContainer::Open(effect.container_id);
+                SunriseMenuAttempt::Opened(effect.container_id)
+            } else {
+                SunriseMenuAttempt::Refused {
+                    hook_tag: "sunrise#openModMenu:unregistered_menu_type",
+                    reason: "refused".to_owned(),
+                }
+            }
+        }
+
+        fn close(&mut self, container_id: i32) -> bool {
+            self.calls.push(format!("close {container_id}"));
+            let shown = self.shown == PlayerContainer::Open(container_id);
+            if shown {
+                self.shown = PlayerContainer::Inventory;
+            }
+            shown
+        }
+
+        fn shown(&mut self) -> PlayerContainer {
+            self.shown
+        }
+    }
+
+    fn opened_effect(container_id: i32) -> MenuEffect {
+        use crate::runtime::Value;
+        MenuEffect::Opened(OpenMenuEffect {
+            container_id,
+            menu_type: Value::Ref(None),
+            menu_type_id: Some("demo:bench".to_owned()),
+            title: Value::Ref(None),
+            title_json: Some(serde_json::json!({ "text": "Bench" })),
+            access_pos: None,
+            constructor: None,
+            provider: Value::Ref(None),
+            menu: Value::Ref(None),
+        })
+    }
+
+    /// #629 review round 3: `[Closed 1, Opened 2]` where Sunrise refuses the open. Java's
+    /// `closeContainer` closed window 1 regardless, so it is closed once the refusal leaves it
+    /// standing.
+    #[test]
+    fn a_refused_replacement_still_closes_the_old_window() {
+        let mut sink = RecordingSink {
+            calls: Vec::new(),
+            accept: false,
+            shown: PlayerContainer::Open(1),
+        };
+        let applied = deliver_menu_effects(
+            &mut sink,
+            &[MenuEffect::Closed { container_id: 1 }, opened_effect(2)],
+        );
+        assert_eq!(sink.calls, ["open 2", "close 1"]);
+        assert_eq!(
+            applied,
+            vec![
+                MenuApplied::Opened {
+                    container_id: 2,
+                    attempt: SunriseMenuAttempt::Refused {
+                        hook_tag: "sunrise#openModMenu:unregistered_menu_type",
+                        reason: "refused".to_owned(),
+                    },
+                },
+                MenuApplied::Closed {
+                    container_id: 1,
+                    closed: true
+                },
+                MenuApplied::Shown(PlayerContainer::Inventory),
+            ]
+        );
+    }
+
+    /// The same sequence where Sunrise opens the replacement: its `CloseFirst` closed window 1
+    /// before opening 2, so nothing closes it a second time.
+    #[test]
+    fn a_successful_replacement_closes_the_old_window_once() {
+        let mut sink = RecordingSink {
+            calls: Vec::new(),
+            accept: true,
+            shown: PlayerContainer::Open(1),
+        };
+        let applied = deliver_menu_effects(
+            &mut sink,
+            &[MenuEffect::Closed { container_id: 1 }, opened_effect(2)],
+        );
+        assert_eq!(sink.calls, ["open 2"]);
+        assert_eq!(
+            applied,
+            vec![
+                MenuApplied::Opened {
+                    container_id: 2,
+                    attempt: SunriseMenuAttempt::Opened(2),
+                },
+                MenuApplied::Shown(PlayerContainer::Open(2)),
+            ]
+        );
+        // A close with no open after it closes its window at once.
+        let mut sink = RecordingSink {
+            calls: Vec::new(),
+            accept: true,
+            shown: PlayerContainer::Open(2),
+        };
+        deliver_menu_effects(&mut sink, &[MenuEffect::Closed { container_id: 2 }]);
+        assert_eq!(sink.calls, ["close 2"]);
+        assert_eq!(sink.shown, PlayerContainer::Inventory);
     }
 
     #[test]
