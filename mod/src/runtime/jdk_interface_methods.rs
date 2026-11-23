@@ -22,7 +22,7 @@
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
-const DATA: &str = include_str!("jdk_interface_methods_25.tsv");
+const DATA: &str = crate::runtime::vendored_jdk_interface_methods_25_tsv::VENDORED_DATA;
 
 /// How an interface's class file declares a method.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

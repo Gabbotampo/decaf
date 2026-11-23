@@ -58671,6 +58671,8 @@ mod vendored_game_rules_oracle_tsv;
 mod vendored_generated_nested_real_java25_txt;
 #[path = "jarjar_version_java25.txt.rs"]
 mod vendored_jarjar_version_java25_txt;
+#[path = "jdk_interface_methods_25.tsv.rs"]
+mod vendored_jdk_interface_methods_25_tsv;
 #[path = "jdk_text_oracle.json.rs"]
 mod vendored_jdk_text_oracle_json;
 #[path = "menu_models_oracle.txt.rs"]
