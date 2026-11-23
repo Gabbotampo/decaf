@@ -105,7 +105,8 @@ fn build_jar(
 
 fn mixin_stubs() -> BTreeMap<&'static str, &'static str> {
     let mut sources = BTreeMap::new();
-    // Real SpongePowered Mixin uses RetentionPolicy.CLASS for @Mixin, @Shadow, @Unique.
+    // sponge-mixin 0.17.5 (Fabric 26.3) declares @Mixin CLASS-retained and @Shadow
+    // RUNTIME-retained with `prefix() default "shadow$"`; @Unique stays CLASS here.
     sources.insert(
         "org/spongepowered/asm/mixin/Mixin.java",
         r#"package org.spongepowered.asm.mixin;
@@ -131,9 +132,13 @@ public @interface Unique {}
         "org/spongepowered/asm/mixin/Shadow.java",
         r#"package org.spongepowered.asm.mixin;
 import java.lang.annotation.*;
-@Retention(RetentionPolicy.CLASS)
-@Target({ElementType.FIELD, ElementType.METHOD})
-public @interface Shadow {}
+@Retention(RetentionPolicy.RUNTIME)
+@Target({ElementType.METHOD, ElementType.FIELD, ElementType.CONSTRUCTOR})
+public @interface Shadow {
+    String prefix() default "shadow$";
+    boolean remap() default true;
+    String[] aliases() default {};
+}
 "#,
     );
     sources.insert(
@@ -3663,19 +3668,15 @@ public final class JdkDefaultProbe {
     assert_eq!(sub_client.unknown_host_call_count(), 0);
 }
 
-/// Round 3 P1: static `@Shadow` fields resolve to their target's static field (jar-local or
-/// host-modelled game static), obey Mixin `@Final`/`@Mutable` rules and `<clinit>` dummy
-/// placeholders, count/refuse ambiguous multi-target static shadows, and leave non-shadow
-/// mixin statics working normally — tested through both `StdHost` and `run_game_hook_in`.
-#[test]
-fn static_shadow_fields_resolve_enforce_final_mutable_and_count_ambiguity() {
-    let mut sources = mixin_stubs();
+/// sponge-mixin 0.17.5's `@Final` and `@Mutable` (both `RUNTIME`-retained, fields and
+/// methods), compile-only like the other annotation stubs.
+fn insert_final_mutable_stubs(sources: &mut BTreeMap<&'static str, &'static str>) {
     sources.insert(
         "org/spongepowered/asm/mixin/Final.java",
         r#"package org.spongepowered.asm.mixin;
 import java.lang.annotation.*;
-@Retention(RetentionPolicy.CLASS)
-@Target({ElementType.FIELD, ElementType.METHOD})
+@Retention(RetentionPolicy.RUNTIME)
+@Target({ElementType.METHOD, ElementType.FIELD})
 public @interface Final {}
 "#,
     );
@@ -3683,11 +3684,45 @@ public @interface Final {}
         "org/spongepowered/asm/mixin/Mutable.java",
         r#"package org.spongepowered.asm.mixin;
 import java.lang.annotation.*;
-@Retention(RetentionPolicy.CLASS)
-@Target({ElementType.FIELD, ElementType.METHOD})
+@Retention(RetentionPolicy.RUNTIME)
+@Target({ElementType.METHOD, ElementType.FIELD})
 public @interface Mutable {}
 "#,
     );
+}
+
+/// The `IllegalAccessError` HotSpot throws for a `putstatic` of `final` field `field` of
+/// `owner` (binary name) from `method`, outside `<clinit>`. Captured on JDK 25.0.5 from
+/// `JarStaticShadowMixin` merged into `StaticTarget` the way `MixinApplicatorStandard`
+/// merges it (trailing space included).
+fn final_static_update_message(owner: &str, field: &str, method: &str) -> String {
+    format!(
+        "Update to static final field {owner}.{field} attempted from a different method ({method}) than the initializer method <clinit> "
+    )
+}
+
+/// Static `@Shadow` fields follow real Mixin (sponge-mixin 0.17.5) and JVM semantics:
+///
+/// - a shadow resolves to the target's own static field (jar-local, or a host-modelled
+///   game static the host answers);
+/// - `@Final` is only a transformer diagnostic (`MixinTargetContext.checkFinal` logs), so a
+///   `@Final` shadow of a non-final target field is writable;
+/// - a write to a target field that really is `ACC_FINAL` fails as HotSpot fails it once
+///   Mixin has merged the code into the target: `IllegalAccessError` outside `<clinit>`;
+/// - `@Mutable` clears the target field's `ACC_FINAL` (`mergeShadowFields`), so the write
+///   goes through;
+/// - a host-modelled game static's flags are not known and no write reaches the game, so
+///   every write through such a shadow (including a mixin `<clinit>`'s `= null`, which
+///   Mixin keeps) is counted, or refused on a strict host and in a game hook;
+/// - an ambiguous multi-target static shadow is counted or refused.
+///
+/// Expected jar-local values come from a JDK 25.0.5 run of these classes merged the way
+/// `MixinApplicatorStandard` merges them (shadow declarations dropped, `@Mutable` clearing
+/// `ACC_FINAL`, mixin members and `<clinit>` moved onto the target).
+#[test]
+fn static_shadow_fields_follow_target_flags_and_count_unknown_writes() {
+    let mut sources = mixin_stubs();
+    insert_final_mutable_stubs(&mut sources);
     sources.insert(
         "net/minecraft/resources/ResourceKey.java",
         "package net.minecraft.resources;\npublic class ResourceKey<T> {}\n",
@@ -3707,79 +3742,114 @@ public class Level {
 }
 "#,
     );
-    // Jar-local target with both mutable and final (non-constant) static fields.
+    // Jar-local target: a mutable static, a non-final static a shadow calls `@Final`, and a
+    // really final (non-constant) static.
     sources.insert(
         "demo/StaticTarget.java",
         r#"package demo;
 public class StaticTarget {
     public static int count = 10;
+    public static int loose = 3;
     public static final int LOCKED = initLocked();
     private static int initLocked() { return 55; }
 }
 "#,
     );
-    // Single-target mixin on jar-local StaticTarget: exercises mutable shadow, shadow$ prefix,
-    // @Final without @Mutable, @Final @Mutable, and non-shadow mixin-owned static.
     sources.insert(
         "demo/JarStaticShadowMixin.java",
         r#"package demo;
 import org.spongepowered.asm.mixin.Final;
 import org.spongepowered.asm.mixin.Mixin;
-import org.spongepowered.asm.mixin.Mutable;
 import org.spongepowered.asm.mixin.Shadow;
 import org.spongepowered.asm.mixin.Unique;
 
 @Mixin(StaticTarget.class)
 public abstract class JarStaticShadowMixin {
     @Shadow private static int count;
-    @Shadow private static int shadow$count;
+    @Shadow @Final private static int loose;
     @Shadow @Final private static int LOCKED;
-    @Shadow @Final @Mutable private static int shadow$LOCKED;
     @Unique private static int MIXIN_OWN = 33;
 
     public static int readCount() { return count; }
-    public static int readPrefixedCount() { return shadow$count; }
     public static void writeCount(int v) { count = v; }
+    public static int readLoose() { return loose; }
+    public static void writeLoose(int v) { loose = v; }
     public static int readLocked() { return LOCKED; }
     public static void writeLockedIllegal(int v) { LOCKED = v; }
-    public static void writeLockedMutable(int v) { shadow$LOCKED = v; }
     public static int readOwn() { return MIXIN_OWN; }
     public static void writeOwn(int v) { MIXIN_OWN = v; }
 }
 "#,
     );
-    // Single-target mixin on host-modelled ItemStack: includes `static final ... = null`
-    // dummy <clinit> placeholder alongside a non-shadow mixin static, plus @Final vs @Mutable.
+    // `@Mutable` clears the target field's ACC_FINAL, so it gets its own target.
+    sources.insert(
+        "demo/MutableTarget.java",
+        r#"package demo;
+public class MutableTarget {
+    public static final int LOCKED = initLocked();
+    private static int initLocked() { return 55; }
+}
+"#,
+    );
+    sources.insert(
+        "demo/MutableStaticShadowMixin.java",
+        r#"package demo;
+import org.spongepowered.asm.mixin.Final;
+import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.Mutable;
+import org.spongepowered.asm.mixin.Shadow;
+
+@Mixin(MutableTarget.class)
+public abstract class MutableStaticShadowMixin {
+    @Shadow @Final @Mutable private static int LOCKED;
+    public static int readLocked() { return LOCKED; }
+    public static void writeLocked(int v) { LOCKED = v; }
+}
+"#,
+    );
+    // Host-modelled `ItemStack`: a modelled static read, a write, and a mixin-owned static.
     sources.insert(
         "demo/ItemStackStaticMixin.java",
         r#"package demo;
 import net.minecraft.world.item.ItemStack;
 import org.spongepowered.asm.mixin.Final;
 import org.spongepowered.asm.mixin.Mixin;
-import org.spongepowered.asm.mixin.Mutable;
 import org.spongepowered.asm.mixin.Shadow;
 import org.spongepowered.asm.mixin.Unique;
 
 @Mixin(ItemStack.class)
 public abstract class ItemStackStaticMixin {
-    @Shadow @Final private static final ItemStack EMPTY = null;
-    @Shadow @Final @Mutable private static ItemStack shadow$EMPTY;
+    @Shadow @Final private static ItemStack EMPTY;
     @Unique private static int OWN_TAG = 77;
 
     public static boolean shadowEmptyMatchesHost() {
         return EMPTY != null && EMPTY == ItemStack.EMPTY;
     }
-    public static void writeEmptyWithoutMutable() {
-        // Use a non-final @Final field via another mixin below; here test @Mutable host write.
-        shadow$EMPTY = null;
-    }
+    public static void writeEmpty() { EMPTY = null; }
     public static int readOwnTag() { return OWN_TAG; }
     public static void writeOwnTag(int v) { OWN_TAG = v; }
 }
 "#,
     );
-    // Single-target mixin on host-modelled Level: modelled OVERWORLD (with @Final write test)
-    // and unmodelled UNMODELLED_STATIC.
+    // A `static final ... = null` shadow: javac emits the `putstatic` in `<clinit>`, and
+    // Mixin keeps it (it removes only the declaration), so the game static is written.
+    sources.insert(
+        "demo/ItemStackClinitMixin.java",
+        r#"package demo;
+import net.minecraft.world.item.ItemStack;
+import org.spongepowered.asm.mixin.Final;
+import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.Shadow;
+import org.spongepowered.asm.mixin.Unique;
+
+@Mixin(ItemStack.class)
+public abstract class ItemStackClinitMixin {
+    @Shadow @Final private static final ItemStack EMPTY = null;
+    @Unique private static int TAG = 5;
+    public static int readTag() { return TAG; }
+}
+"#,
+    );
     sources.insert(
         "demo/LevelStaticMixin.java",
         r#"package demo;
@@ -3797,15 +3867,12 @@ public abstract class LevelStaticMixin {
     public static boolean shadowOverworldMatchesHost() {
         return OVERWORLD != null && OVERWORLD == Level.OVERWORLD;
     }
-    public static void writeFinalOverworld() {
-        OVERWORLD = null;
-    }
+    public static void writeFinalOverworld() { OVERWORLD = null; }
     public static int readUnmodelled() { return UNMODELLED_STATIC; }
     public static void writeUnmodelled(int v) { UNMODELLED_STATIC = v; }
 }
 "#,
     );
-    // Multi-target ambiguous static @Shadow mixin.
     sources.insert(
         "demo/AmbiguousStaticMixin.java",
         r#"package demo;
@@ -3827,7 +3894,6 @@ public abstract class AmbiguousStaticMixin {
 }
 "#,
     );
-    // Player tick hook that exercises all of the above inside `run_game_hook_in`.
     sources.insert(
         "demo/PlayerStaticHookMixin.java",
         r#"package demo;
@@ -3858,8 +3924,13 @@ public abstract class PlayerStaticHookMixin {
             case 5 -> StaticShadowProbe.intResult = AmbiguousStaticMixin.readShared();
             case 6 -> AmbiguousStaticMixin.writeShared(99);
             case 7 -> {
-                JarStaticShadowMixin.writeLockedMutable(77);
-                StaticShadowProbe.intResult = StaticTarget.LOCKED;
+                MutableStaticShadowMixin.writeLocked(77);
+                StaticShadowProbe.intResult = MutableTarget.LOCKED;
+            }
+            case 8 -> JarStaticShadowMixin.writeLockedIllegal(1);
+            case 9 -> {
+                JarStaticShadowMixin.writeLoose(8);
+                StaticShadowProbe.intResult = StaticTarget.loose;
             }
             default -> {}
         }
@@ -3878,7 +3949,9 @@ public final class StaticShadowProbe {
     public static String readReport() { return report; }
     public static int readIntResult() { return intResult; }
     public static int directTargetCount() { return StaticTarget.count; }
+    public static int directTargetLoose() { return StaticTarget.loose; }
     public static int directTargetLocked() { return StaticTarget.LOCKED; }
+    public static int directMutableLocked() { return MutableTarget.LOCKED; }
 }
 "#,
     );
@@ -3900,394 +3973,257 @@ public final class StaticShadowProbe {
             ),
             (
                 "demo.mixins.json",
-                r#"{"required":true,"package":"demo","mixins":["JarStaticShadowMixin","ItemStackStaticMixin","LevelStaticMixin","AmbiguousStaticMixin","PlayerStaticHookMixin"]}"#,
+                r#"{"required":true,"package":"demo","mixins":["JarStaticShadowMixin","MutableStaticShadowMixin","ItemStackStaticMixin","ItemStackClinitMixin","LevelStaticMixin","AmbiguousStaticMixin","PlayerStaticHookMixin"]}"#,
             ),
         ],
         &excluded,
     );
     let jar = NativeJar::from_path(&jar_path).unwrap();
+    let int = |class: &str, method: &str, host: &mut StdHost| {
+        jar.invoke_method(class, method, "()I", None, host)
+    };
+    let put = |class: &str, method: &str, value: i32, host: &mut StdHost| {
+        jar.invoke_method_with_args(class, method, "(I)V", None, &[Value::Int(value)], host)
+    };
+    let boolean = |class: &str, method: &str, host: &mut StdHost| {
+        jar.invoke_method(class, method, "()Z", None, host)
+    };
 
-    // === 1. StdHost: single-target jar-local & host-game static shadows + @Final/@Mutable + non-shadow ===
+    // === 1. StdHost, jar-local target (JDK 25 values of the merged class) ===
     let mut host = StdHost::new().with_environment_type("SERVER");
-
-    // 1a. Jar-local single-target static @Shadow read/write + shadow$ prefix + non-shadow mixin static.
     assert_eq!(
-        jar.invoke_method(
-            "demo.JarStaticShadowMixin",
-            "readCount",
-            "()I",
-            None,
-            &mut host
-        )
-        .unwrap(),
+        int("demo.JarStaticShadowMixin", "readCount", &mut host).unwrap(),
         Value::Int(10)
     );
-    jar.invoke_method_with_args(
-        "demo.JarStaticShadowMixin",
-        "writeCount",
-        "(I)V",
-        None,
-        &[Value::Int(25)],
-        &mut host,
-    )
-    .unwrap();
+    put("demo.JarStaticShadowMixin", "writeCount", 25, &mut host).unwrap();
     assert_eq!(
-        jar.invoke_method(
-            "demo.StaticShadowProbe",
-            "directTargetCount",
-            "()I",
-            None,
-            &mut host
-        )
-        .unwrap(),
+        int("demo.StaticShadowProbe", "directTargetCount", &mut host).unwrap(),
         Value::Int(25)
     );
+    // `@Final` on a target field that is not final: a log line in real Mixin, the write
+    // goes through.
     assert_eq!(
-        jar.invoke_method(
-            "demo.JarStaticShadowMixin",
-            "readPrefixedCount",
-            "()I",
-            None,
-            &mut host
-        )
-        .unwrap(),
-        Value::Int(25)
+        int("demo.JarStaticShadowMixin", "readLoose", &mut host).unwrap(),
+        Value::Int(3)
     );
-    // `@Final` without `@Mutable` refuses with IllegalAccessError and leaves LOCKED unchanged.
+    put("demo.JarStaticShadowMixin", "writeLoose", 8, &mut host).unwrap();
     assert_eq!(
-        jar.invoke_method(
-            "demo.JarStaticShadowMixin",
-            "readLocked",
-            "()I",
-            None,
-            &mut host
-        )
-        .unwrap(),
+        int("demo.StaticShadowProbe", "directTargetLoose", &mut host).unwrap(),
+        Value::Int(8)
+    );
+    // A really final target field: HotSpot's IllegalAccessError, LOCKED unchanged.
+    assert_eq!(
+        int("demo.JarStaticShadowMixin", "readLocked", &mut host).unwrap(),
         Value::Int(55)
     );
-    let illegal = jar.invoke_method_with_args(
+    let illegal = put(
         "demo.JarStaticShadowMixin",
         "writeLockedIllegal",
-        "(I)V",
-        None,
-        &[Value::Int(99)],
+        99,
         &mut host,
     );
+    let expected_message =
+        final_static_update_message("demo.StaticTarget", "LOCKED", "writeLockedIllegal");
     assert!(
         matches!(
             &illegal,
-            Err(NativeError::UncaughtException { class, .. }) if class == "java/lang/IllegalAccessError"
+            Err(NativeError::UncaughtException { class, message: Some(message), .. })
+                if class == "java/lang/IllegalAccessError" && *message == expected_message
         ),
-        "writing @Shadow @Final without @Mutable must throw IllegalAccessError, got: {illegal:?}"
+        "a write to a really final target field outside <clinit> must throw HotSpot's IllegalAccessError, got: {illegal:?}"
     );
     assert_eq!(
-        jar.invoke_method(
-            "demo.StaticShadowProbe",
-            "directTargetLocked",
-            "()I",
-            None,
-            &mut host
-        )
-        .unwrap(),
+        int("demo.StaticShadowProbe", "directTargetLocked", &mut host).unwrap(),
         Value::Int(55)
     );
-    // `@Final @Mutable` allows writing LOCKED on jar-local target.
-    jar.invoke_method_with_args(
-        "demo.JarStaticShadowMixin",
-        "writeLockedMutable",
-        "(I)V",
-        None,
-        &[Value::Int(99)],
+    // `@Mutable` cleared ACC_FINAL on MutableTarget.LOCKED.
+    assert_eq!(
+        int("demo.MutableStaticShadowMixin", "readLocked", &mut host).unwrap(),
+        Value::Int(55)
+    );
+    put(
+        "demo.MutableStaticShadowMixin",
+        "writeLocked",
+        99,
         &mut host,
     )
     .unwrap();
     assert_eq!(
-        jar.invoke_method(
-            "demo.StaticShadowProbe",
-            "directTargetLocked",
-            "()I",
-            None,
-            &mut host
-        )
-        .unwrap(),
+        int("demo.StaticShadowProbe", "directMutableLocked", &mut host).unwrap(),
         Value::Int(99)
     );
-    // Mixin-owned non-shadow static works normally.
+    // A mixin-owned static is the target's (merged) static.
     assert_eq!(
-        jar.invoke_method(
-            "demo.JarStaticShadowMixin",
-            "readOwn",
-            "()I",
-            None,
-            &mut host
-        )
-        .unwrap(),
+        int("demo.JarStaticShadowMixin", "readOwn", &mut host).unwrap(),
         Value::Int(33)
     );
-    jar.invoke_method_with_args(
-        "demo.JarStaticShadowMixin",
-        "writeOwn",
-        "(I)V",
-        None,
-        &[Value::Int(44)],
-        &mut host,
-    )
-    .unwrap();
+    put("demo.JarStaticShadowMixin", "writeOwn", 44, &mut host).unwrap();
     assert_eq!(
-        jar.invoke_method(
-            "demo.JarStaticShadowMixin",
-            "readOwn",
-            "()I",
-            None,
-            &mut host
-        )
-        .unwrap(),
+        int("demo.JarStaticShadowMixin", "readOwn", &mut host).unwrap(),
         Value::Int(44)
-    );
-
-    // 1b. Host-modelled game static @Shadow reads (`ItemStack.EMPTY`, `Level.OVERWORLD`) +
-    // `<clinit>` dummy `= null` placeholder alongside non-shadow `OWN_TAG`.
-    assert_eq!(
-        jar.invoke_method(
-            "demo.ItemStackStaticMixin",
-            "readOwnTag",
-            "()I",
-            None,
-            &mut host
-        )
-        .unwrap(),
-        Value::Int(77)
-    );
-    assert_eq!(
-        jar.invoke_method(
-            "demo.ItemStackStaticMixin",
-            "shadowEmptyMatchesHost",
-            "()Z",
-            None,
-            &mut host
-        )
-        .unwrap(),
-        Value::Int(1),
-        "ItemStack @Shadow EMPTY must resolve to host ItemStack.EMPTY even after mixin <clinit>"
-    );
-    assert_eq!(
-        jar.invoke_method(
-            "demo.LevelStaticMixin",
-            "shadowOverworldMatchesHost",
-            "()Z",
-            None,
-            &mut host
-        )
-        .unwrap(),
-        Value::Int(1),
-        "Level @Shadow OVERWORLD must resolve to host Level.OVERWORLD"
     );
     assert_eq!(
         host.unknown_host_call_count(),
         0,
-        "modelled static @Shadow reads and non-shadow statics must count 0 unknowns: {:?}",
+        "{:?}",
         host.unknown_host_calls()
     );
 
-    // 1c. Writing `@Shadow @Final` on host target without `@Mutable` -> IllegalAccessError.
-    let host_final_err = jar.invoke_method(
+    // === 2. StdHost, host-modelled game statics ===
+    assert_eq!(
+        int("demo.ItemStackStaticMixin", "readOwnTag", &mut host).unwrap(),
+        Value::Int(77)
+    );
+    assert_eq!(
+        boolean(
+            "demo.ItemStackStaticMixin",
+            "shadowEmptyMatchesHost",
+            &mut host
+        )
+        .unwrap(),
+        Value::Int(1),
+        "ItemStack @Shadow EMPTY must resolve to the host's ItemStack.EMPTY"
+    );
+    assert_eq!(
+        boolean(
+            "demo.LevelStaticMixin",
+            "shadowOverworldMatchesHost",
+            &mut host
+        )
+        .unwrap(),
+        Value::Int(1),
+        "Level @Shadow OVERWORLD must resolve to the host's Level.OVERWORLD"
+    );
+    assert_eq!(
+        host.unknown_host_call_count(),
+        0,
+        "modelled static @Shadow reads count nothing: {:?}",
+        host.unknown_host_calls()
+    );
+    // A write to a game static never reaches the game, whatever `@Final` says and whatever
+    // the vanilla flags are: counted, and the host's value is unchanged.
+    jar.invoke_method(
         "demo.LevelStaticMixin",
         "writeFinalOverworld",
-        "()V",
-        None,
-        &mut host,
-    );
-    assert!(
-        matches!(
-            &host_final_err,
-            Err(NativeError::UncaughtException { class, .. }) if class == "java/lang/IllegalAccessError"
-        ),
-        "writing host @Shadow @Final without @Mutable must throw IllegalAccessError, got: {host_final_err:?}"
-    );
-
-    // 1d. Writing `@Shadow @Final @Mutable` or non-final `@Shadow` on a host target counts on
-    // lenient StdHost without corrupting the host static, and refuses on strict StdHost.
-    jar.invoke_method(
-        "demo.ItemStackStaticMixin",
-        "writeEmptyWithoutMutable",
         "()V",
         None,
         &mut host,
     )
     .unwrap();
     assert_eq!(host.unknown_host_call_count(), 1);
+    jar.invoke_method(
+        "demo.ItemStackStaticMixin",
+        "writeEmpty",
+        "()V",
+        None,
+        &mut host,
+    )
+    .unwrap();
+    assert_eq!(host.unknown_host_call_count(), 2);
     assert_eq!(
-        jar.invoke_method(
+        boolean(
+            "demo.LevelStaticMixin",
+            "shadowOverworldMatchesHost",
+            &mut host
+        )
+        .unwrap(),
+        Value::Int(1)
+    );
+    assert_eq!(
+        boolean(
             "demo.ItemStackStaticMixin",
             "shadowEmptyMatchesHost",
-            "()Z",
-            None,
             &mut host
         )
         .unwrap(),
         Value::Int(1),
-        "unapplied host static @Shadow write must not corrupt ItemStack.EMPTY"
+        "an unapplied game static write must not corrupt ItemStack.EMPTY"
     );
+    // An unmodelled game static: both the read and the write count; nothing is stored.
     assert_eq!(
-        jar.invoke_method(
-            "demo.LevelStaticMixin",
-            "readUnmodelled",
-            "()I",
-            None,
-            &mut host
-        )
-        .unwrap(),
+        int("demo.LevelStaticMixin", "readUnmodelled", &mut host).unwrap(),
         Value::Int(0)
     );
-    assert_eq!(host.unknown_host_call_count(), 2);
-    jar.invoke_method_with_args(
-        "demo.LevelStaticMixin",
-        "writeUnmodelled",
-        "(I)V",
-        None,
-        &[Value::Int(42)],
-        &mut host,
-    )
-    .unwrap();
     assert_eq!(host.unknown_host_call_count(), 3);
-    // Writing unmodelled host static did not store 42 locally: next read still counts and returns 0.
+    put("demo.LevelStaticMixin", "writeUnmodelled", 42, &mut host).unwrap();
+    assert_eq!(host.unknown_host_call_count(), 4);
     assert_eq!(
-        jar.invoke_method(
-            "demo.LevelStaticMixin",
-            "readUnmodelled",
-            "()I",
-            None,
+        int("demo.LevelStaticMixin", "readUnmodelled", &mut host).unwrap(),
+        Value::Int(0)
+    );
+    assert_eq!(host.unknown_host_call_count(), 5);
+    // The mixin `<clinit>`'s `EMPTY = null` is a real write Mixin keeps: counted when the
+    // class initialises, and the game's EMPTY is untouched.
+    assert_eq!(
+        int("demo.ItemStackClinitMixin", "readTag", &mut host).unwrap(),
+        Value::Int(5)
+    );
+    assert_eq!(
+        host.unknown_host_call_count(),
+        6,
+        "{:?}",
+        host.unknown_host_calls()
+    );
+    assert_eq!(
+        boolean(
+            "demo.ItemStackStaticMixin",
+            "shadowEmptyMatchesHost",
             &mut host
         )
         .unwrap(),
-        Value::Int(0)
+        Value::Int(1)
     );
-    assert_eq!(host.unknown_host_call_count(), 4);
 
-    // === 2. StdHost: multi-target ambiguous static @Shadow (lenient count + strict refusal) ===
-    let mut ambig_lenient = StdHost::new().with_environment_type("SERVER");
-    // Non-shadow static on the multi-target mixin still works with 0 unknowns.
-    assert_eq!(
-        jar.invoke_method(
-            "demo.AmbiguousStaticMixin",
-            "readOwn",
-            "()I",
-            None,
-            &mut ambig_lenient
-        )
-        .unwrap(),
-        Value::Int(19)
-    );
-    jar.invoke_method_with_args(
-        "demo.AmbiguousStaticMixin",
-        "writeOwn",
-        "(I)V",
-        None,
-        &[Value::Int(29)],
-        &mut ambig_lenient,
-    )
-    .unwrap();
-    assert_eq!(
-        jar.invoke_method(
-            "demo.AmbiguousStaticMixin",
-            "readOwn",
-            "()I",
-            None,
-            &mut ambig_lenient
-        )
-        .unwrap(),
-        Value::Int(29)
-    );
-    assert_eq!(ambig_lenient.unknown_host_call_count(), 0);
-
-    // Ambiguous static @Shadow write & read: counted on lenient, never stored locally.
-    jar.invoke_method_with_args(
-        "demo.AmbiguousStaticMixin",
-        "writeShared",
-        "(I)V",
-        None,
-        &[Value::Int(99)],
-        &mut ambig_lenient,
-    )
-    .unwrap();
-    assert_eq!(ambig_lenient.unknown_host_call_count(), 1);
-    assert_eq!(
-        jar.invoke_method(
-            "demo.AmbiguousStaticMixin",
-            "readShared",
-            "()I",
-            None,
-            &mut ambig_lenient
-        )
-        .unwrap(),
-        Value::Int(0),
-        "ambiguous multi-target static @Shadow write must not persist locally"
-    );
-    assert_eq!(ambig_lenient.unknown_host_call_count(), 2);
-
-    let mut ambig_strict = StdHost::new()
+    // === 3. Strict StdHost: unknown game static writes and ambiguous shadows refuse ===
+    let mut strict = StdHost::new()
         .with_environment_type("SERVER")
         .with_strict_unknown_host_calls();
     assert!(
         jar.invoke_method(
-            "demo.AmbiguousStaticMixin",
-            "readShared",
-            "()I",
-            None,
-            &mut ambig_strict
-        )
-        .is_err(),
-        "ambiguous static @Shadow read must refuse on strict StdHost"
-    );
-    assert!(
-        jar.invoke_method_with_args(
-            "demo.AmbiguousStaticMixin",
-            "writeShared",
-            "(I)V",
-            None,
-            &[Value::Int(99)],
-            &mut ambig_strict,
-        )
-        .is_err(),
-        "ambiguous static @Shadow write must refuse on strict StdHost"
-    );
-    assert!(
-        jar.invoke_method(
             "demo.LevelStaticMixin",
-            "readUnmodelled",
-            "()I",
+            "writeFinalOverworld",
+            "()V",
             None,
-            &mut ambig_strict
+            &mut strict
         )
         .is_err(),
-        "unmodelled host static @Shadow read must refuse on strict StdHost"
+        "a game static write through @Shadow must refuse on a strict host"
     );
     assert!(
-        jar.invoke_method_with_args(
-            "demo.LevelStaticMixin",
-            "writeUnmodelled",
-            "(I)V",
-            None,
-            &[Value::Int(42)],
-            &mut ambig_strict,
-        )
-        .is_err(),
-        "unmodelled host static @Shadow write must refuse on strict StdHost"
+        int("demo.ItemStackClinitMixin", "readTag", &mut strict).is_err(),
+        "a mixin <clinit> writing a game static must refuse on a strict host"
     );
+    assert!(int("demo.LevelStaticMixin", "readUnmodelled", &mut strict).is_err());
+    assert!(put("demo.LevelStaticMixin", "writeUnmodelled", 42, &mut strict).is_err());
+    assert!(int("demo.AmbiguousStaticMixin", "readShared", &mut strict).is_err());
+    assert!(put("demo.AmbiguousStaticMixin", "writeShared", 99, &mut strict).is_err());
 
-    // === 3. `run_game_hook_in`: static @Shadow read/write, @Final/@Mutable, and ambiguity ===
+    // === 4. Lenient StdHost: ambiguous multi-target static shadows count ===
+    let mut ambig = StdHost::new().with_environment_type("SERVER");
+    assert_eq!(
+        int("demo.AmbiguousStaticMixin", "readOwn", &mut ambig).unwrap(),
+        Value::Int(19)
+    );
+    put("demo.AmbiguousStaticMixin", "writeOwn", 29, &mut ambig).unwrap();
+    assert_eq!(
+        int("demo.AmbiguousStaticMixin", "readOwn", &mut ambig).unwrap(),
+        Value::Int(29)
+    );
+    assert_eq!(ambig.unknown_host_call_count(), 0);
+    put("demo.AmbiguousStaticMixin", "writeShared", 99, &mut ambig).unwrap();
+    assert_eq!(ambig.unknown_host_call_count(), 1);
+    assert_eq!(
+        int("demo.AmbiguousStaticMixin", "readShared", &mut ambig).unwrap(),
+        Value::Int(0),
+        "an ambiguous multi-target static @Shadow write must not persist"
+    );
+    assert_eq!(ambig.unknown_host_call_count(), 2);
+
+    // === 5. `run_game_hook_in` ===
     let weave = jar.plan_load_time_weave_with_game_hooks(MixinSide::Server);
     let registrations = jar.register_game_hooks(&weave).unwrap();
     let run_mode = |mode: i32, hook_host: &mut StdHost, hook_state: &mut GameHookState| {
-        jar.invoke_method_with_args(
-            "demo.StaticShadowProbe",
-            "setMode",
-            "(I)V",
-            None,
-            &[Value::Int(mode)],
-            hook_host,
-        )
-        .unwrap();
+        put("demo.StaticShadowProbe", "setMode", mode, hook_host).unwrap();
         let mut ctx = GameHookContext::new();
         let p = ctx.insert(
             GameObject::player(7, "StaticHook")
@@ -4305,9 +4241,10 @@ public final class StaticShadowProbe {
             &ExecutionBudget::within(Duration::from_secs(5)),
         )
     };
+    let read_int =
+        |hook_host: &mut StdHost| int("demo.StaticShadowProbe", "readIntResult", hook_host);
 
-    // Mode 1: modelled host static shadows (`ItemStack.EMPTY`, `Level.OVERWORLD`), jar-local
-    // static shadow read/write (`10 -> 15`), and non-shadow mixin static (`77 -> 78`) inside hook.
+    // Mode 1: modelled game statics, a jar-local shadow (10 -> 15) and a mixin static (77 -> 78).
     let mut hook_host = StdHost::new().with_environment_type("SERVER");
     let mut hook_state = GameHookState::default();
     run_mode(1, &mut hook_host, &mut hook_state).unwrap();
@@ -4323,88 +4260,555 @@ public final class StaticShadowProbe {
         Value::Ref(Some("true,true,10,15,78".into()))
     );
     assert_eq!(hook_host.unknown_host_call_count(), 0);
-
-    // Mode 7: jar-local `@Final @Mutable` static shadow write inside `run_game_hook_in` -> 77.
+    // Mode 7: `@Mutable` cleared MutableTarget.LOCKED's ACC_FINAL -> 77.
     run_mode(7, &mut hook_host, &mut hook_state).unwrap();
-    assert_eq!(
-        jar.invoke_method(
-            "demo.StaticShadowProbe",
-            "readIntResult",
-            "()I",
-            None,
-            &mut hook_host
-        )
-        .unwrap(),
-        Value::Int(77)
-    );
+    assert_eq!(read_int(&mut hook_host).unwrap(), Value::Int(77));
+    // Mode 9: `@Final` shadow of the non-final StaticTarget.loose -> 8.
+    run_mode(9, &mut hook_host, &mut hook_state).unwrap();
+    assert_eq!(read_int(&mut hook_host).unwrap(), Value::Int(8));
     assert_eq!(hook_host.unknown_host_call_count(), 0);
-
-    // Mode 2: writing `@Shadow @Final` without `@Mutable` inside `run_game_hook_in` -> IllegalAccessError.
-    let hook_final_err = run_mode(2, &mut hook_host, &mut hook_state);
+    // Mode 8: the really final StaticTarget.LOCKED -> HotSpot's IllegalAccessError.
+    let hook_illegal = run_mode(8, &mut hook_host, &mut hook_state);
     assert!(
         matches!(
-            &hook_final_err,
-            Err(NativeError::UncaughtException { class, .. }) if class == "java/lang/IllegalAccessError"
+            &hook_illegal,
+            Err(NativeError::UncaughtException { class, message: Some(message), .. })
+                if class == "java/lang/IllegalAccessError" && *message == expected_message
         ),
-        "expected IllegalAccessError for @Final static shadow write in hook, got: {hook_final_err:?}"
+        "expected IllegalAccessError for a final target write in a hook, got: {hook_illegal:?}"
     );
-
-    // Mode 3: writing unmodelled host static shadow inside `run_game_hook_in` refuses loudly.
-    let hook_write_err = run_mode(3, &mut hook_host, &mut hook_state);
-    assert!(
-        hook_write_err.is_err()
-            && hook_write_err
+    // Modes 2 and 3: a game static write through @Shadow refuses in a hook, `@Final` or not.
+    for (mode, field) in [(2, "OVERWORLD"), (3, "UNMODELLED_STATIC")] {
+        let refused = run_mode(mode, &mut hook_host, &mut hook_state);
+        let wanted = format!(
+            "writes the game's static field net/minecraft/world/level/Level#{field} through @Shadow"
+        );
+        assert!(
+            refused
                 .as_ref()
-                .unwrap_err()
-                .to_string()
-                .contains("writes the game's static field net/minecraft/world/level/Level#UNMODELLED_STATIC through @Shadow"),
-        "expected game-hook refusal for host static @Shadow write, got: {hook_write_err:?}"
-    );
-
-    // Mode 4: reading unmodelled host static shadow inside `run_game_hook_in`: lenient counts, strict refuses.
+                .is_err_and(|error| error.to_string().contains(&wanted)),
+            "expected the game-hook refusal for {field}, got: {refused:?}"
+        );
+    }
+    // Mode 4: an unmodelled game static read counts (lenient) or refuses (strict).
     let mut hook_unmod = StdHost::new().with_environment_type("SERVER");
-    let mut state_unmod = GameHookState::default();
-    run_mode(4, &mut hook_unmod, &mut state_unmod).unwrap();
-    assert_eq!(
-        jar.invoke_method(
-            "demo.StaticShadowProbe",
-            "readIntResult",
-            "()I",
-            None,
-            &mut hook_unmod
-        )
-        .unwrap(),
-        Value::Int(0)
-    );
+    run_mode(4, &mut hook_unmod, &mut GameHookState::default()).unwrap();
+    assert_eq!(read_int(&mut hook_unmod).unwrap(), Value::Int(0));
     assert_eq!(hook_unmod.unknown_host_call_count(), 1);
     let mut hook_unmod_strict = StdHost::new()
         .with_environment_type("SERVER")
         .with_strict_unknown_host_calls();
     assert!(run_mode(4, &mut hook_unmod_strict, &mut GameHookState::default()).is_err());
-
-    // Modes 5 & 6: multi-target ambiguous static @Shadow read & write inside `run_game_hook_in`:
-    // lenient counts (and never stores 99), strict refuses.
+    // Modes 5 and 6: an ambiguous multi-target static @Shadow counts and never stores 99.
     let mut hook_ambig = StdHost::new().with_environment_type("SERVER");
     let mut state_ambig = GameHookState::default();
     run_mode(6, &mut hook_ambig, &mut state_ambig).unwrap();
     assert_eq!(hook_ambig.unknown_host_call_count(), 1);
     run_mode(5, &mut hook_ambig, &mut state_ambig).unwrap();
-    assert_eq!(
-        jar.invoke_method(
-            "demo.StaticShadowProbe",
-            "readIntResult",
-            "()I",
-            None,
-            &mut hook_ambig
-        )
-        .unwrap(),
-        Value::Int(0)
-    );
+    assert_eq!(read_int(&mut hook_ambig).unwrap(), Value::Int(0));
     assert_eq!(hook_ambig.unknown_host_call_count(), 2);
-
     let mut hook_ambig_strict = StdHost::new()
         .with_environment_type("SERVER")
         .with_strict_unknown_host_calls();
     assert!(run_mode(5, &mut hook_ambig_strict, &mut GameHookState::default()).is_err());
     assert!(run_mode(6, &mut hook_ambig_strict, &mut GameHookState::default()).is_err());
+}
+
+/// A mixin's static initialiser belongs to its target: `MixinApplicatorStandard.appendInsns`
+/// inserts the mixin `<clinit>`'s instructions (shadow writes included, default values
+/// too) before the target `<clinit>`'s first `RETURN`, or makes it the target's `<clinit>`
+/// when there is none. So the target's own initialiser runs first, then the mixin's, as
+/// one initialisation, whichever class is touched first; and a write to a really final
+/// target field from that merged `<clinit>` is legal.
+///
+/// Expected values come from a JDK 25.0.5 run of these classes merged the way
+/// `MixinApplicatorStandard` merges them: `0,target,mixin:0:55:5,99,5`, and `4` for the
+/// target without a `<clinit>`.
+#[test]
+fn mixin_static_initializer_runs_after_the_jar_target_initializer() {
+    let mut sources = mixin_stubs();
+    insert_final_mutable_stubs(&mut sources);
+    sources.insert(
+        "demo/ClinitTarget.java",
+        r#"package demo;
+public class ClinitTarget {
+    public static int COUNT = 7;
+    public static String TRACE = "target";
+    public static final int FINAL_COUNT = initFinal();
+    private static int initFinal() { return 55; }
+}
+"#,
+    );
+    sources.insert(
+        "demo/ClinitShadowMixin.java",
+        r#"package demo;
+import org.spongepowered.asm.mixin.Final;
+import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.Shadow;
+import org.spongepowered.asm.mixin.Unique;
+
+@Mixin(ClinitTarget.class)
+public abstract class ClinitShadowMixin {
+    @Shadow private static int COUNT = 0;
+    @Shadow private static String TRACE;
+    @Shadow @Final private static int FINAL_COUNT;
+    @Unique private static int OWN = 5;
+    static {
+        TRACE = TRACE + ",mixin:" + COUNT + ":" + FINAL_COUNT + ":" + OWN;
+        FINAL_COUNT = 99;
+    }
+    public static String report() { return COUNT + "," + TRACE + "," + FINAL_COUNT + "," + OWN; }
+}
+"#,
+    );
+    sources.insert(
+        "demo/NoClinitTarget.java",
+        "package demo;\npublic class NoClinitTarget {\n    public static int VALUE;\n}\n",
+    );
+    sources.insert(
+        "demo/NoClinitShadowMixin.java",
+        r#"package demo;
+import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.Shadow;
+
+@Mixin(NoClinitTarget.class)
+public abstract class NoClinitShadowMixin {
+    @Shadow private static int VALUE = 4;
+    public static int readValue() { return VALUE; }
+}
+"#,
+    );
+    sources.insert(
+        "demo/ClinitProbe.java",
+        r#"package demo;
+public final class ClinitProbe {
+    public static int targetCount() { return ClinitTarget.COUNT; }
+    public static String targetTrace() { return ClinitTarget.TRACE; }
+    public static int targetFinal() { return ClinitTarget.FINAL_COUNT; }
+    public static int noClinitValue() { return NoClinitTarget.VALUE; }
+}
+"#,
+    );
+    let mut excluded = COMPILE_ONLY_STUBS.to_vec();
+    excluded.extend([
+        "org/spongepowered/asm/mixin/Final.class",
+        "org/spongepowered/asm/mixin/Mutable.class",
+    ]);
+    let jar_path = build_jar(
+        "mixin-clinit-append",
+        sources,
+        &[
+            (
+                "fabric.mod.json",
+                r#"{"id":"clinitappend","version":"1.0","mixins":["demo.mixins.json"]}"#,
+            ),
+            (
+                "demo.mixins.json",
+                r#"{"required":true,"package":"demo","mixins":["ClinitShadowMixin","NoClinitShadowMixin"]}"#,
+            ),
+        ],
+        &excluded,
+    );
+    let jar = NativeJar::from_path(&jar_path).unwrap();
+    let string = |class: &str, method: &str, host: &mut StdHost| {
+        jar.invoke_method(class, method, "()Ljava/lang/String;", None, host)
+            .unwrap()
+    };
+    let int = |class: &str, method: &str, host: &mut StdHost| {
+        jar.invoke_method(class, method, "()I", None, host).unwrap()
+    };
+    let report = Value::Ref(Some("0,target,mixin:0:55:5,99,5".into()));
+    let trace = Value::Ref(Some("target,mixin:0:55:5".into()));
+
+    // The mixin is touched first: initialising its statics initialises the target, whose
+    // own `<clinit>` runs before the appended one (COUNT 7 -> 0, TRACE sees "target").
+    let mut mixin_first = StdHost::new().with_environment_type("SERVER");
+    assert_eq!(
+        string("demo.ClinitShadowMixin", "report", &mut mixin_first),
+        report
+    );
+    assert_eq!(
+        int("demo.ClinitProbe", "targetCount", &mut mixin_first),
+        Value::Int(0)
+    );
+    assert_eq!(
+        int("demo.ClinitProbe", "targetFinal", &mut mixin_first),
+        Value::Int(99),
+        "the merged <clinit> may write the target's final field"
+    );
+    assert_eq!(
+        string("demo.ClinitProbe", "targetTrace", &mut mixin_first),
+        trace
+    );
+    assert_eq!(mixin_first.unknown_host_call_count(), 0);
+
+    // The target is touched first: the same single initialisation.
+    let mut target_first = StdHost::new().with_environment_type("SERVER");
+    assert_eq!(
+        int("demo.ClinitProbe", "targetCount", &mut target_first),
+        Value::Int(0)
+    );
+    assert_eq!(
+        string("demo.ClinitProbe", "targetTrace", &mut target_first),
+        trace
+    );
+    assert_eq!(
+        string("demo.ClinitShadowMixin", "report", &mut target_first),
+        report
+    );
+    assert_eq!(target_first.unknown_host_call_count(), 0);
+
+    // A target with no `<clinit>` takes the mixin's: VALUE = 4 either way round.
+    let mut no_clinit = StdHost::new().with_environment_type("SERVER");
+    assert_eq!(
+        int("demo.ClinitProbe", "noClinitValue", &mut no_clinit),
+        Value::Int(4)
+    );
+    assert_eq!(
+        int("demo.NoClinitShadowMixin", "readValue", &mut no_clinit),
+        Value::Int(4)
+    );
+    let mut no_clinit_mixin_first = StdHost::new().with_environment_type("SERVER");
+    assert_eq!(
+        int(
+            "demo.NoClinitShadowMixin",
+            "readValue",
+            &mut no_clinit_mixin_first
+        ),
+        Value::Int(4)
+    );
+    assert_eq!(
+        int(
+            "demo.ClinitProbe",
+            "noClinitValue",
+            &mut no_clinit_mixin_first
+        ),
+        Value::Int(4)
+    );
+    assert_eq!(no_clinit.unknown_host_call_count(), 0);
+    assert_eq!(no_clinit_mixin_first.unknown_host_call_count(), 0);
+}
+
+/// `@Shadow` prefixes, as sponge-mixin 0.17.5's `MixinPreProcessorStandard` applies them:
+///
+/// - `validateField` rejects every field (shadow or not) whose name starts with its
+///   `@Shadow` prefix (`prefix`, default `shadow$`) with `InvalidMixinException`, and
+///   `MixinApplicatorStandard.apply` then drops the whole mixin: an `invalid-mixin` row
+///   per target, no interface plan, no type-check or dispatch effect, and any access
+///   through such a class's shadow counts (or refuses) instead of resolving;
+/// - `prepareShadow` strips the prefix from a `@Shadow` *method* (`shadow$getId` and
+///   `@Shadow(prefix = "vanilla$") vanilla$getId` both stand for `getId`).
+#[test]
+fn prefixed_shadow_fields_reject_the_mixin_and_shadow_method_prefixes_resolve() {
+    let mut sources = mixin_stubs();
+    sources.insert(
+        "demo/StaticTarget.java",
+        "package demo;\npublic class StaticTarget {\n    public static int count = 10;\n}\n",
+    );
+    sources.insert(
+        "demo/PrefixedFieldMixin.java",
+        r#"package demo;
+import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.Shadow;
+
+@Mixin(StaticTarget.class)
+public abstract class PrefixedFieldMixin {
+    @Shadow private static int shadow$count;
+    public static int readPrefixedCount() { return shadow$count; }
+    public static void writePrefixedCount(int v) { shadow$count = v; }
+}
+"#,
+    );
+    sources.insert(
+        "demo/CustomPrefixFieldMixin.java",
+        r#"package demo;
+import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.Shadow;
+
+@Mixin(StaticTarget.class)
+public abstract class CustomPrefixFieldMixin {
+    @Shadow(prefix = "vanilla$") private static int vanilla$count;
+    public static int readCustomPrefixed() { return vanilla$count; }
+}
+"#,
+    );
+    sources.insert(
+        "demo/PrefixedDuck.java",
+        "package demo;\npublic interface PrefixedDuck { int prefixedExtra(); }\n",
+    );
+    // Not even a shadow: `validateField` checks every field against the default prefix.
+    sources.insert(
+        "demo/UniquePrefixedDuckMixin.java",
+        r#"package demo;
+import net.minecraft.world.entity.player.Player;
+import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.Unique;
+
+@Mixin(Player.class)
+public abstract class UniquePrefixedDuckMixin implements PrefixedDuck {
+    @Unique private int shadow$extra = 3;
+    @Override public int prefixedExtra() { return this.shadow$extra; }
+}
+"#,
+    );
+    sources.insert(
+        "demo/PrefixIds.java",
+        "package demo;\npublic interface PrefixIds { String prefixIds(); }\n",
+    );
+    sources.insert(
+        "demo/ShadowPrefixMethodMixin.java",
+        r#"package demo;
+import net.minecraft.world.entity.player.Player;
+import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.Shadow;
+import org.spongepowered.asm.mixin.injection.At;
+import org.spongepowered.asm.mixin.injection.Inject;
+import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
+
+@Mixin(Player.class)
+public abstract class ShadowPrefixMethodMixin implements PrefixIds {
+    @Shadow public abstract int shadow$getId();
+    @Shadow(prefix = "vanilla$") public abstract int vanilla$getId();
+
+    @Override public String prefixIds() { return this.shadow$getId() + "," + this.vanilla$getId(); }
+
+    @Inject(method = "tick()V", at = @At("HEAD"))
+    private void onPrefixTick(CallbackInfo ci) {
+        PrefixProbe.hookIds = this.shadow$getId() + "," + this.vanilla$getId();
+    }
+}
+"#,
+    );
+    sources.insert(
+        "demo/PrefixProbe.java",
+        r#"package demo;
+import net.minecraft.world.entity.player.Player;
+
+public final class PrefixProbe {
+    public static String hookIds = "";
+    public static String readHookIds() { return hookIds; }
+    public static int targetCount() { return StaticTarget.count; }
+    public static boolean isPrefixedDuck(Player p) { return ((Object) p) instanceof PrefixedDuck; }
+    public static String ids(Player p) { return ((PrefixIds) (Object) p).prefixIds(); }
+}
+"#,
+    );
+    let jar_path = build_jar(
+        "shadow-prefixes",
+        sources,
+        &[
+            (
+                "fabric.mod.json",
+                r#"{"id":"shadowprefix","version":"1.0","mixins":["demo.mixins.json"]}"#,
+            ),
+            (
+                "demo.mixins.json",
+                r#"{"package":"demo","mixins":["PrefixedFieldMixin","CustomPrefixFieldMixin","UniquePrefixedDuckMixin","ShadowPrefixMethodMixin"]}"#,
+            ),
+        ],
+        COMPILE_ONLY_STUBS,
+    );
+    let jar = NativeJar::from_path(&jar_path).unwrap();
+
+    // === 1. The plan: one `invalid-mixin` row per rejected class and target, nothing else ===
+    let weave = jar.plan_load_time_weave(MixinSide::Server);
+    for (mixin, target, field) in [
+        ("PrefixedFieldMixin", "demo/StaticTarget", "shadow$count"),
+        (
+            "CustomPrefixFieldMixin",
+            "demo/StaticTarget",
+            "vanilla$count",
+        ),
+        (
+            "UniquePrefixedDuckMixin",
+            "net/minecraft/world/entity/player/Player",
+            "shadow$extra",
+        ),
+    ] {
+        let owner = format!("demo/{mixin}");
+        let rows: Vec<_> = weave
+            .skipped
+            .iter()
+            .filter(|row| row.callback.owner == owner)
+            .collect();
+        let detail =
+            format!("@Shadow field demo.{mixin}.{field} has a shadow prefix. This is not allowed.");
+        assert_eq!(rows.len(), 1, "{mixin}: {rows:?}");
+        assert_eq!(rows[0].target.owner, target);
+        assert_eq!(rows[0].reason, MixinSkipReason::InvalidMixin(detail));
+        assert_eq!(rows[0].reason.label(), "invalid-mixin");
+    }
+    assert!(
+        weave
+            .interface_mixins
+            .iter()
+            .all(|plan| plan.mixin != "demo/UniquePrefixedDuckMixin"),
+        "{:?}",
+        weave.interface_mixins
+    );
+    assert!(
+        weave
+            .interface_mixins
+            .iter()
+            .any(|plan| plan.mixin == "demo/ShadowPrefixMethodMixin"),
+        "prefixed shadow METHODS are valid: {:?}",
+        weave.interface_mixins
+    );
+    assert!(
+        jar.mixin_interface_plans()
+            .iter()
+            .all(|plan| plan.mixin != "demo/UniquePrefixedDuckMixin")
+    );
+
+    // === 2. StdHost: the rejected mixins apply nothing; their shadows count ===
+    let mut facade = EventFacade::default();
+    facade.players.push(FacadePlayer {
+        uuid: 1,
+        name: "Prefix".into(),
+        level: Some("minecraft:overworld".into()),
+        entity_id: Some(42),
+        session: 1,
+        life: 0,
+    });
+    let player = server_player(1, "Prefix", 1, 0, 42);
+    let mut host = StdHost::new().with_environment_type("SERVER");
+    host.set_game_event_firing(Some(EventFiring::new(
+        GameEvent::ServerTickEnd,
+        Arc::new(facade.clone()),
+        EventContext::default(),
+    )));
+    assert_eq!(
+        jar.invoke_method_with_args(
+            "demo.PrefixProbe",
+            "ids",
+            "(Lnet/minecraft/world/entity/player/Player;)Ljava/lang/String;",
+            None,
+            std::slice::from_ref(&player),
+            &mut host,
+        )
+        .unwrap(),
+        Value::Ref(Some("42,42".into())),
+        "shadow$getId and @Shadow(prefix = \"vanilla$\") vanilla$getId stand for getId"
+    );
+    assert_eq!(
+        host.unknown_host_call_count(),
+        0,
+        "{:?}",
+        host.unknown_host_calls()
+    );
+    // A rejected mixin adds no interface: the check never passes. Like any interface no
+    // applied mixin adds to a game object (another jar's mixin could), the `false` is
+    // counted rather than claimed.
+    assert_eq!(
+        jar.invoke_method_with_args(
+            "demo.PrefixProbe",
+            "isPrefixedDuck",
+            "(Lnet/minecraft/world/entity/player/Player;)Z",
+            None,
+            std::slice::from_ref(&player),
+            &mut host,
+        )
+        .unwrap(),
+        Value::Int(0),
+        "a rejected mixin adds no interface to its target"
+    );
+    assert_eq!(
+        host.unknown_host_calls(),
+        vec![(
+            "demo/PrefixedDuck#<instanceof>(Ljava/lang/Object;)Z".to_owned(),
+            1
+        )]
+    );
+    assert_eq!(
+        jar.invoke_method(
+            "demo.PrefixedFieldMixin",
+            "readPrefixedCount",
+            "()I",
+            None,
+            &mut host
+        )
+        .unwrap(),
+        Value::Int(0)
+    );
+    assert_eq!(host.unknown_host_call_count(), 2);
+    jar.invoke_method_with_args(
+        "demo.PrefixedFieldMixin",
+        "writePrefixedCount",
+        "(I)V",
+        None,
+        &[Value::Int(99)],
+        &mut host,
+    )
+    .unwrap();
+    assert_eq!(host.unknown_host_call_count(), 3);
+    assert_eq!(
+        jar.invoke_method(
+            "demo.CustomPrefixFieldMixin",
+            "readCustomPrefixed",
+            "()I",
+            None,
+            &mut host
+        )
+        .unwrap(),
+        Value::Int(0)
+    );
+    assert_eq!(host.unknown_host_call_count(), 4);
+    assert_eq!(
+        jar.invoke_method("demo.PrefixProbe", "targetCount", "()I", None, &mut host)
+            .unwrap(),
+        Value::Int(10),
+        "a rejected mixin's shadow write never reaches the target"
+    );
+    let mut strict = StdHost::new()
+        .with_environment_type("SERVER")
+        .with_strict_unknown_host_calls();
+    assert!(
+        jar.invoke_method(
+            "demo.PrefixedFieldMixin",
+            "readPrefixedCount",
+            "()I",
+            None,
+            &mut strict
+        )
+        .is_err()
+    );
+
+    // === 3. `run_game_hook_in`: the prefixed shadow methods redirect to getId ===
+    let hook_weave = jar.plan_load_time_weave_with_game_hooks(MixinSide::Server);
+    let registrations = jar.register_game_hooks(&hook_weave).unwrap();
+    let mut hook_host = StdHost::new().with_environment_type("SERVER");
+    let mut ctx = GameHookContext::new();
+    let hp = ctx.insert(
+        GameObject::player(1, "Prefix")
+            .with_incarnation(1, 0)
+            .with_entity_id(42),
+    );
+    jar.run_game_hook_in(
+        &registrations,
+        &mut GameHookState::default(),
+        &mut ctx,
+        "java_base_player_tick_head",
+        Some(hp),
+        &[],
+        &mut hook_host,
+        &ExecutionBudget::within(Duration::from_secs(5)),
+    )
+    .unwrap();
+    assert_eq!(
+        jar.invoke_method(
+            "demo.PrefixProbe",
+            "readHookIds",
+            "()Ljava/lang/String;",
+            None,
+            &mut hook_host
+        )
+        .unwrap(),
+        Value::Ref(Some("42,42".into()))
+    );
+    assert_eq!(
+        hook_host.unknown_host_call_count(),
+        0,
+        "{:?}",
+        hook_host.unknown_host_calls()
+    );
 }

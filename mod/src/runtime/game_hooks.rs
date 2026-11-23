@@ -542,6 +542,10 @@ struct MixinModel {
     /// `class|name|descriptor` of every member that stands for a game method:
     /// `@Shadow`, abstract, `@Accessor` and `@Invoker` members of a Mixin class.
     shadow_methods: BTreeSet<String>,
+    /// `class|name|descriptor` of each `@Shadow` method whose name carries its
+    /// `@Shadow` prefix → the game method name it stands for (`shadow$getId` →
+    /// `getId`, `MixinPreProcessorStandard.prepareShadow`).
+    shadow_renames: BTreeMap<String, String>,
     /// `class|name|descriptor` of every method with a body a Mixin class
     /// declares, which a redirect may run.
     concrete_methods: BTreeSet<String>,
@@ -647,9 +651,12 @@ impl MixinModel {
             if current.is_none() && is_game_class(&exit) {
                 model.game_heirs.insert(name.clone(), declared);
             }
-            let (fields, methods) = member_annotations(class).unwrap_or_default();
-            for (member, descriptors) in fields {
-                if descriptors.iter().any(|d| d == MIXIN_SHADOW_DESCRIPTOR) {
+            let (fields, methods) = member_annotation_values(class).unwrap_or_default();
+            for (member, annotations) in fields {
+                if annotations
+                    .iter()
+                    .any(|a| a.descriptor == MIXIN_SHADOW_DESCRIPTOR)
+                {
                     let (field, descriptor) = member.split_once('|').unwrap_or((&member, ""));
                     model
                         .shadow_fields
@@ -661,17 +668,25 @@ impl MixinModel {
                     continue;
                 }
                 let key = format!("{}|{}", method.name, method.descriptor);
-                let annotated = methods.get(&key).is_some_and(|descriptors| {
-                    descriptors.iter().any(|d| {
-                        d == MIXIN_SHADOW_DESCRIPTOR
-                            || d == MIXIN_ACCESSOR_DESCRIPTOR
-                            || d == MIXIN_INVOKER_DESCRIPTOR
+                let method_annotations = methods.get(&key);
+                let annotated = method_annotations.is_some_and(|annotations| {
+                    annotations.iter().any(|a| {
+                        a.descriptor == MIXIN_SHADOW_DESCRIPTOR
+                            || a.descriptor == MIXIN_ACCESSOR_DESCRIPTOR
+                            || a.descriptor == MIXIN_INVOKER_DESCRIPTOR
                     })
                 }) || method.annotations.iter().any(|a| {
                     a.descriptor == MIXIN_ACCESSOR_DESCRIPTOR
                         || a.descriptor == MIXIN_INVOKER_DESCRIPTOR
                 });
                 if annotated || method.access & 0x0400 != 0 {
+                    let target = crate::runtime::interface_mixins::shadow_method_target_name(
+                        &method.name,
+                        method_annotations,
+                    );
+                    if target != method.name {
+                        model.shadow_renames.insert(format!("{name}|{key}"), target);
+                    }
                     model.shadow_methods.insert(format!("{name}|{key}"));
                 } else if method.code.is_some() {
                     model.concrete_methods.insert(format!("{name}|{key}"));
@@ -693,13 +708,39 @@ impl MixinModel {
 
 /// Every field and method annotation descriptor of `class`, visible and
 /// invisible, keyed `name|descriptor`. The parser keeps neither the invisible
-/// method table nor any field annotation, and Mixin's `@Shadow` is
-/// `CLASS`-retained, so the table is read back from the class bytes.
+/// method table nor any field annotation, so the table is read back from the
+/// class bytes. sponge-mixin 0.17.5 declares `@Shadow`, `@Final` and `@Mutable`
+/// `RUNTIME`-retained (visible), but jars built against `CLASS`-retained stubs
+/// carry them invisibly, so both tables are read.
 type MemberAnnotations = BTreeMap<String, Vec<String>>;
+
+/// [`MemberAnnotations`] with each annotation's element values kept, for the
+/// members whose meaning depends on them (`@Shadow(prefix = ...)`).
+pub(crate) type MemberAnnotationValues = BTreeMap<String, Vec<Annotation>>;
 
 pub(crate) fn member_annotations(
     class: &ClassFile,
 ) -> Result<(MemberAnnotations, MemberAnnotations), NativeError> {
+    let (fields, methods) = member_annotation_values(class)?;
+    let descriptors = |table: MemberAnnotationValues| -> MemberAnnotations {
+        table
+            .into_iter()
+            .map(|(member, annotations)| {
+                (
+                    member,
+                    annotations.into_iter().map(|a| a.descriptor).collect(),
+                )
+            })
+            .collect()
+    };
+    Ok((descriptors(fields), descriptors(methods)))
+}
+
+/// Every field and method annotation of `class` with its element values,
+/// visible and invisible, keyed `name|descriptor` (see [`MemberAnnotations`]).
+pub(crate) fn member_annotation_values(
+    class: &ClassFile,
+) -> Result<(MemberAnnotationValues, MemberAnnotationValues), NativeError> {
     let mut r = Reader::new(&class.raw);
     if r.u4()? != 0xCAFE_BABE {
         return Err(NativeError::InvalidClass("bad magic"));
@@ -717,7 +758,7 @@ pub(crate) fn member_annotations(
 fn read_member_annotations(
     r: &mut Reader<'_>,
     pool: &[Cp],
-) -> Result<MemberAnnotations, NativeError> {
+) -> Result<MemberAnnotationValues, NativeError> {
     let count = r.u2()? as usize;
     let mut out = BTreeMap::new();
     for _ in 0..count {
@@ -725,7 +766,7 @@ fn read_member_annotations(
         let name = utf8(pool, r.u2()?)?;
         let descriptor = utf8(pool, r.u2()?)?;
         let attributes = r.u2()? as usize;
-        let mut descriptors = Vec::new();
+        let mut annotations = Vec::new();
         for _ in 0..attributes {
             let attribute = utf8(pool, r.u2()?)?;
             let length = r.u4()? as usize;
@@ -734,13 +775,13 @@ fn read_member_annotations(
                 || attribute == "RuntimeVisibleAnnotations"
             {
                 // A malformed table loses this member's annotations only.
-                if let Ok(annotations) = read_annotations(&mut Reader::new(bytes), pool) {
-                    descriptors.extend(annotations.into_iter().map(|a| a.descriptor));
+                if let Ok(read) = read_annotations(&mut Reader::new(bytes), pool) {
+                    annotations.extend(read);
                 }
             }
         }
-        if !descriptors.is_empty() {
-            out.insert(format!("{name}|{descriptor}"), descriptors);
+        if !annotations.is_empty() {
+            out.insert(format!("{name}|{descriptor}"), annotations);
         }
     }
     Ok(out)
@@ -1990,27 +2031,31 @@ impl<H: Host> Host for GameHookHost<'_, H> {
             .and_then(|marker| self.context.object(marker))
             .map(|object| object.hierarchy().into_iter().map(str::to_owned).collect())
             .unwrap_or_default();
-        if let Some(targets) = self.model.targets.get(class)
-            && self
-                .model
-                .shadow_methods
-                .contains(&format!("{class}|{}|{}", method.name, method.descriptor))
-        {
-            return match crate::runtime::interface_mixins::resolve_shadow_target(
-                targets,
-                &receiver_hierarchy,
-            ) {
-                Some(owner) => Some(JarCallRedirect::Host(MethodRef {
-                    owner: owner.to_owned(),
-                    name: method.name.clone(),
-                    descriptor: method.descriptor.clone(),
-                })),
-                None => Some(JarCallRedirect::Ambiguous(MethodRef {
-                    owner: class.to_owned(),
-                    name: method.name.clone(),
-                    descriptor: method.descriptor.clone(),
-                })),
-            };
+        if let Some(targets) = self.model.targets.get(class) {
+            let shadow_key = format!("{class}|{}|{}", method.name, method.descriptor);
+            if self.model.shadow_methods.contains(&shadow_key) {
+                return match crate::runtime::interface_mixins::resolve_shadow_target(
+                    targets,
+                    &receiver_hierarchy,
+                ) {
+                    // The game method's name drops the `@Shadow` prefix.
+                    Some(owner) => Some(JarCallRedirect::Host(MethodRef {
+                        owner: owner.to_owned(),
+                        name: self
+                            .model
+                            .shadow_renames
+                            .get(&shadow_key)
+                            .cloned()
+                            .unwrap_or_else(|| method.name.clone()),
+                        descriptor: method.descriptor.clone(),
+                    })),
+                    None => Some(JarCallRedirect::Ambiguous(MethodRef {
+                        owner: class.to_owned(),
+                        name: method.name.clone(),
+                        descriptor: method.descriptor.clone(),
+                    })),
+                };
+            }
         }
         if method.code.is_some() {
             return None;

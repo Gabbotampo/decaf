@@ -38,6 +38,15 @@
 //!   0). A constant whose pool entry does not fit the field's type is a
 //!   format error the JVM refuses at load; it is left unassigned here.
 //!
+//! * A `@Mixin` class applied to exactly one jar class has no initialization of its
+//!   own: Mixin moves its static fields onto the target and appends its `<clinit>`
+//!   to the target's (`MixinApplicatorStandard.appendInsns`, before the target
+//!   `<clinit>`'s first `RETURN`). Touching the mixin's statics initializes the
+//!   target, and the target's initialization runs its own `<clinit>`, then each such
+//!   mixin's in apply order, as one initializer: a throw from either makes the
+//!   target erroneous. Mixins on host-modelled game classes (whose initializers ran
+//!   in the game, not here) and multi-target mixins keep their own initialization.
+//!
 //! The state lives in the runtime's initialized-class set, which the host
 //! persists between entrypoints and callbacks. An erroneous class is recorded
 //! there under a key no internal class name can collide with (it starts with a
@@ -152,6 +161,10 @@ impl<H: Host> Runtime<'_, H> {
         if !self.has_class(class) {
             return Ok(());
         }
+        // An applied mixin's statics are its jar target's (module docs).
+        if let Some(target) = self.merged_initializer_owner(class) {
+            return self.ensure_initialized(&target);
+        }
         if let Some(cause) = self.erroneous_cause(class) {
             return Err(erroneous_access(class, &cause));
         }
@@ -168,6 +181,7 @@ impl<H: Host> Runtime<'_, H> {
             Err(error) => Err(error),
             Ok(()) => self
                 .run_class_initializer(class)
+                .and_then(|()| self.run_merged_mixin_initializers(class))
                 .map_err(|error| match error {
                     NativeError::UncaughtException {
                         class: thrown,
@@ -287,6 +301,42 @@ impl<H: Host> Runtime<'_, H> {
             if defaults {
                 self.ensure_initialized(&interface)?;
             }
+        }
+        Ok(())
+    }
+
+    /// The jar class whose initialization stands for `class`'s, when `class` is a
+    /// `@Mixin` applied to that one jar target (module docs). The annotation check keeps
+    /// the mixin index out of every other class's initialization check.
+    #[inline(never)]
+    fn merged_initializer_owner(&self, class: &str) -> Option<String> {
+        let is_mixin = self.class(class).is_some_and(|file| {
+            file.annotations
+                .iter()
+                .any(|annotation| annotation.descriptor == MIXIN_ANNOTATION_DESCRIPTOR)
+        });
+        if !is_mixin {
+            return None;
+        }
+        self.merged_initializer_target(class)
+            .filter(|target| target != class)
+    }
+
+    /// The `<clinit>` of every mixin Mixin appends to `class`'s, in apply order, after
+    /// `class`'s own (module docs). An apply order this runtime cannot read exactly
+    /// (initializers from more than one jar) is counted, then run in name order.
+    #[inline(never)]
+    fn run_merged_mixin_initializers(&mut self, class: &str) -> Result<(), NativeError> {
+        let (mixins, exact) = self.merged_initializers(class);
+        if !exact {
+            self.host.unknown_operand_call(&crate::runtime::MethodRef {
+                owner: class.to_owned(),
+                name: "<clinit>".to_owned(),
+                descriptor: "()V".to_owned(),
+            })?;
+        }
+        for mixin in mixins {
+            self.invoke(&mixin, "<clinit>", "()V", None, &[])?;
         }
         Ok(())
     }

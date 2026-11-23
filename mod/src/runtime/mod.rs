@@ -805,6 +805,10 @@ pub enum MixinSkipReason {
     /// declares no injection member this runtime can name, so there is nothing
     /// a weave could apply.
     ListedWithoutPlan,
+    /// Real Mixin rejects the whole `@Mixin` class with `InvalidMixinException`
+    /// before applying it (for example a field carrying a `@Shadow` prefix), so
+    /// none of its members reach the target. Its bounded reason.
+    InvalidMixin(String),
 }
 
 impl MixinSkipReason {
@@ -826,13 +830,16 @@ impl MixinSkipReason {
             Self::ConstructorTarget => "constructor-target",
             Self::Weaver(_) => "weaver-rejected",
             Self::ListedWithoutPlan => "listed-without-plan",
+            Self::InvalidMixin(_) => "invalid-mixin",
         }
     }
 
-    /// The bounded sentence a reason carries, for the two variants that do.
+    /// The bounded sentence a reason carries, for the variants that do.
     pub fn detail(&self) -> Option<&str> {
         match self {
-            Self::Weaver(detail) | Self::GameHookMismatch(detail) => Some(detail),
+            Self::Weaver(detail) | Self::GameHookMismatch(detail) | Self::InvalidMixin(detail) => {
+                Some(detail)
+            }
             _ => None,
         }
     }
@@ -867,9 +874,7 @@ impl std::fmt::Display for SkippedMixinPlan {
             self.callback.name,
             self.callback.descriptor,
         )?;
-        if let MixinSkipReason::Weaver(detail) | MixinSkipReason::GameHookMismatch(detail) =
-            &self.reason
-        {
+        if let Some(detail) = self.reason.detail() {
             write!(f, ": {detail}")?;
         }
         Ok(())
@@ -22789,11 +22794,12 @@ impl NativeJar {
     }
 
     fn plan_load_time_weave_on(&self, side: MixinSide, game_hooks: bool) -> LoadTimeMixinWeave {
-        let (mut plans, unresolved) = self.mixin_plan_scan();
-        let (anchors, unresolved_anchors) = self.mixin_anchor_scan();
-        let (overwrites, unresolved_overwrites) = self.mixin_overwrite_scan();
-        let (modify_args, unresolved_modify_args) = self.mixin_modify_arg_scan();
-        let (modify_variables, unresolved_modify_variables) = self.mixin_modify_variable_scan();
+        let (mut plans, mut unresolved) = self.mixin_plan_scan();
+        let (mut anchors, mut unresolved_anchors) = self.mixin_anchor_scan();
+        let (mut overwrites, mut unresolved_overwrites) = self.mixin_overwrite_scan();
+        let (mut modify_args, mut unresolved_modify_args) = self.mixin_modify_arg_scan();
+        let (mut modify_variables, mut unresolved_modify_variables) =
+            self.mixin_modify_variable_scan();
         let configs = self.mixin_configs();
         let config_sides = self.mixin_config_sides();
         self.sort_mixin_plans_in_apply_order_for_side(
@@ -22802,7 +22808,36 @@ impl NativeJar {
             Some(side),
             &config_sides,
         );
+        // Config plugins run once per weave, as Mixin runs each once per
+        // config (`mixin_plugins.rs`); only the hook tier asks them.
+        let plugins = if game_hooks {
+            self.run_config_plugins(&configs, &config_sides, side)
+        } else {
+            ConfigPlugins::default()
+        };
         let mut weave = LoadTimeMixinWeave::default();
+        // A class real Mixin rejects (`InvalidMixinException`) is dropped whole:
+        // one row per target, and no plan of any family from it is applied.
+        let rejected = self.invalid_mixin_rows(
+            side,
+            &configs,
+            &config_sides,
+            game_hooks.then_some(&plugins),
+            &mut weave.skipped,
+        );
+        if !rejected.is_empty() {
+            let kept = |owner: &String| !rejected.contains(owner);
+            plans.retain(|plan| kept(&plan.callback.owner));
+            unresolved.retain(|plan| kept(&plan.callback.owner));
+            anchors.retain(|plan| kept(&plan.callback.owner));
+            unresolved_anchors.retain(|(plan, _)| kept(&plan.callback.owner));
+            overwrites.retain(|plan| kept(&plan.callback.owner));
+            unresolved_overwrites.retain(|(plan, _)| kept(&plan.callback.owner));
+            modify_args.retain(|plan| kept(&plan.callback.owner));
+            unresolved_modify_args.retain(|(plan, _)| kept(&plan.callback.owner));
+            modify_variables.retain(|plan| kept(&plan.callback.owner));
+            unresolved_modify_variables.retain(|(plan, _)| kept(&plan.callback.owner));
+        }
         weave.skipped.extend(
             unresolved
                 .iter()
@@ -22843,13 +22878,6 @@ impl NativeJar {
                         reason: MixinSkipReason::Unresolved,
                     }),
             );
-        // Config plugins run once per weave, as Mixin runs each once per
-        // config (`mixin_plugins.rs`); only the hook tier asks them.
-        let plugins = if game_hooks {
-            self.run_config_plugins(&configs, &config_sides, side)
-        } else {
-            ConfigPlugins::default()
-        };
         weave.config_plugins = plugins.reports();
         let interface_summary = self.plan_interface_mixins(
             side,
@@ -22864,6 +22892,9 @@ impl NativeJar {
         // targets outside the jar stay skipped as `target-outside-jar`, and
         // classes outside the config keep the config gate's reason.
         for plan in self.mixin_accessor_plans() {
+            if rejected.contains(&plan.accessor.owner) {
+                continue;
+            }
             match mixin_config_gate(&configs, &config_sides, &plan.accessor.owner, side) {
                 Ok(()) if self.classes.contains_key(&plan.target.owner) => {
                     weave.accessors.push(plan);
@@ -22965,6 +22996,9 @@ impl NativeJar {
         // callbacks; every other one is a row with its reason.
         let mut extras_bound = BTreeSet::new();
         for plan in self.mixin_extras_plans() {
+            if rejected.contains(&plan.callback.owner) {
+                continue;
+            }
             let outcome = if game_hooks {
                 self.mixin_extras_game_hook_plan(&plan, side, &configs, &config_sides, &plugins)
             } else if self.classes.contains_key(&plan.target.owner) {
@@ -23059,63 +23093,10 @@ impl NativeJar {
         side: Option<MixinSide>,
         config_sides: &BTreeMap<String, MixinSide>,
     ) {
-        const DEFAULT_PRIORITY: i32 = 1000;
         plans.sort_by_cached_key(|plan| {
             let class = self.classes.get(&plan.callback.owner);
-            let annotation_priority = class
-                .and_then(|class| {
-                    class.annotations.iter().find(|annotation| {
-                        annotation.descriptor == "Lorg/spongepowered/asm/mixin/Mixin;"
-                    })
-                })
-                .and_then(|mixin| match mixin.values.get("priority") {
-                    Some(AnnotationValue::Int(priority)) => Some(*priority),
-                    _ => None,
-                });
-            let binary = plan.callback.owner.replace('/', ".");
-            let listed = configs.iter().enumerate().find_map(|(index, config)| {
-                if side.is_some_and(|side| {
-                    config_sides
-                        .get(&config.path)
-                        .is_some_and(|only| *only != side)
-                }) {
-                    return None;
-                }
-                let mut names: Box<dyn Iterator<Item = &String>> = match side {
-                    Some(MixinSide::Client) => Box::new(config.mixins.iter().chain(&config.client)),
-                    Some(MixinSide::Server) => Box::new(config.mixins.iter().chain(&config.server)),
-                    None => Box::new(
-                        config
-                            .mixins
-                            .iter()
-                            .chain(&config.client)
-                            .chain(&config.server),
-                    ),
-                };
-                names
-                    .position(|name| *name == binary)
-                    .map(|position| (index, position))
-            });
-            let mixin_priority = annotation_priority
-                .or_else(|| {
-                    // `mixinPriority` is the config's default for a class whose
-                    // annotation omits `priority`; an explicit one still wins.
-                    listed.and_then(|(index, _)| configs[index].mixin_priority)
-                })
-                .unwrap_or(DEFAULT_PRIORITY);
-            // Configs are parsed in declaration order, so `index` breaks a
-            // priority tie the way the loader registered them; within one
-            // config, the position in `mixins`/`client`/`server` does. A class
-            // no config lists sorts after every listed one.
-            let listed = listed
-                .map(|(index, position)| {
-                    (
-                        configs[index].priority.unwrap_or(DEFAULT_PRIORITY),
-                        index,
-                        position,
-                    )
-                })
-                .unwrap_or((DEFAULT_PRIORITY, usize::MAX, usize::MAX));
+            let (mixin_priority, listed) =
+                mixin_apply_order_key(class, &plan.callback.owner, configs, side, config_sides);
             let method = class
                 .and_then(|class| {
                     class.methods.iter().position(|method| {
@@ -28007,7 +27988,7 @@ impl<H: Host> Runtime<'_, H> {
         let target = match self.resolve_static_shadow(&field) {
             interface_mixins::StaticShadowResolution::NotShadow => field,
             interface_mixins::StaticShadowResolution::Resolved { target, .. } => target,
-            interface_mixins::StaticShadowResolution::Ambiguous => {
+            interface_mixins::StaticShadowResolution::Unresolved => {
                 self.host.unknown_operand_call(&field)?;
                 return Ok((Value::default_for(&field.descriptor), false));
             }
@@ -28058,8 +28039,14 @@ impl<H: Host> Runtime<'_, H> {
     }
 
     /// Out-of-line `putstatic` body kept out of `invoke_frame` so the unoptimised
-    /// interpreter frame stays within `frame_bound`'s stack budget, while enforcing
-    /// Mixin's `@Shadow` / `@Final` / `@Mutable` rules and target resolution.
+    /// interpreter frame stays within `frame_bound`'s stack budget, while resolving a
+    /// `@Mixin` class's static `@Shadow` to the target field the merged class writes.
+    ///
+    /// Mixin keeps every instruction of a mixin's static initialiser (it removes only the
+    /// shadow field's declaration), so a `<clinit>` write through a shadow is a real write
+    /// to the target, default value or not. Whether a write is legal is the JVM's call on
+    /// the target field's own flags ([`interface_mixins::StaticShadowWrite`]); `@Final`
+    /// is a transformer diagnostic with no runtime effect.
     #[inline(never)]
     fn execute_putstatic(
         &mut self,
@@ -28074,80 +28061,62 @@ impl<H: Host> Runtime<'_, H> {
             owner: self.field_owner(symbolic),
             ..symbolic.clone()
         };
-        // Mixin strips `<clinit>` default-value placeholders (`= null` / `= 0`) on
-        // `@Shadow` static fields that `javac` requires for `static final` declarations.
-        let is_mixin_clinit_default = class == field.owner
-            && method == "<clinit>"
-            && value == Value::default_for(&field.descriptor);
-        match self.resolve_static_shadow(&field) {
-            interface_mixins::StaticShadowResolution::NotShadow => {
-                self.ensure_initialized(&field.owner)?;
-                let outcome = self.dispatch_field_anchor(
-                    &field,
-                    true,
-                    Some(&value),
-                    class,
-                    method,
-                    desc,
-                    at,
-                )?;
-                if outcome == AnchorOutcome::Normal {
-                    self.static_fields
-                        .insert(Self::static_field_key(&field), value);
-                }
-                Ok(())
-            }
-            interface_mixins::StaticShadowResolution::Ambiguous => {
-                if is_mixin_clinit_default {
-                    return Ok(());
-                }
+        let (target, through_shadow) = match self.resolve_static_shadow(&field) {
+            interface_mixins::StaticShadowResolution::NotShadow => (field, false),
+            interface_mixins::StaticShadowResolution::Unresolved => {
                 self.host.unknown_operand_call(&field)?;
-                Ok(())
+                return Ok(());
             }
-            interface_mixins::StaticShadowResolution::Resolved {
-                target,
-                is_final,
-                is_mutable,
-            } => {
-                if is_mixin_clinit_default {
-                    return Ok(());
-                }
-                if is_final && !is_mutable {
-                    return Err(NativeError::UncaughtException {
-                        class: "java/lang/IllegalAccessError".into(),
-                        message: Some(format!(
-                            "Cannot assign final @Shadow static field {}#{} without @Mutable",
-                            target.owner, target.name
-                        )),
-                        frame: None,
-                    });
-                }
-                self.ensure_initialized(&target.owner)?;
-                let outcome = self.dispatch_field_anchor(
-                    &target,
-                    true,
-                    Some(&value),
-                    class,
-                    method,
-                    desc,
-                    at,
-                )?;
-                if outcome == AnchorOutcome::Normal {
-                    if self.has_class(&target.owner) {
-                        self.static_fields
-                            .insert(Self::static_field_key(&target), value);
-                    } else if self.host.defers_game_field_write_check() {
-                        return Err(NativeError::Metadata(format!(
-                            "game hook callback writes the game's static field {}#{} through @Shadow, which the host does not apply",
-                            target.owner, target.name
-                        )));
-                    } else {
-                        self.host.unknown_operand_call(&target)?;
+            interface_mixins::StaticShadowResolution::Resolved { target, write } => {
+                if let interface_mixins::StaticShadowWrite::Final {
+                    symbolic_owner,
+                    declaring,
+                } = &write
+                {
+                    // Field resolution fails before the declaring class initialises.
+                    match self.judge_final_static_put(
+                        symbolic_owner,
+                        declaring,
+                        &target.name,
+                        class,
+                        method,
+                    ) {
+                        interface_mixins::FinalStaticPut::Allowed => {}
+                        interface_mixins::FinalStaticPut::Illegal(message) => {
+                            return Err(NativeError::UncaughtException {
+                                class: "java/lang/IllegalAccessError".into(),
+                                message: Some(message),
+                                frame: None,
+                            });
+                        }
+                        interface_mixins::FinalStaticPut::Unknown => {
+                            self.host.unknown_operand_call(&target)?;
+                            return Ok(());
+                        }
                     }
                 }
-                Ok(())
+                (target, true)
             }
+        };
+        self.ensure_initialized(&target.owner)?;
+        let outcome =
+            self.dispatch_field_anchor(&target, true, Some(&value), class, method, desc, at)?;
+        if outcome != AnchorOutcome::Normal {
+            return Ok(());
         }
+        if !through_shadow || self.has_class(&target.owner) {
+            self.static_fields
+                .insert(Self::static_field_key(&target), value);
+        } else if self.host.defers_game_field_write_check() {
+            return Err(NativeError::Metadata(format!(
+                "game hook callback writes the game's static field {}#{} through @Shadow, which the host does not apply",
+                target.owner, target.name
+            )));
+        } else {
+            // A host-modelled game static: the write never reaches the game.
+            self.host.unknown_operand_call(&target)?;
+        }
+        Ok(())
     }
 
     /// Out-of-line `getfield` body kept out of `invoke_frame` so the unoptimised
@@ -41027,6 +40996,77 @@ impl ExecutionConfigGate {
 /// A class whose only members are outside the bounded families (or that has
 /// none at all) would otherwise read as fully applied: the config says it runs,
 /// yet no plan names it. The row keeps that gap visible.
+/// The order real Mixin applies `@Mixin` class `owner` in, as a sort key:
+/// `@Mixin(priority)` (default 1000, lower first, else the listing config's
+/// `mixinPriority`), then the config's `priority`, declaration index and the class's
+/// position in its `mixins`/`client`/`server` lists. A class no config lists (on
+/// `side`) sorts after every listed one.
+pub(crate) fn mixin_apply_order_key(
+    class: Option<&ClassFile>,
+    owner: &str,
+    configs: &[MixinConfig],
+    side: Option<MixinSide>,
+    config_sides: &BTreeMap<String, MixinSide>,
+) -> (i32, (i32, usize, usize)) {
+    const DEFAULT_PRIORITY: i32 = 1000;
+    let annotation_priority = class
+        .and_then(|class| {
+            class
+                .annotations
+                .iter()
+                .find(|annotation| annotation.descriptor == "Lorg/spongepowered/asm/mixin/Mixin;")
+        })
+        .and_then(|mixin| match mixin.values.get("priority") {
+            Some(AnnotationValue::Int(priority)) => Some(*priority),
+            _ => None,
+        });
+    let binary = owner.replace('/', ".");
+    let listed = configs.iter().enumerate().find_map(|(index, config)| {
+        if side.is_some_and(|side| {
+            config_sides
+                .get(&config.path)
+                .is_some_and(|only| *only != side)
+        }) {
+            return None;
+        }
+        let mut names: Box<dyn Iterator<Item = &String>> = match side {
+            Some(MixinSide::Client) => Box::new(config.mixins.iter().chain(&config.client)),
+            Some(MixinSide::Server) => Box::new(config.mixins.iter().chain(&config.server)),
+            None => Box::new(
+                config
+                    .mixins
+                    .iter()
+                    .chain(&config.client)
+                    .chain(&config.server),
+            ),
+        };
+        names
+            .position(|name| *name == binary)
+            .map(|position| (index, position))
+    });
+    let mixin_priority = annotation_priority
+        .or_else(|| {
+            // `mixinPriority` is the config's default for a class whose
+            // annotation omits `priority`; an explicit one still wins.
+            listed.and_then(|(index, _)| configs[index].mixin_priority)
+        })
+        .unwrap_or(DEFAULT_PRIORITY);
+    // Configs are parsed in declaration order, so `index` breaks a
+    // priority tie the way the loader registered them; within one
+    // config, the position in `mixins`/`client`/`server` does. A class
+    // no config lists sorts after every listed one.
+    let listed = listed
+        .map(|(index, position)| {
+            (
+                configs[index].priority.unwrap_or(DEFAULT_PRIORITY),
+                index,
+                position,
+            )
+        })
+        .unwrap_or((DEFAULT_PRIORITY, usize::MAX, usize::MAX));
+    (mixin_priority, listed)
+}
+
 fn listed_without_plan(
     configs: &[MixinConfig],
     plans: &[MixinInjectionPlan],
