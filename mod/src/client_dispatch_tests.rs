@@ -14,11 +14,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use mod_api::__private::game::BackendRefOf;
 use mod_api::text::{TextContent, TextStyle};
 use mod_api::{
-    Backend, BackendRef, BuildCreativeModeTabContentsEvent, ClientHost, ClientSetupEvent,
-    CreativeTabChange, CreativeTabEdit, CreativeTabEditError, CreativeTabList,
-    CreativeTabPermissions, CreativeTabPlacement, CreativeTabVisibility, Dist, HookId, Hooks, Host,
-    HostSide, Identifier, ItemKey, ItemStack, ItemTooltipEvent, Listener, ModEntry, Tag, Text,
-    TextFormError, TooltipDisplay,
+    Backend, BackendRef, BuildCreativeModeTabContentsEvent, ClientHost, ClientReloadHost,
+    ClientSetupContext, ClientSetupEvent, CreativeTabChange, CreativeTabEdit, CreativeTabEditError,
+    CreativeTabList, CreativeTabPermissions, CreativeTabPlacement, CreativeTabVisibility, Dist,
+    HookId, Hooks, Host, HostSide, Identifier, ItemKey, ItemStack, ItemStackView, ItemTooltipEvent,
+    Listener, ModEntry, ReloadContext, Tag, Text, TextFormError, TooltipDisplay, TooltipLines,
+    TooltipLinesAccess,
 };
 use zip::write::SimpleFileOptions;
 
@@ -117,8 +118,8 @@ impl Hooks for SharedHorizonJava {
     fn listeners(&self) -> &'static [Listener] {
         self.0.listeners()
     }
-    fn client_setup(&self, host: &mut dyn ClientHost, event: &mut ClientSetupEvent) {
-        self.0.client_setup(host, event);
+    fn client_setup(&self, context: &mut dyn ClientSetupContext, event: &mut ClientSetupEvent) {
+        self.0.client_setup(context, event);
     }
     fn build_creative_mode_tab_contents(
         &self,
@@ -189,7 +190,10 @@ impl TestClientHost {
         };
         entries
             .iter()
-            .map(|stack| (stack.item().id(self), stack.count()))
+            .map(|stack| {
+                let id = stack.item().id(self).expect("a test item has a name");
+                (id.to_owned(), stack.count())
+            })
             .collect()
     }
 }
@@ -217,6 +221,93 @@ impl mod_api::prelude::EffectsClientHost for TestClientHost {
     }
 }
 
+/// `client_setup`'s context (since d404b5f02f it is not a `ClientHost`): the same test host,
+/// with the version the game reports and the same local-sound recorder.
+impl ReloadContext for TestClientHost {
+    fn dist(&self) -> Dist {
+        Dist::Client
+    }
+    fn game_version(&self) -> &'static str {
+        "26.3"
+    }
+}
+impl ClientReloadHost for TestClientHost {}
+impl ClientSetupContext for TestClientHost {
+    fn play_local_sound(
+        &self,
+        sound: &mod_api::SoundPlay,
+        after: u32,
+    ) -> Option<mod_api::SoundRef> {
+        mod_api::prelude::EffectsClientHost::play_local_sound(self, sound, after)
+    }
+}
+
+/// The engine's live tooltip line list over a plain vector, as `item_tooltip` lends it since
+/// d404b5f02f (`TooltipLines`): each written line is validated, as the game's list does.
+struct VecLines<'v>(&'v mut Vec<(Text, u32)>);
+
+impl TooltipLinesAccess for VecLines<'_> {
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+    fn color(&self, index: usize) -> Option<u32> {
+        self.0.get(index).map(|line| line.1)
+    }
+    fn get(&self, index: usize) -> Option<Result<(Text, u32), TextFormError>> {
+        self.0.get(index).cloned().map(Ok)
+    }
+    fn push(&mut self, text: Text, color: u32) -> Result<(), TextFormError> {
+        text.validate()?;
+        self.0.push((text, color));
+        Ok(())
+    }
+    fn insert(&mut self, index: usize, text: Text, color: u32) -> Result<bool, TextFormError> {
+        if index > self.0.len() {
+            return Ok(false);
+        }
+        text.validate()?;
+        self.0.insert(index, (text, color));
+        Ok(true)
+    }
+    fn set(&mut self, index: usize, text: Text, color: u32) -> Result<bool, TextFormError> {
+        if index >= self.0.len() {
+            return Ok(false);
+        }
+        text.validate()?;
+        self.0[index] = (text, color);
+        Ok(true)
+    }
+    fn set_color(&mut self, index: usize, color: u32) -> bool {
+        match self.0.get_mut(index) {
+            Some(line) => {
+                line.1 = color;
+                true
+            }
+            None => false,
+        }
+    }
+    fn remove(&mut self, index: usize) -> Option<Result<(Text, u32), TextFormError>> {
+        (index < self.0.len()).then(|| Ok(self.0.remove(index)))
+    }
+    fn pop(&mut self) -> Option<Result<(Text, u32), TextFormError>> {
+        self.0.pop().map(Ok)
+    }
+    fn clear(&mut self) {
+        self.0.clear();
+    }
+    fn truncate(&mut self, len: usize) {
+        self.0.truncate(len);
+    }
+    fn swap(&mut self, a: usize, b: usize) -> bool {
+        if a < self.0.len() && b < self.0.len() {
+            self.0.swap(a, b);
+            true
+        } else {
+            false
+        }
+    }
+}
+
 impl Backend for TestClientHost {}
 mod_api::impl_backend_areas!(TestClientHost, except(items, keys));
 
@@ -239,7 +330,7 @@ impl mod_api::prelude::ItemsHost for TestClientHost {
 }
 
 impl mod_api::prelude::KeysBackend for TestClientHost {
-    fn item_key_id(&self, key: ItemKey) -> String {
+    fn item_key_id(&self, key: ItemKey) -> Option<&str> {
         mod_api::prelude::KeysBackend::item_key_id(&self.fake, key)
     }
 }
@@ -968,11 +1059,11 @@ fn javac_fixture_creative_tab_anchors_visibility_flags_and_tooltip_bridge() {
                 mod_api::__private::ItemTooltipCall {
                     player: 0,
                     player_entity_id: 1,
-                    stack: &tooltip_stack,
+                    stack: ItemStackView::from_stack(&tooltip_stack),
                     display: &display,
                     advanced: true,
                     creative: false,
-                    lines: &mut lines,
+                    lines: TooltipLines::new(&mut VecLines(&mut lines)),
                 },
             );
             let mut expected_style = TextStyle::default();
@@ -1014,11 +1105,11 @@ fn javac_fixture_creative_tab_anchors_visibility_flags_and_tooltip_bridge() {
                 mod_api::__private::ItemTooltipCall {
                     player: 0,
                     player_entity_id: 1,
-                    stack: &hidden_stack,
+                    stack: ItemStackView::from_stack(&hidden_stack),
                     display: &hidden_display,
                     advanced: false,
                     creative: false,
-                    lines: &mut hidden_lines,
+                    lines: TooltipLines::new(&mut VecLines(&mut hidden_lines)),
                 },
             );
             assert!(hidden_lines.is_empty());
@@ -1030,11 +1121,11 @@ fn javac_fixture_creative_tab_anchors_visibility_flags_and_tooltip_bridge() {
                 mod_api::__private::ItemTooltipCall {
                     player: 0,
                     player_entity_id: 1,
-                    stack: &hidden_stack,
+                    stack: ItemStackView::from_stack(&hidden_stack),
                     display: &hidden_display,
                     advanced: false,
                     creative: true,
-                    lines: &mut creative_lines,
+                    lines: TooltipLines::new(&mut VecLines(&mut creative_lines)),
                 },
             );
             assert_eq!(
@@ -1197,11 +1288,11 @@ fn run_real_runes_bridge_test(path: &Path) {
                 mod_api::__private::ItemTooltipCall {
                     player: 0,
                     player_entity_id: 1,
-                    stack: &altar,
+                    stack: ItemStackView::from_stack(&altar),
                     display: &display,
                     advanced: false,
                     creative: false,
-                    lines: &mut lines,
+                    lines: TooltipLines::new(&mut VecLines(&mut lines)),
                 },
             );
             let mut expected_style = TextStyle::default();
@@ -1607,15 +1698,15 @@ fn creative_tab_preserves_custom_components_and_skips_unrepresentable_stacks() {
             assert_eq!(editor.parent.len(), 7, "parent entries: {:?}", editor.parent);
             assert_eq!(editor.search.len(), 7, "search entries: {:?}", editor.search);
             for list in [&editor.parent, &editor.search] {
-                assert_eq!(list[0].item().id(&host), "minecraft:stone");
-                assert_eq!(list[1].item().id(&host), "minecraft:diamond_sword");
+                assert_eq!(list[0].item().id(&host), Some("minecraft:stone"));
+                assert_eq!(list[1].item().id(&host), Some("minecraft:diamond_sword"));
                 assert_eq!(list[1].damage_component(), None);
                 assert!(list[1].components().is_none());
 
-                assert_eq!(list[2].item().id(&host), "minecraft:diamond_sword");
+                assert_eq!(list[2].item().id(&host), Some("minecraft:diamond_sword"));
                 assert_eq!(list[2].damage_component(), Some(12));
 
-                assert_eq!(list[3].item().id(&host), "minecraft:diamond_sword");
+                assert_eq!(list[3].item().id(&host), Some("minecraft:diamond_sword"));
                 assert!(
                     list[3]
                         .components()
@@ -1625,7 +1716,7 @@ fn creative_tab_preserves_custom_components_and_skips_unrepresentable_stacks() {
                 );
                 assert!(!list[3].is_stackable_with(&list[1]));
 
-                assert_eq!(list[4].item().id(&host), "minecraft:diamond_sword");
+                assert_eq!(list[4].item().id(&host), Some("minecraft:diamond_sword"));
                 assert_eq!(
                     list[4]
                         .components()
@@ -1634,7 +1725,7 @@ fn creative_tab_preserves_custom_components_and_skips_unrepresentable_stacks() {
                     Some(&Tag::Int(3))
                 );
 
-                assert_eq!(list[5].item().id(&host), "minecraft:diamond_sword");
+                assert_eq!(list[5].item().id(&host), Some("minecraft:diamond_sword"));
                 assert_eq!(
                     list[5]
                         .components()
@@ -1642,7 +1733,7 @@ fn creative_tab_preserves_custom_components_and_skips_unrepresentable_stacks() {
                     Some(&Tag::Compound(mod_api::Compound::new()))
                 );
 
-                assert_eq!(list[6].item().id(&host), "minecraft:diamond_sword");
+                assert_eq!(list[6].item().id(&host), Some("minecraft:diamond_sword"));
                 assert_eq!(
                     list[6]
                         .components()
@@ -1834,11 +1925,11 @@ fn item_tooltip_passes_real_stack_components_and_tooltip_display() {
                 mod_api::__private::ItemTooltipCall {
                     player: 0,
                     player_entity_id: 1,
-                    stack: &rich,
+                    stack: ItemStackView::from_stack(&rich),
                     display: &rich_display,
                     advanced: false,
                     creative: false,
-                    lines: &mut lines,
+                    lines: TooltipLines::new(&mut VecLines(&mut lines)),
                 },
             );
             assert_eq!(
@@ -1862,11 +1953,11 @@ fn item_tooltip_passes_real_stack_components_and_tooltip_display() {
                 mod_api::__private::ItemTooltipCall {
                     player: 0,
                     player_entity_id: 1,
-                    stack: &plain,
+                    stack: ItemStackView::from_stack(&plain),
                     display: &ominous_display,
                     advanced: false,
                     creative: false,
-                    lines: &mut ominous_lines,
+                    lines: TooltipLines::new(&mut VecLines(&mut ominous_lines)),
                 },
             );
             assert_eq!(
@@ -1900,11 +1991,11 @@ fn item_tooltip_passes_real_stack_components_and_tooltip_display() {
                 mod_api::__private::ItemTooltipCall {
                     player: 0,
                     player_entity_id: 1,
-                    stack: &hidden,
+                    stack: ItemStackView::from_stack(&hidden),
                     display: &hidden_display,
                     advanced: false,
                     creative: true,
-                    lines: &mut hidden_lines,
+                    lines: TooltipLines::new(&mut VecLines(&mut hidden_lines)),
                 },
             );
             assert_eq!(
@@ -1947,11 +2038,11 @@ fn item_tooltip_passes_real_stack_components_and_tooltip_display() {
                 mod_api::__private::ItemTooltipCall {
                     player: 0,
                     player_entity_id: 1,
-                    stack: &opaque_stack,
+                    stack: ItemStackView::from_stack(&opaque_stack),
                     display: &opaque_display,
                     advanced: false,
                     creative: false,
-                    lines: &mut opaque_lines,
+                    lines: TooltipLines::new(&mut VecLines(&mut opaque_lines)),
                 },
             );
             assert_eq!(
@@ -1986,11 +2077,11 @@ fn item_tooltip_passes_real_stack_components_and_tooltip_display() {
                 mod_api::__private::ItemTooltipCall {
                     player: 0,
                     player_entity_id: 1,
-                    stack: &bad_td_stack,
+                    stack: ItemStackView::from_stack(&bad_td_stack),
                     display: &bad_td_display,
                     advanced: false,
                     creative: false,
-                    lines: &mut bad_td_lines,
+                    lines: TooltipLines::new(&mut VecLines(&mut bad_td_lines)),
                 },
             );
             assert!(
@@ -2279,8 +2370,8 @@ fn creative_tab_dedupes_tooltip_display_hidden_components_as_set_matching_jdk25(
                         2,
                         "reordered TooltipDisplay stacks must dedupe to one entry: {list:?}"
                     );
-                    assert_eq!(list[0].item().id(&host), "minecraft:stone");
-                    assert_eq!(list[1].item().id(&host), "minecraft:diamond_sword");
+                    assert_eq!(list[0].item().id(&host), Some("minecraft:stone"));
+                    assert_eq!(list[1].item().id(&host), Some("minecraft:diamond_sword"));
                     assert_eq!(
                         list[1]
                             .components()
@@ -2491,11 +2582,11 @@ fn item_tooltip_drains_recorded_client_sounds_into_play_local_sound() {
                     mod_api::__private::ItemTooltipCall {
                         player: 0,
                         player_entity_id: 1,
-                        stack: &stack,
+                        stack: ItemStackView::from_stack(&stack),
                         display: &display,
                         advanced: false,
                         creative: false,
-                        lines: &mut lines,
+                        lines: TooltipLines::new(&mut VecLines(&mut lines)),
                     },
                 );
                 lines
