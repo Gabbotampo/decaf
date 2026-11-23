@@ -421,8 +421,17 @@ fn dispatch_state(
     // this comparator, so the BTreeMap cannot silently reorder callbacks.
     targets.sort_by_key(|target| (target.priority, target.jar, target.order));
     let mut answer = DispatchAnswer::default();
+    // The level sound streams any jar found unknown. Each target's sounds are delivered in call
+    // order against the streams as they stood before it ran (`sound.rs`).
+    let mut sound_streams =
+        crate::sound::sync_unknown_sound_streams(&mut state.jars, |jar| &mut jar.host);
     for target in targets {
+        // Also what an earlier target, or a dispatch nested in one, left unknown on any jar.
+        sound_streams.extend(crate::sound::gather_unknown_sound_streams(
+            state.jars.iter().map(|jar| &jar.host),
+        ));
         let loaded = &mut state.jars[target.jar];
+        crate::sound::share_unknown_sound_streams([&mut loaded.host], &sound_streams);
         let registrations = loaded.hooks.for_anchor(&target.hook, anchor);
         if registrations.is_empty() {
             continue;
@@ -433,7 +442,9 @@ fn dispatch_state(
         let receiver = dispatch
             .receiver
             .clone()
+            .map(|object| crate::sound::enrich_game_object(dispatch.host, object))
             .map(|object| context.insert(object));
+        loaded.host.set_host_deferred_server_sound_seeds(true);
         let result = crate::caught(
             &format!("{} game hook {}", loaded.row.id, target.hook),
             || {
@@ -467,14 +478,17 @@ fn dispatch_state(
                 })
             },
         );
+        loaded.host.set_host_deferred_server_sound_seeds(false);
         let run = match result {
             Ok(Ok(run)) => run,
             Ok(Err(error)) => {
                 loaded.row.game_hooks.failed += 1;
+                drop_failed_callback_sounds(&mut context, &mut loaded.host, &mut sound_streams);
                 return Err(DispatchError::from_error(error));
             }
             Err(panic) => {
                 loaded.row.game_hooks.failed += 1;
+                drop_failed_callback_sounds(&mut context, &mut loaded.host, &mut sound_streams);
                 return Err(DispatchError::from_error(format!("panicked: {panic}")));
             }
         };
@@ -485,22 +499,61 @@ fn dispatch_state(
             answer.returned = run.returned;
         }
         for effect in context.take_effects() {
-            apply_effect(dispatch.host, effect);
+            apply_effect(dispatch.host, &mut loaded.host, effect, &mut sound_streams);
         }
+        // What this target's calls, or the delivery of its sounds, left unknown: kept on its
+        // host, and lent to the next target's.
+        sound_streams.extend(loaded.host.unknown_sound_streams().iter().cloned());
+        crate::sound::share_unknown_sound_streams([&mut loaded.host], &sound_streams);
         if run.cancelled {
             break;
         }
     }
     Ok(answer)
 }
-fn apply_effect(host: &mut dyn ServerHost, effect: GameHookEffect) {
+fn apply_effect(
+    host: &mut dyn ServerHost,
+    runtime_host: &mut crate::runtime::StdHost,
+    effect: GameHookEffect,
+    sound_streams: &mut std::collections::BTreeSet<String>,
+) {
     match effect {
         GameHookEffect::SystemMessage { player, text } => {
             if let Some(target) = host.player(player) {
                 let _ = target.tell(host, mod_api::Text::literal(text));
             }
         }
+        GameHookEffect::PlaySound(effect) => {
+            crate::sound::apply_server_sounds(host, &[effect], sound_streams, |reason| {
+                runtime_host.note_unknown_game_hook(reason);
+            });
+        }
     }
+}
+
+/// A failed callback's effects are not applied. Its recorded sounds are counted instead, and a
+/// sound whose seed was deferred to Sunrise leaves its stream unknown: Java drew that seed before
+/// the failure, and Sunrise never will.
+fn drop_failed_callback_sounds(
+    context: &mut GameHookContext,
+    runtime_host: &mut crate::runtime::StdHost,
+    sound_streams: &mut std::collections::BTreeSet<String>,
+) {
+    let sounds: Vec<_> = context
+        .take_effects()
+        .into_iter()
+        .filter_map(|effect| match effect {
+            GameHookEffect::PlaySound(sound) => Some(sound),
+            GameHookEffect::SystemMessage { .. } => None,
+        })
+        .collect();
+    crate::sound::count_undelivered_sounds(
+        &sounds,
+        sound_streams,
+        |reason| runtime_host.note_unknown_game_hook(reason),
+        "level sound from a failed game hook callback",
+    );
+    crate::sound::share_unknown_sound_streams([runtime_host], sound_streams);
 }
 impl From<NativeError> for DispatchError {
     fn from(error: NativeError) -> Self {

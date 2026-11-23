@@ -1552,6 +1552,11 @@ pub struct EventContext {
     /// `MinecraftServer.haveTime()`, read once when the tick hook fires (NeoForge
     /// evaluates its `BooleanSupplier` at each call). `None` refuses the read.
     pub has_time: Option<bool>,
+    /// Optional per-entity/player sound facts (`position`, `silent`,
+    /// `sound_source`, `level`, `entity_id`), keyed by the entity/player marker
+    /// (`game/player/...`, `game/entity/<id>`). Absent entries leave those
+    /// reads counted as unknown.
+    pub entity_sound_facts: BTreeMap<String, crate::level_sound::EntitySoundFacts>,
 }
 
 /// One firing of one event, carried across every listener of every jar.
@@ -1566,6 +1571,8 @@ pub struct EventFiring {
     /// The first non-`PASS` `InteractionResult` a Fabric listener returned
     /// (`SUCCESS`, `FAIL`...).
     pub interaction: Option<String>,
+    /// Level/entity sounds recorded during this firing, in call order.
+    pub sounds: Vec<crate::level_sound::LevelSoundEffect>,
     /// The event objects this firing handed its NeoForge/Forge listeners, one
     /// per event class: every listener of one firing gets the same object.
     objects: Vec<(String, Value)>,
@@ -1579,6 +1586,7 @@ impl EventFiring {
             context,
             cancelled: false,
             interaction: None,
+            sounds: Vec::new(),
             objects: Vec::new(),
         }
     }
@@ -1863,7 +1871,7 @@ impl StdHost {
     ) -> Option<Result<Value, NativeError>> {
         // The event object a NeoForge/Forge listener received answers from the firing.
         if crate::host_game_event::fired_event(receiver).is_some() {
-            let answer = self.facade_answer(&Facade::Event, r, args);
+            let answer = self.facade_answer(&Facade::Event, "", r, args);
             return Some(answer.ok_or_else(|| NativeError::UnknownHostCall(r.clone())));
         }
         let text = crate::game_object::text(receiver)?;
@@ -2059,11 +2067,63 @@ impl StdHost {
         if text.starts_with("game/unknown/") {
             return Some(self.unknown_host_call(r));
         }
-        let answer = self.facade_answer(&kind, r, args);
+        if !matches!(kind, Facade::OriginalPlayer(_))
+            && let Some(answer) = crate::level_sound::server_facade_sound_call(self, text, r, args)
+        {
+            return Some(answer);
+        }
+        // Standalone `game/level/<dim>`, `game/player/...`, and `game/entity/...`
+        // handles outside an event firing still answer their intrinsic dimension /
+        // server-side identity and any explicitly seeded sound facts (`getX/Y/Z`,
+        // `level`).
+        if self.game_event.is_none() {
+            match &kind {
+                Facade::Level(id) => match (r.name.as_str(), return_desc(&r.descriptor)) {
+                    ("isClientSide", "Z") => return Some(Ok(Value::Int(0))),
+                    ("dimension", _) => return Some(Ok(dimension_key(id))),
+                    _ => {}
+                },
+                Facade::Player(_) | Facade::Entity(_) => {
+                    if let Some(facts) = self.level_sound.entity_facts.get(text) {
+                        match (r.name.as_str(), r.descriptor.as_str()) {
+                            ("getX", "()D") => {
+                                if let Some(pos) = facts.position {
+                                    return Some(Ok(Value::Float(pos[0])));
+                                }
+                            }
+                            ("getY", "()D") => {
+                                if let Some(pos) = facts.position {
+                                    return Some(Ok(Value::Float(pos[1])));
+                                }
+                            }
+                            ("getZ", "()D") => {
+                                if let Some(pos) = facts.position {
+                                    return Some(Ok(Value::Float(pos[2])));
+                                }
+                            }
+                            ("level" | "serverLevel", _) => {
+                                if let Some(level) = facts.level.as_deref() {
+                                    return Some(Ok(level_marker(level)));
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        let answer = self.facade_answer(&kind, text, r, args);
         Some(answer.ok_or_else(|| NativeError::UnknownHostCall(r.clone())))
     }
 
-    fn facade_answer(&mut self, kind: &Facade<'_>, r: &MethodRef, args: &[Value]) -> Option<Value> {
+    fn facade_answer(
+        &mut self,
+        kind: &Facade<'_>,
+        receiver_marker: &str,
+        r: &MethodRef,
+        args: &[Value],
+    ) -> Option<Value> {
         let firing = self.game_event.as_deref()?;
         let facade = Arc::clone(&firing.facade);
         let context = firing.context.clone();
@@ -2184,12 +2244,20 @@ impl StdHost {
                     return answer;
                 }
                 let p = player(*uuid)?;
+                let sound_pos = context
+                    .entity_sound_facts
+                    .get(receiver_marker)
+                    .or_else(|| self.level_sound.entity_facts.get(receiver_marker))
+                    .and_then(|facts| facts.position);
                 match (name, returns) {
                     ("getScoreboardName" | "getPlainTextName", _) => Some(marker(p.name.clone())),
                     ("getName" | "getDisplayName", _) => Some(component_value("literal", &p.name)),
                     ("getId", "I") => Some(Value::Int(p.entity_id?)),
                     ("isAlive", "Z") => flag(true),
                     ("level" | "serverLevel", _) => p.level.as_deref().map(level_marker),
+                    ("getX", "D") => sound_pos.map(|pos| Value::Float(pos[0])),
+                    ("getY", "D") => sound_pos.map(|pos| Value::Float(pos[1])),
+                    ("getZ", "D") => sound_pos.map(|pos| Value::Float(pos[2])),
                     ("getServer", _) => Some(marker(SERVER.into())),
                     _ => None,
                 }
@@ -2224,10 +2292,18 @@ impl StdHost {
             },
             Facade::Entity(id) => {
                 let entity = context.entity.as_ref().filter(|e| e.id == *id)?;
+                let sound_pos = context
+                    .entity_sound_facts
+                    .get(receiver_marker)
+                    .or_else(|| self.level_sound.entity_facts.get(receiver_marker))
+                    .and_then(|facts| facts.position);
                 match (name, returns) {
                     ("getId", "I") => int(entity.id),
                     ("isAlive", "Z") => flag(true),
                     ("level", _) => entity.level.as_deref().map(level_marker),
+                    ("getX", "D") => sound_pos.map(|pos| Value::Float(pos[0])),
+                    ("getY", "D") => sound_pos.map(|pos| Value::Float(pos[1])),
+                    ("getZ", "D") => sound_pos.map(|pos| Value::Float(pos[2])),
                     _ => None,
                 }
             }
@@ -3086,6 +3162,7 @@ impl NativeJar {
         let result = self.invoke_listener_callback(&listener.callback, event_args, host, budget);
         if let Some(after) = host.game_event.take() {
             firing.cancelled = after.cancelled;
+            firing.sounds = after.sounds;
         }
         host.truncate_call_log(marks);
         let (target, result) = result?;
@@ -3101,11 +3178,10 @@ impl NativeJar {
                 }
             }
             (EventLoader::Fabric, Combine::Interaction) => {
-                let name = expect_ref(&result)
-                    .and_then(|text| text.strip_prefix("interaction-result/"))
-                    .unwrap_or("PASS");
+                let name = crate::block_use::events_interaction_name(host, &result)
+                    .unwrap_or_else(|| "PASS".to_owned());
                 if name != "PASS" {
-                    firing.interaction = Some(name.to_owned());
+                    firing.interaction = Some(name);
                     firing.cancelled = true;
                     run.stop = true;
                 }

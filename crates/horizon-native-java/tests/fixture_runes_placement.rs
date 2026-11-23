@@ -106,6 +106,9 @@ fn real_runes_altar_placement_uses_opposite_horizontal_look() {
         );
     }
     assert_eq!(host.unknown_host_call_count(), 0);
+    // Each placement's context snapshot ended with its call (#635).
+    assert_eq!(host.block_place_context_count(), 0);
+    assert_eq!(host.placement_array_count(), 0);
 
     // Under Placer::Unknown (the honest state until the SDK supplies placer identity),
     // Runes' getHorizontalDirection() call is counted rather than guessed.
@@ -120,4 +123,5 @@ fn real_runes_altar_placement_uses_opposite_horizontal_look() {
         "expected getHorizontalDirection unknown, got {:?}",
         host.unknown_host_calls()
     );
+    assert_eq!(host.block_place_context_count(), 0);
 }
