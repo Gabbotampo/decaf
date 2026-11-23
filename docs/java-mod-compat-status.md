@@ -204,7 +204,9 @@ python3 tools/hybrid_pack.py ~/horizon-corpus/corpus-helix \
   frames. A plan the weaver cannot carry stays skipped with a fixed label (`target-outside-jar`, `non-head-anchor`,
   `unsupported-family`, `cancellable`, `selector-modifier`, `not-in-config`, `other-side`, `config-plugin`,
   `constructor-target`, `unresolved`, `target-missing`, `ambiguous-target`, `listed-without-plan`, `weaver-rejected`,
-  `invalid-mixin` for a class real Mixin rejects whole, such as one with a `@Shadow`-prefixed field).
+  `invalid-mixin` for a class real Mixin rejects whole, such as one with a `@Shadow`-prefixed field or a
+  non-private static field, and `required-mixin-failed` when that class's config is `required`, so real
+  Mixin rethrows and the target class fails to load; a config omitting `required` is not required).
   The game uses the load-time weave only: a game-class target still has no class to rewrite, so a real jar reads
   `native-qualified`. With `HORIZON_JAVA_GAME_HOOKS=1` the loader plans with `plan_load_time_weave_with_game_hooks`
   instead, binds an `@Inject` for a game class to one of the 19 `GAME_HOOK_SITES` rows, and the game fires the

@@ -206,7 +206,8 @@ pub(crate) struct Tally {
     pub unlisted: usize,
     /// Game-class `@Inject` plans a hook point refused when they registered (a cancellable
     /// callback at a listen-only point, an anchor the point has no call site for): they never
-    /// run.
+    /// run. Also each target of a rejected mixin (`InvalidMixinException`) in a `required`
+    /// config: real Fabric fails that class's load, which this run does not do.
     pub refused: usize,
     /// Failure reasons, first line, with counts (at most 16 kept).
     pub failures: BTreeMap<String, usize>,
@@ -240,6 +241,7 @@ pub(crate) fn register(
             matches!(
                 plan.reason,
                 crate::runtime::MixinSkipReason::GameHookMismatch(_)
+                    | crate::runtime::MixinSkipReason::RequiredMixinFailed(_)
             ) || matches!(plan.reason, crate::runtime::MixinSkipReason::Unresolved)
                 && crate::runtime::every_game_hook_site().any(|site| {
                     site.target_owner == plan.target.owner

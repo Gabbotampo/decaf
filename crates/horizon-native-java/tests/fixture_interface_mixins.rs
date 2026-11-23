@@ -4532,6 +4532,65 @@ public abstract class CustomPrefixFieldMixin {
 }
 "#,
     );
+    // `validateField`'s other rules: a non-private static field without `@Shadow`
+    // (`@Unique` does not exempt it), and any non-shadow field of an interface mixin.
+    sources.insert(
+        "demo/PackageStaticMixin.java",
+        r#"package demo;
+import org.spongepowered.asm.mixin.Mixin;
+
+@Mixin(StaticTarget.class)
+public abstract class PackageStaticMixin {
+    static int calls;
+    public static int readCalls() { return calls; }
+}
+"#,
+    );
+    sources.insert(
+        "demo/UniquePublicStaticMixin.java",
+        r#"package demo;
+import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.Unique;
+
+@Mixin(StaticTarget.class)
+public abstract class UniquePublicStaticMixin {
+    @Unique public static int TOTAL = 3;
+}
+"#,
+    );
+    sources.insert(
+        "demo/Shape.java",
+        "package demo;\npublic interface Shape { int sides(); }\n",
+    );
+    sources.insert(
+        "demo/ShapeConstantMixin.java",
+        r#"package demo;
+import org.spongepowered.asm.mixin.Mixin;
+
+@Mixin(Shape.class)
+public interface ShapeConstantMixin {
+    int LIMIT = 4;
+}
+"#,
+    );
+    // The same rejection in a `required` config: Mixin rethrows, and the target class
+    // fails to load.
+    sources.insert(
+        "demo/RequiredTarget.java",
+        "package demo;\npublic class RequiredTarget {\n    public static int VALUE = 6;\n}\n",
+    );
+    sources.insert(
+        "demo/RequiredInvalidMixin.java",
+        r#"package demo;
+import net.minecraft.world.entity.player.Player;
+import org.spongepowered.asm.mixin.Mixin;
+
+@Mixin({RequiredTarget.class, Player.class})
+public abstract class RequiredInvalidMixin {
+    public static int exposed;
+}
+"#,
+    );
     sources.insert(
         "demo/PrefixedDuck.java",
         "package demo;\npublic interface PrefixedDuck { int prefixedExtra(); }\n",
@@ -4588,6 +4647,7 @@ public final class PrefixProbe {
     public static String hookIds = "";
     public static String readHookIds() { return hookIds; }
     public static int targetCount() { return StaticTarget.count; }
+    public static int requiredTargetValue() { return RequiredTarget.VALUE; }
     public static boolean isPrefixedDuck(Player p) { return ((Object) p) instanceof PrefixedDuck; }
     public static String ids(Player p) { return ((PrefixIds) (Object) p).prefixIds(); }
 }
@@ -4599,30 +4659,75 @@ public final class PrefixProbe {
         &[
             (
                 "fabric.mod.json",
-                r#"{"id":"shadowprefix","version":"1.0","mixins":["demo.mixins.json"]}"#,
+                r#"{"id":"shadowprefix","version":"1.0","mixins":["demo.mixins.json","required.mixins.json"]}"#,
             ),
+            // No `required`: Mixin's default is not required, so a rejected class drops.
             (
                 "demo.mixins.json",
-                r#"{"package":"demo","mixins":["PrefixedFieldMixin","CustomPrefixFieldMixin","UniquePrefixedDuckMixin","ShadowPrefixMethodMixin"]}"#,
+                r#"{"package":"demo","mixins":["PrefixedFieldMixin","CustomPrefixFieldMixin","UniquePrefixedDuckMixin","ShadowPrefixMethodMixin","PackageStaticMixin","UniquePublicStaticMixin","ShapeConstantMixin"]}"#,
+            ),
+            (
+                "required.mixins.json",
+                r#"{"required":true,"package":"demo","mixins":["RequiredInvalidMixin"]}"#,
             ),
         ],
         COMPILE_ONLY_STUBS,
     );
     let jar = NativeJar::from_path(&jar_path).unwrap();
 
-    // === 1. The plan: one `invalid-mixin` row per rejected class and target, nothing else ===
+    // === 1. The plan: one row per rejected class and target, nothing else. A config
+    // without `required` drops the class (`invalid-mixin`); a required one fails the
+    // target (`required-mixin-failed`) ===
     let weave = jar.plan_load_time_weave(MixinSide::Server);
-    for (mixin, target, field) in [
-        ("PrefixedFieldMixin", "demo/StaticTarget", "shadow$count"),
+    let prefix = |mixin: &str, field: &str| {
+        format!("@Shadow field demo.{mixin}.{field} has a shadow prefix. This is not allowed.")
+    };
+    let player = "net/minecraft/world/entity/player/Player";
+    for (mixin, targets, reason) in [
+        (
+            "PrefixedFieldMixin",
+            vec!["demo/StaticTarget"],
+            MixinSkipReason::InvalidMixin(prefix("PrefixedFieldMixin", "shadow$count")),
+        ),
         (
             "CustomPrefixFieldMixin",
-            "demo/StaticTarget",
-            "vanilla$count",
+            vec!["demo/StaticTarget"],
+            MixinSkipReason::InvalidMixin(prefix("CustomPrefixFieldMixin", "vanilla$count")),
         ),
         (
             "UniquePrefixedDuckMixin",
-            "net/minecraft/world/entity/player/Player",
-            "shadow$extra",
+            vec![player],
+            MixinSkipReason::InvalidMixin(prefix("UniquePrefixedDuckMixin", "shadow$extra")),
+        ),
+        (
+            "PackageStaticMixin",
+            vec!["demo/StaticTarget"],
+            MixinSkipReason::InvalidMixin(
+                "Mixin demo.PackageStaticMixin contains non-private static field calls:I".into(),
+            ),
+        ),
+        (
+            "UniquePublicStaticMixin",
+            vec!["demo/StaticTarget"],
+            MixinSkipReason::InvalidMixin(
+                "Mixin demo.UniquePublicStaticMixin contains non-private static field TOTAL:I"
+                    .into(),
+            ),
+        ),
+        (
+            "ShapeConstantMixin",
+            vec!["demo/Shape"],
+            MixinSkipReason::InvalidMixin(
+                "Interface mixin demo.ShapeConstantMixin contains a non-shadow field: LIMIT".into(),
+            ),
+        ),
+        (
+            "RequiredInvalidMixin",
+            vec![player, "demo/RequiredTarget"],
+            MixinSkipReason::RequiredMixinFailed(
+                "Mixin demo.RequiredInvalidMixin contains non-private static field exposed:I"
+                    .into(),
+            ),
         ),
     ] {
         let owner = format!("demo/{mixin}");
@@ -4631,13 +4736,24 @@ public final class PrefixProbe {
             .iter()
             .filter(|row| row.callback.owner == owner)
             .collect();
-        let detail =
-            format!("@Shadow field demo.{mixin}.{field} has a shadow prefix. This is not allowed.");
-        assert_eq!(rows.len(), 1, "{mixin}: {rows:?}");
-        assert_eq!(rows[0].target.owner, target);
-        assert_eq!(rows[0].reason, MixinSkipReason::InvalidMixin(detail));
-        assert_eq!(rows[0].reason.label(), "invalid-mixin");
+        let mut row_targets: Vec<_> = rows.iter().map(|row| row.target.owner.as_str()).collect();
+        row_targets.sort_unstable();
+        let mut wanted = targets.clone();
+        wanted.sort_unstable();
+        assert_eq!(row_targets, wanted, "{mixin}: {rows:?}");
+        assert!(
+            rows.iter().all(|row| row.reason == reason),
+            "{mixin}: {rows:?}"
+        );
     }
+    assert_eq!(
+        MixinSkipReason::RequiredMixinFailed(String::new()).label(),
+        "required-mixin-failed"
+    );
+    assert_eq!(
+        MixinSkipReason::InvalidMixin(String::new()).label(),
+        "invalid-mixin"
+    );
     assert!(
         weave
             .interface_mixins
@@ -4757,8 +4873,30 @@ public final class PrefixProbe {
         jar.invoke_method("demo.PrefixProbe", "targetCount", "()I", None, &mut host)
             .unwrap(),
         Value::Int(10),
-        "a rejected mixin's shadow write never reaches the target"
+        "a rejected mixin's shadow write never reaches the target, and a non-required \
+         config's rejection leaves the target loading normally"
     );
+    // A required config's rejection fails its jar target's load in real Fabric (Knot's
+    // "Mixin transformation of demo.RequiredTarget failed"): refused, every time.
+    for _ in 0..2 {
+        let refused = jar.invoke_method(
+            "demo.PrefixProbe",
+            "requiredTargetValue",
+            "()I",
+            None,
+            &mut host,
+        );
+        assert!(
+            matches!(
+                &refused,
+                Err(NativeError::Metadata(message))
+                    if message.contains("jar class demo/RequiredTarget fails to load")
+                        && message.contains("required.mixins.json")
+                        && message.contains("Mixin transformation of demo.RequiredTarget failed")
+            ),
+            "{refused:?}"
+        );
+    }
     let mut strict = StdHost::new()
         .with_environment_type("SERVER")
         .with_strict_unknown_host_calls();
@@ -4808,6 +4946,325 @@ public final class PrefixProbe {
     assert_eq!(
         hook_host.unknown_host_call_count(),
         0,
+        "{:?}",
+        hook_host.unknown_host_calls()
+    );
+}
+
+/// Static `@Shadow` methods never answer from their placeholder bodies. sponge-mixin
+/// 0.17.5 merges no body for a shadow and rewrites every `invokestatic M.method` (and a
+/// method handle naming it) to `Target.method`, its `@Shadow` prefix removed
+/// (`prepareShadow`); the target method must be one the target class itself declares,
+/// static (`findAliasedMethod`, "STATIC modifier ... does not match the target").
+///
+/// - a jar-local target runs its own method (direct calls, a method reference, and a
+///   call straight into the shadow);
+/// - a game target is the host's, as any static call to it is (`Identifier`'s factory
+///   is modelled; an unmodelled one counts);
+/// - no exact target (a missing method, a static-modifier mismatch, an ambiguous
+///   multi-target shadow) counts, or refuses on a strict host;
+/// - the same under `run_game_hook_in`.
+#[test]
+fn static_shadow_methods_call_their_target_never_the_placeholder() {
+    let mut sources = mixin_stubs();
+    sources.insert(
+        "net/minecraft/resources/Identifier.java",
+        r#"package net.minecraft.resources;
+public final class Identifier {
+    public static Identifier fromNamespaceAndPath(String namespace, String path) { return null; }
+}
+"#,
+    );
+    sources.insert(
+        "demo/MethodTarget.java",
+        r#"package demo;
+public class MethodTarget {
+    public static int twice(int v) { return v * 2; }
+    private static String secret() { return "target-secret"; }
+    public int halve(int v) { return v / 2; }
+}
+"#,
+    );
+    sources.insert(
+        "demo/StaticMethodShadowMixin.java",
+        r#"package demo;
+import java.util.function.IntUnaryOperator;
+import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.Shadow;
+
+@Mixin(MethodTarget.class)
+public abstract class StaticMethodShadowMixin {
+    @Shadow public static int twice(int v) { return -1; }
+    @Shadow private static String shadow$secret() { return "placeholder"; }
+
+    public static String report(int v) { return twice(v) + "," + shadow$secret(); }
+    public static int viaReference(int v) {
+        IntUnaryOperator op = StaticMethodShadowMixin::twice;
+        return op.applyAsInt(v);
+    }
+}
+"#,
+    );
+    // No exact target: each of these makes real Mixin reject its class, so each lives in
+    // a class of its own and its call counts.
+    sources.insert(
+        "demo/MissingShadowMethodMixin.java",
+        r#"package demo;
+import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.Shadow;
+
+@Mixin(MethodTarget.class)
+public abstract class MissingShadowMethodMixin {
+    @Shadow private static int missing() { return -2; }
+    public static int callMissing() { return missing(); }
+}
+"#,
+    );
+    sources.insert(
+        "demo/StaticMismatchShadowMixin.java",
+        r#"package demo;
+import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.Shadow;
+
+@Mixin(MethodTarget.class)
+public abstract class StaticMismatchShadowMixin {
+    @Shadow private static int halve(int v) { return -3; }
+    public static int callHalve() { return halve(8); }
+}
+"#,
+    );
+    sources.insert(
+        "demo/AmbiguousStaticMethodMixin.java",
+        r#"package demo;
+import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.world.entity.player.Player;
+import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.Shadow;
+
+@Mixin({ServerPlayer.class, Player.class})
+public abstract class AmbiguousStaticMethodMixin {
+    @Shadow private static int sharedStatic() { return -4; }
+    public static int callShared() { return sharedStatic(); }
+}
+"#,
+    );
+    sources.insert(
+        "demo/IdentifierShadowMixin.java",
+        r#"package demo;
+import net.minecraft.resources.Identifier;
+import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.Shadow;
+
+@Mixin(Identifier.class)
+public abstract class IdentifierShadowMixin {
+    @Shadow public static Identifier fromNamespaceAndPath(String namespace, String path) {
+        throw new AssertionError("placeholder");
+    }
+    @Shadow private static int unmodelledFactory() { return 77; }
+
+    public static String build() { return fromNamespaceAndPath("demo", "made").toString(); }
+    public static int callUnmodelled() { return unmodelledFactory(); }
+}
+"#,
+    );
+    sources.insert(
+        "demo/PlayerShadowMethodHookMixin.java",
+        r#"package demo;
+import net.minecraft.world.entity.player.Player;
+import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.injection.At;
+import org.spongepowered.asm.mixin.injection.Inject;
+import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
+
+@Mixin(Player.class)
+public abstract class PlayerShadowMethodHookMixin {
+    @Inject(method = "tick()V", at = @At("HEAD"))
+    private void onTick(CallbackInfo ci) {
+        ShadowMethodProbe.hookReport = StaticMethodShadowMixin.report(21) + ","
+            + StaticMethodShadowMixin.viaReference(5) + "," + IdentifierShadowMixin.build();
+        ShadowMethodProbe.hookMissing = MissingShadowMethodMixin.callMissing();
+    }
+}
+"#,
+    );
+    sources.insert(
+        "demo/ShadowMethodProbe.java",
+        r#"package demo;
+public final class ShadowMethodProbe {
+    public static String hookReport = "";
+    public static int hookMissing = -9;
+    public static String readHookReport() { return hookReport; }
+    public static int readHookMissing() { return hookMissing; }
+}
+"#,
+    );
+    let mut excluded = COMPILE_ONLY_STUBS.to_vec();
+    excluded.push("net/minecraft/resources/Identifier.class");
+    let jar_path = build_jar(
+        "static-shadow-methods",
+        sources,
+        &[
+            (
+                "fabric.mod.json",
+                r#"{"id":"staticshadowmethods","version":"1.0","mixins":["demo.mixins.json"]}"#,
+            ),
+            (
+                "demo.mixins.json",
+                r#"{"package":"demo","mixins":["StaticMethodShadowMixin","MissingShadowMethodMixin","StaticMismatchShadowMixin","AmbiguousStaticMethodMixin","IdentifierShadowMixin","PlayerShadowMethodHookMixin"]}"#,
+            ),
+        ],
+        &excluded,
+    );
+    let jar = NativeJar::from_path(&jar_path).unwrap();
+    let call_int = |class: &str, method: &str, desc: &str, args: &[Value], host: &mut StdHost| {
+        jar.invoke_method_with_args(class, method, desc, None, args, host)
+    };
+
+    // === 1. StdHost ===
+    let mut host = StdHost::new().with_environment_type("SERVER");
+    assert_eq!(
+        call_int(
+            "demo.StaticMethodShadowMixin",
+            "report",
+            "(I)Ljava/lang/String;",
+            &[Value::Int(21)],
+            &mut host
+        )
+        .unwrap(),
+        Value::Ref(Some("42,target-secret".into())),
+        "twice and shadow$secret are MethodTarget's, not the placeholders"
+    );
+    assert_eq!(
+        call_int(
+            "demo.StaticMethodShadowMixin",
+            "viaReference",
+            "(I)I",
+            &[Value::Int(5)],
+            &mut host
+        )
+        .unwrap(),
+        Value::Int(10),
+        "a method reference to the shadow is MethodTarget::twice"
+    );
+    assert_eq!(
+        call_int(
+            "demo.StaticMethodShadowMixin",
+            "twice",
+            "(I)I",
+            &[Value::Int(7)],
+            &mut host
+        )
+        .unwrap(),
+        Value::Int(14),
+        "a call straight into the shadow never runs its placeholder"
+    );
+    assert_eq!(
+        jar.invoke_method(
+            "demo.IdentifierShadowMixin",
+            "build",
+            "()Ljava/lang/String;",
+            None,
+            &mut host
+        )
+        .unwrap(),
+        Value::Ref(Some("demo:made".into())),
+        "a game target's static is the host's"
+    );
+    assert_eq!(
+        host.unknown_host_call_count(),
+        0,
+        "{:?}",
+        host.unknown_host_calls()
+    );
+    for (class, method, desc, args) in [
+        (
+            "demo.IdentifierShadowMixin",
+            "callUnmodelled",
+            "()I",
+            vec![],
+        ),
+        (
+            "demo.MissingShadowMethodMixin",
+            "callMissing",
+            "()I",
+            vec![],
+        ),
+        ("demo.StaticMismatchShadowMixin", "callHalve", "()I", vec![]),
+        (
+            "demo.AmbiguousStaticMethodMixin",
+            "callShared",
+            "()I",
+            vec![],
+        ),
+    ] {
+        let before = host.unknown_host_call_count();
+        assert_eq!(
+            call_int(class, method, desc, &args, &mut host).unwrap(),
+            Value::Int(0),
+            "{class}#{method} must not answer from the placeholder"
+        );
+        assert_eq!(
+            host.unknown_host_call_count(),
+            before + 1,
+            "{class}#{method}: {:?}",
+            host.unknown_host_calls()
+        );
+        let mut strict = StdHost::new()
+            .with_environment_type("SERVER")
+            .with_strict_unknown_host_calls();
+        assert!(
+            call_int(class, method, desc, &args, &mut strict).is_err(),
+            "{class}#{method} must refuse on a strict host"
+        );
+    }
+
+    // === 2. `run_game_hook_in` ===
+    let weave = jar.plan_load_time_weave_with_game_hooks(MixinSide::Server);
+    let registrations = jar.register_game_hooks(&weave).unwrap();
+    let mut hook_host = StdHost::new().with_environment_type("SERVER");
+    let mut ctx = GameHookContext::new();
+    let p = ctx.insert(
+        GameObject::player(3, "ShadowMethods")
+            .with_incarnation(1, 0)
+            .with_entity_id(42),
+    );
+    jar.run_game_hook_in(
+        &registrations,
+        &mut GameHookState::default(),
+        &mut ctx,
+        "java_base_player_tick_head",
+        Some(p),
+        &[],
+        &mut hook_host,
+        &ExecutionBudget::within(Duration::from_secs(5)),
+    )
+    .unwrap();
+    assert_eq!(
+        jar.invoke_method(
+            "demo.ShadowMethodProbe",
+            "readHookReport",
+            "()Ljava/lang/String;",
+            None,
+            &mut hook_host
+        )
+        .unwrap(),
+        Value::Ref(Some("42,target-secret,10,demo:made".into()))
+    );
+    assert_eq!(
+        jar.invoke_method(
+            "demo.ShadowMethodProbe",
+            "readHookMissing",
+            "()I",
+            None,
+            &mut hook_host
+        )
+        .unwrap(),
+        Value::Int(0),
+        "a missing shadow target counts in a hook too, never answers -2"
+    );
+    assert_eq!(
+        hook_host.unknown_host_call_count(),
+        1,
         "{:?}",
         hook_host.unknown_host_calls()
     );

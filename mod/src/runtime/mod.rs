@@ -806,9 +806,17 @@ pub enum MixinSkipReason {
     /// a weave could apply.
     ListedWithoutPlan,
     /// Real Mixin rejects the whole `@Mixin` class with `InvalidMixinException`
-    /// before applying it (for example a field carrying a `@Shadow` prefix), so
-    /// none of its members reach the target. Its bounded reason.
+    /// before applying it (for example a field carrying a `@Shadow` prefix), and
+    /// its config is not `required`: `MixinApplicatorStandard.apply` drops the
+    /// class and applies the target's other mixins, so none of its members reach
+    /// the target. Its bounded reason.
     InvalidMixin(String),
+    /// [`Self::InvalidMixin`] in a `required` config: `apply` rethrows, Mixin
+    /// raises `MixinApplyError`, and Fabric's Knot fails the target's class load
+    /// (`RuntimeException: Mixin transformation of <target> failed`). The game
+    /// does not run past that, so the plan is refused, not dropped. Its bounded
+    /// reason.
+    RequiredMixinFailed(String),
 }
 
 impl MixinSkipReason {
@@ -831,15 +839,17 @@ impl MixinSkipReason {
             Self::Weaver(_) => "weaver-rejected",
             Self::ListedWithoutPlan => "listed-without-plan",
             Self::InvalidMixin(_) => "invalid-mixin",
+            Self::RequiredMixinFailed(_) => "required-mixin-failed",
         }
     }
 
     /// The bounded sentence a reason carries, for the variants that do.
     pub fn detail(&self) -> Option<&str> {
         match self {
-            Self::Weaver(detail) | Self::GameHookMismatch(detail) | Self::InvalidMixin(detail) => {
-                Some(detail)
-            }
+            Self::Weaver(detail)
+            | Self::GameHookMismatch(detail)
+            | Self::InvalidMixin(detail)
+            | Self::RequiredMixinFailed(detail) => Some(detail),
             _ => None,
         }
     }
@@ -21014,6 +21024,10 @@ pub struct NativeJar {
     /// and game-hook dispatch share one gated evaluation without re-running plugins.
     server_config_plugins: Arc<std::sync::OnceLock<mixin_plugins::ConfigPlugins>>,
     client_config_plugins: Arc<std::sync::OnceLock<mixin_plugins::ConfigPlugins>>,
+    /// Cached jar classes a `required` config's rejected mixin fails, per physical
+    /// side ([`NativeJar::failed_required_targets`]).
+    server_failed_required_targets: Arc<std::sync::OnceLock<BTreeMap<String, String>>>,
+    client_failed_required_targets: Arc<std::sync::OnceLock<BTreeMap<String, String>>>,
 }
 
 /// Zero-length array backing a host answer such as `Thread.getStackTrace`
@@ -21244,7 +21258,13 @@ pub struct MixinConfig {
     pub client: Vec<String>,
     /// `server` entries, package-qualified, in declaration order.
     pub server: Vec<String>,
-    /// Mixin's `required` flag; true when the config omits it.
+    /// Mixin's `required` flag; false when the config omits it.
+    ///
+    /// sponge-mixin 0.17.5 (`MixinConfig.onLoad`): `required = requiredValue != null
+    /// && requiredValue && !mixin.ignoreRequired`. It decides what an
+    /// `InvalidMixinException` does: a required config's failure is rethrown and
+    /// fails the target class, any other is dropped with a warning
+    /// ([`MixinSkipReason::RequiredMixinFailed`] / [`MixinSkipReason::InvalidMixin`]).
     pub required: bool,
     /// Mixin's `priority`; absent when the config omits it.
     pub priority: Option<i32>,
@@ -37310,6 +37330,10 @@ impl<H: Host> Runtime<'_, H> {
                 }
             };
         }
+        // A static `@Shadow` method's body is a placeholder Mixin never merges.
+        if let Some(value) = self.invoke_static_shadow_body(class, &target, args)? {
+            return Ok(value);
+        }
         // A `static` accessor in a Mixin interface has a placeholder body that
         // only throws; Mixin generates the real one. Run the generated contract
         // instead of the placeholder.
@@ -38579,7 +38603,9 @@ impl<H: Host> Runtime<'_, H> {
                             ));
                         }
                     }
-                    let r = file.method_ref(i)?;
+                    let mut r = file.method_ref(i)?;
+                    // Mixin's rewrite of a static `@Shadow` call to its target.
+                    self.rewrite_static_shadow_call(op, &mut r);
                     let n = arg_count(&r.descriptor);
                     let mut args = (0..n)
                         .map(|_| pop(&mut stack, class, method, at))
@@ -41061,6 +41087,27 @@ fn mixin_config_gate(
     })
 }
 
+/// The first config that applies `@Mixin` class `class` on `side`, as
+/// [`mixin_config_gate`] finds it.
+pub(crate) fn listing_mixin_config<'a>(
+    configs: &'a [MixinConfig],
+    config_sides: &BTreeMap<String, MixinSide>,
+    class: &str,
+    side: MixinSide,
+) -> Option<&'a MixinConfig> {
+    let binary = class.replace('/', ".");
+    configs.iter().find(|config| {
+        let here = match side {
+            MixinSide::Client => &config.client,
+            MixinSide::Server => &config.server,
+        };
+        (config.mixins.contains(&binary) || here.contains(&binary))
+            && config_sides
+                .get(&config.path)
+                .is_none_or(|only| *only == side)
+    })
+}
+
 /// Whether any readable config lists one `@Mixin` class, on either side.
 ///
 /// The side-agnostic interpreter entry has no physical side to split
@@ -41432,10 +41479,11 @@ fn parse_mixin_config(path: &str, bytes: &[u8]) -> Result<MixinConfig, String> {
         mixins,
         client,
         server,
+        // Mixin's default is not required (see `MixinConfig::required`).
         required: object
             .get("required")
             .and_then(serde_json::Value::as_bool)
-            .unwrap_or(true),
+            .unwrap_or(false),
         priority: object
             .get("priority")
             .and_then(serde_json::Value::as_i64)
@@ -45387,8 +45435,8 @@ mandatory = true
             "only root-level configs are discovered without metadata"
         );
         assert_eq!(configs[0].mixins, ["demo.AutoMixin"]);
-        // Mixin's defaults: required unless declared, no priority.
-        assert!(configs[0].required);
+        // Mixin's defaults: not required unless declared, no priority.
+        assert!(!configs[0].required);
         assert_eq!(configs[0].priority, None);
         assert!(jar.mixin_config_errors().is_empty());
         let warnings = jar.mixin_config_warnings();

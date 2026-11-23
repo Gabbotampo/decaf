@@ -47,6 +47,11 @@
 //!   target erroneous. Mixins on host-modelled game classes (whose initializers ran
 //!   in the game, not here) and multi-target mixins keep their own initialization.
 //!
+//! * A jar class a rejected mixin (`InvalidMixinException`) of a `required` Mixin
+//!   config targets never loads in real Fabric: Mixin rethrows, and Knot fails the
+//!   class load with `RuntimeException: Mixin transformation of <class> failed`.
+//!   Its initialization is refused here (a later load's behavior is not modelled).
+//!
 //! The state lives in the runtime's initialized-class set, which the host
 //! persists between entrypoints and callbacks. An erroneous class is recorded
 //! there under a key no internal class name can collide with (it starts with a
@@ -165,6 +170,7 @@ impl<H: Host> Runtime<'_, H> {
         if let Some(target) = self.merged_initializer_owner(class) {
             return self.ensure_initialized(&target);
         }
+        self.refuse_failed_mixin_target(class)?;
         if let Some(cause) = self.erroneous_cause(class) {
             return Err(erroneous_access(class, &cause));
         }
@@ -320,6 +326,20 @@ impl<H: Host> Runtime<'_, H> {
         }
         self.merged_initializer_target(class)
             .filter(|target| target != class)
+    }
+
+    /// Refuse a jar class a `required` Mixin config's rejected mixin targets (module
+    /// docs): real Fabric fails its class load with a `RuntimeException` from Knot, and
+    /// what a later load does is not modelled, so this is a refusal, not a Java throw.
+    #[inline(never)]
+    fn refuse_failed_mixin_target(&self, class: &str) -> Result<(), NativeError> {
+        match self.required_mixin_failure(class) {
+            Some(reason) => Err(NativeError::Metadata(format!(
+                "jar class {class} fails to load: {reason}; Mixin rethrows for a required config and Fabric's Knot throws \"Mixin transformation of {} failed\"",
+                class.replace('/', ".")
+            ))),
+            None => Ok(()),
+        }
     }
 
     /// The `<clinit>` of every mixin Mixin appends to `class`'s, in apply order, after

@@ -37,12 +37,14 @@ use crate::{
     return_desc,
 };
 
+const ACC_PUBLIC: u16 = 0x0001;
 const ACC_PRIVATE: u16 = 0x0002;
 const ACC_STATIC: u16 = 0x0008;
 const ACC_FINAL: u16 = 0x0010;
 const ACC_INTERFACE: u16 = 0x0200;
 const ACC_ABSTRACT: u16 = 0x0400;
 const ACC_SYNTHETIC: u16 = 0x1000;
+const ACC_ENUM: u16 = 0x4000;
 
 /// `@Mutable`: on a `@Shadow` field, `MixinApplicatorStandard.mergeShadowFields`
 /// clears `ACC_FINAL` from the target field (sponge-mixin 0.17.5, `isDecoratedMutable`).
@@ -205,6 +207,21 @@ pub(crate) enum StaticShadowWrite {
     /// A host-modelled game field: its flags are not known here. A write is never
     /// applied to the game, so it is counted or refused whatever they are.
     HostField,
+}
+
+/// Where a call to a `@Mixin` class's static `@Shadow` method goes
+/// ([`Runtime::resolve_static_shadow_method`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum StaticShadowCall {
+    /// Not a static `@Shadow` method: the method runs as declared.
+    NotShadow,
+    /// The target method the merged class calls instead: Mixin rewrites `M.method` to
+    /// `Target.method` (its `@Shadow` prefix removed) and drops the placeholder body.
+    Target(MethodRef),
+    /// No exact answer (a rejected mixin, an ambiguous multi-target shadow, or a
+    /// jar-local target that does not declare the method as static): counted or refused,
+    /// never answered from the placeholder body.
+    Unresolved,
 }
 
 /// The JVM's verdict on a `putstatic` of a `final` jar field
@@ -625,6 +642,9 @@ pub(crate) struct RuntimeMixinState {
     plugins: ConfigPlugins,
     side: Option<MixinSide>,
     require_config: bool,
+    /// Jar classes a `required` config's rejected mixin fails to load, with why
+    /// ([`NativeJar::failed_required_targets`]).
+    failed_required_targets: BTreeMap<String, String>,
     index: OnceCell<RuntimeMixinIndex>,
 }
 
@@ -643,6 +663,7 @@ impl RuntimeMixinState {
             plugins: jar.cached_config_plugins(side).clone(),
             side: Some(side),
             require_config: true,
+            failed_required_targets: jar.failed_required_targets(side).clone(),
             index: OnceCell::new(),
         }
     }
@@ -657,6 +678,7 @@ impl RuntimeMixinState {
             plugins: ConfigPlugins::default(),
             side: None,
             require_config: false,
+            failed_required_targets: BTreeMap::new(),
             index: OnceCell::new(),
         }
     }
@@ -777,25 +799,93 @@ pub(crate) fn shadow_method_target_name(
 }
 
 /// Why sponge-mixin 0.17.5 rejects `class` with `InvalidMixinException` before
-/// applying it to any target, for the rules that need nothing but the class itself.
+/// applying it to any target, for the rules that need nothing but the class itself:
+/// the `validateField` check `attachFields` runs on every field (shadow or not).
 ///
-/// `MixinPreProcessorStandard.validateField` (run from `attachFields` for every field,
-/// shadow or not): a field whose name starts with its `@Shadow` prefix (the
-/// annotation's `prefix`, else `shadow$`) is "a shadow prefix. This is not allowed."
-/// Prefixes rename shadow *methods* only; a prefixed field is an error. The exception
-/// drops the whole mixin from the target (`MixinApplicatorStandard.apply` removes it,
-/// or rethrows for a `required` config, failing the target class).
+/// Which preprocessor runs depends on `MixinInfo.getVariant`:
+/// - a class (`MixinPreProcessorStandard.validateField`): a static field that is
+///   neither `private`, synthetic nor `@Shadow` is "non-private static" (`@Unique` does
+///   not exempt it); then any field whose name starts with its `@Shadow` prefix (the
+///   annotation's `prefix`, else `shadow$`) has "a shadow prefix". Prefixes rename
+///   shadow *methods* only;
+/// - an interface (`MixinPreProcessorInterface`, also used for accessor mixins): every
+///   field must be `public static final`, a `@Shadow`, not `@Mutable`, and unprefixed;
+/// - an enum (`MixinPreProcessorEnumExtension`): its enum constants answer to a
+///   separate annotation rule this runtime does not model; every other field takes the
+///   class rules.
+///
+/// The exception drops the whole mixin from the target (`MixinApplicatorStandard.apply`
+/// removes it, or rethrows for a `required` config, failing the target class). Mixin
+/// reads only visible annotations; jars built against `CLASS`-retained stubs carry
+/// `@Shadow` invisibly, and this runtime reads both, as everywhere else.
 fn invalid_mixin_reason(class: &ClassFile, field_anns: &MemberAnnotationValues) -> Option<String> {
+    let mixin = class.name.replace('/', ".");
+    let access = class_access(class).unwrap_or(0);
+    let is_interface = access & ACC_INTERFACE != 0;
+    let is_enum = access & ACC_ENUM != 0;
+    let own_type = format!("L{};", class.name);
     class.fields.iter().find_map(|field| {
         let anns = field_anns.get(&format!("{}|{}", field.name, field.descriptor));
+        let is_shadow = has_annotation_value(anns, MIXIN_SHADOW_DESCRIPTOR);
+        if is_enum && field.access & ACC_ENUM != 0 && field.descriptor == own_type {
+            return None;
+        }
+        if is_interface {
+            if field.access & (ACC_PUBLIC | ACC_STATIC | ACC_FINAL)
+                != ACC_PUBLIC | ACC_STATIC | ACC_FINAL
+            {
+                return Some(format!(
+                    "Interface mixin contains an illegal field! Found {} {} in {mixin}",
+                    field_modifiers(field.access),
+                    field.name
+                ));
+            }
+            if !is_shadow {
+                return Some(format!(
+                    "Interface mixin {mixin} contains a non-shadow field: {}",
+                    field.name
+                ));
+            }
+            if has_annotation_value(anns, MIXIN_MUTABLE_DESCRIPTOR) {
+                return Some(format!(
+                    "@Shadow field {mixin}.{} is marked as mutable. This is not allowed.",
+                    field.name
+                ));
+            }
+        } else if field.is_static()
+            && field.access & (ACC_PRIVATE | ACC_SYNTHETIC) == 0
+            && !is_shadow
+        {
+            return Some(format!(
+                "Mixin {mixin} contains non-private static field {}:{}",
+                field.name, field.descriptor
+            ));
+        }
         field.name.starts_with(shadow_prefix(anns)).then(|| {
             format!(
-                "@Shadow field {}.{} has a shadow prefix. This is not allowed.",
-                class.name.replace('/', "."),
+                "@Shadow field {mixin}.{} has a shadow prefix. This is not allowed.",
                 field.name
             )
         })
     })
+}
+
+/// `java.lang.reflect.Modifier.toString` for a field's access flags.
+fn field_modifiers(access: u16) -> String {
+    [
+        (ACC_PUBLIC, "public"),
+        (0x0004, "protected"),
+        (ACC_PRIVATE, "private"),
+        (ACC_STATIC, "static"),
+        (ACC_FINAL, "final"),
+        (0x0080, "transient"),
+        (0x0040, "volatile"),
+    ]
+    .iter()
+    .filter(|(flag, _)| access & flag != 0)
+    .map(|(_, word)| *word)
+    .collect::<Vec<_>>()
+    .join(" ")
 }
 
 fn is_planned_method_annotation(descriptor: &str) -> bool {
@@ -1125,10 +1215,12 @@ impl NativeJar {
     }
 
     /// One row per target of every `@Mixin` class real Mixin rejects with
-    /// `InvalidMixinException` ([`invalid_mixin_reason`]): `invalid-mixin` where the
-    /// config (and, for the hook tier, its plugin) would apply the class, else the gate's
-    /// own reason. Returns the rejected classes, whose plans of every family the weave
-    /// then leaves out: Mixin drops the whole class, not single members.
+    /// `InvalidMixinException` ([`invalid_mixin_reason`]): where the config (and, for the
+    /// hook tier, its plugin) would apply the class, `invalid-mixin` when the config is
+    /// not `required` (Mixin drops the class) and `required-mixin-failed` when it is
+    /// (Mixin rethrows and the target fails to load); else the gate's own reason. Returns
+    /// the rejected classes, whose plans of every family the weave then leaves out:
+    /// Mixin drops the whole class, not single members.
     pub(crate) fn invalid_mixin_rows(
         &self,
         side: MixinSide,
@@ -1148,6 +1240,9 @@ impl NativeJar {
             let Some(detail) = details.invalid else {
                 continue;
             };
+            let required = crate::listing_mixin_config(configs, config_sides, &details.mixin, side)
+                .is_some_and(|config| config.required);
+            let detail = crate::bounded_weave_reason(&detail);
             for target in &details.targets {
                 let gate = match plugins {
                     Some(plugins) => self.game_hook_config_gate(
@@ -1165,13 +1260,65 @@ impl NativeJar {
                     callback: class_ref(&details.mixin),
                     at: "@Mixin".to_owned(),
                     reason: gate.err().unwrap_or_else(|| {
-                        MixinSkipReason::InvalidMixin(crate::bounded_weave_reason(&detail))
+                        if required {
+                            MixinSkipReason::RequiredMixinFailed(detail.clone())
+                        } else {
+                            MixinSkipReason::InvalidMixin(detail.clone())
+                        }
                     }),
                 });
             }
             rejected.insert(details.mixin);
         }
         rejected
+    }
+
+    /// The jar classes a `required` config's rejected mixin fails on `side`, each with
+    /// why: Mixin rethrows the `InvalidMixinException` (`MixinApplicatorStandard.apply`),
+    /// and Fabric's Knot turns it into `RuntimeException: Mixin transformation of
+    /// <target> failed` from the class load. What a later load of that class does then
+    /// is not modelled, so the runtime refuses the class instead
+    /// ([`Runtime::required_mixin_failure`]). Cached per side.
+    pub(crate) fn failed_required_targets(&self, side: MixinSide) -> &BTreeMap<String, String> {
+        let slot = match side {
+            MixinSide::Server => &self.server_failed_required_targets,
+            MixinSide::Client => &self.client_failed_required_targets,
+        };
+        slot.get_or_init(|| {
+            let configs = self.mixin_configs();
+            let config_sides = self.mixin_config_sides();
+            let mut failed = BTreeMap::new();
+            for class in self.classes.values() {
+                if mixin_annotations(class).is_empty() {
+                    continue;
+                }
+                let Some(details) = inspect_mixin_class(class, |name| self.classes.get(name))
+                else {
+                    continue;
+                };
+                let Some(detail) = details.invalid else {
+                    continue;
+                };
+                let Some(config) =
+                    crate::listing_mixin_config(&configs, &config_sides, &details.mixin, side)
+                        .filter(|config| config.required)
+                else {
+                    continue;
+                };
+                for target in details.targets {
+                    if self.classes.contains_key(&target) {
+                        failed.entry(target).or_insert_with(|| {
+                            format!(
+                                "required Mixin config {} rejects {}: {detail}",
+                                config.path,
+                                details.mixin.replace('/', ".")
+                            )
+                        });
+                    }
+                }
+            }
+            failed
+        })
     }
 
     /// Plan interface-injection mixins for [`NativeJar::plan_load_time_weave`] /
@@ -1925,6 +2072,117 @@ impl<H: Host> Runtime<'_, H> {
         }
     }
 
+    /// Resolve a call to static method `name descriptor` of `owner` when it is a `@Mixin`
+    /// class's static `@Shadow` method.
+    ///
+    /// A static `@Shadow` method needs a body to compile, but it is only a placeholder:
+    /// Mixin merges no body for it and rewrites every `invokestatic M.method` to
+    /// `Target.method`, with the `@Shadow` prefix removed (`prepareShadow`). The target
+    /// method must be one the target class itself declares with the same descriptor and
+    /// `static` modifier (`TargetClassContext.findAliasedMethod`, then "STATIC modifier of
+    /// ... does not match the target" in `attachSpecialMethod`), else Mixin rejects the
+    /// class. A host-modelled game target is the host's to answer, as any static call to
+    /// it is.
+    #[inline(never)]
+    pub(crate) fn resolve_static_shadow_method(
+        &self,
+        owner: &str,
+        name: &str,
+        descriptor: &str,
+    ) -> StaticShadowCall {
+        // Cheap checks first: this runs at every `invokestatic`.
+        let Some(file) = self.class(owner) else {
+            return StaticShadowCall::NotShadow;
+        };
+        if !file
+            .annotations
+            .iter()
+            .any(|annotation| annotation.descriptor == crate::MIXIN_ANNOTATION_DESCRIPTOR)
+            || !file
+                .method(name, descriptor)
+                .is_some_and(|method| method.is_static())
+        {
+            return StaticShadowCall::NotShadow;
+        }
+        let (target, target_name) = {
+            let index = self.runtime_mixin_index();
+            let Some(meta) = index.meta.get(owner) else {
+                return StaticShadowCall::NotShadow;
+            };
+            let Some(target_name) = meta
+                .shadow_methods
+                .get(&(name.to_owned(), descriptor.to_owned()))
+            else {
+                return StaticShadowCall::NotShadow;
+            };
+            if meta.invalid.is_some() {
+                return StaticShadowCall::Unresolved;
+            }
+            let Some(target) = resolve_shadow_target(&meta.targets, &[]) else {
+                return StaticShadowCall::Unresolved;
+            };
+            (target.to_owned(), target_name.clone())
+        };
+        if let Some(target_file) = self.class(&target)
+            && !target_file
+                .method(&target_name, descriptor)
+                .is_some_and(|method| method.is_static())
+        {
+            return StaticShadowCall::Unresolved;
+        }
+        StaticShadowCall::Target(MethodRef {
+            owner: target,
+            name: target_name,
+            descriptor: descriptor.to_owned(),
+        })
+    }
+
+    /// Rewrite an `invokestatic` of a static `@Shadow` method to its target, as Mixin
+    /// rewrites the merged bytecode, so the call then takes the ordinary path of a call
+    /// to that target ([`Self::resolve_static_shadow_method`]). An unresolved shadow is
+    /// left for [`Self::invoke_static_shadow_body`] to count.
+    #[inline(never)]
+    pub(crate) fn rewrite_static_shadow_call(&self, op: u8, r: &mut MethodRef) {
+        if op != 0xb8 {
+            return;
+        }
+        if let StaticShadowCall::Target(target) =
+            self.resolve_static_shadow_method(&r.owner, &r.name, &r.descriptor)
+        {
+            *r = target;
+        }
+    }
+
+    /// Never run a static `@Shadow` method's placeholder body: a frame about to run one
+    /// (reached through a method reference, a handle, or an unresolved call site) calls
+    /// the target instead, or counts the call when there is no exact target.
+    #[inline(never)]
+    pub(crate) fn invoke_static_shadow_body(
+        &mut self,
+        class: &str,
+        method: &crate::Method,
+        args: &[Value],
+    ) -> Result<Option<Value>, NativeError> {
+        if !method.is_static() {
+            return Ok(None);
+        }
+        match self.resolve_static_shadow_method(class, &method.name, &method.descriptor) {
+            StaticShadowCall::NotShadow => Ok(None),
+            StaticShadowCall::Unresolved => {
+                self.host.unknown_operand_call(&MethodRef {
+                    owner: class.to_owned(),
+                    name: method.name.clone(),
+                    descriptor: method.descriptor.clone(),
+                })?;
+                Ok(Some(Value::default_for(return_desc(&method.descriptor))))
+            }
+            StaticShadowCall::Target(target) if self.has_class(&target.owner) => self
+                .invoke(&target.owner, &target.name, &target.descriptor, None, args)
+                .map(Some),
+            StaticShadowCall::Target(target) => self.host.invoke(&target, args).map(Some),
+        }
+    }
+
     /// How a `putstatic` of jar field `field` (declared by `declaring` with `access`) is
     /// judged: [`StaticShadowWrite::Writable`] unless the field is `ACC_FINAL` and no
     /// applied `@Shadow @Mutable` cleared that flag.
@@ -1974,6 +2232,16 @@ impl<H: Host> Runtime<'_, H> {
             })
             .cloned()
             .collect()
+    }
+
+    /// Why jar class `class` cannot load, when a `required` Mixin config's rejected mixin
+    /// targets it: Mixin rethrows the `InvalidMixinException` and Fabric's Knot fails the
+    /// class load ([`NativeJar::failed_required_targets`]).
+    pub(crate) fn required_mixin_failure(&self, class: &str) -> Option<&str> {
+        self.mixin_index
+            .failed_required_targets
+            .get(class)
+            .map(String::as_str)
     }
 
     /// The one jar class whose static initialiser absorbs `class`'s, when `class` is a

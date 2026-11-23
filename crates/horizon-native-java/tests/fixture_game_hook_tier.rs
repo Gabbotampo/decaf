@@ -1077,10 +1077,11 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
 @Mixin(ServerPlayer.class)
 public abstract class CollMixin {
-    static Object prev;
-    static final Set<Object> KEPT = new HashSet<>();
-    static final Map<Object, Integer> COUNT = new HashMap<>();
-    static final Map<Object, Integer> IDS = new IdentityHashMap<>();
+    // `private`: sponge-mixin 0.17.5 rejects a mixin with a non-private static field.
+    private static Object prev;
+    private static final Set<Object> KEPT = new HashSet<>();
+    private static final Map<Object, Integer> COUNT = new HashMap<>();
+    private static final Map<Object, Integer> IDS = new IdentityHashMap<>();
     private int[] ticks = new int[1];
 
     @Inject(method = "tick", at = @At("TAIL"))

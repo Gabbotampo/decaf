@@ -185,9 +185,10 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
 @Mixin(PlayerList.class)
 public class LoginMixin {
-    static final CustomPacketPayload.Type<?> SYNC =
+    // `private`: sponge-mixin 0.17.5 rejects a mixin with a non-private static field.
+    private static final CustomPacketPayload.Type<?> SYNC =
         new CustomPacketPayload.Type<>(Identifier.fromNamespaceAndPath("demo", "sync"));
-    static final CustomPacketPayload.Type<?> OTHER =
+    private static final CustomPacketPayload.Type<?> OTHER =
         new CustomPacketPayload.Type<>(Identifier.fromNamespaceAndPath("demo", "other"));
 
     @Inject(method = "placeNewPlayer", at = @At("TAIL"))
