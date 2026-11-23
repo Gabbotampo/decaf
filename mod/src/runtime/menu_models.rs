@@ -22,6 +22,13 @@ pub(crate) const ITEM_COMBINER_MENU: &str = "net/minecraft/world/inventory/ItemC
 pub(crate) const MENU_TYPE: &str = "net/minecraft/world/inventory/MenuType";
 pub(crate) const SLOT: &str = "net/minecraft/world/inventory/Slot";
 pub(crate) const INVENTORY: &str = "net/minecraft/world/entity/player/Inventory";
+pub(crate) const SIMPLE_MENU_PROVIDER: &str = "net/minecraft/world/SimpleMenuProvider";
+pub(crate) const MENU_PROVIDER: &str = "net/minecraft/world/MenuProvider";
+pub(crate) const MENU_CONSTRUCTOR: &str = "net/minecraft/world/inventory/MenuConstructor";
+pub(crate) const CONTAINER_LEVEL_ACCESS: &str =
+    "net/minecraft/world/inventory/ContainerLevelAccess";
+pub(crate) const CONTAINER_LEVEL_ACCESS_2: &str =
+    "net/minecraft/world/inventory/ContainerLevelAccess$2";
 
 /// `ItemStack.EMPTY`'s key, as the client surface answers the static (`client_surface.rs`).
 const EMPTY_STACK: &str = "client/stack/empty";
@@ -188,6 +195,23 @@ pub enum MenuAction {
         container_id: Value,
         inventory: Value,
     },
+    MenuConstructor {
+        constructor: Value,
+        container_id: Value,
+        inventory: Value,
+        player: Value,
+    },
+    AccessEvaluate {
+        function: Value,
+        level: Value,
+        pos: Value,
+        default: Option<Value>,
+    },
+    AccessExecute {
+        consumer: Value,
+        level: Value,
+        pos: Value,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -196,6 +220,14 @@ pub(crate) enum Object {
     MenuType {
         constructor: Value,
         required_features: Value,
+    },
+    SimpleMenuProvider {
+        menu_constructor: Value,
+        title: Value,
+    },
+    ContainerLevelAccess {
+        level: Value,
+        pos: Value,
     },
     Screen(ScreenState),
     Inventory {
@@ -365,6 +397,37 @@ pub(crate) fn menu_combiner_access(states: &States, menu: &Value) -> Option<Valu
     let key = expect_ref(menu)?;
     match states.get(key) {
         Some(Object::Menu(state)) => state.combiner.as_ref().map(|c| c.access.clone()),
+        _ => None,
+    }
+}
+
+pub(crate) fn alloc_simple_menu_provider(next_id: &mut u64) -> Value {
+    marker(next_key(next_id, SIMPLE_MENU_PROVIDER))
+}
+
+pub(crate) fn allocate_inventory(states: &mut States, next_id: &mut u64, player: Value) -> Value {
+    let key = next_key(next_id, INVENTORY);
+    states.insert(key.clone(), Object::Inventory { player });
+    marker(key)
+}
+
+pub(crate) fn simple_menu_provider_constructor(states: &States, provider: &Value) -> Option<Value> {
+    let key = expect_ref(provider)?;
+    match states.get(key) {
+        Some(Object::SimpleMenuProvider {
+            menu_constructor, ..
+        }) => Some(menu_constructor.clone()),
+        _ => None,
+    }
+}
+
+pub(crate) fn container_level_access_pos(states: &States, access: &Value) -> Option<[i32; 3]> {
+    let key = expect_ref(access)?;
+    match states.get(key) {
+        Some(Object::ContainerLevelAccess { pos, .. }) => {
+            let pos_key = crate::runtime::game_object::handle_key(pos)?;
+            crate::runtime::server_values::block_pos(pos_key)
+        }
         _ => None,
     }
 }
@@ -606,7 +669,11 @@ pub(crate) fn is_menu_class(owner: &str) -> bool {
             | "net/minecraft/world/Container"
             | SLOT
             | INVENTORY
-            | "net/minecraft/world/inventory/ContainerLevelAccess"
+            | SIMPLE_MENU_PROVIDER
+            | MENU_PROVIDER
+            | MENU_CONSTRUCTOR
+            | CONTAINER_LEVEL_ACCESS
+            | CONTAINER_LEVEL_ACCESS_2
             | "java/util/function/Predicate"
             | SCREEN
             | ABSTRACT_CONTAINER_SCREEN
@@ -995,8 +1062,26 @@ pub(crate) fn static_call(
     states: &mut States,
     next_id: &mut u64,
     r: &MethodRef,
-    _args: &[Value],
+    args: &[Value],
 ) -> Option<Result<Value, NativeError>> {
+    if r.owner == CONTAINER_LEVEL_ACCESS
+        && r.name == "create"
+        && r.descriptor
+            == "(Lnet/minecraft/world/level/Level;Lnet/minecraft/core/BlockPos;)Lnet/minecraft/world/inventory/ContainerLevelAccess;"
+    {
+        let [level, pos] = args else {
+            return None;
+        };
+        let key = next_key(next_id, CONTAINER_LEVEL_ACCESS_2);
+        states.insert(
+            key.clone(),
+            Object::ContainerLevelAccess {
+                level: level.clone(),
+                pos: pos.clone(),
+            },
+        );
+        return Some(Ok(marker(key)));
+    }
     if r.owner == "net/minecraft/world/inventory/ItemCombinerMenuSlotDefinition"
         && r.name == "create"
     {
@@ -1038,6 +1123,50 @@ pub(crate) fn take_action(states: &mut States) -> Option<MenuAction> {
 
 pub(crate) fn keyed_text(states: &States, key: &str) -> Option<String> {
     states.get(key).map(|object| format!("{object:?}"))
+}
+
+/// Default vanilla `Container.getMaxStackSize()` in Minecraft 26.3 (`Container.DEFAULT_MAX_STACK_SIZE`).
+pub(crate) const DEFAULT_CONTAINER_MAX_STACK_SIZE: i32 = 99;
+
+/// How `SimpleContainer.setItem` should clamp the placed stack:
+/// - `ContainerMax(n)` computes `min(n, stack.getMaxStackSize())` (vanilla `Container.getMaxStackSize(ItemStack)`).
+/// - `Exact(limit)` uses the value returned by a mod subclass's overridden `getMaxStackSize(ItemStack)`.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum ContainerClamp {
+    ContainerMax(i32),
+    Exact(i32),
+}
+
+pub(crate) trait StackOps {
+    fn is_empty(&self, value: &Value) -> Option<bool>;
+    fn max_stack_size(&self, value: &Value) -> Option<i32>;
+    fn clamp_for_container(&mut self, value: &Value, container_max: i32) -> Option<()>;
+    fn clamp_exact(&mut self, value: &Value, limit: i32) -> Option<()>;
+    fn take_pending_clamp(&mut self) -> Option<ContainerClamp> {
+        None
+    }
+}
+
+#[cfg(test)]
+struct EmptyOnlyStacks;
+
+#[cfg(test)]
+impl StackOps for EmptyOnlyStacks {
+    fn is_empty(&self, value: &Value) -> Option<bool> {
+        (*value == empty_stack()).then_some(true)
+    }
+
+    fn max_stack_size(&self, value: &Value) -> Option<i32> {
+        (*value == empty_stack()).then_some(1)
+    }
+
+    fn clamp_for_container(&mut self, value: &Value, _max: i32) -> Option<()> {
+        (*value == empty_stack()).then_some(())
+    }
+
+    fn clamp_exact(&mut self, value: &Value, _limit: i32) -> Option<()> {
+        (*value == empty_stack()).then_some(())
+    }
 }
 
 fn inventory_display_name(
@@ -1153,15 +1282,24 @@ pub(crate) fn call(
     receiver: &Value,
     args: &[Value],
 ) -> Option<Result<Value, NativeError>> {
-    call_with_client_player(states, next_id, r, receiver, args, None)
+    call_with_stacks_and_client_player(
+        states,
+        next_id,
+        r,
+        receiver,
+        args,
+        &mut EmptyOnlyStacks,
+        None,
+    )
 }
 
-pub(crate) fn call_with_client_player(
+pub(crate) fn call_with_stacks_and_client_player(
     states: &mut States,
     next_id: &mut u64,
     r: &MethodRef,
     receiver: &Value,
     args: &[Value],
+    stacks: &mut dyn StackOps,
     client_player: Option<Value>,
 ) -> Option<Result<Value, NativeError>> {
     let key = expect_ref(receiver)?.to_owned();
@@ -1396,9 +1534,7 @@ pub(crate) fn call_with_client_player(
         }
     }
 
-    if r.owner == "net/minecraft/world/inventory/ContainerLevelAccess"
-        && key == "container-level-access/null"
-    {
+    if r.owner == CONTAINER_LEVEL_ACCESS && key == "container-level-access/null" {
         if r.name == "execute" && r.descriptor == "(Ljava/util/function/BiConsumer;)V" {
             return Some(Ok(Value::Void));
         }
@@ -1416,6 +1552,145 @@ pub(crate) fn call_with_client_player(
             return Some(Ok(args.get(1)?.clone()));
         }
         return None;
+    }
+
+    if matches!(
+        r.owner.as_str(),
+        CONTAINER_LEVEL_ACCESS | CONTAINER_LEVEL_ACCESS_2
+    ) && let Some(Object::ContainerLevelAccess { level, pos }) = states.get(&key).cloned()
+    {
+        match (r.name.as_str(), r.descriptor.as_str()) {
+            ("evaluate", "(Ljava/util/function/BiFunction;)Ljava/util/Optional;") => {
+                let function = args.first()?.clone();
+                if matches!(function, Value::Ref(None)) {
+                    return Some(Err(crate::runtime::null_checks::invoke_on_null(&MethodRef {
+                        owner: "java/util/function/BiFunction".into(),
+                        name: "apply".into(),
+                        descriptor: "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;"
+                            .into(),
+                    })));
+                }
+                let pending = next_key(next_id, "menu/action");
+                states.insert(
+                    pending,
+                    Object::Pending(MenuAction::AccessEvaluate {
+                        function,
+                        level,
+                        pos,
+                        default: None,
+                    }),
+                );
+                return Some(Ok(crate::runtime::empty_optional()));
+            }
+            (
+                "evaluate",
+                "(Ljava/util/function/BiFunction;Ljava/lang/Object;)Ljava/lang/Object;",
+            ) => {
+                let [function, default] = args else {
+                    return None;
+                };
+                if matches!(function, Value::Ref(None)) {
+                    return Some(Err(crate::runtime::null_checks::invoke_on_null(&MethodRef {
+                        owner: "java/util/function/BiFunction".into(),
+                        name: "apply".into(),
+                        descriptor: "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;"
+                            .into(),
+                    })));
+                }
+                let pending = next_key(next_id, "menu/action");
+                states.insert(
+                    pending,
+                    Object::Pending(MenuAction::AccessEvaluate {
+                        function: function.clone(),
+                        level,
+                        pos,
+                        default: Some(default.clone()),
+                    }),
+                );
+                return Some(Ok(default.clone()));
+            }
+            ("execute", "(Ljava/util/function/BiConsumer;)V") => {
+                let consumer = args.first()?.clone();
+                if matches!(consumer, Value::Ref(None)) {
+                    return Some(Err(crate::runtime::null_checks::invoke_on_null(&MethodRef {
+                        owner: "java/util/function/BiConsumer".into(),
+                        name: "accept".into(),
+                        descriptor: "(Ljava/lang/Object;Ljava/lang/Object;)V".into(),
+                    })));
+                }
+                let pending = next_key(next_id, "menu/action");
+                states.insert(
+                    pending,
+                    Object::Pending(MenuAction::AccessExecute {
+                        consumer,
+                        level,
+                        pos,
+                    }),
+                );
+                return Some(Ok(Value::Void));
+            }
+            _ => return None,
+        }
+    }
+
+    // 26.3 SimpleMenuProvider.<init>, getDisplayName, createMenu
+    if r.owner == SIMPLE_MENU_PROVIDER
+        && r.name == "<init>"
+        && r.descriptor
+            == "(Lnet/minecraft/world/inventory/MenuConstructor;Lnet/minecraft/network/chat/Component;)V"
+    {
+        let [menu_constructor, title] = args else {
+            return None;
+        };
+        states.insert(
+            key,
+            Object::SimpleMenuProvider {
+                menu_constructor: menu_constructor.clone(),
+                title: title.clone(),
+            },
+        );
+        return Some(Ok(Value::Void));
+    }
+    if matches!(
+        r.owner.as_str(),
+        SIMPLE_MENU_PROVIDER | MENU_PROVIDER | MENU_CONSTRUCTOR
+    ) && let Some(Object::SimpleMenuProvider {
+        menu_constructor,
+        title,
+    }) = states.get(&key).cloned()
+    {
+        match (r.name.as_str(), r.descriptor.as_str()) {
+            ("getDisplayName", "()Lnet/minecraft/network/chat/Component;") => {
+                return Some(Ok(title));
+            }
+            (
+                "createMenu",
+                "(ILnet/minecraft/world/entity/player/Inventory;Lnet/minecraft/world/entity/player/Player;)Lnet/minecraft/world/inventory/AbstractContainerMenu;",
+            ) => {
+                let [container_id, inventory, player] = args else {
+                    return None;
+                };
+                if matches!(menu_constructor, Value::Ref(None)) {
+                    return Some(Err(crate::runtime::null_checks::invoke_on_null(&MethodRef {
+                        owner: MENU_CONSTRUCTOR.into(),
+                        name: "createMenu".into(),
+                        descriptor: "(ILnet/minecraft/world/entity/player/Inventory;Lnet/minecraft/world/entity/player/Player;)Lnet/minecraft/world/inventory/AbstractContainerMenu;".into(),
+                    })));
+                }
+                let pending = next_key(next_id, "menu/action");
+                states.insert(
+                    pending,
+                    Object::Pending(MenuAction::MenuConstructor {
+                        constructor: menu_constructor,
+                        container_id: container_id.clone(),
+                        inventory: inventory.clone(),
+                        player: player.clone(),
+                    }),
+                );
+                return Some(Ok(Value::Ref(None)));
+            }
+            _ => return None,
+        }
     }
 
     // The builder and immutable definition are ordinary objects in vanilla.
@@ -2104,17 +2379,33 @@ pub(crate) fn call_with_client_player(
         let mut pending_action = None;
         let answer = match r.name.as_str() {
             "getContainerSize" => Ok(Value::Int(*size)),
-            "isEmpty" => {
-                // Only `ItemStack.EMPTY` is known to be empty. A Java `null` here (a mod's
-                // `setItem(i, null)`, which this model refuses below) would make
-                // `ItemStack.isEmpty()` throw, so it is never answered as empty.
-                if items.iter().all(|v| *v == empty_stack()) {
-                    Ok(Value::Int(1))
-                } else {
-                    // ItemStack.isEmpty is observable per element.  An arbitrary
-                    // marker does not tell us whether its count/item is empty.
-                    return None;
+            "getMaxStackSize" => match r.descriptor.as_str() {
+                "()I" => Ok(Value::Int(DEFAULT_CONTAINER_MAX_STACK_SIZE)),
+                "(Lnet/minecraft/world/item/ItemStack;)I" => {
+                    let stack = args.first()?;
+                    if matches!(stack, Value::Ref(None)) {
+                        return None;
+                    }
+                    let smax = stacks.max_stack_size(stack)?;
+                    Ok(Value::Int(DEFAULT_CONTAINER_MAX_STACK_SIZE.min(smax)))
                 }
+                _ => return None,
+            },
+            "isEmpty" => {
+                // Only `ItemStack.EMPTY` and known live stacks have known emptiness.
+                // Any unknown stack marker stays counted so we never guess.
+                let mut all_empty = true;
+                for v in items.iter() {
+                    match stacks.is_empty(v) {
+                        Some(true) => {}
+                        Some(false) => {
+                            all_empty = false;
+                            break;
+                        }
+                        None => return None,
+                    }
+                }
+                Ok(Value::Int(i32::from(all_empty)))
             }
             "getItem" => {
                 let position = if *result { 0 } else { index };
@@ -2134,12 +2425,19 @@ pub(crate) fn call_with_client_player(
                 if matches!(value, Value::Ref(None)) {
                     return None;
                 }
-                // SimpleContainer clamps through getMaxStackSize(stack) and
-                // ItemStack.limitSize(max).  Only EMPTY is fully known here;
-                // refuse to mutate for an unknown stack so Java's clamp cannot
-                // be silently skipped. ResultContainer has no clamp in 26.3.
-                if !*result && *value != empty_stack() {
-                    return None;
+                // SimpleContainer clamps through `this.getMaxStackSize(stack)` (default 99
+                // bounded by `stack.getMaxStackSize()`, or a mod container's virtual override)
+                // and `ItemStack.limitSize(max)`. Refuse to mutate for an unknown stack so Java's
+                // clamp cannot be silently skipped. ResultContainer has no clamp in 26.3.
+                let pending_clamp = stacks.take_pending_clamp();
+                if !*result {
+                    match pending_clamp {
+                        Some(ContainerClamp::Exact(limit)) => stacks.clamp_exact(value, limit),
+                        Some(ContainerClamp::ContainerMax(max)) => {
+                            stacks.clamp_for_container(value, max)
+                        }
+                        None => stacks.clamp_for_container(value, DEFAULT_CONTAINER_MAX_STACK_SIZE),
+                    }?;
                 }
                 let item = items.get_mut(index)?;
                 *item = value.clone();

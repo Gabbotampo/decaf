@@ -251,9 +251,14 @@ impl Fixture {
             zip.write_all(&bytes).unwrap();
         }
         for (entry, bytes) in extra {
-            zip.start_file(*entry, SimpleFileOptions::default())
-                .unwrap();
-            zip.write_all(bytes).unwrap();
+            if entry.ends_with('/') {
+                zip.add_directory(*entry, SimpleFileOptions::default())
+                    .unwrap();
+            } else {
+                zip.start_file(*entry, SimpleFileOptions::default())
+                    .unwrap();
+                zip.write_all(bytes).unwrap();
+            }
         }
         zip.finish().unwrap();
         let jar = NativeJar::from_path(&jar_path).unwrap();

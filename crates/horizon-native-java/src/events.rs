@@ -1050,6 +1050,32 @@ pub struct CreativeTabBuildContext {
     /// Explicit `CreativeModeTab` instance passed to `MODIFY_OUTPUT_ALL`
     /// (`None` resolves the tab registered under `tab_key`, or a canonical handle).
     pub tab: Option<Value>,
+    /// Existing `displayItems` already in the tab before Fabric listeners run
+    /// (`CreativeModeTabMixin.getStacks` offsets 64..75).
+    pub initial_display_stacks: Vec<Value>,
+    /// Existing `displayItemsSearchTab` already in the tab before Fabric listeners run
+    /// (`CreativeModeTabMixin.getStacks` offsets 77..88).
+    pub initial_search_tab_stacks: Vec<Value>,
+}
+
+/// Convert Sunrise's enabled feature identifiers to the exact Minecraft 26.3 feature mask this
+/// runtime models. An unknown identifier is refused rather than being treated as enabled.
+pub fn creative_feature_mask(features: &[String]) -> Option<u64> {
+    let mut mask = 0;
+    for feature in features {
+        mask |= match feature.as_str() {
+            "minecraft:vanilla" => crate::host_creative_tab::FEATURE_VANILLA,
+            "minecraft:trade_rebalance" => crate::host_creative_tab::FEATURE_TRADE_REBALANCE,
+            "minecraft:redstone_experiments" => {
+                crate::host_creative_tab::FEATURE_REDSTONE_EXPERIMENTS
+            }
+            "minecraft:minecart_improvements" => {
+                crate::host_creative_tab::FEATURE_MINECART_IMPROVEMENTS
+            }
+            _ => return None,
+        };
+    }
+    Some(mask)
 }
 
 impl Default for CreativeTabBuildContext {
@@ -1059,6 +1085,8 @@ impl Default for CreativeTabBuildContext {
             has_permissions: false,
             aligned_right: None,
             tab: None,
+            initial_display_stacks: Vec::new(),
+            initial_search_tab_stacks: Vec::new(),
         }
     }
 }
@@ -1323,12 +1351,18 @@ impl NativeJar {
         // `CreativeModeTabMixin.getStacks` offsets 28..43:
         // `if (self.isAlignedRight() && resourceKey != CreativeModeTabs.OP_BLOCKS) return;`
         if aligned_right && tab_id != "minecraft:op_blocks" {
-            return Ok(CreativeTabContents::default());
+            return Ok(CreativeTabContents {
+                display_stacks: context.initial_display_stacks,
+                search_tab_stacks: context.initial_search_tab_stacks,
+            });
         }
         // `CreativeModeTabMixin.getStacks` offsets 104..118:
         // `if (resourceKey != CreativeModeTabs.OP_BLOCKS || context.hasPermissions())`
         if tab_id == "minecraft:op_blocks" && !context.has_permissions {
-            return Ok(CreativeTabContents::default());
+            return Ok(CreativeTabContents {
+                display_stacks: context.initial_display_stacks,
+                search_tab_stacks: context.initial_search_tab_stacks,
+            });
         }
         // Snapshot the per-tab event's phase-sorted listeners BEFORE running any per-tab
         // callback (`CreativeModeTabMixin.getStacks` offsets 119..145; `ArrayBackedEvent.invoker()`
@@ -1339,10 +1373,12 @@ impl NativeJar {
             &CreativeTabEventTarget::Tab(event_key.clone()),
         );
         // One shared collector across every listener of this tab firing (offsets 90..102).
-        let output = host.begin_creative_tab_output_with(
+        let output = host.begin_creative_tab_output_with_initial(
             &event_key,
             context.enabled_features,
             context.has_permissions,
+            context.initial_display_stacks,
+            context.initial_search_tab_stacks,
         );
         for (invocation_index, callback) in per_tab {
             host.mark_creative_tab_registration_fired(invocation_index);
@@ -1516,6 +1552,11 @@ pub struct EventContext {
     /// `MinecraftServer.haveTime()`, read once when the tick hook fires (NeoForge
     /// evaluates its `BooleanSupplier` at each call). `None` refuses the read.
     pub has_time: Option<bool>,
+    /// Optional per-entity/player sound facts (`position`, `silent`,
+    /// `sound_source`, `level`, `entity_id`), keyed by the entity/player marker
+    /// (`game/player/...`, `game/entity/<id>`). Absent entries leave those
+    /// reads counted as unknown.
+    pub entity_sound_facts: BTreeMap<String, crate::level_sound::EntitySoundFacts>,
 }
 
 /// One firing of one event, carried across every listener of every jar.
@@ -1530,6 +1571,8 @@ pub struct EventFiring {
     /// The first non-`PASS` `InteractionResult` a Fabric listener returned
     /// (`SUCCESS`, `FAIL`...).
     pub interaction: Option<String>,
+    /// Level/entity sounds recorded during this firing, in call order.
+    pub sounds: Vec<crate::level_sound::LevelSoundEffect>,
     /// The event objects this firing handed its NeoForge/Forge listeners, one
     /// per event class: every listener of one firing gets the same object.
     objects: Vec<(String, Value)>,
@@ -1543,6 +1586,7 @@ impl EventFiring {
             context,
             cancelled: false,
             interaction: None,
+            sounds: Vec::new(),
             objects: Vec::new(),
         }
     }
@@ -1827,7 +1871,7 @@ impl StdHost {
     ) -> Option<Result<Value, NativeError>> {
         // The event object a NeoForge/Forge listener received answers from the firing.
         if crate::host_game_event::fired_event(receiver).is_some() {
-            let answer = self.facade_answer(&Facade::Event, r, args);
+            let answer = self.facade_answer(&Facade::Event, "", r, args);
             return Some(answer.ok_or_else(|| NativeError::UnknownHostCall(r.clone())));
         }
         let text = crate::game_object::text(receiver)?;
@@ -1911,9 +1955,51 @@ impl StdHost {
                 _ => Err(NativeError::UnknownHostCall(r.clone())),
             });
         }
-        // A `Block` value: its `toString`, `equals` and `hashCode` are the
+        // A canonical default `BlockState` (`Blocks.X.defaultBlockState()`):
+        // its block is known; for vanilla (`minecraft:`) blocks `is`/`isAir` are
+        // exact against vanilla `Blocks.*` (`AIR`, `CAVE_AIR`, `VOID_AIR`);
+        // property reads/writes and unknown mod-block comparisons stay counted.
+        if let Some(block) = text.strip_prefix("game/default-block-state/") {
+            return Some(match (r.name.as_str(), r.descriptor.as_str()) {
+                ("getBlock", "()Lnet/minecraft/world/level/block/Block;") => {
+                    Ok(block_marker(block))
+                }
+                ("is", "(Lnet/minecraft/world/level/block/Block;)Z") => match args.first() {
+                    Some(Value::Ref(None)) => Ok(Value::Int(0)),
+                    Some(arg) => {
+                        if let Some(other) = crate::game_object::text(arg)
+                            .and_then(|value| value.strip_prefix("game/block/"))
+                        {
+                            Ok(Value::Int(i32::from(other == block)))
+                        } else if matches!(arg, Value::Ref(Some(handle)) if handle.starts_with("obj/"))
+                            && block.starts_with("minecraft:")
+                        {
+                            Ok(Value::Int(0))
+                        } else {
+                            Err(NativeError::UnknownHostCall(r.clone()))
+                        }
+                    }
+                    None => Err(NativeError::UnknownHostCall(r.clone())),
+                },
+                ("isAir", "()Z") if block.starts_with("minecraft:") => {
+                    Ok(Value::Int(i32::from(matches!(
+                        block,
+                        "minecraft:air" | "minecraft:cave_air" | "minecraft:void_air"
+                    ))))
+                }
+                _ => Err(NativeError::UnknownHostCall(r.clone())),
+            });
+        }
+        // A `Block` value: `defaultBlockState()` yields its canonical vanilla
+        // default state handle; `toString`, `equals` and `hashCode` are the
         // kind's (`server_values.rs`); no other member is modelled.
-        if text.starts_with("game/block/") {
+        if let Some(block_id) = text.strip_prefix("game/block/") {
+            if r.name == "defaultBlockState"
+                && r.descriptor == "()Lnet/minecraft/world/level/block/state/BlockState;"
+                && r.owner.starts_with("net/minecraft/world/level/block/")
+            {
+                return Some(Ok(marker(format!("game/default-block-state/{block_id}"))));
+            }
             return Some(Err(NativeError::UnknownHostCall(r.clone())));
         }
         // The clone's old player, keyed as its previous life: the original's facts.
@@ -1928,6 +2014,29 @@ impl StdHost {
             }
             kind => kind,
         };
+        // ServerLevel.recipeAccess() and MinecraftServer.{getRecipeManager,recipeAccess}() return
+        // the server's recipe manager singleton, whether called inside an event firing or directly
+        // on a server/level handle.
+        if matches!(kind, Facade::Level(_))
+            && r.name == "recipeAccess"
+            && matches!(
+                r.descriptor.as_str(),
+                "()Lnet/minecraft/world/item/crafting/RecipeManager;"
+                    | "()Lnet/minecraft/world/item/crafting/RecipeAccess;"
+            )
+        {
+            return Some(Ok(marker(crate::recipe_models::RECIPE_MANAGER_KEY.into())));
+        }
+        if matches!(kind, Facade::Server)
+            && matches!(r.name.as_str(), "getRecipeManager" | "recipeAccess")
+            && matches!(
+                r.descriptor.as_str(),
+                "()Lnet/minecraft/world/item/crafting/RecipeManager;"
+                    | "()Lnet/minecraft/world/item/crafting/RecipeAccess;"
+            )
+        {
+            return Some(Ok(marker(crate::recipe_models::RECIPE_MANAGER_KEY.into())));
+        }
         if matches!(
             kind,
             Facade::Server | Facade::Level(_) | Facade::Player(_) | Facade::Entity(_)
@@ -1958,11 +2067,63 @@ impl StdHost {
         if text.starts_with("game/unknown/") {
             return Some(self.unknown_host_call(r));
         }
-        let answer = self.facade_answer(&kind, r, args);
+        if !matches!(kind, Facade::OriginalPlayer(_))
+            && let Some(answer) = crate::level_sound::server_facade_sound_call(self, text, r, args)
+        {
+            return Some(answer);
+        }
+        // Standalone `game/level/<dim>`, `game/player/...`, and `game/entity/...`
+        // handles outside an event firing still answer their intrinsic dimension /
+        // server-side identity and any explicitly seeded sound facts (`getX/Y/Z`,
+        // `level`).
+        if self.game_event.is_none() {
+            match &kind {
+                Facade::Level(id) => match (r.name.as_str(), return_desc(&r.descriptor)) {
+                    ("isClientSide", "Z") => return Some(Ok(Value::Int(0))),
+                    ("dimension", _) => return Some(Ok(dimension_key(id))),
+                    _ => {}
+                },
+                Facade::Player(_) | Facade::Entity(_) => {
+                    if let Some(facts) = self.level_sound.entity_facts.get(text) {
+                        match (r.name.as_str(), r.descriptor.as_str()) {
+                            ("getX", "()D") => {
+                                if let Some(pos) = facts.position {
+                                    return Some(Ok(Value::Float(pos[0])));
+                                }
+                            }
+                            ("getY", "()D") => {
+                                if let Some(pos) = facts.position {
+                                    return Some(Ok(Value::Float(pos[1])));
+                                }
+                            }
+                            ("getZ", "()D") => {
+                                if let Some(pos) = facts.position {
+                                    return Some(Ok(Value::Float(pos[2])));
+                                }
+                            }
+                            ("level" | "serverLevel", _) => {
+                                if let Some(level) = facts.level.as_deref() {
+                                    return Some(Ok(level_marker(level)));
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        let answer = self.facade_answer(&kind, text, r, args);
         Some(answer.ok_or_else(|| NativeError::UnknownHostCall(r.clone())))
     }
 
-    fn facade_answer(&mut self, kind: &Facade<'_>, r: &MethodRef, args: &[Value]) -> Option<Value> {
+    fn facade_answer(
+        &mut self,
+        kind: &Facade<'_>,
+        receiver_marker: &str,
+        r: &MethodRef,
+        args: &[Value],
+    ) -> Option<Value> {
         let firing = self.game_event.as_deref()?;
         let facade = Arc::clone(&firing.facade);
         let context = firing.context.clone();
@@ -2083,12 +2244,20 @@ impl StdHost {
                     return answer;
                 }
                 let p = player(*uuid)?;
+                let sound_pos = context
+                    .entity_sound_facts
+                    .get(receiver_marker)
+                    .or_else(|| self.level_sound.entity_facts.get(receiver_marker))
+                    .and_then(|facts| facts.position);
                 match (name, returns) {
                     ("getScoreboardName" | "getPlainTextName", _) => Some(marker(p.name.clone())),
                     ("getName" | "getDisplayName", _) => Some(component_value("literal", &p.name)),
                     ("getId", "I") => Some(Value::Int(p.entity_id?)),
                     ("isAlive", "Z") => flag(true),
                     ("level" | "serverLevel", _) => p.level.as_deref().map(level_marker),
+                    ("getX", "D") => sound_pos.map(|pos| Value::Float(pos[0])),
+                    ("getY", "D") => sound_pos.map(|pos| Value::Float(pos[1])),
+                    ("getZ", "D") => sound_pos.map(|pos| Value::Float(pos[2])),
                     ("getServer", _) => Some(marker(SERVER.into())),
                     _ => None,
                 }
@@ -2123,10 +2292,18 @@ impl StdHost {
             },
             Facade::Entity(id) => {
                 let entity = context.entity.as_ref().filter(|e| e.id == *id)?;
+                let sound_pos = context
+                    .entity_sound_facts
+                    .get(receiver_marker)
+                    .or_else(|| self.level_sound.entity_facts.get(receiver_marker))
+                    .and_then(|facts| facts.position);
                 match (name, returns) {
                     ("getId", "I") => int(entity.id),
                     ("isAlive", "Z") => flag(true),
                     ("level", _) => entity.level.as_deref().map(level_marker),
+                    ("getX", "D") => sound_pos.map(|pos| Value::Float(pos[0])),
+                    ("getY", "D") => sound_pos.map(|pos| Value::Float(pos[1])),
+                    ("getZ", "D") => sound_pos.map(|pos| Value::Float(pos[2])),
                     _ => None,
                 }
             }
@@ -2985,6 +3162,7 @@ impl NativeJar {
         let result = self.invoke_listener_callback(&listener.callback, event_args, host, budget);
         if let Some(after) = host.game_event.take() {
             firing.cancelled = after.cancelled;
+            firing.sounds = after.sounds;
         }
         host.truncate_call_log(marks);
         let (target, result) = result?;
@@ -3000,11 +3178,10 @@ impl NativeJar {
                 }
             }
             (EventLoader::Fabric, Combine::Interaction) => {
-                let name = expect_ref(&result)
-                    .and_then(|text| text.strip_prefix("interaction-result/"))
-                    .unwrap_or("PASS");
+                let name = crate::block_use::events_interaction_name(host, &result)
+                    .unwrap_or_else(|| "PASS".to_owned());
                 if name != "PASS" {
-                    firing.interaction = Some(name.to_owned());
+                    firing.interaction = Some(name);
                     firing.cancelled = true;
                     run.stop = true;
                 }

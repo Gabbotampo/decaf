@@ -245,6 +245,14 @@ pub enum HostKind {
     MobEffectCategory,
     /// A freshly constructed vanilla `RangedAttribute`.
     RangedAttribute,
+    /// A modelled Minecraft 26.3 `VoxelShape` (`voxel_shape.rs`).
+    VoxelShape,
+    /// A modelled Minecraft 26.3 `AABB` (`voxel_shape.rs`).
+    Aabb,
+    /// A canonical Minecraft 26.3 `BooleanOp` constant (`voxel_shape.rs`).
+    BooleanOp,
+    /// A modelled Minecraft 26.3 `CollisionContext` (`CollisionContext.empty()`).
+    CollisionContext,
     /// `net.minecraft.references.BlockItemId`: key the block and item ids'
     /// [`HostRef::of_values`].
     BlockItemId,
@@ -618,8 +626,22 @@ pub enum HostKind {
     /// A `java.util.regex.Matcher` from `Pattern.matcher(input)`: a serial (one
     /// object per call), the pattern text and the input (`host_jdk_constant.rs`).
     RegexMatcher,
-    /// Vanilla's ItemStackTemplate built by `fromNonEmptyStack` (`host_item_stack_template.rs`).
+    /// Vanilla's ItemStackTemplate (`host_item_stack_template.rs`).
     ItemStackTemplate,
+    /// Vanilla's `DataComponentPatch` (`recipe_models.rs`).
+    DataComponentPatch,
+    /// Vanilla's `DataComponentPatch$Builder` (`recipe_models.rs`).
+    DataComponentPatchBuilder,
+    /// Vanilla's `Ingredient` (`recipe_models.rs`).
+    Ingredient,
+    /// Vanilla's `Recipe$CommonInfo` (`recipe_models.rs`).
+    RecipeCommonInfo,
+    /// Vanilla's `RecipeHolder` (`recipe_models.rs`).
+    RecipeHolder,
+    /// Vanilla's `CustomData` holding a copied `CompoundTag` (`recipe_models.rs`).
+    CustomData,
+    /// Vanilla's `net.minecraft.util.Unit.INSTANCE` singleton (`recipe_models.rs`).
+    Unit,
     /// Fabric CreativeModeTab builder and built tab handles.
     CreativeModeTabBuilder,
     CreativeModeTab,
@@ -661,6 +683,21 @@ pub enum HostKind {
     FeatureFlag,
     /// Vanilla `FeatureFlagSet` values (`FeatureFlags.VANILLA_SET`, `FeatureFlagSet.of(...)`).
     FeatureFlagSet,
+    /// Opaque `BlockGetter` / `BlockPos` / `CollisionContext` probes passed into
+    /// `Block.getShape` / `getCollisionShape` extraction so every observation
+    /// (`equals`, `hashCode`, `toString`, `instanceof`, `checkcast`, `==`, `getClass`,
+    /// or any method call) counts on the host and refuses static shape export.
+    ShapeProbe,
+    /// Apache Commons Lang `org.apache.commons.lang3.math.Fraction` (`commons_fraction.rs`).
+    CommonsFraction,
+    /// Vanilla `StreamCodec$CodecOperation` combinator returned by `ByteBufCodecs.list(...)`
+    /// and friends (`stream_codec.rs`).
+    StreamCodecOperation,
+    /// Vanilla 26.3 `InteractionResult` sealed record (`Success`, `Fail`, `Pass`,
+    /// `TryEmptyHandInteraction`, `block_use.rs`).
+    InteractionResult,
+    /// Vanilla 26.3 `InteractionResult$ItemContext` record (`block_use.rs`).
+    InteractionItemContext,
 }
 
 /// How a kind's Java class follows from its key.
@@ -728,6 +765,21 @@ pub(crate) trait Nested {
     /// host's table (the caller counts).
     fn component_json(&mut self, value: &Value) -> Option<serde_json::Value> {
         let _ = value;
+        None
+    }
+    /// The MC 26.3 `VoxelShape.toString()` for a non-singleton shape key (`cube/<n>`, `array/<n>`).
+    fn voxel_shape_to_string(&mut self, key: &str) -> Option<String> {
+        let _ = key;
+        None
+    }
+    /// Dynamic `InteractionResult$Success(swingSource, itemContext)` fields (`block_use.rs`).
+    fn interaction_result_success(&mut self, key: &str) -> Option<(Value, Value)> {
+        let _ = key;
+        None
+    }
+    /// Dynamic `InteractionResult$ItemContext(wasItemInteraction, heldItemTransformedTo)` fields.
+    fn interaction_item_context(&mut self, key: &str) -> Option<(bool, Value)> {
+        let _ = key;
         None
     }
     /// The key and value a host `Map.Entry` holds now (`host_map_entry.rs`);
@@ -939,6 +991,10 @@ const CLASS_SIDES: &[(HostKind, &ClassSide)] = &[
     (
         HostKind::TooltipFlagDefault,
         &crate::client_surface::TOOLTIP_FLAG_DEFAULT_CLASS_SIDE,
+    ),
+    (
+        HostKind::CommonsFraction,
+        &crate::commons_fraction::CLASS_SIDE,
     ),
 ];
 
@@ -1399,6 +1455,36 @@ const KINDS: &[KindInfo] = &[
         class: ClassRule::Fixed(crate::vanilla_values::RANGED_ATTRIBUTE),
         canonical: never_canonical,
         methods: &crate::vanilla_values::RANGED_ATTRIBUTE_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::VoxelShape,
+        tag: "vshp",
+        class: ClassRule::FromKey(crate::voxel_shape::voxel_shape_class),
+        canonical: always_canonical,
+        methods: &crate::voxel_shape::VOXEL_SHAPE_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::Aabb,
+        tag: "aabb",
+        class: ClassRule::FromKey(|_| crate::voxel_shape::AABB),
+        canonical: never_canonical,
+        methods: &crate::voxel_shape::AABB_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::BooleanOp,
+        tag: "bop",
+        class: ClassRule::Unknown {
+            declared: crate::voxel_shape::boolean_op_declared_types,
+        },
+        canonical: always_canonical,
+        methods: &crate::voxel_shape::BOOLEAN_OP_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::CollisionContext,
+        tag: "cctx",
+        class: ClassRule::FromKey(|_| crate::voxel_shape::EMPTY_COLLISION_CONTEXT),
+        canonical: always_canonical,
+        methods: &crate::voxel_shape::COLLISION_CONTEXT_METHODS,
     },
     KindInfo {
         kind: HostKind::BlockItemId,
@@ -2777,9 +2863,58 @@ const KINDS: &[KindInfo] = &[
     KindInfo {
         kind: HostKind::ItemStackTemplate,
         tag: "ist",
-        class: ClassRule::Fixed("net/minecraft/world/item/ItemStackTemplate"),
+        class: ClassRule::FromKey(|_| "net/minecraft/world/item/ItemStackTemplate"),
         canonical: always_canonical,
         methods: &crate::host_item_stack_template::METHODS,
+    },
+    KindInfo {
+        kind: HostKind::DataComponentPatch,
+        tag: "dcp",
+        class: ClassRule::FromKey(|_| crate::recipe_models::DATA_COMPONENT_PATCH),
+        canonical: always_canonical,
+        methods: &crate::recipe_models::PATCH_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::DataComponentPatchBuilder,
+        tag: "dcpb",
+        class: ClassRule::FromKey(|_| crate::recipe_models::DATA_COMPONENT_PATCH_BUILDER),
+        canonical: always_canonical,
+        methods: &crate::recipe_models::PATCH_BUILDER_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::Ingredient,
+        tag: "ingr",
+        class: ClassRule::FromKey(|_| crate::recipe_models::INGREDIENT),
+        canonical: always_canonical,
+        methods: &crate::recipe_models::INGREDIENT_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::RecipeCommonInfo,
+        tag: "rci",
+        class: ClassRule::FromKey(|_| crate::recipe_models::RECIPE_COMMON_INFO),
+        canonical: always_canonical,
+        methods: &crate::recipe_models::COMMON_INFO_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::RecipeHolder,
+        tag: "rhld",
+        class: ClassRule::FromKey(|_| crate::recipe_models::RECIPE_HOLDER),
+        canonical: always_canonical,
+        methods: &crate::recipe_models::HOLDER_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::CustomData,
+        tag: "cdat",
+        class: ClassRule::FromKey(|_| crate::recipe_models::CUSTOM_DATA),
+        canonical: always_canonical,
+        methods: &crate::recipe_models::CUSTOM_DATA_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::Unit,
+        tag: "unit",
+        class: ClassRule::Fixed(crate::recipe_models::UNIT),
+        canonical: always_canonical,
+        methods: &crate::recipe_models::UNIT_METHODS,
     },
     KindInfo {
         kind: HostKind::CreativeModeTabBuilder,
@@ -2930,6 +3065,43 @@ const KINDS: &[KindInfo] = &[
         // `join`/`subtract` allocation carries its own serial `n:<serial>:<mask>`.
         canonical: always_canonical,
         methods: &crate::host_creative_tab::FEATURE_FLAG_SET_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::ShapeProbe,
+        tag: "sprobe",
+        class: ClassRule::Unknown { declared: |_| &[] },
+        canonical: never_canonical,
+        methods: &crate::voxel_shape::SHAPE_PROBE_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::CommonsFraction,
+        tag: "cfrac",
+        class: ClassRule::FromKey(crate::commons_fraction::fraction_class),
+        canonical: always_canonical,
+        methods: &crate::commons_fraction::METHODS,
+    },
+    KindInfo {
+        kind: HostKind::StreamCodecOperation,
+        tag: "scdo",
+        class: ClassRule::Unknown {
+            declared: crate::stream_codec::codec_operation_types,
+        },
+        canonical: never_canonical,
+        methods: &crate::stream_codec::CODEC_OPERATION_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::InteractionResult,
+        tag: "ires",
+        class: ClassRule::FromKey(crate::block_use::interaction_result_class),
+        canonical: always_canonical,
+        methods: &crate::block_use::INTERACTION_RESULT_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::InteractionItemContext,
+        tag: "ictx",
+        class: ClassRule::Fixed(crate::block_use::INTERACTION_RESULT_ITEM_CONTEXT),
+        canonical: always_canonical,
+        methods: &crate::block_use::INTERACTION_ITEM_CONTEXT_METHODS,
     },
 ];
 
@@ -3121,6 +3293,15 @@ impl HostRef {
     }
 
     pub(crate) fn same_object(&self, other: &HostRef) -> Option<bool> {
+        if self.kind == HostKind::ShapeProbe || other.kind == HostKind::ShapeProbe {
+            return None;
+        }
+        if self.kind == HostKind::GameRegistryObject
+            && other.kind == HostKind::GameRegistryObject
+            && crate::server_values::same_block_state_unknown(self.key(), other.key())
+        {
+            return None;
+        }
         if self != other {
             return Some(false);
         }

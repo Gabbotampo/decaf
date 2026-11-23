@@ -21,18 +21,133 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-use mod_api::{BlocksEvent, ItemsEvent, PackageKind, RegistrationContext};
+use mod_api::{BlocksEvent, ItemsEvent, PackageKind, Registrar, RegistrationContext};
 
 use crate::runtime;
 use crate::{JARS, JarRow, LOG, LoadedJar, State, jar_id, load_jar};
+
+/// Run a registered jar block's vanilla placement override. The game hook
+/// supplies a resolved Sunrise placement snapshot; the runtime owns the
+/// `BlockPlaceContext` façade and returns the canonical Java `BlockState`.
+/// `None` is vanilla's `null` refusal. This helper deliberately does not
+/// inspect a mod name or a block-specific property.
+pub(crate) fn state_for_placement(
+    jar: &mut LoadedJar,
+    block_id: &str,
+    context: runtime::BlockPlaceContextData,
+) -> Result<Option<runtime::Value>, runtime::NativeError> {
+    let block = jar
+        .host
+        .registrations()
+        .iter()
+        .rev()
+        .find(|entry| entry.registry == "minecraft:block" && entry.id == block_id)
+        .map(|entry| entry.value.clone());
+    let Some(block) = block else { return Ok(None) };
+    jar.jar
+        .block_state_for_placement(block, context, &mut jar.host)
+}
+
+pub(crate) enum PlacementContentOutcome {
+    /// Java returned `null` (vanilla placement refusal) with no unknown calls.
+    Refused,
+    /// Java returned a decoded `(block_id, properties)` state with no unknown calls.
+    State(String, BTreeMap<String, String>),
+    /// Java returned a non-null state whose block could not be decoded (e.g. unregistered).
+    UnknownState,
+    /// One or more unmodelled / unknown-placer calls were hit during execution.
+    CountedUnknown(usize),
+}
+
+pub(crate) fn state_for_placement_content(
+    jar: &mut LoadedJar,
+    block_id: &str,
+    context: runtime::BlockPlaceContextData,
+) -> Result<PlacementContentOutcome, runtime::NativeError> {
+    let unknown_before = jar.host.unknown_host_call_count();
+    let result = state_for_placement(jar, block_id, context);
+    let unknown_delta = jar
+        .host
+        .unknown_host_call_count()
+        .saturating_sub(unknown_before);
+    jar.row.callback_unknown_host_calls += unknown_delta;
+    let state = result?;
+    if unknown_delta > 0 {
+        return Ok(PlacementContentOutcome::CountedUnknown(unknown_delta));
+    }
+    let Some(state) = state else {
+        return Ok(PlacementContentOutcome::Refused);
+    };
+    Ok(match jar.host.block_state_content(&state) {
+        Some((id, props)) => PlacementContentOutcome::State(id, props),
+        None => PlacementContentOutcome::UnknownState,
+    })
+}
 
 /// This mod's manifest id (`mod/sunrise-mod.toml`): the package whose namespaces the game's
 /// declaration fence checks.
 pub(crate) const MOD_ID: &str = "horizon_java";
 
+pub(crate) fn register_placement_parts(
+    state: &mut State,
+    context: &RegistrationContext,
+    registrar: &mut dyn mod_api::Registrar,
+    shared: Arc<Mutex<State>>,
+) {
+    state.ensure_loaded(context, registration_game_version(context));
+    let owned = owned_namespaces(context);
+    for jar in &state.jars {
+        for declaration in runtime::content::declarations(jar.host.registrations()) {
+            let runtime::content::ContentDeclaration::Block(block) = declaration else {
+                continue;
+            };
+            if !usable_id(&block.id) || !owns(&owned, &block.id) {
+                continue;
+            }
+            let key = registrar.block_key(&block.id);
+            registrar.block_part(
+                key,
+                crate::JavaPlacementPart {
+                    state: Arc::clone(&shared),
+                },
+            );
+        }
+    }
+}
+
 impl State {
+    pub(crate) fn has_registered_block(&self, block_id: &str) -> bool {
+        self.jars.iter().any(|jar| {
+            jar.host
+                .registrations()
+                .iter()
+                .any(|entry| entry.registry == "minecraft:block" && entry.id == block_id)
+        })
+    }
+
+    /// Placement hook adapter used by the Sunrise `state_for_placement` part.
+    /// The lookup is by the game's registered block id; no block-specific
+    /// behavior is embedded in the native mod.
+    pub(crate) fn state_for_placement_content(
+        &mut self,
+        block_id: &str,
+        context: runtime::BlockPlaceContextData,
+    ) -> Result<Option<PlacementContentOutcome>, runtime::NativeError> {
+        for jar in &mut self.jars {
+            if jar
+                .host
+                .registrations()
+                .iter()
+                .any(|entry| entry.registry == "minecraft:block" && entry.id == block_id)
+            {
+                return state_for_placement_content(jar, block_id, context).map(Some);
+            }
+        }
+        Ok(None)
+    }
+
     /// Runs every jar once, the first time content is asked for, and keeps its runtime for the
     /// server lifecycle hooks. The game asks for blocks before items, so this guard also makes
     /// the two hooks one pass.
@@ -376,6 +491,50 @@ pub(crate) fn declare_items(
     );
 }
 
+/// Attaches a generic [`crate::block_use::JavaBlockUsePart`] to every registered Java mod block
+/// whose namespace is owned by this mod or by an installed content package (so Sunrise's block
+/// key validation always succeeds).
+pub(crate) fn register_block_parts(
+    state: &Arc<Mutex<State>>,
+    registrar: &mut dyn Registrar,
+    context: &RegistrationContext,
+) {
+    let owned = owned_namespaces(context);
+    let mut attached = BTreeSet::new();
+    let mut guard = state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard.ensure_loaded(context, registration_game_version(context));
+    for jar in &guard.jars {
+        for entry in jar.host.registrations() {
+            if entry.registry != "minecraft:block" {
+                continue;
+            }
+            let id = entry.id.as_str();
+            if !usable_id(id) {
+                continue;
+            }
+            if !owns(&owned, id) && !owns_assets(context, id) {
+                continue;
+            }
+            if !attached.insert(id.to_owned()) {
+                continue;
+            }
+            let key = registrar.block_key(id);
+            registrar.block_part(
+                key,
+                crate::block_use::JavaBlockUsePart::new(Arc::clone(state), id.to_owned()),
+            );
+        }
+    }
+    if !attached.is_empty() {
+        log::info!(
+            "{LOG}: attached Java block-use part(s) to {} block(s)",
+            attached.len()
+        );
+    }
+}
+
 /// Whether an installed content package owns the id's namespace, and so supplies that content's
 /// assets (models, item definitions, textures). A runtime declaration then leaves the template's
 /// `minecraft:item_model` alone; the package's files decide what is drawn.
@@ -402,6 +561,20 @@ fn block_entry(declaration: &runtime::content::Block, id: &str) -> mod_api::Bloc
     block.properties.friction = declaration.friction;
     block.properties.requires_tool = declaration.requires_tool;
     block.properties.occludes = declaration.occludes;
+    if let Some(shapes) = &declaration.shapes {
+        block.shapes = Some(mod_api::BlockShapes {
+            properties: shapes.properties.clone(),
+            values: shapes.values.clone(),
+            default: shapes.default.clone(),
+        });
+    }
+    if let Some(collision_shapes) = &declaration.collision_shapes {
+        block.collision_shapes = Some(mod_api::BlockShapes {
+            properties: collision_shapes.properties.clone(),
+            values: collision_shapes.values.clone(),
+            default: collision_shapes.default.clone(),
+        });
+    }
     // The vocabulary has `Boolean` and `Enum`: an integer property is an enum of the same value
     // strings, in its `getPossibleValues()` order (as blockstate JSON spells `age=3`). The runtime
     // records only these three kinds; any other is left out rather than guessed.
@@ -544,6 +717,14 @@ impl LoadedJar {
     /// more), and the row's verdict over everything its load ran. The log line is written again
     /// when the stages changed it.
     fn finish_loading(&mut self) {
+        let budget = runtime::ExecutionBudget::within(crate::JAR_BUDGET);
+        let (jar, host) = (&self.jar, &mut self.host);
+        if let Err(panic) = crate::caught(&format!("{} block shapes", self.row.id), || {
+            jar.populate_block_shapes(host, &budget);
+        }) {
+            self.failures
+                .push(format!("block shapes: panicked: {panic}"));
+        }
         let registered = self.host.game_listeners(&self.jar, true);
         self.listeners = registered.listeners;
         self.orderings = registered.phase_orderings;
@@ -730,6 +911,8 @@ mod tests {
             state_properties: BTreeMap::new(),
             default_state: BTreeMap::new(),
             occludes: None,
+            shapes: None,
+            collision_shapes: None,
         };
         let block = block_entry(&declaration, &declaration.id);
         assert!(!block.item);
@@ -741,6 +924,70 @@ mod tests {
         assert_eq!(block.properties.hardness, Some(2.0));
         assert_eq!(block.properties.explosion_resistance, Some(6.0));
         assert_eq!(block.properties.requires_tool, Some(true));
+        assert!(block.shapes.is_none());
+        assert!(block.collision_shapes.is_none());
+    }
+
+    #[test]
+    fn a_block_declaration_carries_evaluated_shapes_into_mod_api() {
+        let declaration = runtime::content::Block {
+            id: "horizon_java:shaped_block".to_owned(),
+            template: "minecraft:stone".to_owned(),
+            item: false,
+            hardness: None,
+            explosion_resistance: None,
+            friction: None,
+            requires_tool: None,
+            state_properties: BTreeMap::from([(
+                "facing".to_owned(),
+                runtime::content::StateProperty {
+                    kind: "enum".to_owned(),
+                    values: vec!["north".into(), "south".into(), "west".into(), "east".into()],
+                },
+            )]),
+            default_state: BTreeMap::from([("facing".to_owned(), "north".to_owned())]),
+            occludes: None,
+            shapes: Some(runtime::content::BlockShapes {
+                properties: vec!["facing".to_owned()],
+                values: BTreeMap::from([
+                    (
+                        "east".to_owned(),
+                        vec![[0.625, 0.0, 0.125, 1.0, 0.75, 0.875]],
+                    ),
+                    (
+                        "north".to_owned(),
+                        vec![[0.125, 0.0, 0.0, 0.875, 0.75, 0.375]],
+                    ),
+                    (
+                        "south".to_owned(),
+                        vec![[0.125, 0.0, 0.625, 0.875, 0.75, 1.0]],
+                    ),
+                    (
+                        "west".to_owned(),
+                        vec![[0.0, 0.0, 0.125, 0.375, 0.75, 0.875]],
+                    ),
+                ]),
+                default: None,
+            }),
+            collision_shapes: Some(runtime::content::BlockShapes {
+                properties: Vec::new(),
+                values: BTreeMap::new(),
+                default: Some(Vec::new()),
+            }),
+        };
+        let block = block_entry(&declaration, &declaration.id);
+        let shapes = block.shapes.expect("shapes mapped to mod_api::BlockShapes");
+        assert_eq!(shapes.properties, vec!["facing".to_owned()]);
+        assert_eq!(shapes.default, None);
+        assert_eq!(
+            shapes.values.get("north"),
+            Some(&vec![[0.125, 0.0, 0.0, 0.875, 0.75, 0.375]])
+        );
+        assert_eq!(shapes.values.len(), 4);
+        let collision = block
+            .collision_shapes
+            .expect("collision_shapes mapped to mod_api::BlockShapes");
+        assert_eq!(collision.default, Some(Vec::new()));
     }
 
     /// A mod's own `BlockItem` is an item registration and is declared with its properties even

@@ -19,6 +19,11 @@ impl<H: Host> Runtime<'_, H> {
         class: &str,
         method: &str,
     ) -> Result<Option<Value>, NativeError> {
+        if let Some(receiver) = receiver
+            && let Some(result) = crate::commons_fraction::instance_call(r, receiver, args)
+        {
+            return result.map(Some);
+        }
         // `EnumSet.allOf` is implemented by the JDK from the enum class's
         // declared constants.  Jar enums are available in the class table;
         // retain their declaration order in the mutable collection row so
@@ -396,8 +401,10 @@ impl<H: Host> Runtime<'_, H> {
             && let Some(receiver) = receiver
             && r.owner == "net/minecraft/world/item/ItemStack"
             && r.name == "<init>"
-            && crate::jar_object::object_class(receiver)
-                == Some("net/minecraft/world/item/ItemStack")
+            && matches!(
+                receiver,
+                Value::Host(handle) if handle.kind() == crate::host_ref::HostKind::ItemStack
+            )
         {
             let count = match (r.descriptor.as_str(), args) {
                 ("(Lnet/minecraft/world/level/ItemLike;)V", [_]) => Some(1),
@@ -450,12 +457,14 @@ impl<H: Host> Runtime<'_, H> {
                 None => self.host.unknown_operand_call(r).map(Some),
             };
         }
-        // `FabricCreativeModeTabOutput.accept(...)` (`fabric-creative-tab-api-v1` 5.0.21
-        // offsets 0..98, `checkStack` 0..42, and `CreativeModeTab$Output` defaults 0..17).
+        // `FabricCreativeModeTabOutput.accept(...)` and `prepend(...)`
+        // (`fabric-creative-tab-api-v1` 5.0.21 offsets 0..171, `checkStack` 0..42, and
+        // `CreativeModeTab$Output` defaults 0..17).
         if let Some(receiver) = receiver
-            && r.name == "accept"
+            && matches!(r.name.as_str(), "accept" | "prepend")
             && let Some((enabled_features, _)) = self.host.creative_tab_output_context(receiver)
         {
+            let is_prepend = r.name == "prepend";
             let (stack, visibility_arg) = match (r.descriptor.as_str(), args) {
                 ("(Lnet/minecraft/world/item/ItemStack;)V", [stack]) => (stack.clone(), None),
                 (
@@ -526,7 +535,7 @@ impl<H: Host> Runtime<'_, H> {
                     frame: None,
                 });
             }
-            // Offsets 12..98: `visibility.ordinal()` throws NPE on null, then appends by visibility.
+            // Offsets 12..98: `visibility.ordinal()` throws NPE on null, then appends/prepends.
             let visibility = match visibility_arg {
                 None => crate::host_creative_tab::TabVisibility::ParentAndSearchTabs,
                 Some(Value::Ref(None)) => {
@@ -547,13 +556,230 @@ impl<H: Host> Runtime<'_, H> {
                     parsed
                 }
             };
-            if self
-                .host
-                .creative_tab_output_accept_verified(receiver, stack, visibility.ordinal())
-            {
+            let ok = if is_prepend {
+                self.host.creative_tab_output_prepend_verified(
+                    receiver,
+                    stack,
+                    visibility.ordinal(),
+                )
+            } else {
+                self.host
+                    .creative_tab_output_accept_verified(receiver, stack, visibility.ordinal())
+            };
+            if ok {
                 return Ok(Some(Value::Void));
             }
             return self.host.unknown_operand_call(r).map(Some);
+        }
+        // `FabricCreativeModeTabOutput.insertBefore(...)` and `insertAfter(...)`
+        // (`fabric-creative-tab-api-v1` 5.0.21 offsets 173..801). Predicate overloads remain
+        // unmodelled (counted).
+        if let Some(receiver) = receiver
+            && matches!(r.name.as_str(), "insertBefore" | "insertAfter")
+            && let Some((enabled_features, _)) = self.host.creative_tab_output_context(receiver)
+        {
+            let before = r.name == "insertBefore";
+            enum RawItems {
+                StackArray,
+                ItemLikeArray,
+                Collection,
+            }
+            let (anchor_arg, anchor_is_stack, raw_kind, items_arg, visibility_arg) = match (
+                r.descriptor.as_str(),
+                args,
+            ) {
+                (
+                    "(Lnet/minecraft/world/level/ItemLike;[Lnet/minecraft/world/item/ItemStack;)V",
+                    [a, items],
+                ) => (a, false, RawItems::StackArray, items, None),
+                (
+                    "(Lnet/minecraft/world/item/ItemStack;[Lnet/minecraft/world/item/ItemStack;)V",
+                    [a, items],
+                ) => (a, true, RawItems::StackArray, items, None),
+                (
+                    "(Lnet/minecraft/world/level/ItemLike;[Lnet/minecraft/world/level/ItemLike;)V",
+                    [a, items],
+                ) => (a, false, RawItems::ItemLikeArray, items, None),
+                (
+                    "(Lnet/minecraft/world/item/ItemStack;[Lnet/minecraft/world/level/ItemLike;)V",
+                    [a, items],
+                ) => (a, true, RawItems::ItemLikeArray, items, None),
+                ("(Lnet/minecraft/world/level/ItemLike;Ljava/util/Collection;)V", [a, items]) => {
+                    (a, false, RawItems::Collection, items, None)
+                }
+                ("(Lnet/minecraft/world/item/ItemStack;Ljava/util/Collection;)V", [a, items]) => {
+                    (a, true, RawItems::Collection, items, None)
+                }
+                (
+                    "(Lnet/minecraft/world/level/ItemLike;Ljava/util/Collection;Lnet/minecraft/world/item/CreativeModeTab$TabVisibility;)V",
+                    [a, items, vis],
+                ) => (a, false, RawItems::Collection, items, Some(vis)),
+                (
+                    "(Lnet/minecraft/world/item/ItemStack;Ljava/util/Collection;Lnet/minecraft/world/item/CreativeModeTab$TabVisibility;)V",
+                    [a, items, vis],
+                ) => (a, true, RawItems::Collection, items, Some(vis)),
+                _ => return Ok(None),
+            };
+            // Convert varargs or Collection<ItemStack> to `Vec<Value>` with Fabric's exact null checks.
+            let raw_stacks: Vec<Value> = match raw_kind {
+                RawItems::StackArray => {
+                    if matches!(items_arg, Value::Ref(None)) {
+                        return Err(NativeError::UncaughtException {
+                            class: "java/lang/NullPointerException".into(),
+                            message: None,
+                            frame: None,
+                        });
+                    }
+                    let Ok(elements) = self.array(items_arg).map(std::borrow::Cow::into_owned)
+                    else {
+                        return self.host.unknown_operand_call(r).map(Some);
+                    };
+                    elements
+                }
+                RawItems::ItemLikeArray => {
+                    if matches!(items_arg, Value::Ref(None)) {
+                        return Err(NativeError::UncaughtException {
+                            class: "java/lang/NullPointerException".into(),
+                            message: Some(
+                                "Cannot read the array length because \"array\" is null".into(),
+                            ),
+                            frame: None,
+                        });
+                    }
+                    let Ok(elements) = self.array(items_arg).map(std::borrow::Cow::into_owned)
+                    else {
+                        return self.host.unknown_operand_call(r).map(Some);
+                    };
+                    let mut stacks = Vec::with_capacity(elements.len());
+                    for item_like in &elements {
+                        let Some(item) = self.resolve_item_like_value(item_like)? else {
+                            return self.host.unknown_operand_call(r).map(Some);
+                        };
+                        let Some(stack) = self.host.make_host_item_stack(item, 1) else {
+                            return self.host.unknown_operand_call(r).map(Some);
+                        };
+                        stacks.push(stack);
+                    }
+                    stacks
+                }
+                RawItems::Collection => {
+                    if matches!(items_arg, Value::Ref(None)) {
+                        return Err(NativeError::UncaughtException {
+                            class: "java/lang/NullPointerException".into(),
+                            message: Some(
+                                "Cannot invoke \"java.util.Collection.stream()\" because \"newStacks\" is null"
+                                    .into(),
+                            ),
+                            frame: None,
+                        });
+                    }
+                    let Ok(elements) = runtime_collection_values(&*self.host, items_arg) else {
+                        return self.host.unknown_operand_call(r).map(Some);
+                    };
+                    elements
+                }
+            };
+            // `getEnabledStacks`: filters out disabled stacks before visibility/checkStacks/anchor.
+            let mut enabled: Vec<(Value, Value, i32, bool)> = Vec::with_capacity(raw_stacks.len());
+            for stack in raw_stacks {
+                if matches!(stack, Value::Ref(None)) {
+                    return Err(NativeError::UncaughtException {
+                        class: "java/lang/NullPointerException".into(),
+                        message: Some(
+                            "Cannot invoke \"net.minecraft.world.item.ItemStack.getItem()\" because \"stack\" is null"
+                                .into(),
+                        ),
+                        frame: None,
+                    });
+                }
+                let Some((item, count, is_empty)) = self.host.read_item_stack(&stack) else {
+                    return self.host.unknown_operand_call(r).map(Some);
+                };
+                let Some(is_enabled) = self.item_is_enabled_mask(&item, enabled_features)? else {
+                    return self.host.unknown_operand_call(r).map(Some);
+                };
+                if is_enabled {
+                    enabled.push((stack, item, count, is_empty));
+                }
+            }
+            if enabled.is_empty() {
+                return Ok(Some(Value::Void));
+            }
+            // `visibility.ordinal()` runs before `checkStacks` and anchor lookup.
+            let visibility = match visibility_arg {
+                None => crate::host_creative_tab::TabVisibility::ParentAndSearchTabs,
+                Some(Value::Ref(None)) => {
+                    return Err(NativeError::UncaughtException {
+                        class: "java/lang/NullPointerException".into(),
+                        message: Some(
+                            "Cannot invoke \"net.minecraft.world.item.CreativeModeTab$TabVisibility.ordinal()\" because \"visibility\" is null"
+                                .into(),
+                        ),
+                        frame: None,
+                    });
+                }
+                Some(vis) => {
+                    let Some(parsed) = crate::host_creative_tab::TabVisibility::from_value(vis)
+                    else {
+                        return self.host.unknown_operand_call(r).map(Some);
+                    };
+                    parsed
+                }
+            };
+            // `checkStacks(newStacks)` runs before `anchor.asItem()` / list scan.
+            let mut stacks = Vec::with_capacity(enabled.len());
+            for (stack, item, count, is_empty) in enabled {
+                if is_empty {
+                    return Err(NativeError::UncaughtException {
+                        class: "java/lang/IllegalArgumentException".into(),
+                        message: Some("Cannot add empty stack".into()),
+                        frame: None,
+                    });
+                }
+                if count != 1 {
+                    let Some(item_text) = self.item_to_string_opt(&item, false, class, method)?
+                    else {
+                        return self.host.unknown_operand_call(r).map(Some);
+                    };
+                    return Err(NativeError::UncaughtException {
+                        class: "java/lang/IllegalArgumentException".into(),
+                        message: Some(format!(
+                            "Stack size must be exactly 1 for stack: {count} {item_text}"
+                        )),
+                        frame: None,
+                    });
+                }
+                stacks.push(stack);
+            }
+            let resolved_anchor = if anchor_is_stack {
+                anchor_arg.clone()
+            } else {
+                if matches!(anchor_arg, Value::Ref(None)) {
+                    return Err(NativeError::UncaughtException {
+                        class: "java/lang/NullPointerException".into(),
+                        message: Some(
+                            "Cannot invoke \"net.minecraft.world.level.ItemLike.asItem()\" because \"anchor\" is null"
+                                .into(),
+                        ),
+                        frame: None,
+                    });
+                }
+                let Some(item) = self.resolve_item_like_value(anchor_arg)? else {
+                    return self.host.unknown_operand_call(r).map(Some);
+                };
+                item
+            };
+            match self.host.creative_tab_output_insert_relative(
+                receiver,
+                &resolved_anchor,
+                anchor_is_stack,
+                stacks,
+                visibility.ordinal(),
+                before,
+            )? {
+                Some(true) => return Ok(Some(Value::Void)),
+                Some(false) | None => return self.host.unknown_operand_call(r).map(Some),
+            }
         }
         Ok(None)
     }
@@ -1867,20 +2093,83 @@ impl<H: Host> Runtime<'_, H> {
         let Ok(items) = runtime_collection_values(&*self.host, receiver) else {
             return Ok(None);
         };
-        // `toArray(IntFunction)` on an entry set of `Collections.unmodifiableMap` is JDK 25's
-        // `UnmodifiableCollection.toArray(f)`, `c.toArray(f)`: the source map's own entries.
-        // `UnmodifiableEntrySet` wraps each entry only in `toArray()` and `toArray(T[])`, so the
-        // other two forms keep the wrappers (#221 review 7, B11). Only a view's entry set holds
-        // wrappers (a list copied from it keeps them, as Java's copy does).
-        let unwrap = r.descriptor == "(Ljava/util/function/IntFunction;)[Ljava/lang/Object;"
-            && expect_ref(receiver).is_some_and(|marker| {
-                self.host.view_copy_kind(marker).as_deref() == Some("entrySet")
-            });
-        let values = if unwrap {
-            items
-                .into_iter()
-                .map(|entry| self.host.unwrapped_view_entry(&entry).unwrap_or(entry))
-                .collect()
+        let entry_set_root = expect_ref(receiver)
+            .filter(|marker| self.host.view_copy_kind(marker).as_deref() == Some("entrySet"))
+            .and_then(|marker| self.host.view_copy_source(marker))
+            .map(|source| self.root_map_of_view(crate::jar_object::stored_value(&source)));
+        if let Some((root_map, _)) = entry_set_root.as_ref()
+            && self.collection_uncertain(root_map)
+        {
+            return self.host.unknown_operand_call(r).map(Some);
+        }
+        // JDK 25 `entrySet().toArray` behavior per root map behind any chain of
+        // `Collections.unmodifiableMap` / `Collections.synchronizedMap` views:
+        // - `UnmodifiableEntrySet.toArray()` and `toArray(T[])` wrap every entry
+        //   in `UnmodifiableEntry` (`Life::Wrapped`, already in `items`).
+        // - `UnmodifiableCollection.toArray(IntFunction)` (and `SynchronizedCollection`)
+        //   delegates to the root map's `entrySet().toArray(T[])`:
+        //   - `IdentityHashMap`, `EnumMap`, and `WeakHashMap` return detached
+        //     `AbstractMap$SimpleEntry` copies (both directly and via `IntFunction`).
+        //   - The verified map types below return their own entries (unwrapped from
+        //     `Life::Wrapped` when reached through `toArray(IntFunction)`).
+        //   - Any other non-empty entrySet root is counted instead of guessed.
+        let by_generator = r.descriptor == "(Ljava/util/function/IntFunction;)[Ljava/lang/Object;";
+        let values = if let Some((root_map, saw_unmodifiable)) = entry_set_root {
+            if saw_unmodifiable && !by_generator {
+                items
+            } else {
+                match self.map_root_class(&root_map).as_deref() {
+                    Some(
+                        "java/util/IdentityHashMap" | "java/util/EnumMap" | "java/util/WeakHashMap",
+                    ) => {
+                        let mut detached = Vec::with_capacity(items.len());
+                        for entry in items {
+                            let Some((key, value)) = self.host.map_entry_parts(&entry) else {
+                                return self.host.unknown_operand_call(r).map(Some);
+                            };
+                            detached.push(self.host.mint_map_entry(
+                                None,
+                                &key,
+                                &value,
+                                host_map_entry::EntryMade::SimpleEntry,
+                            ));
+                        }
+                        detached
+                    }
+                    Some(
+                        "java/util/HashMap"
+                        | "java/util/LinkedHashMap"
+                        | "java/util/TreeMap"
+                        | "java/util/Hashtable"
+                        | "java/util/concurrent/ConcurrentHashMap"
+                        | "java/util/concurrent/ConcurrentSkipListMap"
+                        | "java/util/Collections$SingletonMap"
+                        | "java/util/Collections$EmptyMap"
+                        | "java/util/ImmutableCollections$Map1"
+                        | "java/util/ImmutableCollections$MapN"
+                        | crate::gson_tree::TREE_MAP
+                        | "com/google/common/collect/RegularImmutableMap"
+                        | "com/google/common/collect/SingletonImmutableBiMap"
+                        | "com/google/common/collect/RegularImmutableBiMap",
+                    ) => {
+                        if saw_unmodifiable {
+                            items
+                                .into_iter()
+                                .map(|mut entry| {
+                                    while let Some(inner) = self.host.unwrapped_view_entry(&entry) {
+                                        entry = inner;
+                                    }
+                                    entry
+                                })
+                                .collect()
+                        } else {
+                            items
+                        }
+                    }
+                    _ if items.is_empty() => items,
+                    _ => return self.host.unknown_operand_call(r).map(Some),
+                }
+            }
         } else {
             items
         };

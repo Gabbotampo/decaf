@@ -1,0 +1,16 @@
+colorFromFloat.0=-10066177|0xff6666ff
+colorFromFloat.1=0|0x00000000
+colorFromFloat.2=-1|0xffffffff
+colorFromFloat.3=2134884121|0x7f3fbf19
+colorFromFloat.4=-16744449|0xff007fff
+colorFromFloat.5=-427949826|0xe67e00fe
+colorFromFloat.6=16711680|0x00ff0000
+as8Bit.04=102
+as8Bit.neg=-26
+as8Bit.nan=0
+channels.bar=255|102|102|255
+color3=-10066177
+gray=-8421505
+multiply=-2139078624
+average=-1088409536
+floats.bar=1065353216|1053609165|1053609165|1065353216
