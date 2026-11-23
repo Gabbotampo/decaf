@@ -198,11 +198,30 @@ impl<H: Host> Runtime<'_, H> {
                 // Each element looks its provider up when it is used, so a
                 // `findFirst()` never reaches a later provider's failure. The
                 // loader keeps one `Provider` per provider (`host_services.rs`).
-                let providers = self
-                    .service_names(&service)
-                    .into_iter()
-                    .map(|provider| host_services::provider(&service, &provider))
-                    .collect();
+                //
+                // A provider real Fabric refuses to load is left out. JDK 25's streams
+                // advance a lookup of their own (`lookupIterator2`, one per loader until
+                // `reload`), which throws Knot's exception when it reaches the provider
+                // and spends its name: measured, a second `stream()` of the same loader
+                // never tries it again. This stream is built whole, so whether the
+                // pipeline reaches it is not known: counted once per loader, when its
+                // first stream is made.
+                let reloads = self.int_slot(loader, "reloads");
+                let mut providers = Vec::new();
+                for provider in self.service_names(&service) {
+                    if self.is_unloadable_by_name(&provider) {
+                        let tried = slot(loader, &format!("stream-refused{reloads}:{provider}"));
+                        // A first insert is this loader's first stream to reach it.
+                        if self.fields.insert(tried, Value::Int(1)).is_none() {
+                            self.count_refused_provider(
+                                &provider,
+                                "Ljava/util/ServiceLoader$Provider;",
+                            )?;
+                        }
+                        continue;
+                    }
+                    providers.push(host_services::provider(&service, &provider));
+                }
                 // `ProviderSpliterator` is not `SIZED`.
                 let stream = self.new_stream("java/util/ServiceLoader", "stream", providers);
                 Ok(Some(stream))
@@ -287,17 +306,26 @@ impl<H: Host> Runtime<'_, H> {
         if self.int_slot(iterator, "index") < self.int_slot(&loader, "count") {
             return Ok(true);
         }
-        let lookup = self.int_slot(&loader, "lookup");
         let names = self.service_names(&service);
-        let Some(next) = names.get(lookup as usize) else {
-            return Ok(false);
-        };
-        // JDK 25's `hasNextService` already loads the next provider class
-        // (`nextProviderClass`): one real Fabric refuses fails there, counted.
-        if self.is_unloadable_by_name(next) {
+        loop {
+            let lookup = self.int_slot(&loader, "lookup");
+            let Some(next) = names.get(lookup as usize) else {
+                return Ok(false);
+            };
+            if !self.is_unloadable_by_name(next) {
+                return Ok(true);
+            }
+            // JDK 25's `hasNextService` loads the next provider class
+            // (`nextProviderClass`, after `pending.next()` took its name). One real
+            // Fabric refuses throws Knot's `RuntimeException` out of `hasNext`: not a
+            // `ServiceConfigurationError`, so `nextError` keeps nothing, and the name is
+            // spent. Measured on a real Fabric 26.3 server: the next `hasNext` goes on to
+            // the provider after it. Counted once, for that one load; this call then
+            // answers as the next one does.
+            self.fields
+                .insert(slot(&loader, "lookup"), Value::Int(lookup + 1));
             self.count_refused_provider(next, "Z")?;
         }
-        Ok(true)
     }
 
     fn iterator_next(&mut self, iterator: &str) -> Result<Value, NativeError> {
@@ -327,6 +355,13 @@ impl<H: Host> Runtime<'_, H> {
             // can be built.
             self.fields
                 .insert(slot(&loader, "lookup"), Value::Int(lookup + 1));
+            if self.is_unloadable_by_name(&provider) {
+                // `next()` loads it the same way. Measured: it throws, the name is spent
+                // and nothing is cached (the following `next()` answers the provider
+                // after it), so this iterator's position and the loader's providers stay
+                // as they were.
+                return self.count_refused_provider(&provider, &format!("L{service};"));
+            }
             let value = self.provider_instance(&service, &provider)?;
             self.fields
                 .insert(slot(&loader, &format!("instance{count}")), value.clone());

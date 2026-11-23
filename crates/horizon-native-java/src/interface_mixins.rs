@@ -734,8 +734,9 @@ pub(crate) struct RuntimeMixinState {
     /// Per class: the pool entries its code may not resolve (`mixin_class_loading.rs`).
     pub(crate) unloadable_pools:
         std::cell::RefCell<BTreeMap<String, Option<std::rc::Rc<BTreeSet<u16>>>>>,
-    /// Per class: whether its load fails (`Runtime::class_load_fails`).
-    pub(crate) load_failures: std::cell::RefCell<BTreeMap<String, bool>>,
+    /// Per class: what its load does (`Runtime::class_load_failure`).
+    pub(crate) load_failures:
+        std::cell::RefCell<BTreeMap<String, crate::mixin_class_loading::LoadFailure>>,
 }
 
 impl RuntimeMixinState {
@@ -1394,7 +1395,7 @@ impl NativeJar {
     /// keeps it off that target (`MixinInfo.readDeclaredTargets`), so it neither applies
     /// nor validates there; a plugin answer that is not known leaves the failure
     /// [`FailedTarget::certain`] `false`. What the runtime does with the map:
-    /// [`Runtime::class_load_fails`] (the use of such a class is counted where the jar's
+    /// [`Runtime::class_load_failure`] (the use of such a class is counted where the jar's
     /// code first resolves it) and [`Runtime::refuse_failed_game_mixin_target`] (a game
     /// class the server loads before any mod runs: the game does not start). Cached per
     /// side.
@@ -2635,7 +2636,7 @@ impl<H: Host> Runtime<'_, H> {
     /// ([`crate::mixin_class_loading::server_loads_before_mods`], measured, not guessed).
     /// Any other failed class (one the game loads later or never, or any on the client,
     /// whose bootstrap is not measured) is counted where the jar's code first uses it
-    /// ([`Self::class_load_fails`]).
+    /// ([`Self::class_load_failure`]).
     pub(crate) fn game_fails_before_mods(&self) -> Option<(&str, &FailedTarget)> {
         if self.mixin_index.side != Some(MixinSide::Server) {
             return None;

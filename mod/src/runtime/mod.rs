@@ -24311,9 +24311,10 @@ impl NativeJar {
         if !runtime.classes.contains_key(&class_name) {
             return Err(NativeError::MissingMethod(format!("class {class}")));
         }
-        // The loader loads an entrypoint class by name; one whose load fails in real
-        // Fabric (`mixin_class_loading.rs`) stops the loader there, so it is refused.
-        if let Some(refusal) = runtime.entrypoint_load_failure(&class_name) {
+        // The loader loads an entrypoint class by name; one whose load surely fails in
+        // real Fabric (`mixin_class_loading.rs`) stops the loader there, so it is refused
+        // (one that may fail is counted there, and runs).
+        if let Some(refusal) = runtime.entrypoint_load_failure(&class_name)? {
             return Err(NativeError::Metadata(refusal));
         }
         // The objects an earlier entrypoint of this jar built are this one's

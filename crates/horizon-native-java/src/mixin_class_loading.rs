@@ -25,7 +25,7 @@
 //! throwing it (the exception's cause, and how a bytecode resolution surfaces it, are not
 //! modelled), and runs nothing for it.
 //!
-//! Two more loads fail the same way ([`Runtime::class_load_fails`]):
+//! Two more loads fail the same way ([`Runtime::class_load_failure`]):
 //!
 //! - a class a `required` Mixin config's rejected mixin targets: Mixin rethrows from that
 //!   class's transformation ([`NativeJar::failed_required_targets`], which a config
@@ -37,6 +37,12 @@
 //! - a class whose superclass or a superinterface fails to load (the JVM loads them with
 //!   it), a jar class through the class files and a game class through
 //!   `vanilla_host_methods.tsv`.
+//!
+//! Only a load that surely fails refuses: the game not starting, or an entrypoint whose
+//! own load surely fails. A load that may fail and cannot be told
+//! ([`LoadFailure::Unknown`]: a config plugin answer that is not known, a game supertype
+//! outside the table while a game class failed) is counted wherever it happens, the
+//! entrypoint's own load included, and never refused.
 //!
 //! A mixin's own code is merged into its target, and Mixin rewrites a merged method's
 //! references to its own class (`MixinTargetContext.transformMethodRef` /
@@ -99,6 +105,20 @@ fn loaded_class(name: &str) -> Option<String> {
         Some(_) => descriptor_classes(name).into_iter().next(),
         None => Some(name.to_owned()),
     }
+}
+
+/// What a class load does on real Fabric ([`Runtime::class_load_failure`]), ordered so
+/// the worst of a class's supertypes is its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum LoadFailure {
+    /// It loads.
+    Loads,
+    /// It may fail, and this runtime cannot tell (a config plugin answer that is not
+    /// known, a game supertype outside `vanilla_host_methods.tsv`): counted at first use,
+    /// never refused.
+    Unknown,
+    /// It surely fails.
+    Fails,
 }
 
 /// `ClassLoader.loadClass(String)` / `loadClass(String, boolean)` on the runtime's one
@@ -227,9 +247,10 @@ impl<H: Host> Runtime<'_, H> {
     }
 
     /// Whether loading class `name` (internal name; an array loads its element class) by
-    /// name, from anywhere, fails on real Fabric (module docs): it is in a selected mixin
-    /// package and no coprocessor or library-type exemption applies, or its load fails
-    /// otherwise ([`Self::class_load_fails`]).
+    /// name, from anywhere, fails on real Fabric or may (module docs): it is in a selected
+    /// mixin package and no coprocessor or library-type exemption applies, or its load
+    /// fails otherwise or cannot be told ([`Self::class_load_failure`]). Either way the
+    /// load is counted, never answered.
     #[inline(never)]
     pub(crate) fn is_unloadable_by_name(&self, name: &str) -> bool {
         if crate::mixin_plugins::running_config_plugins() {
@@ -238,43 +259,64 @@ impl<H: Host> Runtime<'_, H> {
         let Some(name) = loaded_class(name) else {
             return false;
         };
-        self.in_refused_mixin_package(&name) || self.class_load_fails(&name, 0)
+        self.in_refused_mixin_package(&name)
+            || self.class_load_failure(&name, 0) != LoadFailure::Loads
     }
 
-    /// Why the loader's load of entrypoint class `class` fails on real Fabric, which stops
-    /// the loader there: the class is in a mixin package, a `required` config's rejected
-    /// mixin surely targets it, or a supertype fails to load. `None` when it loads (a
-    /// failure that hangs on an unknown plugin answer is counted when the class
-    /// initialises instead).
-    pub(crate) fn entrypoint_load_failure(&self, class: &str) -> Option<String> {
+    /// What the loader's own load of entrypoint class `class` does on real Fabric:
+    /// `Some(why)` when it surely fails, which stops the loader there (refused): the
+    /// class is in a mixin package, or its load or a supertype's surely fails
+    /// ([`LoadFailure::Fails`]). A failure that cannot be told (a config plugin answer
+    /// that is not known, a game supertype outside `vanilla_host_methods.tsv`) is counted
+    /// here and the entrypoint runs: `None`, as for a class that loads.
+    pub(crate) fn entrypoint_load_failure(
+        &mut self,
+        class: &str,
+    ) -> Result<Option<String>, NativeError> {
         if crate::mixin_plugins::running_config_plugins() {
-            return None;
+            return Ok(None);
         }
         let binary = class.replace('/', ".");
         if self.in_refused_mixin_package(class) {
-            return Some(format!(
+            return Ok(Some(format!(
                 "entrypoint {binary} is in a Mixin config's package: Mixin refuses to load it (IllegalClassLoadError) and Fabric's Knot fails the load (\"Mixin transformation of {binary} failed\")"
-            ));
+            )));
         }
-        if let Some(failure) = self.required_mixin_failure(class) {
-            return failure.certain.then(|| {
-                format!(
-                    "entrypoint {binary} fails to load: {}; Mixin rethrows for a required config and Fabric's Knot throws \"Mixin transformation of {binary} failed\"",
-                    failure.reason
-                )
-            });
-        }
-        let file = self.class(class)?;
-        std::iter::once(file.super_name.clone())
-            .chain(file.interface_names())
-            .filter(|parent| !parent.is_empty())
-            .find(|parent| self.in_refused_mixin_package(parent) || self.class_load_fails(parent, 1))
-            .map(|parent| {
-                format!(
+        match self.class_load_failure(class, 0) {
+            LoadFailure::Loads => Ok(None),
+            LoadFailure::Unknown => self
+                .host
+                .unknown_operand_call(&MethodRef {
+                    owner: class.to_owned(),
+                    name: LOAD.to_owned(),
+                    descriptor: "()V".to_owned(),
+                })
+                .map(|_| None),
+            LoadFailure::Fails => {
+                if let Some(failure) = self.required_mixin_failure(class) {
+                    return Ok(Some(format!(
+                        "entrypoint {binary} fails to load: {}; Mixin rethrows for a required config and Fabric's Knot throws \"Mixin transformation of {binary} failed\"",
+                        failure.reason
+                    )));
+                }
+                let parent = self
+                    .class(class)
+                    .map(|file| {
+                        std::iter::once(file.super_name.clone())
+                            .chain(file.interface_names())
+                            .find(|parent| {
+                                self.in_refused_mixin_package(parent)
+                                    || self.class_load_failure(parent, 1) == LoadFailure::Fails
+                            })
+                            .unwrap_or_default()
+                    })
+                    .unwrap_or_default();
+                Ok(Some(format!(
                     "entrypoint {binary} fails to load: its supertype {} does not load on real Fabric (a Mixin package or a failed required Mixin target)",
                     parent.replace('/', ".")
-                )
-            })
+                )))
+            }
+        }
     }
 
     /// Mixin's own refusal ([`Self::is_unloadable_by_name`]'s first half).
@@ -290,62 +332,88 @@ impl<H: Host> Runtime<'_, H> {
     ///
     /// - a `required` config's rejected mixin targets it
     ///   ([`NativeJar::failed_required_targets`]): Mixin rethrows from the class's
-    ///   transformation and Knot fails the load;
+    ///   transformation and Knot fails the load ([`LoadFailure::Unknown`] when that hangs
+    ///   on a config plugin answer that is not known);
     /// - a jar class's superclass or superinterface fails to load: the JVM loads them with
     ///   the class (JVMS §5.3.5), so the class fails with them;
     /// - a game class whose supertypes include a failed game class (`ServerPlayer` when
-    ///   `Player` failed), by `vanilla_host_methods.tsv`; a game class that table does not
-    ///   hold the hierarchy of cannot be told apart, and counts as failing while any game
-    ///   class has failed.
-    pub(crate) fn class_load_fails(&self, name: &str, depth: usize) -> bool {
+    ///   `Player` failed), by `vanilla_host_methods.tsv`. While any game class has failed,
+    ///   a game class that table does not hold the hierarchy of cannot be told apart:
+    ///   [`LoadFailure::Unknown`].
+    ///
+    /// A surely failing supertype makes the class fail; else an unknown one makes it
+    /// unknown.
+    pub(crate) fn class_load_failure(&self, name: &str, depth: usize) -> LoadFailure {
         let failed = &self.mixin_index.failed_required_targets;
-        if failed.contains_key(name) {
-            return true;
+        if let Some(failure) = failed.get(name) {
+            return if failure.certain {
+                LoadFailure::Fails
+            } else {
+                LoadFailure::Unknown
+            };
         }
         if depth >= MAX_SUPERCLASS_WALK {
-            return false;
+            return LoadFailure::Loads;
         }
         if let Some(known) = self.mixin_index.load_failures.borrow().get(name) {
             return *known;
         }
-        let fails = match self.class(name) {
-            Some(_) if self.mixin_package_prefixes().is_empty() && failed.is_empty() => false,
+        let outcome = match self.class(name) {
+            Some(_) if self.mixin_package_prefixes().is_empty() && failed.is_empty() => {
+                LoadFailure::Loads
+            }
             Some(file) => std::iter::once(file.super_name.clone())
                 .chain(file.interface_names())
                 .filter(|parent| !parent.is_empty())
-                .any(|parent| {
-                    self.in_refused_mixin_package(&parent)
-                        || self.class_load_fails(&parent, depth + 1)
-                }),
-            None => self.game_class_load_fails(name),
+                .map(|parent| {
+                    if self.in_refused_mixin_package(&parent) {
+                        LoadFailure::Fails
+                    } else {
+                        self.class_load_failure(&parent, depth + 1)
+                    }
+                })
+                .max()
+                .unwrap_or(LoadFailure::Loads),
+            None => self.game_class_load_failure(name),
         };
         self.mixin_index
             .load_failures
             .borrow_mut()
-            .insert(name.to_owned(), fails);
-        fails
+            .insert(name.to_owned(), outcome);
+        outcome
     }
 
     /// A class no jar declares whose load fails because a failed game class is among its
-    /// supertypes ([`Self::class_load_fails`]).
-    fn game_class_load_fails(&self, name: &str) -> bool {
-        let failed_game: Vec<&str> = self
+    /// supertypes ([`Self::class_load_failure`]).
+    fn game_class_load_failure(&self, name: &str) -> LoadFailure {
+        let failed_game: Vec<(&str, bool)> = self
             .mixin_index
             .failed_required_targets
-            .keys()
-            .filter(|target| !self.has_class(target))
-            .map(String::as_str)
+            .iter()
+            .filter(|(target, _)| !self.has_class(target))
+            .map(|(target, failure)| (target.as_str(), failure.certain))
             .collect();
         if failed_game.is_empty()
             || library_dispatch::jdk_class_exists(name)
             || crate::jdk_closure::in_jdk_package(name)
         {
-            return false;
+            return LoadFailure::Loads;
         }
-        match crate::interface_mixins::vanilla_supertypes(name) {
-            Some(supertypes) => supertypes.iter().any(|ty| failed_game.contains(ty)),
-            None => true,
-        }
+        let Some(supertypes) = crate::interface_mixins::vanilla_supertypes(name) else {
+            return LoadFailure::Unknown;
+        };
+        failed_game
+            .iter()
+            .filter(|(target, _)| supertypes.contains(target))
+            .map(|(_, certain)| {
+                if *certain {
+                    LoadFailure::Fails
+                } else {
+                    LoadFailure::Unknown
+                }
+            })
+            .max()
+            .unwrap_or(LoadFailure::Loads)
     }
 
     /// Whether code in `frame_class` resolving a reference to class `named` is refused:
@@ -692,7 +760,7 @@ impl<H: Host> Runtime<'_, H> {
     }
 
     /// A call on a game object whose class cannot exist: one of its declared types failed
-    /// to load ([`Self::class_load_fails`]), so real Fabric never made such an object and
+    /// to load or may ([`Self::class_load_failure`]), so real Fabric never made such an object and
     /// the jar's code never reaches it. Counted where the jar's code first uses one, with
     /// the placeholder as the call's answer (or `void`); `None` otherwise. A call naming
     /// the failed class itself is already counted at the constant pool
@@ -713,7 +781,7 @@ impl<H: Host> Runtime<'_, H> {
         let Some(failed) = self
             .game_handle_types(key)
             .into_iter()
-            .find(|ty| self.class_load_fails(ty, 0))
+            .find(|ty| self.class_load_failure(ty, 0) != LoadFailure::Loads)
         else {
             return Ok(None);
         };
