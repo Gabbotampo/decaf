@@ -264,6 +264,7 @@ impl mod_api::BlockPart for JavaPlacementPart {
 }
 
 mod attachments;
+mod block_use;
 mod client;
 mod content;
 pub mod game_dispatch;
@@ -594,9 +595,13 @@ fn hyphenated_uuid(uuid: u128) -> String {
 
 #[mod_api::sunrise_mod]
 impl Hooks for HorizonJava {
+    /// Register scoped Sunrise block parts (placement and block-use hooks) for Java mod blocks.
     fn register(&self, registrar: &mut dyn Registrar, context: &RegistrationContext) {
         let mut state = self.lock();
         content::register_placement_parts(&mut state, context, registrar, Arc::clone(&self.state));
+        drop(state);
+        content::register_block_parts(&self.state, registrar, context);
+        self.refresh_game_hook_plan_bits();
     }
 
     /// The content root still accepts native block declarations here, at the Registration phase
@@ -1207,12 +1212,16 @@ impl Hooks for HorizonJava {
         let leaving = {
             let mut state = self.lock();
             let leaving = state.take_leaver(event.player);
-            // The leaver's `ServerPlayer` is gone: what callbacks kept on it is dropped.
+            // The leaver's `ServerPlayer` is gone: what callbacks kept on it is dropped, and so
+            // is any Java menu a jar held as its `containerMenu`.
             for object in leaving
                 .iter()
                 .filter_map(|entry| game_hooks::player_of(entry, 0))
             {
                 game_hooks::forget(&mut state, &object);
+            }
+            for jar in &mut state.jars {
+                jar.host.server_player_removed(event.player);
             }
             leaving
         };
@@ -1253,6 +1262,25 @@ impl Hooks for HorizonJava {
             context,
             |_| true,
         );
+    }
+
+    /// A window a mod opened closed (the player closed it, something replaced it, or the
+    /// player left). A jar holding the Java menu behind it runs its close, and what that close
+    /// opens goes out on Sunrise (`block_use.rs`).
+    fn menu_closed(&self, host: &mut dyn ServerHost, event: &mut mod_api::MenuClosedEvent) {
+        block_use::menu_closed(self, host, event.uuid, event.window);
+    }
+
+    /// A menu opened for a player, by anything. Its container id is the `ServerPlayer`'s
+    /// `containerCounter` now, which every jar's block-use model follows (`block_use.rs`).
+    fn player_container_open(
+        &self,
+        host: &mut dyn ServerHost,
+        event: &mut mod_api::PlayerContainerOpenEvent<'_>,
+    ) {
+        let container_id = event.menu.and_then(|menu| menu.container_id(&*host));
+        let mut state = self.lock();
+        block_use::container_opened(&mut state, event.player, container_id);
     }
 
     /// A player's data was copied to their new player (Fabric's `COPY_FROM`, NeoForge's
@@ -2257,6 +2285,11 @@ impl HorizonJava {
             player.session = session;
             player.life = life;
         }
+        // A new `ServerPlayer`: its `containerCounter` starts at 0 and its `containerMenu` is
+        // its inventory menu, in every jar (`block_use.rs`).
+        for jar in &mut state.jars {
+            jar.host.server_player_created(uuid, session, life);
+        }
     }
 
     /// The player whose action a hook hears, as the mod API's own helpers name them.
@@ -3057,6 +3090,10 @@ impl State {
             jar.row.command_unknown_host_calls = 0;
             jar.row.commands_translated = 0;
             jar.row.commands_refused_at_registration = 0;
+            jar.row.block_use = block_use::Tally::default();
+            // Every player of a new server is a new `ServerPlayer`: no Java menu or
+            // `containerCounter` carries over (`block_use.rs`).
+            jar.host.reset_player_menus();
             // No player value carries into another server's world.
             jar.host.reset_attachment_values();
             // Nor a level sound stream: the new server's levels (and Sunrise's streams for them)
@@ -3106,6 +3143,8 @@ struct JarRow {
     content_skipped: BTreeMap<String, (usize, usize)>,
     /// Game-class Mixin callbacks: bound or not, and what their firings did (`game_hooks.rs`).
     game_hooks: game_hooks::Tally,
+    /// Block-use hooks (`use_item_on` / `use_without_item`) and `openMenu` bridge outcomes (`block_use.rs`).
+    block_use: block_use::Tally,
 }
 
 impl JarRow {
@@ -3131,6 +3170,7 @@ impl JarRow {
             content_items: 0,
             content_skipped: BTreeMap::new(),
             game_hooks: game_hooks::Tally::default(),
+            block_use: block_use::Tally::default(),
         }
     }
 
@@ -3176,6 +3216,7 @@ impl JarRow {
             "entity_interact_client_skipped": self.entity_interact_client_skipped,
             "entity_interact_try_empty_hand": self.entity_interact_try_empty_hand,
             "game_hooks": self.game_hooks.json(),
+            "block_use": self.block_use.json(),
             "content": {
                 "blocks": self.content_blocks,
                 "items": self.content_items,
@@ -3345,6 +3386,7 @@ fn load_jar(
             content_items: 0,
             content_skipped: BTreeMap::new(),
             game_hooks: game_hooks::Tally::default(),
+            block_use: block_use::Tally::default(),
         });
     }
     let unknown = host.unknown_host_call_count();
@@ -3375,6 +3417,7 @@ fn load_jar(
             content_items: 0,
             content_skipped: BTreeMap::new(),
             game_hooks: game_hooks::Tally::default(),
+            block_use: block_use::Tally::default(),
         },
         jar,
         host,

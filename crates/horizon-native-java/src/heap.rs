@@ -391,6 +391,8 @@ impl StdHost {
         self.guava_tables.root_texts(out);
         // Recipe holders, component patches, and decoded mod recipes.
         self.recipes.root_texts(out);
+        // Active block-use state and open-menu effects.
+        self.block_use.root_texts(out);
         // Seeded `Level.random` handles kept per dimension (`level_sound.rs`).
         for held in self.level_sound.level_random_handles.values() {
             value(held, out);
@@ -458,6 +460,9 @@ impl StdHost {
         if let Some(text) = crate::menu_models::keyed_text(&self.menu_states, marker) {
             out.push(text);
         }
+        if let Some(text) = self.block_use.keyed_text(marker) {
+            out.push(text);
+        }
         if let Some(lines) = self.tooltip_sinks.get(marker) {
             out.push(marker.to_owned());
             for line in lines {
@@ -508,6 +513,7 @@ impl StdHost {
             .chain(self.menu_states.keys())
             .chain(self.tooltip_sinks.keys())
             .map(String::as_str)
+            .chain(self.block_use.keyed_table_keys())
     }
 
     /// Drop every per-object row of a collected object (`keep` false).
@@ -550,6 +556,7 @@ impl StdHost {
         self.ranged_attributes.retain(|key, _| keep(key));
         self.voxel_shapes.retain(|key, _| keep(key));
         self.menu_states.retain(|key, _| keep(key));
+        self.block_use.prune_keyed_tables(&keep);
         self.tooltip_sinks.retain(|key, _| keep(key));
         self.jdk_list_of.retain(|key| keep(key));
         self.render_objects.retain(|key, _| keep(key));
@@ -603,6 +610,8 @@ fn collectable(marker: &str) -> bool {
             .strip_prefix("entry")
             .or_else(|| serial.strip_prefix("node"))
             .or_else(|| serial.strip_prefix("menu"))
+            .or_else(|| serial.strip_prefix("ir"))
+            .or_else(|| serial.strip_prefix("hit"))
     {
         return !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit());
     }
@@ -655,6 +664,7 @@ fn heap_entries(heap: &JavaHeap, host: &StdHost) -> usize {
         + host.vec2.entry_count()
         + host.guava_tables.entry_count()
         + host.recipes.entry_count()
+        + host.block_use.entry_count()
 }
 
 fn over_count_bound(heap: &JavaHeap) -> bool {
@@ -2115,6 +2125,7 @@ mod tests {
             "fabric_biome_modifications",
             "recipe_sync_serializers",
             "vec2",
+            "block_use",
             "level_sound",
         ];
         const HOLDS_NO_OBJECT: &[&str] = &[
