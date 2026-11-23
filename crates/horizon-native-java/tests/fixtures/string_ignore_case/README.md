@@ -23,3 +23,15 @@ Two runs are byte-identical (`cmp`). Rows with a `grid_` label run one call over
 (or every offset and length for `regionMatches`) and print the results in one line.
 
 The probe holds no unpaired surrogate: a runtime `String` is valid Unicode and cannot hold one.
+
+## Counted rows (no `java25.txt` line)
+
+A `java/lang/String#n` jar-object marker (an unmodelled constructor's result) or a host handle in place of a `String`
+is a value no Java 25 program can hold, so it has no oracle row. `demo/Counted.java` gives the test entry points
+(`equalsIgnoreCase`, `compareToIgnoreCase`, both `regionMatches` overloads, `String.CASE_INSENSITIVE_ORDER.compare`);
+the test calls each with a marker, a jar-object handle spelling `java/lang/String#n` and a plain host handle, as the
+receiver, as the argument and as both, and asserts the call is counted (`java/lang/String#<method><descriptor>`, the
+comparator as `compareToIgnoreCase`) and never answered from the key text the value carries. A real `String` pair in
+the same entry points is answered and counts nothing. For the comparator, the bridge casts the first operand first:
+a wrong class there is a `ClassCastException` whatever the second is (`cmporder_raw_int_first` and `_second` are the
+Java rows), and a marker in either position is counted.

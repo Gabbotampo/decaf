@@ -14652,6 +14652,20 @@ impl Host for StdHost {
                         as i32,
                 ))
             }
+            // A receiver or argument that is a jar-object marker (`String#n`) or a
+            // host handle has no text to compare: counted, never answered from
+            // its key text (`string_ignore_case.rs`).
+            ("java/lang/String", "equalsIgnoreCase", "(Ljava/lang/String;)Z")
+            | ("java/lang/String", "compareToIgnoreCase", "(Ljava/lang/String;)I")
+            | (
+                "java/lang/String",
+                "regionMatches",
+                "(ZILjava/lang/String;II)Z" | "(ILjava/lang/String;II)Z",
+            ) if string_ignore_case::unreadable(receiver)
+                || args.iter().any(string_ignore_case::unreadable) =>
+            {
+                self.unknown_host_call(r)
+            }
             ("java/lang/String", "equalsIgnoreCase", "(Ljava/lang/String;)Z") => {
                 let other = Self::argument(r, args, 0)?;
                 Ok(Value::Int(

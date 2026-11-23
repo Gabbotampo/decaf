@@ -15,9 +15,21 @@
 //!
 //! The case mappings are `jdk_character`'s Java 25 tables. A runtime `String`
 //! is valid Unicode (no unpaired surrogate), so every operand is well formed.
+//!
+//! Only a real `String` is compared. A `java/lang/String#n` jar-object marker
+//! (an unmodelled constructor's result) or a host handle has no text to
+//! compare, so a call with either as the receiver or an argument is counted
+//! (`unreadable`), never answered from the key text it carries.
 
 use crate::runtime::jdk_character::{to_lower_case, to_upper_case};
 use crate::runtime::{NativeError, Value, checkcast};
+
+/// Whether `value` is no `String` whose text can be compared: a text that
+/// spells an object's key (`java/lang/String#3`) or a host handle. Such a call
+/// is counted, as `strip` and `indexOf(int)` count theirs.
+pub(crate) fn unreadable(value: &Value) -> bool {
+    crate::runtime::jar_object::spells_key(value) || matches!(value, Value::Host(_))
+}
 
 /// What both `equalsIgnoreCase` characters turn into before they are compared.
 fn fold(code_point: i32) -> i32 {
@@ -122,16 +134,27 @@ pub(crate) fn region_matches(
     })
 }
 
+/// What a `String.CASE_INSENSITIVE_ORDER` operand is once the bridge cast it.
+enum Operand<'a> {
+    Null,
+    Text(&'a str),
+    /// A marker or host handle: no text to compare (`unreadable`).
+    Counted,
+}
+
 /// The `String` an operand of `String.CASE_INSENSITIVE_ORDER` is, as the
-/// bridge `compare(Object, Object)` casts it: `None` for null, a
-/// `ClassCastException` for another class.
-fn string_operand(value: &Value) -> Result<Option<&str>, NativeError> {
+/// bridge `compare(Object, Object)` casts it: null, a `ClassCastException` for
+/// another class, counted for a marker or a host handle.
+fn string_operand(value: &Value) -> Result<Operand<'_>, NativeError> {
+    if unreadable(value) {
+        return Ok(Operand::Counted);
+    }
     match value {
-        Value::Ref(None) => Ok(None),
+        Value::Ref(None) => Ok(Operand::Null),
         // A text with no class of its own (`class_of_value` has none for a plain
         // `String`) is a `String`, as `natural_order` takes it.
         Value::Ref(Some(text)) => match crate::runtime::class_of_value(value).as_deref() {
-            None | Some("java/lang/String") => Ok(Some(text)),
+            None | Some("java/lang/String") => Ok(Operand::Text(text)),
             Some(class) => Err(checkcast::class_cast_exception(class, "java/lang/String")),
         },
         _ => match crate::runtime::class_of_value(value) {
@@ -159,8 +182,21 @@ pub(crate) fn compare_strings(a: Option<&str>, b: Option<&str>) -> Result<i32, N
 }
 
 /// `String.CASE_INSENSITIVE_ORDER.compare(a, b)`: the bridge casts both
-/// arguments first, so a wrong class wins over a null.
-pub(crate) fn case_insensitive_order(a: &Value, b: &Value) -> Result<i32, NativeError> {
-    let (a, b) = (string_operand(a)?, string_operand(b)?);
-    compare_strings(a, b)
+/// arguments first (the first one first), so a wrong class wins over a null.
+/// `None` when an operand cast is a marker or a host handle: counted.
+pub(crate) fn case_insensitive_order(a: &Value, b: &Value) -> Result<Option<i32>, NativeError> {
+    let a = string_operand(a)?;
+    if matches!(a, Operand::Counted) {
+        return Ok(None);
+    }
+    let b = string_operand(b)?;
+    let (a, b) = match (a, b) {
+        (_, Operand::Counted) => return Ok(None),
+        (Operand::Null, Operand::Null) => (None, None),
+        (Operand::Null, Operand::Text(b)) => (None, Some(b)),
+        (Operand::Text(a), Operand::Null) => (Some(a), None),
+        (Operand::Text(a), Operand::Text(b)) => (Some(a), Some(b)),
+        (Operand::Counted, _) => return Ok(None),
+    };
+    compare_strings(a, b).map(Some)
 }

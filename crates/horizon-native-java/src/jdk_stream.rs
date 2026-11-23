@@ -381,7 +381,19 @@ impl<H: crate::Host> crate::Runtime<'_, H> {
         let operand = |at: usize| operands.get(at).cloned().unwrap_or(Value::Ref(None));
         match op.as_str() {
             "natural" => self.natural_order(a, b),
-            "case-insensitive" => crate::string_ignore_case::case_insensitive_order(a, b),
+            "case-insensitive" => match crate::string_ignore_case::case_insensitive_order(a, b)? {
+                Some(order) => Ok(order),
+                // A marker or a host handle has no text to compare: counted as
+                // the `String` method it would run, answering "equal".
+                None => {
+                    self.host.unknown_operand_call(&MethodRef {
+                        owner: "java/lang/String".into(),
+                        name: "compareToIgnoreCase".into(),
+                        descriptor: "(Ljava/lang/String;)I".into(),
+                    })?;
+                    Ok(0)
+                }
+            },
             "reverse-natural" => self.natural_order(b, a),
             "reverse" => self.compare_with(&operand(0), b, a),
             "key" => {
