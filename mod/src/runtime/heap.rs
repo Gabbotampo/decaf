@@ -391,6 +391,10 @@ impl StdHost {
         self.guava_tables.root_texts(out);
         // Recipe holders, component patches, and decoded mod recipes.
         self.recipes.root_texts(out);
+        // Seeded `Level.random` handles kept per dimension (`level_sound.rs`).
+        for held in self.level_sound.level_random_handles.values() {
+            value(held, out);
+        }
     }
 
     /// The host's own state that may name a jar object without a table this
@@ -2111,6 +2115,7 @@ mod tests {
             "fabric_biome_modifications",
             "recipe_sync_serializers",
             "vec2",
+            "level_sound",
         ];
         const HOLDS_NO_OBJECT: &[&str] = &[
             "next_unmodifiable_collection",
