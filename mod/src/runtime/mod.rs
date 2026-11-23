@@ -12515,6 +12515,20 @@ impl Host for StdHost {
                     if is_collection_owner(owner) && !is_map_owner(owner) =>
                 {
                     let mut source = host_collection_values(self, Self::argument(r, args, 0)?)?;
+                    // The null-rejecting queues (`ArrayDeque` and its
+                    // kin) copy through `addAll`, which throws
+                    // `NullPointerException` on the first null element:
+                    // the collection never exists afterwards, so reject
+                    // up front with Java's message (`null`).
+                    if queue_rejects_null(owner)
+                        && source.iter().any(|value| value == &Value::Ref(None))
+                    {
+                        return Err(NativeError::UncaughtException {
+                            class: "java/lang/NullPointerException".into(),
+                            message: None,
+                            frame: None,
+                        });
+                    }
                     // A set built from a collection holds each element once
                     // (`addAll`: `equals`, so one `NaN`).
                     if is_set_owner(owner) {
@@ -12558,11 +12572,16 @@ impl Host for StdHost {
                     }
                     return Ok(Value::Void);
                 }
-                (owner, "offer" | "offerLast" | "addLast", "(Ljava/lang/Object;)Z")
+                (owner, "offer" | "offerLast" | "offerFirst", "(Ljava/lang/Object;)Z")
                     if is_queue_owner(owner) =>
                 {
                     let value = Self::argument(r, args, 0)?.clone();
-                    if queue_rejects_null(owner) && value == Value::Ref(None) {
+                    if value == Value::Ref(None)
+                        && queue_insert_rejects_null(
+                            owner,
+                            crate::runtime::jar_object::collection_class(marker),
+                        )
+                    {
                         return Err(NativeError::UncaughtException {
                             class: "java/lang/NullPointerException".into(),
                             message: None,
@@ -12575,11 +12594,16 @@ impl Host for StdHost {
                         .push(value);
                     return Ok(Value::Int(1));
                 }
-                (owner, "push" | "addFirst" | "offerFirst", "(Ljava/lang/Object;)V")
+                (owner, "push" | "addFirst" | "addLast", "(Ljava/lang/Object;)V")
                     if is_queue_owner(owner) =>
                 {
                     let value = Self::argument(r, args, 0)?.clone();
-                    if queue_rejects_null(owner) && value == Value::Ref(None) {
+                    if value == Value::Ref(None)
+                        && queue_insert_rejects_null(
+                            owner,
+                            crate::runtime::jar_object::collection_class(marker),
+                        )
+                    {
                         return Err(NativeError::UncaughtException {
                             class: "java/lang/NullPointerException".into(),
                             message: None,
@@ -12594,7 +12618,12 @@ impl Host for StdHost {
                 }
                 (owner, "push", "(Ljava/lang/Object;)Z") if is_queue_owner(owner) => {
                     let value = Self::argument(r, args, 0)?.clone();
-                    if queue_rejects_null(owner) && value == Value::Ref(None) {
+                    if value == Value::Ref(None)
+                        && queue_insert_rejects_null(
+                            owner,
+                            crate::runtime::jar_object::collection_class(marker),
+                        )
+                    {
                         return Err(NativeError::UncaughtException {
                             class: "java/lang/NullPointerException".into(),
                             message: None,
@@ -12702,6 +12731,18 @@ impl Host for StdHost {
                 }
                 (owner, "add", "(Ljava/lang/Object;)Z") if is_list_like_owner(owner) => {
                     let value = Self::argument(r, args, 0)?.clone();
+                    if value == Value::Ref(None)
+                        && queue_insert_rejects_null(
+                            owner,
+                            crate::runtime::jar_object::collection_class(marker),
+                        )
+                    {
+                        return Err(NativeError::UncaughtException {
+                            class: "java/lang/NullPointerException".into(),
+                            message: None,
+                            frame: None,
+                        });
+                    }
                     let needed = self
                         .mutable_collections
                         .get(marker)
@@ -12732,10 +12773,28 @@ impl Host for StdHost {
                     let changed = !additions.is_empty();
                     let current = self.mutable_collections.get(marker).map_or(0, Vec::len);
                     self.ensure_collection_capacity(marker, current + additions.len())?;
-                    self.mutable_collections
+                    let values = self
+                        .mutable_collections
                         .entry(marker.to_owned())
-                        .or_default()
-                        .extend(additions);
+                        .or_default();
+                    if queue_insert_rejects_null(owner, crate::runtime::jar_object::collection_class(marker))
+                    {
+                        // `ArrayDeque.addAll` adds one element at a time and
+                        // throws `NullPointerException` on the first null:
+                        // everything added before it stays.
+                        for addition in additions {
+                            if addition == Value::Ref(None) {
+                                return Err(NativeError::UncaughtException {
+                                    class: "java/lang/NullPointerException".into(),
+                                    message: None,
+                                    frame: None,
+                                });
+                            }
+                            values.push(addition);
+                        }
+                    } else {
+                        values.extend(additions);
+                    }
                     return Ok(Value::Int(changed as i32));
                 }
                 (owner, "addAll", "(ILjava/util/Collection;)Z") if is_list_like_owner(owner) => {
@@ -12750,7 +12809,26 @@ impl Host for StdHost {
                         .or_default();
                     let index = checked_list_insert(at, values.len())?;
                     let changed = !additions.is_empty();
-                    values.splice(index..index, additions);
+                    if queue_insert_rejects_null(owner, crate::runtime::jar_object::collection_class(marker))
+                    {
+                        // `ArrayDeque.addAll(int, Collection)` throws
+                        // `NullPointerException` on the first null too, after
+                        // inserting the elements before it.
+                        let mut insert_at = index;
+                        for addition in additions {
+                            if addition == Value::Ref(None) {
+                                return Err(NativeError::UncaughtException {
+                                    class: "java/lang/NullPointerException".into(),
+                                    message: None,
+                                    frame: None,
+                                });
+                            }
+                            values.insert(insert_at, addition);
+                            insert_at += 1;
+                        }
+                    } else {
+                        values.splice(index..index, additions);
+                    }
                     return Ok(Value::Int(changed as i32));
                 }
                 (owner, "set", "(ILjava/lang/Object;)Ljava/lang/Object;")
@@ -18118,6 +18196,16 @@ fn queue_rejects_null(owner: &str) -> bool {
             | "java/util/concurrent/ConcurrentLinkedQueue"
             | "java/util/concurrent/ConcurrentLinkedDeque"
     )
+}
+
+/// Whether inserting `null` into the receiver (the call names `owner`)
+/// throws `NullPointerException`. The call may name the concrete class
+/// (`ArrayDeque.add`) or one of its interfaces (`Deque.add`), so both the
+/// call site's owner and the receiver's own class (from its marker) count:
+/// `deque.add(null)` names `Deque` at the call site, but the deque itself is
+/// an `ArrayDeque`.
+fn queue_insert_rejects_null(owner: &str, receiver_class: &str) -> bool {
+    queue_rejects_null(owner) || queue_rejects_null(receiver_class)
 }
 
 /// Every queue a jar constructs directly.

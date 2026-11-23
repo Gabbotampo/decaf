@@ -226,21 +226,14 @@ fn sub_list_members_check_where_jdk_25_does() {
     );
 }
 
-/// `ArrayDeque.addLast` and `List.hashCode` are counted by the host.
+/// `List.hashCode` is counted by the host; `ArrayDeque.addLast` is now
+/// answered exactly (a null element is rejected, everything else is
+/// inserted), so it no longer shows up among the counted calls.
 #[test]
 fn members_the_host_counts_on_a_deque_or_view() {
     let fixture = fixture("members-the-host-counts-on-a-deque-or-vi");
-    let cases: &[(&str, &[(&str, usize)])] = &[
-        (
-            "forEachAddLastRoomy",
-            &[("java/util/ArrayDeque#addLast(Ljava/lang/Object;)V", 1)],
-        ),
-        (
-            "loopAddLastSmall",
-            &[("java/util/ArrayDeque#addLast(Ljava/lang/Object;)V", 1)],
-        ),
-        ("staleHashCode", &[("java/util/List#hashCode()I", 1)]),
-    ];
+    let cases: &[(&str, &[(&str, usize)])] =
+        &[("staleHashCode", &[("java/util/List#hashCode()I", 1)])];
     for (method, expected) in cases {
         let mut host = fixture.jar.seed_host(StdHost::new());
         fixture.text_on(&mut host, method);
