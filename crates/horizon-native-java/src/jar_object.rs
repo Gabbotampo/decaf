@@ -148,6 +148,18 @@ fn menu_object_supertypes(class: &str) -> &'static [&'static str] {
     ];
     const SLOT: &[&str] = &["net/minecraft/world/inventory/Slot"];
     const RECORD: &[&str] = &["java/lang/Record"];
+    const SIMPLE_MENU_PROVIDER: &[&str] = &[
+        "net/minecraft/world/MenuProvider",
+        "net/minecraft/world/inventory/MenuConstructor",
+    ];
+    const CONTAINER_LEVEL_ACCESS: &[&str] = &["net/minecraft/world/inventory/ContainerLevelAccess"];
+    const INVENTORY: &[&str] = &[
+        "net/minecraft/world/Container",
+        "net/minecraft/world/Clearable",
+        "java/lang/Iterable",
+        "net/minecraft/world/entity/SlotProvider",
+        "net/minecraft/world/Nameable",
+    ];
     match class {
         "net/minecraft/core/NonNullList" => crate::java_immutable::cast_supertypes(class),
         "net/minecraft/world/inventory/ItemCombinerMenu$1" => RESULT_CONTAINER,
@@ -155,6 +167,9 @@ fn menu_object_supertypes(class: &str) -> &'static [&'static str] {
         "net/minecraft/world/inventory/ItemCombinerMenu$2"
         | "net/minecraft/world/inventory/ItemCombinerMenu$3" => SLOT,
         "net/minecraft/world/inventory/ItemCombinerMenuSlotDefinition$SlotDefinition" => RECORD,
+        "net/minecraft/world/SimpleMenuProvider" => SIMPLE_MENU_PROVIDER,
+        "net/minecraft/world/inventory/ContainerLevelAccess$2" => CONTAINER_LEVEL_ACCESS,
+        "net/minecraft/world/entity/player/Inventory" => INVENTORY,
         _ => &[],
     }
 }
