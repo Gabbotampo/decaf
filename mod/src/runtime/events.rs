@@ -3178,11 +3178,10 @@ impl NativeJar {
                 }
             }
             (EventLoader::Fabric, Combine::Interaction) => {
-                let name = expect_ref(&result)
-                    .and_then(|text| text.strip_prefix("interaction-result/"))
-                    .unwrap_or("PASS");
+                let name = crate::runtime::block_use::events_interaction_name(host, &result)
+                    .unwrap_or_else(|| "PASS".to_owned());
                 if name != "PASS" {
-                    firing.interaction = Some(name.to_owned());
+                    firing.interaction = Some(name);
                     firing.cancelled = true;
                     run.stop = true;
                 }
