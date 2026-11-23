@@ -11018,13 +11018,39 @@ impl Host for StdHost {
                 }
                 let fallback = Self::argument(r, args, 1)?;
                 if matches!(fallback, Value::Ref(None)) {
+                    // `Objects.requireNonNullElse(null, null)` throws an NPE
+                    // whose message is `defaultObj`, not a message-less one.
                     return Err(NativeError::UncaughtException {
                         class: "java/lang/NullPointerException".into(),
-                        message: None,
+                        message: Some("defaultObj".into()),
                         frame: None,
                     });
                 }
                 Ok(fallback.clone())
+            }
+            (
+                "java/util/Objects",
+                "requireNonNullElseGet",
+                "(Ljava/lang/Object;Ljava/util/function/Supplier;)Ljava/lang/Object;",
+            ) => {
+                let value = Self::argument(r, args, 0)?;
+                if !matches!(&value, Value::Ref(None)) {
+                    return Ok(value.clone());
+                }
+                let supplier = Self::argument(r, args, 1)?;
+                if matches!(supplier, Value::Ref(None)) {
+                    // `requireNonNullElseGet(null, null)` fails on the null
+                    // supplier itself, with message `supplier`.
+                    return Err(NativeError::UncaughtException {
+                        class: "java/lang/NullPointerException".into(),
+                        message: Some("supplier".into()),
+                        frame: None,
+                    });
+                }
+                // A live supplier's `get()` needs the interpreter to run it:
+                // keep the call counted instead of fabricating a value or a
+                // message.
+                self.unknown_host_call(r)
             }
             // `Objects.isNull`/`nonNull` are predicates a mod passes as a
             // method reference (`filter(Objects::nonNull)`).
@@ -11039,32 +11065,88 @@ impl Host for StdHost {
                     && descriptor.ends_with(")Ljava/lang/Object;") =>
             {
                 let value = Self::argument(r, args, 0)?;
-                if matches!(&value, Value::Ref(None)) {
-                    // A mod's `try { Objects.requireNonNull(x) } catch
-                    // (NullPointerException ignored)` is real control flow, so
-                    // this raises the NPE the JVM would raise; the interpreter
-                    // delivers it to the caller's handler and only reports an
-                    // uncaught throw when the frame has none.
-                    let message = if descriptor
-                        == "(Ljava/lang/Object;Ljava/lang/String;)Ljava/lang/Object;"
-                    {
-                        args.get(1).and_then(expect_ref).cloned()
-                    } else {
-                        None
-                    };
-                    return Err(NativeError::UncaughtException {
-                        class: "java/lang/NullPointerException".into(),
-                        message,
-                        frame: None,
-                    });
+                if !matches!(&value, Value::Ref(None)) {
+                    return Ok(value.clone());
                 }
-                Ok(value.clone())
+                // A mod's `try { Objects.requireNonNull(x) } catch
+                // (NullPointerException ignored)` is real control flow, so
+                // this raises the NPE the JVM would raise; the interpreter
+                // delivers it to the caller's handler and only reports an
+                // uncaught throw when the frame has none.
+                let message = match descriptor {
+                    "(Ljava/lang/Object;Ljava/lang/String;)Ljava/lang/Object;" => {
+                        args.get(1).and_then(expect_ref).cloned()
+                    }
+                    // A live supplier's `get()` supplies the message and
+                    // needs the interpreter to run it: stay counted. A null
+                    // supplier is never called, so the message stays null.
+                    "(Ljava/lang/Object;Ljava/util/function/Supplier;)Ljava/lang/Object;"
+                        if !matches!(args.get(1), Some(Value::Ref(None))) =>
+                    {
+                        return self.unknown_host_call(r);
+                    }
+                    _ => None,
+                };
+                Err(NativeError::UncaughtException {
+                    class: "java/lang/NullPointerException".into(),
+                    message,
+                    frame: None,
+                })
             }
             ("java/util/Objects", "toString", "(Ljava/lang/Object;)Ljava/lang/String;") => {
                 // A model object prints its own `toString`, not its marker.
                 let value = Self::argument(r, args, 0)?;
                 let text = self.modelled_to_string_checked(value)?;
                 Ok(Value::Ref(Some(text.unwrap_or_else(|| value_text(value)))))
+            }
+            (
+                "java/util/Objects",
+                method @ ("checkIndex" | "checkFromToIndex" | "checkFromIndexSize"),
+                descriptor @ ("(II)I" | "(JJ)J" | "(III)I" | "(JJJ)J"),
+            ) if (method == "checkIndex") == (descriptor.len() == 5) => {
+                // `(index, length)`, `(from, to, length)` or `(from, size,
+                // length)`, as `int`s or `long`s; the result is the first
+                // operand.
+                let wide = descriptor.starts_with("(J");
+                let mut operands = [0_i64; 3];
+                for (position, operand) in
+                    operands.iter_mut().enumerate().take(descriptor.len() - 3)
+                {
+                    let value = Self::argument(r, args, position)?;
+                    *operand = if wide {
+                        expect_long(r, value)?
+                    } else {
+                        i64::from(expect_int(r, value)?)
+                    };
+                }
+                let [first, second, third] = operands;
+                let message = match method {
+                    "checkIndex" => (first < 0 || first >= second)
+                        .then(|| format!("Index {first} out of bounds for length {second}")),
+                    "checkFromToIndex" => ((first | second | third) < 0
+                        || first > second
+                        || second > third)
+                        .then(|| {
+                            format!("Range [{first}, {second}) out of bounds for length {third}")
+                        }),
+                    _ => ((first | second | third) < 0 || second > third - first).then(|| {
+                        format!(
+                            "Range [{first}, {first} + {second}) out of bounds for length {third}"
+                        )
+                    }),
+                };
+                if let Some(message) = message {
+                    return Err(NativeError::UncaughtException {
+                        class: "java/lang/IndexOutOfBoundsException".into(),
+                        message: Some(message),
+                        frame: None,
+                    });
+                }
+                Ok(if wide {
+                    long_value(first)
+                } else {
+                    Value::Int(first as i32)
+                })
             }
             ("java/lang/Math", "abs", "(I)I") => {
                 let value = expect_int(r, Self::argument(r, args, 0)?)?;
