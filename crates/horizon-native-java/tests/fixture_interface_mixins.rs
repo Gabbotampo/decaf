@@ -116,6 +116,7 @@ import java.lang.annotation.*;
 public @interface Mixin {
     Class<?>[] value() default {};
     String[] targets() default {};
+    int priority() default 1000;
 }
 "#,
     );
@@ -3714,7 +3715,10 @@ fn final_static_update_message(owner: &str, field: &str, method: &str) -> String
 /// - a host-modelled game static's flags are not known and no write reaches the game, so
 ///   every write through such a shadow (including a mixin `<clinit>`'s `= null`, which
 ///   Mixin keeps) is counted, or refused on a strict host and in a game hook;
-/// - an ambiguous multi-target static shadow is counted or refused.
+/// - an ambiguous multi-target static shadow, and a multi-target mixin's own statics
+///   (one copy per target), are counted or refused;
+/// - a mixin's own static merged into a game target is one slot across hook firings,
+///   and a reference to another mixin class from merged code counts.
 ///
 /// Expected jar-local values come from a JDK 25.0.5 run of these classes merged the way
 /// `MixinApplicatorStandard` merges them (shadow declarations dropped, `@Mutable` clearing
@@ -3899,39 +3903,30 @@ public abstract class AmbiguousStaticMixin {
         r#"package demo;
 import net.minecraft.world.entity.player.Player;
 import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.Shadow;
+import org.spongepowered.asm.mixin.Unique;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
 @Mixin(Player.class)
 public abstract class PlayerStaticHookMixin {
+    @Shadow private static int unmodelledPlayerStatic;
+    @Unique private static int hookTicks;
+
     @Inject(method = "tick()V", at = @At("HEAD"))
     private void onTick(CallbackInfo ci) {
         switch (StaticShadowProbe.mode) {
+            // A static this mixin merged into Player: one slot, kept across firings.
             case 1 -> {
-                boolean okEmpty = ItemStackStaticMixin.shadowEmptyMatchesHost();
-                boolean okWorld = LevelStaticMixin.shadowOverworldMatchesHost();
-                int before = JarStaticShadowMixin.readCount();
-                JarStaticShadowMixin.writeCount(before + 5);
-                int after = StaticTarget.count;
-                int own = ItemStackStaticMixin.readOwnTag();
-                ItemStackStaticMixin.writeOwnTag(own + 1);
-                StaticShadowProbe.report = okEmpty + "," + okWorld + "," + before + "," + after + "," + ItemStackStaticMixin.readOwnTag();
+                hookTicks++;
+                StaticShadowProbe.intResult = hookTicks;
             }
-            case 2 -> LevelStaticMixin.writeFinalOverworld();
-            case 3 -> LevelStaticMixin.writeUnmodelled(123);
-            case 4 -> StaticShadowProbe.intResult = LevelStaticMixin.readUnmodelled();
-            case 5 -> StaticShadowProbe.intResult = AmbiguousStaticMixin.readShared();
-            case 6 -> AmbiguousStaticMixin.writeShared(99);
-            case 7 -> {
-                MutableStaticShadowMixin.writeLocked(77);
-                StaticShadowProbe.intResult = MutableTarget.LOCKED;
-            }
-            case 8 -> JarStaticShadowMixin.writeLockedIllegal(1);
-            case 9 -> {
-                JarStaticShadowMixin.writeLoose(8);
-                StaticShadowProbe.intResult = StaticTarget.loose;
-            }
+            // Its own shadow of a game static the host does not model.
+            case 2 -> StaticShadowProbe.intResult = unmodelledPlayerStatic;
+            case 3 -> unmodelledPlayerStatic = 5;
+            // Another mixin class: Mixin leaves the reference alone and it cannot load.
+            case 4 -> StaticShadowProbe.intResult = JarStaticShadowMixin.readCount();
             default -> {}
         }
     }
@@ -3952,6 +3947,8 @@ public final class StaticShadowProbe {
     public static int directTargetLoose() { return StaticTarget.loose; }
     public static int directTargetLocked() { return StaticTarget.LOCKED; }
     public static int directMutableLocked() { return MutableTarget.LOCKED; }
+    // Not merged code: naming the mixin class itself cannot load in real Fabric.
+    public static int readCountThroughMixin() { return JarStaticShadowMixin.readCount(); }
 }
 "#,
     );
@@ -4198,28 +4195,52 @@ public final class StaticShadowProbe {
     assert!(int("demo.AmbiguousStaticMixin", "readShared", &mut strict).is_err());
     assert!(put("demo.AmbiguousStaticMixin", "writeShared", 99, &mut strict).is_err());
 
-    // === 4. Lenient StdHost: ambiguous multi-target static shadows count ===
+    // === 4. Lenient StdHost: a multi-target mixin's statics count ===
+    // Its shadows name no single target, and its own statics exist once per target (Mixin
+    // copies them into each), which one slot cannot hold: its `<clinit>` write of
+    // OWN_VALUE counts too.
     let mut ambig = StdHost::new().with_environment_type("SERVER");
-    assert_eq!(
-        int("demo.AmbiguousStaticMixin", "readOwn", &mut ambig).unwrap(),
-        Value::Int(19)
-    );
+    for (step, expected_total) in [("readOwn", 2), ("readOwn", 3), ("readShared", 4)] {
+        assert_eq!(
+            int("demo.AmbiguousStaticMixin", step, &mut ambig).unwrap(),
+            Value::Int(0),
+            "{step} must not answer 19 or 0 from a guessed slot"
+        );
+        assert_eq!(
+            ambig.unknown_host_call_count(),
+            expected_total,
+            "{step}: {:?}",
+            ambig.unknown_host_calls()
+        );
+    }
     put("demo.AmbiguousStaticMixin", "writeOwn", 29, &mut ambig).unwrap();
-    assert_eq!(
-        int("demo.AmbiguousStaticMixin", "readOwn", &mut ambig).unwrap(),
-        Value::Int(29)
-    );
-    assert_eq!(ambig.unknown_host_call_count(), 0);
     put("demo.AmbiguousStaticMixin", "writeShared", 99, &mut ambig).unwrap();
-    assert_eq!(ambig.unknown_host_call_count(), 1);
+    assert_eq!(ambig.unknown_host_call_count(), 6);
     assert_eq!(
         int("demo.AmbiguousStaticMixin", "readShared", &mut ambig).unwrap(),
         Value::Int(0),
         "an ambiguous multi-target static @Shadow write must not persist"
     );
-    assert_eq!(ambig.unknown_host_call_count(), 2);
 
-    // === 5. `run_game_hook_in` ===
+    // === 4b. Code that is not merged with a mixin names the mixin class itself ===
+    // (`MixinProcessor`'s `IllegalClassLoadError`, rethrown by Knot): counted, nothing runs.
+    let mut outside = StdHost::new().with_environment_type("SERVER");
+    assert_eq!(
+        int(
+            "demo.StaticShadowProbe",
+            "readCountThroughMixin",
+            &mut outside
+        )
+        .unwrap(),
+        Value::Int(0),
+        "never StaticTarget.count (10) through a mixin class reference"
+    );
+    assert_eq!(
+        outside.unknown_host_calls(),
+        vec![("demo/JarStaticShadowMixin#readCount()I".to_owned(), 1)]
+    );
+
+    // === 5. `run_game_hook_in`: the hook mixin's own merged code ===
     let weave = jar.plan_load_time_weave_with_game_hooks(MixinSide::Server);
     let registrations = jar.register_game_hooks(&weave).unwrap();
     let run_mode = |mode: i32, hook_host: &mut StdHost, hook_state: &mut GameHookState| {
@@ -4244,74 +4265,43 @@ public final class StaticShadowProbe {
     let read_int =
         |hook_host: &mut StdHost| int("demo.StaticShadowProbe", "readIntResult", hook_host);
 
-    // Mode 1: modelled game statics, a jar-local shadow (10 -> 15) and a mixin static (77 -> 78).
+    // Mode 1 twice: the @Unique static merged into Player is one slot across firings.
     let mut hook_host = StdHost::new().with_environment_type("SERVER");
     let mut hook_state = GameHookState::default();
-    run_mode(1, &mut hook_host, &mut hook_state).unwrap();
-    assert_eq!(
-        jar.invoke_method(
-            "demo.StaticShadowProbe",
-            "readReport",
-            "()Ljava/lang/String;",
-            None,
-            &mut hook_host
-        )
-        .unwrap(),
-        Value::Ref(Some("true,true,10,15,78".into()))
-    );
-    assert_eq!(hook_host.unknown_host_call_count(), 0);
-    // Mode 7: `@Mutable` cleared MutableTarget.LOCKED's ACC_FINAL -> 77.
-    run_mode(7, &mut hook_host, &mut hook_state).unwrap();
-    assert_eq!(read_int(&mut hook_host).unwrap(), Value::Int(77));
-    // Mode 9: `@Final` shadow of the non-final StaticTarget.loose -> 8.
-    run_mode(9, &mut hook_host, &mut hook_state).unwrap();
-    assert_eq!(read_int(&mut hook_host).unwrap(), Value::Int(8));
-    assert_eq!(hook_host.unknown_host_call_count(), 0);
-    // Mode 8: the really final StaticTarget.LOCKED -> HotSpot's IllegalAccessError.
-    let hook_illegal = run_mode(8, &mut hook_host, &mut hook_state);
-    assert!(
-        matches!(
-            &hook_illegal,
-            Err(NativeError::UncaughtException { class, message: Some(message), .. })
-                if class == "java/lang/IllegalAccessError" && *message == expected_message
-        ),
-        "expected IllegalAccessError for a final target write in a hook, got: {hook_illegal:?}"
-    );
-    // Modes 2 and 3: a game static write through @Shadow refuses in a hook, `@Final` or not.
-    for (mode, field) in [(2, "OVERWORLD"), (3, "UNMODELLED_STATIC")] {
-        let refused = run_mode(mode, &mut hook_host, &mut hook_state);
-        let wanted = format!(
-            "writes the game's static field net/minecraft/world/level/Level#{field} through @Shadow"
-        );
-        assert!(
-            refused
-                .as_ref()
-                .is_err_and(|error| error.to_string().contains(&wanted)),
-            "expected the game-hook refusal for {field}, got: {refused:?}"
-        );
+    for expected in [1, 2] {
+        run_mode(1, &mut hook_host, &mut hook_state).unwrap();
+        assert_eq!(read_int(&mut hook_host).unwrap(), Value::Int(expected));
     }
-    // Mode 4: an unmodelled game static read counts (lenient) or refuses (strict).
-    let mut hook_unmod = StdHost::new().with_environment_type("SERVER");
-    run_mode(4, &mut hook_unmod, &mut GameHookState::default()).unwrap();
-    assert_eq!(read_int(&mut hook_unmod).unwrap(), Value::Int(0));
-    assert_eq!(hook_unmod.unknown_host_call_count(), 1);
-    let mut hook_unmod_strict = StdHost::new()
+    assert_eq!(
+        hook_host.unknown_host_call_count(),
+        0,
+        "{:?}",
+        hook_host.unknown_host_calls()
+    );
+    // Mode 2: an unmodelled game static read counts (lenient) or refuses (strict).
+    run_mode(2, &mut hook_host, &mut hook_state).unwrap();
+    assert_eq!(read_int(&mut hook_host).unwrap(), Value::Int(0));
+    assert_eq!(hook_host.unknown_host_call_count(), 1);
+    let mut hook_strict = StdHost::new()
         .with_environment_type("SERVER")
         .with_strict_unknown_host_calls();
-    assert!(run_mode(4, &mut hook_unmod_strict, &mut GameHookState::default()).is_err());
-    // Modes 5 and 6: an ambiguous multi-target static @Shadow counts and never stores 99.
-    let mut hook_ambig = StdHost::new().with_environment_type("SERVER");
-    let mut state_ambig = GameHookState::default();
-    run_mode(6, &mut hook_ambig, &mut state_ambig).unwrap();
-    assert_eq!(hook_ambig.unknown_host_call_count(), 1);
-    run_mode(5, &mut hook_ambig, &mut state_ambig).unwrap();
-    assert_eq!(read_int(&mut hook_ambig).unwrap(), Value::Int(0));
-    assert_eq!(hook_ambig.unknown_host_call_count(), 2);
-    let mut hook_ambig_strict = StdHost::new()
-        .with_environment_type("SERVER")
-        .with_strict_unknown_host_calls();
-    assert!(run_mode(5, &mut hook_ambig_strict, &mut GameHookState::default()).is_err());
-    assert!(run_mode(6, &mut hook_ambig_strict, &mut GameHookState::default()).is_err());
+    assert!(run_mode(2, &mut hook_strict, &mut GameHookState::default()).is_err());
+    // Mode 3: a game static write through @Shadow refuses in a hook.
+    let refused = run_mode(3, &mut hook_host, &mut hook_state);
+    assert!(
+        refused.as_ref().is_err_and(|error| error.to_string().contains(
+            "writes the game's static field net/minecraft/world/entity/player/Player#unmodelledPlayerStatic through @Shadow"
+        )),
+        "{refused:?}"
+    );
+    // Mode 4: another mixin class from merged hook code counts; it never runs.
+    let mut hook_cross = StdHost::new().with_environment_type("SERVER");
+    run_mode(4, &mut hook_cross, &mut GameHookState::default()).unwrap();
+    assert_eq!(read_int(&mut hook_cross).unwrap(), Value::Int(0));
+    assert_eq!(
+        hook_cross.unknown_host_calls(),
+        vec![("demo/JarStaticShadowMixin#readCount()I".to_owned(), 1)]
+    );
 }
 
 /// A mixin's static initialiser belongs to its target: `MixinApplicatorStandard.appendInsns`
@@ -4573,21 +4563,20 @@ public interface ShapeConstantMixin {
 }
 "#,
     );
-    // The same rejection in a `required` config: Mixin rethrows, and the target class
-    // fails to load.
+    // An enum-extension mixin's enum constant may carry neither @Shadow nor @Unique.
     sources.insert(
-        "demo/RequiredTarget.java",
-        "package demo;\npublic class RequiredTarget {\n    public static int VALUE = 6;\n}\n",
+        "demo/Colour.java",
+        "package demo;\npublic enum Colour { RED }\n",
     );
     sources.insert(
-        "demo/RequiredInvalidMixin.java",
+        "demo/ColourConstantMixin.java",
         r#"package demo;
-import net.minecraft.world.entity.player.Player;
 import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.Shadow;
 
-@Mixin({RequiredTarget.class, Player.class})
-public abstract class RequiredInvalidMixin {
-    public static int exposed;
+@Mixin(Colour.class)
+public enum ColourConstantMixin {
+    @Shadow RED;
 }
 "#,
     );
@@ -4647,7 +4636,6 @@ public final class PrefixProbe {
     public static String hookIds = "";
     public static String readHookIds() { return hookIds; }
     public static int targetCount() { return StaticTarget.count; }
-    public static int requiredTargetValue() { return RequiredTarget.VALUE; }
     public static boolean isPrefixedDuck(Player p) { return ((Object) p) instanceof PrefixedDuck; }
     public static String ids(Player p) { return ((PrefixIds) (Object) p).prefixIds(); }
 }
@@ -4659,25 +4647,20 @@ public final class PrefixProbe {
         &[
             (
                 "fabric.mod.json",
-                r#"{"id":"shadowprefix","version":"1.0","mixins":["demo.mixins.json","required.mixins.json"]}"#,
+                r#"{"id":"shadowprefix","version":"1.0","mixins":["demo.mixins.json"]}"#,
             ),
             // No `required`: Mixin's default is not required, so a rejected class drops.
             (
                 "demo.mixins.json",
-                r#"{"package":"demo","mixins":["PrefixedFieldMixin","CustomPrefixFieldMixin","UniquePrefixedDuckMixin","ShadowPrefixMethodMixin","PackageStaticMixin","UniquePublicStaticMixin","ShapeConstantMixin"]}"#,
-            ),
-            (
-                "required.mixins.json",
-                r#"{"required":true,"package":"demo","mixins":["RequiredInvalidMixin"]}"#,
+                r#"{"package":"demo","mixins":["PrefixedFieldMixin","CustomPrefixFieldMixin","UniquePrefixedDuckMixin","ShadowPrefixMethodMixin","PackageStaticMixin","UniquePublicStaticMixin","ShapeConstantMixin","ColourConstantMixin"]}"#,
             ),
         ],
         COMPILE_ONLY_STUBS,
     );
     let jar = NativeJar::from_path(&jar_path).unwrap();
 
-    // === 1. The plan: one row per rejected class and target, nothing else. A config
-    // without `required` drops the class (`invalid-mixin`); a required one fails the
-    // target (`required-mixin-failed`) ===
+    // === 1. The plan: one row per rejected class and target, nothing else. The config
+    // omits `required`, so each rejected class is dropped (`invalid-mixin`) ===
     let weave = jar.plan_load_time_weave(MixinSide::Server);
     let prefix = |mixin: &str, field: &str| {
         format!("@Shadow field demo.{mixin}.{field} has a shadow prefix. This is not allowed.")
@@ -4722,10 +4705,10 @@ public final class PrefixProbe {
             ),
         ),
         (
-            "RequiredInvalidMixin",
-            vec![player, "demo/RequiredTarget"],
-            MixinSkipReason::RequiredMixinFailed(
-                "Mixin demo.RequiredInvalidMixin contains non-private static field exposed:I"
+            "ColourConstantMixin",
+            vec!["demo/Colour"],
+            MixinSkipReason::InvalidMixin(
+                "Enum constant RED in demo.ColourConstantMixin has @Shadow annotation. This is not allowed."
                     .into(),
             ),
         ),
@@ -4876,27 +4859,6 @@ public final class PrefixProbe {
         "a rejected mixin's shadow write never reaches the target, and a non-required \
          config's rejection leaves the target loading normally"
     );
-    // A required config's rejection fails its jar target's load in real Fabric (Knot's
-    // "Mixin transformation of demo.RequiredTarget failed"): refused, every time.
-    for _ in 0..2 {
-        let refused = jar.invoke_method(
-            "demo.PrefixProbe",
-            "requiredTargetValue",
-            "()I",
-            None,
-            &mut host,
-        );
-        assert!(
-            matches!(
-                &refused,
-                Err(NativeError::Metadata(message))
-                    if message.contains("jar class demo/RequiredTarget fails to load")
-                        && message.contains("required.mixins.json")
-                        && message.contains("Mixin transformation of demo.RequiredTarget failed")
-            ),
-            "{refused:?}"
-        );
-    }
     let mut strict = StdHost::new()
         .with_environment_type("SERVER")
         .with_strict_unknown_host_calls();
@@ -4957,13 +4919,18 @@ public final class PrefixProbe {
 /// (`prepareShadow`); the target method must be one the target class itself declares,
 /// static (`findAliasedMethod`, "STATIC modifier ... does not match the target").
 ///
-/// - a jar-local target runs its own method (direct calls, a method reference, and a
-///   call straight into the shadow);
+/// Mixin rewrites only a merged method's references to its own mixin class
+/// (`MixinTargetContext.transformMethodRef`):
+/// - in the mixin's own code a jar-local target runs its own method (calls, a method
+///   reference, and an embedder call straight into the shadow);
 /// - a game target is the host's, as any static call to it is (`Identifier`'s factory
-///   is modelled; an unmodelled one counts);
+///   is modelled; an unmodelled one counts, or refuses in a hook);
 /// - no exact target (a missing method, a static-modifier mismatch, an ambiguous
 ///   multi-target shadow) counts, or refuses on a strict host;
-/// - the same under `run_game_hook_in`.
+/// - code not merged with the mixin (a probe class, another mixin's hook) names the
+///   mixin class itself, which `MixinProcessor` refuses to load (`IllegalClassLoadError`,
+///   rethrown by Knot): its call, field read and method reference count, and neither the
+///   placeholder nor the target runs.
 #[test]
 fn static_shadow_methods_call_their_target_never_the_placeholder() {
     let mut sources = mixin_stubs();
@@ -4979,6 +4946,7 @@ public final class Identifier {
         "demo/MethodTarget.java",
         r#"package demo;
 public class MethodTarget {
+    public static int VISIBLE = 9;
     public static int twice(int v) { return v * 2; }
     private static String secret() { return "target-secret"; }
     public int halve(int v) { return v / 2; }
@@ -4994,10 +4962,12 @@ import org.spongepowered.asm.mixin.Shadow;
 
 @Mixin(MethodTarget.class)
 public abstract class StaticMethodShadowMixin {
+    @Shadow public static int VISIBLE;
     @Shadow public static int twice(int v) { return -1; }
     @Shadow private static String shadow$secret() { return "placeholder"; }
 
     public static String report(int v) { return twice(v) + "," + shadow$secret(); }
+    public static int readVisible() { return VISIBLE; }
     public static int viaReference(int v) {
         IntUnaryOperator op = StaticMethodShadowMixin::twice;
         return op.applyAsInt(v);
@@ -5072,17 +5042,24 @@ public abstract class IdentifierShadowMixin {
         r#"package demo;
 import net.minecraft.world.entity.player.Player;
 import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.Shadow;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
 @Mixin(Player.class)
 public abstract class PlayerShadowMethodHookMixin {
+    @Shadow private static int shadow$unmodelledPlayerFactory() { return 77; }
+
     @Inject(method = "tick()V", at = @At("HEAD"))
     private void onTick(CallbackInfo ci) {
-        ShadowMethodProbe.hookReport = StaticMethodShadowMixin.report(21) + ","
-            + StaticMethodShadowMixin.viaReference(5) + "," + IdentifierShadowMixin.build();
-        ShadowMethodProbe.hookMissing = MissingShadowMethodMixin.callMissing();
+        switch (ShadowMethodProbe.hookMode) {
+            // Its own static shadow: the game's method (prefix removed), never 77.
+            case 1 -> ShadowMethodProbe.hookInt = shadow$unmodelledPlayerFactory();
+            // Another mixin class's static shadow: that class cannot load.
+            case 2 -> ShadowMethodProbe.hookInt = StaticMethodShadowMixin.twice(21);
+            default -> {}
+        }
     }
 }
 "#,
@@ -5090,11 +5067,20 @@ public abstract class PlayerShadowMethodHookMixin {
     sources.insert(
         "demo/ShadowMethodProbe.java",
         r#"package demo;
+import java.util.function.IntUnaryOperator;
+
 public final class ShadowMethodProbe {
-    public static String hookReport = "";
-    public static int hookMissing = -9;
-    public static String readHookReport() { return hookReport; }
-    public static int readHookMissing() { return hookMissing; }
+    public static int hookMode = 0;
+    public static int hookInt = -9;
+    public static void setHookMode(int mode) { hookMode = mode; hookInt = -9; }
+    public static int readHookInt() { return hookInt; }
+    // Not merged code: each names the mixin class itself, which cannot load.
+    public static int callTwiceDirectly(int v) { return StaticMethodShadowMixin.twice(v); }
+    public static int readVisibleDirectly() { return StaticMethodShadowMixin.VISIBLE; }
+    public static int referenceFromOutside(int v) {
+        IntUnaryOperator op = StaticMethodShadowMixin::twice;
+        return op.applyAsInt(v);
+    }
 }
 "#,
     );
@@ -5171,12 +5157,39 @@ public final class ShadowMethodProbe {
         "a game target's static is the host's"
     );
     assert_eq!(
+        call_int(
+            "demo.StaticMethodShadowMixin",
+            "readVisible",
+            "()I",
+            &[],
+            &mut host
+        )
+        .unwrap(),
+        Value::Int(9),
+        "the mixin's own shadow field reference is MethodTarget.VISIBLE"
+    );
+    assert_eq!(
         host.unknown_host_call_count(),
         0,
         "{:?}",
         host.unknown_host_calls()
     );
     for (class, method, desc, args) in [
+        // Code not merged with the mixin names the mixin class itself (Mixin's
+        // `IllegalClassLoadError`, rethrown by Knot): neither the placeholder (-1) nor the
+        // target (2v, 9) answers.
+        (
+            "demo.ShadowMethodProbe",
+            "callTwiceDirectly",
+            "(I)I",
+            vec![Value::Int(21)],
+        ),
+        (
+            "demo.ShadowMethodProbe",
+            "readVisibleDirectly",
+            "()I",
+            vec![],
+        ),
         (
             "demo.IdentifierShadowMixin",
             "callUnmodelled",
@@ -5201,7 +5214,7 @@ public final class ShadowMethodProbe {
         assert_eq!(
             call_int(class, method, desc, &args, &mut host).unwrap(),
             Value::Int(0),
-            "{class}#{method} must not answer from the placeholder"
+            "{class}#{method} must not answer from the placeholder or the target"
         );
         assert_eq!(
             host.unknown_host_call_count(),
@@ -5218,54 +5231,390 @@ public final class ShadowMethodProbe {
         );
     }
 
-    // === 2. `run_game_hook_in` ===
-    let weave = jar.plan_load_time_weave_with_game_hooks(MixinSide::Server);
-    let registrations = jar.register_game_hooks(&weave).unwrap();
-    let mut hook_host = StdHost::new().with_environment_type("SERVER");
-    let mut ctx = GameHookContext::new();
-    let p = ctx.insert(
-        GameObject::player(3, "ShadowMethods")
-            .with_incarnation(1, 0)
-            .with_entity_id(42),
-    );
-    jar.run_game_hook_in(
-        &registrations,
-        &mut GameHookState::default(),
-        &mut ctx,
-        "java_base_player_tick_head",
-        Some(p),
-        &[],
-        &mut hook_host,
-        &ExecutionBudget::within(Duration::from_secs(5)),
+    // A method reference created outside the mixin resolves the mixin class too: the
+    // lambda is counted when it is made and never runs the target.
+    let before = host.unknown_host_call_count();
+    let referenced = call_int(
+        "demo.ShadowMethodProbe",
+        "referenceFromOutside",
+        "(I)I",
+        &[Value::Int(5)],
+        &mut host,
     )
     .unwrap();
-    assert_eq!(
-        jar.invoke_method(
+    assert_ne!(referenced, Value::Int(10), "the target never runs");
+    assert_ne!(referenced, Value::Int(-1), "the placeholder never runs");
+    assert!(
+        host.unknown_host_calls()
+            .iter()
+            .any(|(call, _)| call == "demo/StaticMethodShadowMixin#twice(I)I"),
+        "{:?}",
+        host.unknown_host_calls()
+    );
+    assert!(host.unknown_host_call_count() > before);
+
+    // === 2. `run_game_hook_in`: the hook mixin's own merged code ===
+    let weave = jar.plan_load_time_weave_with_game_hooks(MixinSide::Server);
+    let registrations = jar.register_game_hooks(&weave).unwrap();
+    let run_mode = |mode: i32, hook_host: &mut StdHost| {
+        call_int(
             "demo.ShadowMethodProbe",
-            "readHookReport",
-            "()Ljava/lang/String;",
-            None,
-            &mut hook_host
+            "setHookMode",
+            "(I)V",
+            &[Value::Int(mode)],
+            hook_host,
+        )
+        .unwrap();
+        let mut ctx = GameHookContext::new();
+        let p = ctx.insert(
+            GameObject::player(3, "ShadowMethods")
+                .with_incarnation(1, 0)
+                .with_entity_id(42),
+        );
+        jar.run_game_hook_in(
+            &registrations,
+            &mut GameHookState::default(),
+            &mut ctx,
+            "java_base_player_tick_head",
+            Some(p),
+            &[],
+            hook_host,
+            &ExecutionBudget::within(Duration::from_secs(5)),
+        )
+    };
+    // Mode 1: the hook's own static shadow is the game's `unmodelledPlayerFactory` (the
+    // prefix removed), which the hook tier does not model: refused, never 77.
+    let mut hook_host = StdHost::new().with_environment_type("SERVER");
+    let own = run_mode(1, &mut hook_host);
+    assert!(
+        own.as_ref().is_err_and(|error| {
+            let text = error.to_string();
+            text.contains("unmodelledPlayerFactory") && !text.contains("shadow$")
+        }),
+        "{own:?}"
+    );
+    // Mode 2: another mixin class's shadow from merged hook code counts; nothing runs.
+    let mut hook_cross = StdHost::new().with_environment_type("SERVER");
+    run_mode(2, &mut hook_cross).unwrap();
+    assert_eq!(
+        call_int(
+            "demo.ShadowMethodProbe",
+            "readHookInt",
+            "()I",
+            &[],
+            &mut hook_cross
         )
         .unwrap(),
-        Value::Ref(Some("42,target-secret,10,demo:made".into()))
+        Value::Int(0)
     );
     assert_eq!(
+        hook_cross.unknown_host_calls(),
+        vec![("demo/StaticMethodShadowMixin#twice(I)I".to_owned(), 1)]
+    );
+}
+
+/// What a rejected mixin (`InvalidMixinException`) does depends on its config's
+/// `required` flag (false when omitted, sponge-mixin 0.17.5 `MixinConfig`):
+/// `MixinApplicatorStandard.apply` drops it from a non-required config and the target
+/// loads normally; for a required one it rethrows, and fabric-loader 0.20.1's Knot fails
+/// the target's class load (`RuntimeException: Mixin transformation of <target> failed`).
+///
+/// - a jar target of a required failure refuses to initialize; the rest of the jar runs;
+/// - a game target (the game loads that class itself, so the real game does not run
+///   past it) refuses every entry into the jar's code: a game class has no single point
+///   of loading here;
+/// - the rows are `required-mixin-failed` / `invalid-mixin`.
+#[test]
+fn required_mixin_configs_fail_the_target_and_others_drop_the_mixin() {
+    let build = |name: &str, targets: &str, required: Option<bool>| {
+        let mut sources = mixin_stubs();
+        sources.insert(
+            "demo/RequiredTarget.java",
+            "package demo;\npublic class RequiredTarget {\n    public static int VALUE = 6;\n}\n",
+        );
+        sources.insert(
+            "demo/RequiredProbe.java",
+            r#"package demo;
+public final class RequiredProbe {
+    public static int plain() { return 1; }
+    public static int targetValue() { return RequiredTarget.VALUE; }
+}
+"#,
+        );
+        let mixin = format!(
+            r#"package demo;
+import net.minecraft.world.entity.player.Player;
+import org.spongepowered.asm.mixin.Mixin;
+
+@Mixin({{{targets}}})
+public abstract class RejectedMixin {{
+    public static int exposed;
+}}
+"#
+        );
+        sources.insert("demo/RejectedMixin.java", Box::leak(mixin.into_boxed_str()));
+        let required = match required {
+            Some(flag) => format!(r#""required":{flag},"#),
+            None => String::new(),
+        };
+        let config = format!(r#"{{{required}"package":"demo","mixins":["RejectedMixin"]}}"#);
+        let jar_path = build_jar(
+            name,
+            sources,
+            &[
+                (
+                    "fabric.mod.json",
+                    r#"{"id":"requiredmixin","version":"1.0","mixins":["demo.mixins.json"]}"#,
+                ),
+                ("demo.mixins.json", Box::leak(config.into_boxed_str())),
+            ],
+            COMPILE_ONLY_STUBS,
+        );
+        NativeJar::from_path(&jar_path).unwrap()
+    };
+    let detail = "Mixin demo.RejectedMixin contains non-private static field exposed:I";
+    let rows = |jar: &NativeJar| {
+        let mut rows: Vec<(String, MixinSkipReason)> = jar
+            .plan_load_time_weave(MixinSide::Server)
+            .skipped
+            .into_iter()
+            .filter(|row| row.callback.owner == "demo/RejectedMixin")
+            .map(|row| (row.target.owner, row.reason))
+            .collect();
+        rows.sort_by(|a, b| a.0.cmp(&b.0));
+        rows
+    };
+    let int = |jar: &NativeJar, method: &str| {
+        let mut host = StdHost::new().with_environment_type("SERVER");
+        jar.invoke_method("demo.RequiredProbe", method, "()I", None, &mut host)
+    };
+
+    // A non-required config (omitted `required`): dropped, the target loads.
+    let dropped = build("required-omitted", "RequiredTarget.class", None);
+    assert!(!dropped.mixin_configs()[0].required);
+    assert_eq!(
+        rows(&dropped),
+        [(
+            "demo/RequiredTarget".to_owned(),
+            MixinSkipReason::InvalidMixin(detail.into())
+        )]
+    );
+    assert_eq!(int(&dropped, "targetValue").unwrap(), Value::Int(6));
+
+    // A required config failing a jar class: that class refuses to load, every time;
+    // other classes still run.
+    let jar_only = build("required-jar-target", "RequiredTarget.class", Some(true));
+    assert_eq!(
+        rows(&jar_only),
+        [(
+            "demo/RequiredTarget".to_owned(),
+            MixinSkipReason::RequiredMixinFailed(detail.into())
+        )]
+    );
+    assert_eq!(int(&jar_only, "plain").unwrap(), Value::Int(1));
+    for _ in 0..2 {
+        let refused = int(&jar_only, "targetValue");
+        assert!(
+            matches!(
+                &refused,
+                Err(NativeError::Metadata(message))
+                    if message.contains("jar class demo/RequiredTarget fails to load")
+                        && message.contains("demo.mixins.json")
+                        && message.contains("Mixin transformation of demo.RequiredTarget failed")
+            ),
+            "{refused:?}"
+        );
+    }
+
+    // A required config failing a game class: the game does not run past that load, so
+    // every entry into the jar's code refuses.
+    let game = build(
+        "required-game-target",
+        "RequiredTarget.class, Player.class",
+        Some(true),
+    );
+    assert_eq!(
+        rows(&game),
+        [
+            (
+                "demo/RequiredTarget".to_owned(),
+                MixinSkipReason::RequiredMixinFailed(detail.into())
+            ),
+            (
+                "net/minecraft/world/entity/player/Player".to_owned(),
+                MixinSkipReason::RequiredMixinFailed(detail.into())
+            ),
+        ]
+    );
+    let refused = int(&game, "plain");
+    assert!(
+        matches!(
+            &refused,
+            Err(NativeError::Metadata(message))
+                if message.contains("jar code refused")
+                    && message.contains(
+                        "Mixin transformation of net.minecraft.world.entity.player.Player failed"
+                    )
+        ),
+        "{refused:?}"
+    );
+}
+
+/// A mixin's own static field lives on its target once merged: `mergeNewFields` moves it
+/// there, and `transformFieldRef` rewrites every `M.field` to `Target.field`. So a second
+/// mixin's `@Shadow` of that field (applied after the first, which `@Mixin(priority)`
+/// orders) reads and writes the same slot. A shadow applied before the declaring mixin
+/// finds no field (Mixin rejects it), and counts.
+///
+/// Expected values come from a JDK 25.0.5 run of `SharedTarget` with the writer, then the
+/// reader merged into it the way `MixinApplicatorStandard` merges them: `readShared()` is
+/// 2, then 7 after `bump()`, and the writer sees the reader's `setShared(40)`.
+#[test]
+fn merged_mixin_statics_are_one_slot_on_the_target() {
+    let mut sources = mixin_stubs();
+    sources.insert(
+        "net/minecraft/world/item/ItemStack.java",
+        "package net.minecraft.world.item;\npublic class ItemStack {}\n",
+    );
+    sources.insert(
+        "demo/SharedTarget.java",
+        "package demo;\npublic class SharedTarget {\n    public static int base = 1;\n}\n",
+    );
+    for (name, target, import) in [
+        ("SharedWriterMixin", "SharedTarget", ""),
+        (
+            "HostWriterMixin",
+            "ItemStack",
+            "import net.minecraft.world.item.ItemStack;\n",
+        ),
+    ] {
+        let source = format!(
+            r#"package demo;
+{import}import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.Unique;
+
+@Mixin(value = {target}.class, priority = 900)
+public abstract class {name} {{
+    @Unique private static int SHARED = 2;
+    public static void bump() {{ SHARED += 5; }}
+    public static int writerView() {{ return SHARED; }}
+}}
+"#
+        );
+        sources.insert(
+            Box::leak(format!("demo/{name}.java").into_boxed_str()),
+            Box::leak(source.into_boxed_str()),
+        );
+    }
+    for (name, target, import, priority) in [
+        ("SharedReaderMixin", "SharedTarget", "", 1000),
+        (
+            "HostReaderMixin",
+            "ItemStack",
+            "import net.minecraft.world.item.ItemStack;\n",
+            1000,
+        ),
+        // Applied before the writer: the field is not on the target yet.
+        ("EarlyReaderMixin", "SharedTarget", "", 800),
+    ] {
+        let source = format!(
+            r#"package demo;
+{import}import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.Shadow;
+
+@Mixin(value = {target}.class, priority = {priority})
+public abstract class {name} {{
+    @Shadow private static int SHARED;
+    public static int readShared() {{ return SHARED; }}
+    public static void setShared(int v) {{ SHARED = v; }}
+}}
+"#
+        );
+        sources.insert(
+            Box::leak(format!("demo/{name}.java").into_boxed_str()),
+            Box::leak(source.into_boxed_str()),
+        );
+    }
+    let mut excluded = COMPILE_ONLY_STUBS.to_vec();
+    excluded.push("net/minecraft/world/item/ItemStack.class");
+    let jar_path = build_jar(
+        "merged-statics",
+        sources,
+        &[
+            (
+                "fabric.mod.json",
+                r#"{"id":"mergedstatics","version":"1.0","mixins":["demo.mixins.json"]}"#,
+            ),
+            (
+                "demo.mixins.json",
+                r#"{"package":"demo","mixins":["SharedWriterMixin","SharedReaderMixin","EarlyReaderMixin","HostWriterMixin","HostReaderMixin"]}"#,
+            ),
+        ],
+        &excluded,
+    );
+    let jar = NativeJar::from_path(&jar_path).unwrap();
+
+    for (writer, reader) in [
+        ("demo.SharedWriterMixin", "demo.SharedReaderMixin"),
+        ("demo.HostWriterMixin", "demo.HostReaderMixin"),
+    ] {
+        let mut host = StdHost::new().with_environment_type("SERVER");
+        let int = |class: &str, method: &str, host: &mut StdHost| {
+            jar.invoke_method(class, method, "()I", None, host).unwrap()
+        };
+        assert_eq!(
+            int(reader, "readShared", &mut host),
+            Value::Int(2),
+            "{reader}"
+        );
+        jar.invoke_method(writer, "bump", "()V", None, &mut host)
+            .unwrap();
+        assert_eq!(
+            int(reader, "readShared", &mut host),
+            Value::Int(7),
+            "{reader}"
+        );
+        assert_eq!(
+            int(writer, "writerView", &mut host),
+            Value::Int(7),
+            "{writer}"
+        );
+        jar.invoke_method_with_args(
+            reader,
+            "setShared",
+            "(I)V",
+            None,
+            &[Value::Int(40)],
+            &mut host,
+        )
+        .unwrap();
+        assert_eq!(
+            int(writer, "writerView", &mut host),
+            Value::Int(40),
+            "{writer}"
+        );
+        assert_eq!(
+            host.unknown_host_call_count(),
+            0,
+            "{writer}/{reader}: {:?}",
+            host.unknown_host_calls()
+        );
+    }
+
+    let mut early = StdHost::new().with_environment_type("SERVER");
+    assert_eq!(
         jar.invoke_method(
-            "demo.ShadowMethodProbe",
-            "readHookMissing",
+            "demo.EarlyReaderMixin",
+            "readShared",
             "()I",
             None,
-            &mut hook_host
+            &mut early
         )
         .unwrap(),
-        Value::Int(0),
-        "a missing shadow target counts in a hook too, never answers -2"
+        Value::Int(0)
     );
     assert_eq!(
-        hook_host.unknown_host_call_count(),
-        1,
-        "{:?}",
-        hook_host.unknown_host_calls()
+        early.unknown_host_calls(),
+        vec![("demo/EarlyReaderMixin#SHAREDI".to_owned(), 1)],
     );
 }

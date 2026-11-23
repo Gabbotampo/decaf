@@ -28238,13 +28238,28 @@ impl<H: Host> Runtime<'_, H> {
         desc: &str,
         at: usize,
     ) -> Result<(Value, bool), NativeError> {
+        // A `@Mixin` class this frame is not merged with cannot load in real Fabric.
+        if self.is_unmerged_mixin_reference(class, &symbolic.owner) {
+            self.host.unknown_operand_call(symbolic)?;
+            return Ok((Value::default_for(&symbolic.descriptor), false));
+        }
         let field = MethodRef {
             owner: self.field_owner(symbolic),
             ..symbolic.clone()
         };
-        let target = match self.resolve_static_shadow(&field) {
-            interface_mixins::StaticShadowResolution::NotShadow => field,
-            interface_mixins::StaticShadowResolution::Resolved { target, .. } => target,
+        // `merged`: the declaring mixin of a static Mixin moved onto its target.
+        let (target, init, merged) = match self.resolve_static_shadow(&field) {
+            interface_mixins::StaticShadowResolution::NotShadow => {
+                let init = field.owner.clone();
+                (field, init, None)
+            }
+            interface_mixins::StaticShadowResolution::Resolved { target, .. } => {
+                let init = target.owner.clone();
+                (target, init, None)
+            }
+            interface_mixins::StaticShadowResolution::Merged { slot, init, .. } => {
+                (slot, init.clone(), Some(init))
+            }
             interface_mixins::StaticShadowResolution::Unresolved => {
                 self.host.unknown_operand_call(&field)?;
                 return Ok((Value::default_for(&field.descriptor), false));
@@ -28253,11 +28268,21 @@ impl<H: Host> Runtime<'_, H> {
         // Reading a static field initializes its declaring class first, exactly as
         // the JVM does. Without this a jar's `ItemInit.HANGING_POT_ITEM` read from
         // another class's `<clinit>` sees an unset field and answers null.
-        self.ensure_initialized(&target.owner)?;
+        self.ensure_initialized(&init)?;
         let outcome = self.dispatch_field_anchor(&target, false, None, class, method, desc, at)?;
         let modified =
             outcome != AnchorOutcome::Normal && target.descriptor.starts_with(['L', '[']);
         let value = match outcome {
+            // A merged static is the runtime's own slot: its JVM default (or constant)
+            // until written, never the host's.
+            AnchorOutcome::Normal if let Some(declaring) = &merged => {
+                match self.static_fields.get(&Self::static_field_key(&target)) {
+                    Some(value) => value.clone(),
+                    None => self
+                        .static_constant(declaring, &target.name, &target.descriptor)?
+                        .unwrap_or_else(|| Value::default_for(&target.descriptor)),
+                }
+            }
             AnchorOutcome::Normal => {
                 if let Some(value) = gson_model::static_field(&target)
                     .or_else(|| gson_tree::static_field(&target))
@@ -28314,48 +28339,64 @@ impl<H: Host> Runtime<'_, H> {
         desc: &str,
         at: usize,
     ) -> Result<(), NativeError> {
+        // A `@Mixin` class this frame is not merged with cannot load in real Fabric.
+        if self.is_unmerged_mixin_reference(class, &symbolic.owner) {
+            self.host.unknown_operand_call(symbolic)?;
+            return Ok(());
+        }
         let field = MethodRef {
             owner: self.field_owner(symbolic),
             ..symbolic.clone()
         };
-        let (target, through_shadow) = match self.resolve_static_shadow(&field) {
-            interface_mixins::StaticShadowResolution::NotShadow => (field, false),
+        // `through_shadow`: the write names a target's own field (which a host-modelled
+        // game class never takes); `init`: the class to initialize first; `write`: how a
+        // resolved field judges the write.
+        let (target, through_shadow, init, write) = match self.resolve_static_shadow(&field) {
+            interface_mixins::StaticShadowResolution::NotShadow => {
+                let init = field.owner.clone();
+                (field, false, init, None)
+            }
             interface_mixins::StaticShadowResolution::Unresolved => {
                 self.host.unknown_operand_call(&field)?;
                 return Ok(());
             }
             interface_mixins::StaticShadowResolution::Resolved { target, write } => {
-                if let interface_mixins::StaticShadowWrite::Final {
-                    symbolic_owner,
-                    declaring,
-                } = &write
-                {
-                    // Field resolution fails before the declaring class initialises.
-                    match self.judge_final_static_put(
-                        symbolic_owner,
-                        declaring,
-                        &target.name,
-                        class,
-                        method,
-                    ) {
-                        interface_mixins::FinalStaticPut::Allowed => {}
-                        interface_mixins::FinalStaticPut::Illegal(message) => {
-                            return Err(NativeError::UncaughtException {
-                                class: "java/lang/IllegalAccessError".into(),
-                                message: Some(message),
-                                frame: None,
-                            });
-                        }
-                        interface_mixins::FinalStaticPut::Unknown => {
-                            self.host.unknown_operand_call(&target)?;
-                            return Ok(());
-                        }
-                    }
-                }
-                (target, true)
+                let init = target.owner.clone();
+                (target, true, init, Some(write))
+            }
+            // The runtime's own slot for a static Mixin moved onto its target.
+            interface_mixins::StaticShadowResolution::Merged { slot, init, write } => {
+                (slot, false, init, Some(write))
             }
         };
-        self.ensure_initialized(&target.owner)?;
+        if let Some(interface_mixins::StaticShadowWrite::Final {
+            symbolic_owner,
+            declaring,
+        }) = &write
+        {
+            // Field resolution fails before the declaring class initialises.
+            match self.judge_final_static_put(
+                symbolic_owner,
+                declaring,
+                &target.name,
+                class,
+                method,
+            ) {
+                interface_mixins::FinalStaticPut::Allowed => {}
+                interface_mixins::FinalStaticPut::Illegal(message) => {
+                    return Err(NativeError::UncaughtException {
+                        class: "java/lang/IllegalAccessError".into(),
+                        message: Some(message),
+                        frame: None,
+                    });
+                }
+                interface_mixins::FinalStaticPut::Unknown => {
+                    self.host.unknown_operand_call(&target)?;
+                    return Ok(());
+                }
+            }
+        }
+        self.ensure_initialized(&init)?;
         let outcome =
             self.dispatch_field_anchor(&target, true, Some(&value), class, method, desc, at)?;
         if outcome != AnchorOutcome::Normal {
@@ -36389,6 +36430,10 @@ impl<H: Host> Runtime<'_, H> {
         {
             return Err(self.budget_exceeded(class, method));
         }
+        if self.depth == 0 {
+            // A required Mixin config that fails a game class stops the game itself.
+            self.refuse_failed_game_mixin_target()?;
+        }
         if method != "<clinit>" {
             self.ensure_initialized(class)?;
         }
@@ -38712,8 +38757,9 @@ impl<H: Host> Runtime<'_, H> {
                         }
                     }
                     let mut r = file.method_ref(i)?;
-                    // Mixin's rewrite of a static `@Shadow` call to its target.
-                    self.rewrite_static_shadow_call(op, &mut r);
+                    // Mixin's rewrite of a static `@Shadow` call to its target; a call
+                    // naming a `@Mixin` class this frame is not merged with is counted.
+                    let unmerged_mixin = self.rewrite_static_shadow_call(op, class, &mut r);
                     let n = arg_count(&r.descriptor);
                     let mut args = (0..n)
                         .map(|_| pop(&mut stack, class, method, at))
@@ -38736,12 +38782,15 @@ impl<H: Host> Runtime<'_, H> {
                     {
                         frame_modified_identity = true;
                     }
-                    if self.check_shape_probes
-                        && (receiver.as_ref().is_some_and(is_shape_probe)
-                            || args.iter().any(is_shape_probe))
-                        && !self.is_allowed_shape_probe_invoke(op, &r, receiver.as_ref(), &args)
+                    if unmerged_mixin
+                        || self.check_shape_probes
+                            && (receiver.as_ref().is_some_and(is_shape_probe)
+                                || args.iter().any(is_shape_probe))
+                            && !self.is_allowed_shape_probe_invoke(op, &r, receiver.as_ref(), &args)
                     {
-                        self.host.note_retained_shape_probe();
+                        if !unmerged_mixin {
+                            self.host.note_retained_shape_probe();
+                        }
                         let value = invoke_or_catch!(at, self.host.unknown_operand_call(&r));
                         if value != Value::Void {
                             stack.push(value);
@@ -40164,6 +40213,16 @@ impl<H: Host> Runtime<'_, H> {
                         continue;
                     }
                     let target = file.invoke_dynamic_target(index)?;
+                    // A handle naming a `@Mixin` class this frame is not merged with:
+                    // counted, and its placeholder stands for the lambda.
+                    if let Some(counted) =
+                        self.count_unmerged_mixin_handle(class, target.as_ref())?
+                    {
+                        if return_desc(&descriptor) != "V" {
+                            stack.push(counted);
+                        }
+                        continue;
+                    }
                     // The call site's own type is the functional interface the
                     // lambda's class implements, with `altMetafactory`'s
                     // markers after it (`callback_marker.rs`).
