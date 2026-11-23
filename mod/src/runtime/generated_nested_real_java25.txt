@@ -1,3 +1,0 @@
-generated-single|OK|carrier@1@root@0,fabricloader@0.19.5@root@0,generated-lib@1.0@nested@1,java@25@root@0,minecraft@26.3@root@0
-generated-two|OK|carrier_a@1@root@0,carrier_b@1@root@0,fabricloader@0.19.5@root@0,generated-lib@2.0@nested@1,java@25@root@0,minecraft@26.3@root@0
-plain-library|OK|fabricloader@0.19.5@root@0,java@25@root@0,minecraft@26.3@root@0,plain-carrier@1@root@0

@@ -340,7 +340,7 @@ pub(crate) fn owned_namespaces(context: &RegistrationContext) -> Vec<String> {
 pub(crate) fn registration_game_version(context: &RegistrationContext) -> Option<&str> {
     context
         .instance_dir()
-        .is_ok()
+        .is_some()
         .then(|| context.game_version())
 }
 

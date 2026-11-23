@@ -17,8 +17,8 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use mod_api::{
-    BlockClick, BlockPart, Hand, InteractionResult, LogicalSide, MenuReplace, OpenMenuError,
-    PlayerRef, ServerHost, UseItemOnEvent, UseWithoutItemEvent,
+    BlockClick, BlockPart, Hand, InteractionResult, LogicalSide, MenuReplace, ModMenuOpen,
+    OpenMenuError, PlayerRef, ServerHost, UseItemOnEvent, UseWithoutItemEvent,
 };
 use serde_json::json;
 
@@ -222,7 +222,7 @@ impl JavaBlockUsePart {
 
         let player_ref = host.player(click.player);
         let player_name = player_ref
-            .and_then(|p| p.name(&*host))
+            .and_then(|p| p.name(&*host).map(str::to_owned))
             .or(facade_name)
             .unwrap_or_else(|| "Player".to_owned());
         let sneaking = player_ref
@@ -240,9 +240,22 @@ impl JavaBlockUsePart {
 
         let jar = &mut guard.jars[jar_index];
 
-        let clicked_stack = click
-            .stack
-            .map(|s| crate::client::runtime_stack_from_api(&*host, &mut jar.host, None, s));
+        // A held stack whose item the host cannot name has no Java form: the use fails and is
+        // counted rather than run with an empty hand Java would not see.
+        let clicked_stack = match click.stack {
+            None => None,
+            Some(s) => {
+                match crate::client::runtime_stack_from_api(&*host, &mut jar.host, None, s) {
+                    Some(value) => Some(value),
+                    None => {
+                        jar.host
+                            .note_unknown_game_hook("block-use:held item has no registry id");
+                        let reason = "the held stack's item has no registry id".to_owned();
+                        return Some((jar_index, jar.row.id.clone(), Err(reason)));
+                    }
+                }
+            }
+        };
         let stack = if with_item {
             clicked_stack.clone()
         } else {
@@ -672,7 +685,7 @@ fn run_menu_closes(
     let player = BlockUsePlayerData {
         uuid: player_uuid,
         name: player_ref
-            .and_then(|p| p.name(host))
+            .and_then(|p| p.name(host).map(str::to_owned))
             .or_else(|| facade.map(|p| p.name.clone()))
             .unwrap_or_else(|| "Player".to_owned()),
         entity_id: player_ref
@@ -785,7 +798,7 @@ fn try_open_sunrise_menu(
     let menu_key = host
         .menu_keys()
         .into_iter()
-        .find(|key| key.id(&*host) == menu_id);
+        .find(|key| key.id(&*host).is_some_and(|id| id == menu_id));
     let Some(menu_key) = menu_key else {
         return SunriseMenuAttempt::Refused {
             hook_tag: "sunrise#openModMenu:unregistered_menu_type",
@@ -824,14 +837,12 @@ fn try_open_sunrise_menu(
         };
     };
 
-    let result = player_ref.open_mod_menu(
-        host,
-        menu_key,
-        title_text,
-        Vec::new(),
-        effect.access_pos,
-        MenuReplace::CloseFirst,
-    );
+    // No opening bytes, no live data values (Decaf's menus declare none), no opening hand (a
+    // block opened it), and the old window closed first: `ModMenuOpen::new`'s defaults.
+    let mut request = ModMenuOpen::new(menu_key, title_text);
+    request.pos = effect.access_pos;
+    request.replace = MenuReplace::CloseFirst;
+    let result = player_ref.open_mod_menu(host, request);
     classify_open_mod_menu_result(menu_id, result)
 }
 
@@ -877,8 +888,8 @@ mod tests {
 
     use crate::runtime::{InteractionItemContext, NativeJar, StdHost};
     use mod_api::{
-        Backend, BackendMut, BlockHit, BlockKey, BlockState, BlockStateRecord, EntityRef, Host,
-        LevelDimension, PlayerRef, Text, WorldEpoch,
+        Backend, BackendMut, BlockHit, BlockKey, BlockState, EntityRef, Host, LevelDimension,
+        PlayerRef, Text, WorldEpoch,
     };
 
     struct BlockUseTestHost {
@@ -939,8 +950,8 @@ mod tests {
     mod_api::impl_server_host_areas!(BlockUseTestHost);
 
     impl mod_api::prelude::PlayerSessionBackend for BlockUseTestHost {
-        fn player_name(&self, player: PlayerRef) -> Option<String> {
-            (player.uuid() == self.player_uuid).then(|| self.player_name.clone())
+        fn player_name(&self, player: PlayerRef) -> Option<&str> {
+            (player.uuid() == self.player_uuid).then_some(self.player_name.as_str())
         }
     }
     impl mod_api::prelude::EntityStanceBackend for BlockUseTestHost {
@@ -982,7 +993,7 @@ mod tests {
 
     fn test_block_state() -> BlockState {
         let key: BlockKey = mod_api::__private::parts_installation::block_key(0);
-        BlockState::from(BlockStateRecord::new(key, 0))
+        mod_api::__private::block_state_from_ordinal(key, 0)
     }
 
     fn test_click<'a>(pos: [i32; 3], player: u128) -> BlockClick<'a> {
@@ -1114,7 +1125,6 @@ mod tests {
     #[test]
     fn menu_effects_go_out_in_bytecode_order() {
         let _ = mod_api::__private::initialize();
-        let _phase = mod_api::__private::PhaseOwner::scope(mod_api::__private::ModPhase::World);
         let mut host = BlockUseTestHost::new(None);
         let uuid = host.player_uuid;
         let applied = apply_menu_effects(
@@ -1284,7 +1294,6 @@ mod tests {
 
     fn run_runes_block_part_test(jar_path: &str) {
         let _ = mod_api::__private::initialize();
-        let _phase = mod_api::__private::PhaseOwner::scope(mod_api::__private::ModPhase::World);
         let jar = Arc::new(NativeJar::from_path(Path::new(jar_path)).expect("load RUNES_JAR"));
         let mut host = jar
             .try_seed_host(StdHost::new().with_game_version("26.3"))
