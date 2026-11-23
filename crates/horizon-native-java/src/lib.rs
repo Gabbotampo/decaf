@@ -38251,6 +38251,20 @@ impl<H: Host> Runtime<'_, H> {
                     // for byte[] and the low bit for boolean[].
                     let boolean_array = value_class::array_component(&array)
                         .is_some_and(|component| component == "boolean");
+                    // `castore` keeps the low 16 bits zero-extended and `sastore` the low 16
+                    // sign-extended (JVMS 6.5), whatever the int on the stack held: a hand-written
+                    // class file or generated code need not have narrowed it with i2c / i2s.
+                    // `Value::Int` only; any other value is the caller's type error below.
+                    let value = match (op, value) {
+                        (0x55, Value::Int(wide)) => Value::Int(i32::from(wide as u16)),
+                        (0x56, Value::Int(wide)) => Value::Int(i32::from(wide as i16)),
+                        // A `byte[]` that is not compact (`ArrayData::of_class`) keeps `Value`s:
+                        // narrow here too, as the compact one does.
+                        (0x54, Value::Int(wide)) if !boolean_array => {
+                            Value::Int(i32::from(wide as i8))
+                        }
+                        (_, value) => value,
+                    };
                     let stored = if op == 0x54 && boolean_array {
                         data.boolean_store(index as usize, value)
                     } else {
