@@ -696,6 +696,11 @@ pub enum HostKind {
     /// Vanilla `StreamCodec$CodecOperation` combinator returned by `ByteBufCodecs.list(...)`
     /// and friends (`stream_codec.rs`).
     StreamCodecOperation,
+    /// Vanilla 26.3 `InteractionResult` sealed record (`Success`, `Fail`, `Pass`,
+    /// `TryEmptyHandInteraction`, `block_use.rs`).
+    InteractionResult,
+    /// Vanilla 26.3 `InteractionResult$ItemContext` record (`block_use.rs`).
+    InteractionItemContext,
 }
 
 /// How a kind's Java class follows from its key.
@@ -767,6 +772,16 @@ pub(crate) trait Nested {
     }
     /// The MC 26.3 `VoxelShape.toString()` for a non-singleton shape key (`cube/<n>`, `array/<n>`).
     fn voxel_shape_to_string(&mut self, key: &str) -> Option<String> {
+        let _ = key;
+        None
+    }
+    /// Dynamic `InteractionResult$Success(swingSource, itemContext)` fields (`block_use.rs`).
+    fn interaction_result_success(&mut self, key: &str) -> Option<(Value, Value)> {
+        let _ = key;
+        None
+    }
+    /// Dynamic `InteractionResult$ItemContext(wasItemInteraction, heldItemTransformedTo)` fields.
+    fn interaction_item_context(&mut self, key: &str) -> Option<(bool, Value)> {
         let _ = key;
         None
     }
@@ -3086,6 +3101,20 @@ const KINDS: &[KindInfo] = &[
         },
         canonical: never_canonical,
         methods: &crate::stream_codec::CODEC_OPERATION_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::InteractionResult,
+        tag: "ires",
+        class: ClassRule::FromKey(crate::block_use::interaction_result_class),
+        canonical: always_canonical,
+        methods: &crate::block_use::INTERACTION_RESULT_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::InteractionItemContext,
+        tag: "ictx",
+        class: ClassRule::Fixed(crate::block_use::INTERACTION_RESULT_ITEM_CONTEXT),
+        canonical: always_canonical,
+        methods: &crate::block_use::INTERACTION_ITEM_CONTEXT_METHODS,
     },
 ];
 
