@@ -35,6 +35,12 @@ mod attachment_codec;
 mod bigdecimal_slice;
 mod block_entity_types;
 mod block_item_id;
+mod block_use;
+pub use block_use::{
+    BlockHitData, BlockUseContext, BlockUseOutcome, BlockUsePlayerData, BlockUseSide,
+    InteractionItemContext, InteractionResultValue, MenuCloseOutcome, MenuEffect, OpenMenuEffect,
+    PlayerContainer, SwingSource,
+};
 mod boxed;
 pub mod brigadier;
 mod callback_marker;
@@ -283,6 +289,7 @@ mod vanilla_block_items;
 mod vanilla_block_shapes;
 mod vanilla_block_state_definers;
 mod vanilla_block_state_properties;
+mod vanilla_block_use_methods;
 mod vanilla_blocks;
 mod vanilla_entity_types;
 mod vanilla_holders;
@@ -4221,6 +4228,7 @@ pub struct StdHost {
     menu_states: menu_models::States,
     next_menu_object: u64,
     freed_menu_objects: heap::FreedObjects,
+    block_use: block_use::BlockUseHostState,
     pub(crate) level_sound: level_sound::LevelSoundState,
 }
 
@@ -4540,6 +4548,7 @@ impl StdHost {
             menu_states: BTreeMap::new(),
             next_menu_object: 0,
             freed_menu_objects: heap::FreedObjects::default(),
+            block_use: block_use::BlockUseHostState::default(),
             level_sound: level_sound::LevelSoundState::default(),
         }
     }
@@ -9618,6 +9627,9 @@ impl Host for StdHost {
         if let Some(value) = voxel_shape::static_field(self, r) {
             return value;
         }
+        if let Some(value) = block_use::static_field(r) {
+            return Ok(value);
+        }
         if r.owner == "net/minecraft/core/BlockPos"
             && r.name == "ZERO"
             && r.descriptor == "Lnet/minecraft/core/BlockPos;"
@@ -9918,6 +9930,7 @@ impl Host for StdHost {
     fn random_new(&mut self, class: &str) -> Option<Value> {
         recipe_models::random_new(self, class)
             .or_else(|| vanilla_values::random_new(self, class))
+            .or_else(|| block_use::random_new(self, class))
             .or_else(|| StdHost::random_new(self, class))
     }
 
@@ -10049,6 +10062,9 @@ impl Host for StdHost {
     }
 
     fn invoke(&mut self, r: &MethodRef, args: &[Value]) -> Result<Value, NativeError> {
+        if let Some(value) = block_use::static_call(self, r, args) {
+            return value;
+        }
         if menu_models::is_menu_class(&r.owner)
             && let Some(value) =
                 menu_models::static_call(&mut self.menu_states, &mut self.next_menu_object, r, args)
@@ -11615,6 +11631,9 @@ impl Host for StdHost {
             return result;
         }
         if let Some(result) = voxel_shape::direction_instance_call(r, receiver) {
+            return result;
+        }
+        if let Some(result) = block_use::instance_call(self, r, receiver, args) {
             return result;
         }
         if let Value::Host(handle) = receiver
@@ -17239,6 +17258,9 @@ fn game_enum_constants(owner: &str) -> Option<&'static [&'static str]> {
         "net/minecraft/core/Direction$Axis" => &["X", "Y", "Z"],
         "net/minecraft/core/Direction$AxisDirection" => &["POSITIVE", "NEGATIVE"],
         "net/minecraft/world/InteractionHand" => &["MAIN_HAND", "OFF_HAND"],
+        "net/minecraft/world/InteractionResult$SwingSource" => {
+            &["NONE", "PREDICTED", "SERVER_ONLY"]
+        }
         // `CreativeModeTab$TabVisibility` (`server-26.3.jar` `<clinit>` offsets 0..45).
         "net/minecraft/world/item/CreativeModeTab$TabVisibility" => &[
             "PARENT_AND_SEARCH_TABS",
@@ -17628,6 +17650,16 @@ impl host_ref::Nested for HostNested<'_> {
             .voxel_shapes
             .get(key)
             .map(|s| s.to_java_string())
+    }
+
+    fn interaction_result_success(&mut self, key: &str) -> Option<(Value, Value)> {
+        let host = self.0.as_deref()?;
+        block_use::success_parts_in_host(host, key)
+    }
+
+    fn interaction_item_context(&mut self, key: &str) -> Option<(bool, Value)> {
+        let host = self.0.as_deref()?;
+        block_use::item_context_parts_in_host(host, key)
     }
 
     fn uuid_bits(&mut self, value: &Value) -> Option<(i64, i64)> {
@@ -24439,6 +24471,16 @@ impl NativeJar {
         roots: &[Value],
         action: impl FnOnce(&mut Runtime<'_, H>) -> Result<Value, NativeError>,
     ) -> Result<Value, NativeError> {
+        self.with_persistent_runtime_with_budget(host, roots, &ExecutionBudget::UNBOUNDED, action)
+    }
+
+    fn with_persistent_runtime_with_budget<H: Host>(
+        &self,
+        host: &mut H,
+        roots: &[Value],
+        budget: &ExecutionBudget,
+        action: impl FnOnce(&mut Runtime<'_, H>) -> Result<Value, NativeError>,
+    ) -> Result<Value, NativeError> {
         let (static_fields, initialized_classes) = host.persistent_class_state();
         let (io_paths, io_files, io_file_bytes, io_dirs) = host.persistent_io_state();
         let mut callback_infos = CallbackInfos::new();
@@ -24497,7 +24539,7 @@ impl NativeJar {
             next_frame_id: 0,
             shape_extraction: None,
             check_shape_probes: false,
-            budget: &ExecutionBudget::UNBOUNDED,
+            budget,
         };
         let resident = runtime.adopt_resident_heap();
         let mut crossing = roots.to_vec();
@@ -31174,6 +31216,9 @@ impl<H: Host> Runtime<'_, H> {
                 return self.host.voxel_shape_or_array(r, first, &others).map(Some);
             }
         }
+        if let Some(value) = block_use::invoke_runtime_helper(self, r, receiver, args)? {
+            return Ok(Some(value));
+        }
         // `BlockStateBase.getShape(BlockGetter, BlockPos[, CollisionContext])`: dispatches to the
         // block's `getShape` (MC 26.3 `BlockBehaviour$BlockStateBase.getShape`).
         if matches!(
@@ -35961,6 +36006,75 @@ impl<H: Host> Runtime<'_, H> {
                             &supplier_args,
                         )?
                     }
+                }
+                menu_models::MenuAction::MenuConstructor {
+                    constructor,
+                    container_id,
+                    inventory,
+                    player,
+                } => {
+                    let ctor_args = [container_id, inventory, player];
+                    if let Some(menu) = self.invoke_callback(&constructor, &ctor_args)? {
+                        menu
+                    } else {
+                        self.call_virtual(
+                            jdk_call::Site::Interface,
+                            menu_models::MENU_CONSTRUCTOR,
+                            "createMenu",
+                            "(ILnet/minecraft/world/entity/player/Inventory;Lnet/minecraft/world/entity/player/Player;)Lnet/minecraft/world/inventory/AbstractContainerMenu;",
+                            &constructor,
+                            &ctor_args,
+                        )?
+                    }
+                }
+                menu_models::MenuAction::AccessEvaluate {
+                    function,
+                    level,
+                    pos,
+                    default,
+                } => {
+                    let fn_args = [level, pos];
+                    let applied = if let Some(v) = self.invoke_callback(&function, &fn_args)? {
+                        v
+                    } else {
+                        self.call_virtual(
+                            jdk_call::Site::Interface,
+                            "java/util/function/BiFunction",
+                            "apply",
+                            "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+                            &function,
+                            &fn_args,
+                        )?
+                    };
+                    if applied == Value::Ref(None) {
+                        return Err(NativeError::UncaughtException {
+                            class: "java/lang/NullPointerException".into(),
+                            message: None,
+                            frame: None,
+                        });
+                    }
+                    match default {
+                        Some(_) => applied,
+                        None => host_optional::optional_wrap(applied),
+                    }
+                }
+                menu_models::MenuAction::AccessExecute {
+                    consumer,
+                    level,
+                    pos,
+                } => {
+                    let fn_args = [level, pos];
+                    if self.invoke_callback(&consumer, &fn_args)?.is_none() {
+                        let _ = self.call_virtual(
+                            jdk_call::Site::Interface,
+                            "java/util/function/BiConsumer",
+                            "accept",
+                            "(Ljava/lang/Object;Ljava/lang/Object;)V",
+                            &consumer,
+                            &fn_args,
+                        )?;
+                    }
+                    Value::Void
                 }
             };
         }
