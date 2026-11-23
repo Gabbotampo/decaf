@@ -58703,6 +58703,8 @@ mod vendored_generated_nested_real_java25_txt;
 mod vendored_jarjar_version_java25_txt;
 #[path = "jdk_text_oracle.json.rs"]
 mod vendored_jdk_text_oracle_json;
+#[path = "live_menu_item_hooks_java25.txt.rs"]
+mod vendored_live_menu_item_hooks_java25_txt;
 #[path = "menu_models_oracle.txt.rs"]
 mod vendored_menu_models_oracle_txt;
 #[path = "nested_jars_cases.txt.rs"]

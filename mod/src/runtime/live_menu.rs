@@ -3210,7 +3210,7 @@ fn quick_move_stack(
 /// `map <id>` for `MapItem` (`onCraftedPostProcess`), captured by
 /// `tests/fixtures/live_menu/oracle/CaptureItemHooks.java`. javap over the server jar shows
 /// no other `Item` subclass declares any of those or `onCraftedBy`.
-const ITEM_HOOKS_JAVA25: &str = include_str!("live_menu_item_hooks_java25.txt");
+const ITEM_HOOKS_JAVA25: &str = crate::runtime::vendored_live_menu_item_hooks_java25_txt::VENDORED_DATA;
 
 /// Whether the vanilla item `id` is listed under `kind` in [`ITEM_HOOKS_JAVA25`].
 fn item_hook(kind: &str, id: &str) -> bool {
