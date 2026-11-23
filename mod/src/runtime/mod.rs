@@ -3406,6 +3406,12 @@ pub trait Host {
         None
     }
 
+    /// Mark a level sound stream unknown (see `level_sound.rs`): Java drew, or
+    /// may have drawn, from it where Decaf did not, so every later draw from
+    /// it counts. A host that models no sound streams keeps the default: its
+    /// draws already count.
+    fn mark_sound_stream_unknown(&mut self, _stream: &str) {}
+
     /// Construct a `SoundEvent` record handle from `new SoundEvent(Identifier, Optional<Float>)`.
     fn construct_sound_event(&mut self, _r: &MethodRef, _args: &[Value]) -> Option<Value> {
         None
@@ -9369,6 +9375,10 @@ impl Host for StdHost {
         server_side: bool,
     ) -> Option<level_sound::SoundSeed> {
         self.draw_level_sound_seed_impl(level_marker, server_side)
+    }
+
+    fn mark_sound_stream_unknown(&mut self, stream: &str) {
+        StdHost::mark_sound_stream_unknown(self, stream);
     }
 
     fn construct_sound_event(&mut self, r: &MethodRef, args: &[Value]) -> Option<Value> {

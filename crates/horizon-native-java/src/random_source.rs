@@ -164,6 +164,15 @@ impl StdHost {
         Some(value)
     }
 
+    /// Forget the state behind a random handle whose position is no longer
+    /// known (`level_sound.rs`): with no row, every later call on the handle
+    /// falls through to the counted unknown path instead of answering.
+    pub(crate) fn forget_random_state(&mut self, handle: &Value) {
+        if let Some(key) = Self::random_key(handle) {
+            self.random_sources.remove(&key);
+        }
+    }
+
     fn random_handle(&mut self, state: State) -> Value {
         let key = format!("{}#{}", state.class(), self.random_sources.len());
         self.random_sources.insert(key.clone(), state);

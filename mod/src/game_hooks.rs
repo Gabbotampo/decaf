@@ -398,7 +398,12 @@ pub(crate) fn fire_with_host(
         })
         .collect();
     let defer_seeds = server.is_some();
-    for (jar_idx, loaded) in state.jars.iter_mut().enumerate() {
+    for jar_idx in 0..state.jars.len() {
+        // Each jar's callbacks run after the previous jar's: a level sound stream any jar left
+        // unknown is unknown for this one (`sound.rs`).
+        let sound_streams =
+            crate::sound::gather_unknown_sound_streams(state.jars.iter().map(|jar| &jar.host));
+        let loaded = &mut state.jars[jar_idx];
         let LoadedJar {
             jar,
             host,
@@ -429,6 +434,7 @@ pub(crate) fn fire_with_host(
             })
             .collect();
         let budget = ExecutionBudget::within(JAR_BUDGET);
+        crate::sound::share_unknown_sound_streams([&mut *host], &sound_streams);
         host.set_host_deferred_server_sound_seeds(defer_seeds);
         let outcome = crate::caught(&format!("{} game hook {site}", row.id), || {
             jar.run_game_hook_in(

@@ -37,8 +37,36 @@
 //! coordinates, target entity id, entity position/silent/sound-source, camera
 //! position for `distanceDelay`, or the needed random stream) is absent or
 //! unmodelled, the call is counted as unknown instead of guessing.
+//!
+//! # Where the seed is drawn
+//!
+//! Every draw happens exactly where the bytecode draws. Each unseeded
+//! `Level.playSound` overload draws `soundSeedGenerator.nextLong()` before
+//! `playSeededSound` reads `except`, the target, the sound or the source;
+//! `ClientLevel.playLocalSound` and `playPlayerSound` draw `random.nextLong()`
+//! before the sound instance reads anything. A call that then counts or
+//! throws has still consumed its seed, so the next sound gets the next one.
+//!
+//! # Stream positions
+//!
+//! Each draw advances a level's stream, named by a stream key
+//! ([`server_level_sound_stream`], [`CLIENT_LEVEL_SOUND_STREAM`],
+//! [`level_random_stream`]). A stream whose position may differ from Java's is
+//! *unknown* ([`StdHost::mark_sound_stream_unknown`]); every later draw from it
+//! counts until a host seeds it again. A stream becomes unknown when:
+//!
+//! - Java draws where Decaf cannot (no seeded copy and no live host to defer
+//!   the draw to);
+//! - a call may or may not reach its draw (a `BlockPos` Decaf cannot read, or
+//!   an entity whose `isSilent()`, level or `getSoundSource()` is unknown);
+//! - a seed deferred to a live host ([`SoundSeed::HostDeferred`]) is never
+//!   delivered: the call records no effect, or the host bridge refuses the
+//!   effect. The host draws only for a sound it plays, so its stream falls one
+//!   draw behind Java's. A live host may back every level with one stream (as
+//!   Sunrise does), so while seeds are deferred a mark covers every stream on
+//!   its side ([`host_sound_streams`]).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{
     Host, MethodRef, NativeError, StdHost, Value, client_surface, events, game_hooks, game_object,
@@ -255,6 +283,94 @@ impl LevelSoundEffect {
             SoundSeed::HostDeferred => None,
         }
     }
+
+    /// The stream key this effect's seed was drawn from (or deferred to a live
+    /// host for); `None` for an explicit `playSeededSound` seed, which draws
+    /// nothing.
+    ///
+    /// A server effect's is its level's `soundSeedGenerator`. A client effect
+    /// with a [`Self::holder`] came through `Level.playSound` /
+    /// `playSeededSound`, which draw the client level's `soundSeedGenerator`;
+    /// one without came through `playLocalSound`, `playPlayerSound` or
+    /// `LocalPlayer.playSound`, which draw `Level.random`.
+    pub fn seed_stream(&self) -> Option<String> {
+        if matches!(self.seed, SoundSeed::Explicit(_)) {
+            return None;
+        }
+        Some(match self.side {
+            SoundSide::Server => self.dimension.as_deref().map_or_else(
+                || ANY_SERVER_LEVEL_SOUND_STREAM.to_owned(),
+                server_level_sound_stream,
+            ),
+            SoundSide::Client if self.holder.is_some() => CLIENT_LEVEL_SOUND_STREAM.to_owned(),
+            SoundSide::Client => level_random_stream(client_surface::LEVEL),
+        })
+    }
+}
+
+const SERVER_LEVEL_PREFIX: &str = "game/level/";
+const LEVEL_RANDOM_SUFFIX: &str = "#random";
+
+/// Stream key of a server level's `soundSeedGenerator`: the level's marker,
+/// `game/level/<dimension>`.
+pub fn server_level_sound_stream(dimension: &str) -> String {
+    format!("{SERVER_LEVEL_PREFIX}{dimension}")
+}
+
+/// Stream key standing for the `soundSeedGenerator` of every server level.
+/// Marked unknown when Java drew on some server level Decaf cannot name (an
+/// entity whose level is unknown); a dimension id never contains `*`.
+pub const ANY_SERVER_LEVEL_SOUND_STREAM: &str = "game/level/*";
+
+/// Stream key of the client level's `soundSeedGenerator`.
+pub const CLIENT_LEVEL_SOUND_STREAM: &str = client_surface::LEVEL;
+
+/// Stream key of a level's `Level.random`, which `ClientLevel.playLocalSound`
+/// and `playPlayerSound` draw from.
+pub fn level_random_stream(level_marker: &str) -> String {
+    format!("{level_marker}{LEVEL_RANDOM_SUFFIX}")
+}
+
+/// A server level's `soundSeedGenerator` key (or [`ANY_SERVER_LEVEL_SOUND_STREAM`]).
+fn is_server_seed_generator(stream: &str) -> bool {
+    stream.starts_with(SERVER_LEVEL_PREFIX) && !stream.ends_with(LEVEL_RANDOM_SUFFIX)
+}
+
+/// Whether `stream` is known, given the set of unknown stream keys. The one
+/// place [`ANY_SERVER_LEVEL_SOUND_STREAM`] is read: it makes every server
+/// level's `soundSeedGenerator` unknown.
+pub fn sound_stream_known_in(unknown: &BTreeSet<String>, stream: &str) -> bool {
+    if unknown.contains(stream) {
+        return false;
+    }
+    !(is_server_seed_generator(stream) && unknown.contains(ANY_SERVER_LEVEL_SOUND_STREAM))
+}
+
+/// Every stream key a live host's one stream for `stream` may stand for.
+///
+/// Java keeps one `soundSeedGenerator` per level (and a `Level.random`), but
+/// a live host need not. Sunrise (at the pinned commit) draws every server
+/// sound's seed from one server-wide stream (`LanHub::next_sound_seed`), and
+/// every client mod sound's from its audio engine's one random
+/// (`Audio::play_mod_sound`). So once a seed deferred to the host goes
+/// undelivered on one stream, every stream on that side is out of step with
+/// the host: a server stream widens to [`ANY_SERVER_LEVEL_SOUND_STREAM`], a
+/// client one to both client streams.
+pub fn host_sound_streams(stream: &str) -> Vec<String> {
+    if is_server_seed_generator(stream) {
+        let mut streams = vec![stream.to_owned()];
+        if stream != ANY_SERVER_LEVEL_SOUND_STREAM {
+            streams.push(ANY_SERVER_LEVEL_SOUND_STREAM.to_owned());
+        }
+        streams
+    } else if stream.starts_with(client_surface::LEVEL) {
+        vec![
+            CLIENT_LEVEL_SOUND_STREAM.to_owned(),
+            level_random_stream(client_surface::LEVEL),
+        ]
+    } else {
+        vec![stream.to_owned()]
+    }
 }
 
 /// Optional sound-relevant facts for an entity or player marker.
@@ -278,6 +394,9 @@ pub(crate) struct LevelSoundState {
     pub(crate) level_sound_seeds: BTreeMap<String, random_source::State>,
     pub(crate) host_deferred_server_seeds: bool,
     pub(crate) host_deferred_client_seeds: bool,
+    /// Stream keys whose position may differ from Java's (see the module
+    /// docs): every draw from one counts.
+    pub(crate) unknown_sound_streams: BTreeSet<String>,
     pub(crate) entity_facts: BTreeMap<String, EntitySoundFacts>,
     pub(crate) standalone_client_camera: Option<[f64; 3]>,
     pub(crate) standalone_client_player: Option<EntitySoundFacts>,
@@ -994,6 +1113,110 @@ fn client_target_entity(
     TargetEntityArg::Unmodelled
 }
 
+/// The sound argument of a `Level` sound overload.
+///
+/// A `SoundEvent` is wrapped with `BuiltInRegistries.SOUND_EVENT.wrapAsHolder`
+/// (`MappedRegistry.wrapAsHolder`: an `IdentityHashMap.get`, then
+/// `Holder.direct` when unregistered), which reads nothing of the event and
+/// cannot throw. A `Holder<SoundEvent>` is unwrapped by `Holder.value()` in the
+/// seeded half, which throws for an unbound stand-alone reference.
+#[derive(Clone, Copy)]
+enum SoundArg<'a> {
+    Event(&'a Value),
+    Holder(&'a Value),
+}
+
+/// Where the seeded half of a `Level` sound call plays.
+#[derive(Clone, Copy)]
+enum PlayAt<'a> {
+    Position([f64; 3]),
+    /// Bound to an entity (`ClientboundSoundEntityPacket` / `EntityBoundSoundInstance`).
+    Entity(&'a Value),
+}
+
+/// What `playSeededSound` reads, once an overload has parsed (and, for an
+/// unseeded overload, once it has drawn its seed).
+#[derive(Clone, Copy)]
+struct SeededArgs<'a> {
+    except: &'a Value,
+    at: PlayAt<'a>,
+    sound: SoundArg<'a>,
+    source: &'a Value,
+    volume: f32,
+    pitch: f32,
+}
+
+/// The `SoundEvent`-taking calls that draw `Level.random` (`playLocalSound`,
+/// `playPlayerSound`, `LocalPlayer.playSound`): the event itself, its source,
+/// volume and pitch.
+#[derive(Clone, Copy)]
+struct LocalSoundArgs<'a> {
+    sound: &'a Value,
+    source: &'a Value,
+    volume: f32,
+    pitch: f32,
+}
+
+/// The facts a `ServerLevel` call resolves its arguments against.
+struct ServerLevelCall<'a> {
+    level_marker: &'a str,
+    dimension: &'a str,
+    firing: Option<&'a events::EventFiring>,
+    hook_context: Option<&'a game_hooks::GameHookContext>,
+    host_facts: &'a BTreeMap<String, EntitySoundFacts>,
+}
+
+/// The facts a `ClientLevel` call resolves its arguments against.
+struct ClientLevelCall<'a> {
+    frame: Option<&'a client_surface::ClientSnapshot>,
+    dimension: Option<String>,
+    has_local_player: bool,
+    camera_pos: Option<[f64; 3]>,
+}
+
+fn resolve_sound_arg<H: Host + ?Sized>(
+    host: &mut H,
+    sound: SoundArg<'_>,
+) -> Result<ResolvedSound, SoundCallOutcome> {
+    match sound {
+        SoundArg::Event(value) => {
+            wrap_sound_event_as_holder(host, value).ok_or(SoundCallOutcome::Unmodelled)
+        }
+        SoundArg::Holder(value) => match resolve_sound_holder(host, value) {
+            Ok(Some(resolved)) => Ok(resolved),
+            Ok(None) => Err(SoundCallOutcome::Unmodelled),
+            Err(err) => Err(SoundCallOutcome::Exception(err)),
+        },
+    }
+}
+
+/// `BlockPos` overloads pass `(double) pos.getX() + 0.5` (and Y, Z) on.
+fn centred(coords: [i32; 3]) -> [f64; 3] {
+    [
+        f64::from(coords[0]) + 0.5,
+        f64::from(coords[1]) + 0.5,
+        f64::from(coords[2]) + 0.5,
+    ]
+}
+
+fn null_block_pos() -> NativeError {
+    npe(r#"Cannot invoke "net.minecraft.core.BlockPos.getX()" because "pos" is null"#)
+}
+
+/// A seed was drawn for a call that then recorded no effect: Decaf counted
+/// it, it threw, or a client call skipped another player's sound.
+///
+/// Java consumed that seed all the same. A seed Decaf drew itself (or an
+/// explicit one) leaves Decaf's copy of the stream exactly where Java's is.
+/// A seed deferred to a live host ([`SoundSeed::HostDeferred`]) does not: the
+/// host draws only for an effect that reaches it, so its stream is now one
+/// draw behind Java's and every later draw from `stream` must count.
+fn seed_not_delivered<H: Host + ?Sized>(host: &mut H, stream: &str, seed: SoundSeed) {
+    if seed == SoundSeed::HostDeferred {
+        host.mark_sound_stream_unknown(stream);
+    }
+}
+
 /// Core `ServerLevel` sound/random dispatcher shared by standalone `StdHost`,
 /// `events::EventFiring`, and `game_hooks::GameHookHost`.
 #[allow(clippy::too_many_arguments)]
@@ -1017,14 +1240,19 @@ fn execute_server_level_call<H: Host + ?Sized>(
     let Some(op) = parse_level_op(r, args) else {
         return SoundCallOutcome::Unmodelled;
     };
+    let call = ServerLevelCall {
+        level_marker,
+        dimension,
+        firing,
+        hook_context,
+        host_facts,
+    };
     match op {
         // `ServerLevel` inherits `Level.playLocalSound` / `playPlayerSound` as no-ops.
         // Only the `BlockPos` overload reads `pos.getX/Y/Z()` before delegating.
         LevelSoundOp::LocalBlockPos { pos, .. } => match block_pos_arg(pos) {
             BlockPosArg::Coords(_) => SoundCallOutcome::Handled(Value::Void),
-            BlockPosArg::Null => SoundCallOutcome::Exception(npe(
-                r#"Cannot invoke "net.minecraft.core.BlockPos.getX()" because "pos" is null"#,
-            )),
+            BlockPosArg::Null => SoundCallOutcome::Exception(null_block_pos()),
             BlockPosArg::Unmodelled => SoundCallOutcome::Unmodelled,
         },
         LevelSoundOp::LocalPos { .. }
@@ -1039,52 +1267,29 @@ fn execute_server_level_call<H: Host + ?Sized>(
             volume,
             pitch,
         } => {
-            let [bx, by, bz] = match block_pos_arg(pos) {
+            // `Level.playSound(Entity, BlockPos, ...)` reads `pos.getX/Y/Z()` (a
+            // null `pos` throws here, before any draw), then calls the `double`
+            // overload, which draws.
+            let coords = match block_pos_arg(pos) {
                 BlockPosArg::Coords(coords) => coords,
-                BlockPosArg::Null => {
-                    return SoundCallOutcome::Exception(npe(
-                        r#"Cannot invoke "net.minecraft.core.BlockPos.getX()" because "pos" is null"#,
-                    ));
+                BlockPosArg::Null => return SoundCallOutcome::Exception(null_block_pos()),
+                BlockPosArg::Unmodelled => {
+                    // A `BlockPos` Decaf cannot read may or may not throw before
+                    // the draw: the stream's position is no longer known.
+                    host.mark_sound_stream_unknown(level_marker);
+                    return SoundCallOutcome::Unmodelled;
                 }
-                BlockPosArg::Unmodelled => return SoundCallOutcome::Unmodelled,
             };
-            let centered = [
-                f64::from(bx) + 0.5,
-                f64::from(by) + 0.5,
-                f64::from(bz) + 0.5,
-            ];
-            let Some(source) = SoundSource::from_value(source) else {
-                return SoundCallOutcome::Unmodelled;
-            };
-            let except_player = match server_except_arg(except, hook_context, host_facts) {
-                ExceptArg::None | ExceptArg::NonPlayer => None,
-                ExceptArg::Player(uuid) => Some(uuid),
-                ExceptArg::Unmodelled => return SoundCallOutcome::Unmodelled,
-            };
-            let Some(resolved) = wrap_sound_event_as_holder(host, sound) else {
-                return SoundCallOutcome::Unmodelled;
-            };
-            let Some(seed) = host.draw_level_sound_seed(level_marker, true) else {
-                return SoundCallOutcome::Unmodelled;
-            };
-            emit(LevelSoundEffect {
-                side: SoundSide::Server,
-                dimension: Some(dimension.to_owned()),
-                sound_id: resolved.sound_id,
-                fixed_range: resolved.fixed_range,
-                holder: resolved.holder,
-                target: SoundTarget::Position(centered),
+            let args = SeededArgs {
+                except,
+                at: PlayAt::Position(centred(coords)),
+                sound: SoundArg::Event(sound),
                 source,
                 volume,
                 pitch,
-                except_player,
-                seed,
-                distance_delay: false,
-                delay_ticks: 0,
-            });
-            SoundCallOutcome::Handled(Value::Void)
+            };
+            server_play(host, &call, args, None, emit)
         }
-
         LevelSoundOp::PosEvent {
             except,
             pos,
@@ -1093,38 +1298,16 @@ fn execute_server_level_call<H: Host + ?Sized>(
             volume,
             pitch,
         } => {
-            let Some(source) = SoundSource::from_value(source) else {
-                return SoundCallOutcome::Unmodelled;
-            };
-            let except_player = match server_except_arg(except, hook_context, host_facts) {
-                ExceptArg::None | ExceptArg::NonPlayer => None,
-                ExceptArg::Player(uuid) => Some(uuid),
-                ExceptArg::Unmodelled => return SoundCallOutcome::Unmodelled,
-            };
-            let Some(resolved) = wrap_sound_event_as_holder(host, sound) else {
-                return SoundCallOutcome::Unmodelled;
-            };
-            let Some(seed) = host.draw_level_sound_seed(level_marker, true) else {
-                return SoundCallOutcome::Unmodelled;
-            };
-            emit(LevelSoundEffect {
-                side: SoundSide::Server,
-                dimension: Some(dimension.to_owned()),
-                sound_id: resolved.sound_id,
-                fixed_range: resolved.fixed_range,
-                holder: resolved.holder,
-                target: SoundTarget::Position(pos),
+            let args = SeededArgs {
+                except,
+                at: PlayAt::Position(pos),
+                sound: SoundArg::Event(sound),
                 source,
                 volume,
                 pitch,
-                except_player,
-                seed,
-                distance_delay: false,
-                delay_ticks: 0,
-            });
-            SoundCallOutcome::Handled(Value::Void)
+            };
+            server_play(host, &call, args, None, emit)
         }
-
         LevelSoundOp::PosHolder {
             except,
             pos,
@@ -1133,47 +1316,16 @@ fn execute_server_level_call<H: Host + ?Sized>(
             volume,
             pitch,
         } => {
-            let Some(source) = SoundSource::from_value(source) else {
-                return SoundCallOutcome::Unmodelled;
-            };
-            let except_player = match server_except_arg(except, hook_context, host_facts) {
-                ExceptArg::None | ExceptArg::NonPlayer => None,
-                ExceptArg::Player(uuid) => Some(uuid),
-                ExceptArg::Unmodelled => return SoundCallOutcome::Unmodelled,
-            };
-            let resolved = match resolve_sound_holder(host, holder) {
-                Ok(Some(resolved)) => resolved,
-                Ok(None) => return SoundCallOutcome::Unmodelled,
-                Err(err) => {
-                    // `Level.playSound(..., Holder, ...)` draws `soundSeedGenerator` before
-                    // `ServerLevel.playSeededSound` calls `holder.value()`.
-                    if host.draw_level_sound_seed(level_marker, true).is_none() {
-                        return SoundCallOutcome::Unmodelled;
-                    }
-                    return SoundCallOutcome::Exception(err);
-                }
-            };
-            let Some(seed) = host.draw_level_sound_seed(level_marker, true) else {
-                return SoundCallOutcome::Unmodelled;
-            };
-            emit(LevelSoundEffect {
-                side: SoundSide::Server,
-                dimension: Some(dimension.to_owned()),
-                sound_id: resolved.sound_id,
-                fixed_range: resolved.fixed_range,
-                holder: resolved.holder,
-                target: SoundTarget::Position(pos),
+            let args = SeededArgs {
+                except,
+                at: PlayAt::Position(pos),
+                sound: SoundArg::Holder(holder),
                 source,
                 volume,
                 pitch,
-                except_player,
-                seed,
-                distance_delay: false,
-                delay_ticks: 0,
-            });
-            SoundCallOutcome::Handled(Value::Void)
+            };
+            server_play(host, &call, args, None, emit)
         }
-
         LevelSoundOp::EntityEvent {
             except,
             target,
@@ -1182,48 +1334,16 @@ fn execute_server_level_call<H: Host + ?Sized>(
             volume,
             pitch,
         } => {
-            let Some(source) = SoundSource::from_value(source) else {
-                return SoundCallOutcome::Unmodelled;
-            };
-            let except_player = match server_except_arg(except, hook_context, host_facts) {
-                ExceptArg::None | ExceptArg::NonPlayer => None,
-                ExceptArg::Player(uuid) => Some(uuid),
-                ExceptArg::Unmodelled => return SoundCallOutcome::Unmodelled,
-            };
-            let TargetEntityArg::Entity {
-                entity_id,
-                position,
-            } = server_target_entity(target, firing, hook_context, host_facts)
-            else {
-                return SoundCallOutcome::Unmodelled;
-            };
-            let Some(resolved) = wrap_sound_event_as_holder(host, sound) else {
-                return SoundCallOutcome::Unmodelled;
-            };
-            let Some(seed) = host.draw_level_sound_seed(level_marker, true) else {
-                return SoundCallOutcome::Unmodelled;
-            };
-            emit(LevelSoundEffect {
-                side: SoundSide::Server,
-                dimension: Some(dimension.to_owned()),
-                sound_id: resolved.sound_id,
-                fixed_range: resolved.fixed_range,
-                holder: resolved.holder,
-                target: SoundTarget::Entity {
-                    entity_id,
-                    position,
-                },
+            let args = SeededArgs {
+                except,
+                at: PlayAt::Entity(target),
+                sound: SoundArg::Event(sound),
                 source,
                 volume,
                 pitch,
-                except_player,
-                seed,
-                distance_delay: false,
-                delay_ticks: 0,
-            });
-            SoundCallOutcome::Handled(Value::Void)
+            };
+            server_play(host, &call, args, None, emit)
         }
-
         LevelSoundOp::EntityHolder {
             except,
             target,
@@ -1232,55 +1352,16 @@ fn execute_server_level_call<H: Host + ?Sized>(
             volume,
             pitch,
         } => {
-            let Some(source) = SoundSource::from_value(source) else {
-                return SoundCallOutcome::Unmodelled;
-            };
-            let except_player = match server_except_arg(except, hook_context, host_facts) {
-                ExceptArg::None | ExceptArg::NonPlayer => None,
-                ExceptArg::Player(uuid) => Some(uuid),
-                ExceptArg::Unmodelled => return SoundCallOutcome::Unmodelled,
-            };
-            let TargetEntityArg::Entity {
-                entity_id,
-                position,
-            } = server_target_entity(target, firing, hook_context, host_facts)
-            else {
-                return SoundCallOutcome::Unmodelled;
-            };
-            let resolved = match resolve_sound_holder(host, holder) {
-                Ok(Some(resolved)) => resolved,
-                Ok(None) => return SoundCallOutcome::Unmodelled,
-                Err(err) => {
-                    if host.draw_level_sound_seed(level_marker, true).is_none() {
-                        return SoundCallOutcome::Unmodelled;
-                    }
-                    return SoundCallOutcome::Exception(err);
-                }
-            };
-            let Some(seed) = host.draw_level_sound_seed(level_marker, true) else {
-                return SoundCallOutcome::Unmodelled;
-            };
-            emit(LevelSoundEffect {
-                side: SoundSide::Server,
-                dimension: Some(dimension.to_owned()),
-                sound_id: resolved.sound_id,
-                fixed_range: resolved.fixed_range,
-                holder: resolved.holder,
-                target: SoundTarget::Entity {
-                    entity_id,
-                    position,
-                },
+            let args = SeededArgs {
+                except,
+                at: PlayAt::Entity(target),
+                sound: SoundArg::Holder(holder),
                 source,
                 volume,
                 pitch,
-                except_player,
-                seed,
-                distance_delay: false,
-                delay_ticks: 0,
-            });
-            SoundCallOutcome::Handled(Value::Void)
+            };
+            server_play(host, &call, args, None, emit)
         }
-
         LevelSoundOp::SeededPosHolder {
             except,
             pos,
@@ -1290,37 +1371,16 @@ fn execute_server_level_call<H: Host + ?Sized>(
             pitch,
             seed,
         } => {
-            let Some(source) = SoundSource::from_value(source) else {
-                return SoundCallOutcome::Unmodelled;
-            };
-            let except_player = match server_except_arg(except, hook_context, host_facts) {
-                ExceptArg::None | ExceptArg::NonPlayer => None,
-                ExceptArg::Player(uuid) => Some(uuid),
-                ExceptArg::Unmodelled => return SoundCallOutcome::Unmodelled,
-            };
-            let resolved = match resolve_sound_holder(host, holder) {
-                Ok(Some(resolved)) => resolved,
-                Ok(None) => return SoundCallOutcome::Unmodelled,
-                Err(err) => return SoundCallOutcome::Exception(err),
-            };
-            emit(LevelSoundEffect {
-                side: SoundSide::Server,
-                dimension: Some(dimension.to_owned()),
-                sound_id: resolved.sound_id,
-                fixed_range: resolved.fixed_range,
-                holder: resolved.holder,
-                target: SoundTarget::Position(pos),
+            let args = SeededArgs {
+                except,
+                at: PlayAt::Position(pos),
+                sound: SoundArg::Holder(holder),
                 source,
                 volume,
                 pitch,
-                except_player,
-                seed: SoundSeed::Explicit(seed),
-                distance_delay: false,
-                delay_ticks: 0,
-            });
-            SoundCallOutcome::Handled(Value::Void)
+            };
+            server_play(host, &call, args, Some(seed), emit)
         }
-
         LevelSoundOp::SeededPosEvent {
             except,
             pos,
@@ -1330,35 +1390,16 @@ fn execute_server_level_call<H: Host + ?Sized>(
             pitch,
             seed,
         } => {
-            let Some(source) = SoundSource::from_value(source) else {
-                return SoundCallOutcome::Unmodelled;
-            };
-            let except_player = match server_except_arg(except, hook_context, host_facts) {
-                ExceptArg::None | ExceptArg::NonPlayer => None,
-                ExceptArg::Player(uuid) => Some(uuid),
-                ExceptArg::Unmodelled => return SoundCallOutcome::Unmodelled,
-            };
-            let Some(resolved) = wrap_sound_event_as_holder(host, sound) else {
-                return SoundCallOutcome::Unmodelled;
-            };
-            emit(LevelSoundEffect {
-                side: SoundSide::Server,
-                dimension: Some(dimension.to_owned()),
-                sound_id: resolved.sound_id,
-                fixed_range: resolved.fixed_range,
-                holder: resolved.holder,
-                target: SoundTarget::Position(pos),
+            let args = SeededArgs {
+                except,
+                at: PlayAt::Position(pos),
+                sound: SoundArg::Event(sound),
                 source,
                 volume,
                 pitch,
-                except_player,
-                seed: SoundSeed::Explicit(seed),
-                distance_delay: false,
-                delay_ticks: 0,
-            });
-            SoundCallOutcome::Handled(Value::Void)
+            };
+            server_play(host, &call, args, Some(seed), emit)
         }
-
         LevelSoundOp::SeededEntityHolder {
             except,
             target,
@@ -1368,47 +1409,104 @@ fn execute_server_level_call<H: Host + ?Sized>(
             pitch,
             seed,
         } => {
-            let Some(source) = SoundSource::from_value(source) else {
-                return SoundCallOutcome::Unmodelled;
-            };
-            let except_player = match server_except_arg(except, hook_context, host_facts) {
-                ExceptArg::None | ExceptArg::NonPlayer => None,
-                ExceptArg::Player(uuid) => Some(uuid),
-                ExceptArg::Unmodelled => return SoundCallOutcome::Unmodelled,
-            };
-            let TargetEntityArg::Entity {
-                entity_id,
-                position,
-            } = server_target_entity(target, firing, hook_context, host_facts)
-            else {
-                return SoundCallOutcome::Unmodelled;
-            };
-            let resolved = match resolve_sound_holder(host, holder) {
-                Ok(Some(resolved)) => resolved,
-                Ok(None) => return SoundCallOutcome::Unmodelled,
-                Err(err) => return SoundCallOutcome::Exception(err),
-            };
-            emit(LevelSoundEffect {
-                side: SoundSide::Server,
-                dimension: Some(dimension.to_owned()),
-                sound_id: resolved.sound_id,
-                fixed_range: resolved.fixed_range,
-                holder: resolved.holder,
-                target: SoundTarget::Entity {
-                    entity_id,
-                    position,
-                },
+            let args = SeededArgs {
+                except,
+                at: PlayAt::Entity(target),
+                sound: SoundArg::Holder(holder),
                 source,
                 volume,
                 pitch,
-                except_player,
-                seed: SoundSeed::Explicit(seed),
-                distance_delay: false,
-                delay_ticks: 0,
-            });
-            SoundCallOutcome::Handled(Value::Void)
+            };
+            server_play(host, &call, args, Some(seed), emit)
         }
     }
+}
+
+/// `Level.playSound` (`explicit_seed == None`) or `playSeededSound` on a
+/// `ServerLevel`.
+///
+/// Every unseeded overload draws `this.soundSeedGenerator.nextLong()` before
+/// `playSeededSound` reads a single argument: `Level.playSound(Entity, DDD,
+/// SoundEvent | Holder, SoundSource, FF)` at offsets 16-19 and
+/// `playSound(Entity, Entity, Holder, ...)` at 11-14, straight after loading
+/// its arguments; `playSound(Entity, Entity, SoundEvent, ...)` at 19-22, after
+/// only `wrapAsHolder`, which cannot throw. So the draw comes first here too,
+/// and a sound, holder, source, `except` or target Decaf cannot resolve, or one
+/// that throws, has still advanced the stream.
+fn server_play<H: Host + ?Sized>(
+    host: &mut H,
+    call: &ServerLevelCall<'_>,
+    args: SeededArgs<'_>,
+    explicit_seed: Option<i64>,
+    emit: &mut dyn FnMut(LevelSoundEffect),
+) -> SoundCallOutcome {
+    let seed = match explicit_seed {
+        Some(seed) => SoundSeed::Explicit(seed),
+        None => match host.draw_level_sound_seed(call.level_marker, true) {
+            Some(seed) => seed,
+            None => return SoundCallOutcome::Unmodelled,
+        },
+    };
+    match server_seeded_effect(host, call, args, seed) {
+        Ok(effect) => {
+            emit(effect);
+            SoundCallOutcome::Handled(Value::Void)
+        }
+        Err(outcome) => {
+            seed_not_delivered(host, call.level_marker, seed);
+            outcome
+        }
+    }
+}
+
+/// `ServerLevel.playSeededSound`'s reads, in bytecode order: `except
+/// instanceof Player` (never throws), the target's `getX/Y/Z()` (entity
+/// overload), then `sound.value()` and `SoundEvent.getRange(volume)`. `source`
+/// is only stored in the packet; Decaf needs it to record the effect, so it is
+/// resolved last.
+fn server_seeded_effect<H: Host + ?Sized>(
+    host: &mut H,
+    call: &ServerLevelCall<'_>,
+    args: SeededArgs<'_>,
+    seed: SoundSeed,
+) -> Result<LevelSoundEffect, SoundCallOutcome> {
+    let except_player = match server_except_arg(args.except, call.hook_context, call.host_facts) {
+        ExceptArg::None | ExceptArg::NonPlayer => None,
+        ExceptArg::Player(uuid) => Some(uuid),
+        ExceptArg::Unmodelled => return Err(SoundCallOutcome::Unmodelled),
+    };
+    let target = match args.at {
+        PlayAt::Position(pos) => SoundTarget::Position(pos),
+        PlayAt::Entity(target) => {
+            match server_target_entity(target, call.firing, call.hook_context, call.host_facts) {
+                TargetEntityArg::Entity {
+                    entity_id,
+                    position,
+                } => SoundTarget::Entity {
+                    entity_id,
+                    position,
+                },
+                TargetEntityArg::Unmodelled => return Err(SoundCallOutcome::Unmodelled),
+            }
+        }
+    };
+    let resolved = resolve_sound_arg(host, args.sound)?;
+    let source = SoundSource::from_value(args.source).ok_or(SoundCallOutcome::Unmodelled)?;
+    Ok(LevelSoundEffect {
+        side: SoundSide::Server,
+        dimension: Some(call.dimension.to_owned()),
+        sound_id: resolved.sound_id,
+        fixed_range: resolved.fixed_range,
+        holder: resolved.holder,
+        target,
+        source,
+        volume: args.volume,
+        pitch: args.pitch,
+        except_player,
+        seed,
+        distance_delay: false,
+        delay_ticks: 0,
+    })
 }
 
 /// Core `ClientLevel` sound/random dispatcher for both `ClientSnapshot` frames
@@ -1430,17 +1528,20 @@ fn execute_client_level_call(
     let Some(op) = parse_level_op(r, args) else {
         return SoundCallOutcome::Unmodelled;
     };
-    let dimension = frame
-        .and_then(|f| f.level.as_ref())
-        .map(|l| l.dimension.clone())
-        .filter(|d| !d.is_empty());
-    let has_local_player = frame.map_or_else(
-        || host.level_sound.standalone_client_player.is_some(),
-        |f| f.player.is_some(),
-    );
-    let camera_pos = frame
-        .and_then(|f| f.camera.as_ref().map(|c| c.pos))
-        .or(host.level_sound.standalone_client_camera);
+    let call = ClientLevelCall {
+        frame,
+        dimension: frame
+            .and_then(|f| f.level.as_ref())
+            .map(|l| l.dimension.clone())
+            .filter(|d| !d.is_empty()),
+        has_local_player: frame.map_or_else(
+            || host.level_sound.standalone_client_player.is_some(),
+            |f| f.player.is_some(),
+        ),
+        camera_pos: frame
+            .and_then(|f| f.camera.as_ref().map(|c| c.pos))
+            .or(host.level_sound.standalone_client_camera),
+    };
 
     match op {
         LevelSoundOp::BlockPos {
@@ -1451,36 +1552,25 @@ fn execute_client_level_call(
             volume,
             pitch,
         } => {
-            let [bx, by, bz] = match block_pos_arg(pos) {
+            let coords = match block_pos_arg(pos) {
                 BlockPosArg::Coords(coords) => coords,
-                BlockPosArg::Null => {
-                    return SoundCallOutcome::Exception(npe(
-                        r#"Cannot invoke "net.minecraft.core.BlockPos.getX()" because "pos" is null"#,
-                    ));
+                BlockPosArg::Null => return SoundCallOutcome::Exception(null_block_pos()),
+                BlockPosArg::Unmodelled => {
+                    // May or may not throw before `soundSeedGenerator` draws.
+                    host.mark_sound_stream_unknown(CLIENT_LEVEL_SOUND_STREAM);
+                    return SoundCallOutcome::Unmodelled;
                 }
-                BlockPosArg::Unmodelled => return SoundCallOutcome::Unmodelled,
             };
-            let centered = [
-                f64::from(bx) + 0.5,
-                f64::from(by) + 0.5,
-                f64::from(bz) + 0.5,
-            ];
-            client_play_seeded_or_unseeded_pos(
-                host,
-                dimension,
-                has_local_player,
+            let args = SeededArgs {
                 except,
-                centered,
-                sound,
-                false,
+                at: PlayAt::Position(centred(coords)),
+                sound: SoundArg::Event(sound),
                 source,
                 volume,
                 pitch,
-                None,
-                emit,
-            )
+            };
+            client_play(host, &call, args, None, emit)
         }
-
         LevelSoundOp::PosEvent {
             except,
             pos,
@@ -1488,21 +1578,17 @@ fn execute_client_level_call(
             source,
             volume,
             pitch,
-        } => client_play_seeded_or_unseeded_pos(
-            host,
-            dimension,
-            has_local_player,
-            except,
-            pos,
-            sound,
-            false,
-            source,
-            volume,
-            pitch,
-            None,
-            emit,
-        ),
-
+        } => {
+            let args = SeededArgs {
+                except,
+                at: PlayAt::Position(pos),
+                sound: SoundArg::Event(sound),
+                source,
+                volume,
+                pitch,
+            };
+            client_play(host, &call, args, None, emit)
+        }
         LevelSoundOp::PosHolder {
             except,
             pos,
@@ -1510,21 +1596,17 @@ fn execute_client_level_call(
             source,
             volume,
             pitch,
-        } => client_play_seeded_or_unseeded_pos(
-            host,
-            dimension,
-            has_local_player,
-            except,
-            pos,
-            holder,
-            true,
-            source,
-            volume,
-            pitch,
-            None,
-            emit,
-        ),
-
+        } => {
+            let args = SeededArgs {
+                except,
+                at: PlayAt::Position(pos),
+                sound: SoundArg::Holder(holder),
+                source,
+                volume,
+                pitch,
+            };
+            client_play(host, &call, args, None, emit)
+        }
         LevelSoundOp::EntityEvent {
             except,
             target,
@@ -1532,22 +1614,17 @@ fn execute_client_level_call(
             source,
             volume,
             pitch,
-        } => client_play_seeded_or_unseeded_entity(
-            host,
-            frame,
-            dimension,
-            has_local_player,
-            except,
-            target,
-            sound,
-            false,
-            source,
-            volume,
-            pitch,
-            None,
-            emit,
-        ),
-
+        } => {
+            let args = SeededArgs {
+                except,
+                at: PlayAt::Entity(target),
+                sound: SoundArg::Event(sound),
+                source,
+                volume,
+                pitch,
+            };
+            client_play(host, &call, args, None, emit)
+        }
         LevelSoundOp::EntityHolder {
             except,
             target,
@@ -1555,22 +1632,17 @@ fn execute_client_level_call(
             source,
             volume,
             pitch,
-        } => client_play_seeded_or_unseeded_entity(
-            host,
-            frame,
-            dimension,
-            has_local_player,
-            except,
-            target,
-            holder,
-            true,
-            source,
-            volume,
-            pitch,
-            None,
-            emit,
-        ),
-
+        } => {
+            let args = SeededArgs {
+                except,
+                at: PlayAt::Entity(target),
+                sound: SoundArg::Holder(holder),
+                source,
+                volume,
+                pitch,
+            };
+            client_play(host, &call, args, None, emit)
+        }
         LevelSoundOp::SeededPosHolder {
             except,
             pos,
@@ -1579,21 +1651,17 @@ fn execute_client_level_call(
             volume,
             pitch,
             seed,
-        } => client_play_seeded_or_unseeded_pos(
-            host,
-            dimension,
-            has_local_player,
-            except,
-            pos,
-            holder,
-            true,
-            source,
-            volume,
-            pitch,
-            Some(seed),
-            emit,
-        ),
-
+        } => {
+            let args = SeededArgs {
+                except,
+                at: PlayAt::Position(pos),
+                sound: SoundArg::Holder(holder),
+                source,
+                volume,
+                pitch,
+            };
+            client_play(host, &call, args, Some(seed), emit)
+        }
         LevelSoundOp::SeededPosEvent {
             except,
             pos,
@@ -1602,21 +1670,17 @@ fn execute_client_level_call(
             volume,
             pitch,
             seed,
-        } => client_play_seeded_or_unseeded_pos(
-            host,
-            dimension,
-            has_local_player,
-            except,
-            pos,
-            sound,
-            false,
-            source,
-            volume,
-            pitch,
-            Some(seed),
-            emit,
-        ),
-
+        } => {
+            let args = SeededArgs {
+                except,
+                at: PlayAt::Position(pos),
+                sound: SoundArg::Event(sound),
+                source,
+                volume,
+                pitch,
+            };
+            client_play(host, &call, args, Some(seed), emit)
+        }
         LevelSoundOp::SeededEntityHolder {
             except,
             target,
@@ -1625,21 +1689,17 @@ fn execute_client_level_call(
             volume,
             pitch,
             seed,
-        } => client_play_seeded_or_unseeded_entity(
-            host,
-            frame,
-            dimension,
-            has_local_player,
-            except,
-            target,
-            holder,
-            true,
-            source,
-            volume,
-            pitch,
-            Some(seed),
-            emit,
-        ),
+        } => {
+            let args = SeededArgs {
+                except,
+                at: PlayAt::Entity(target),
+                sound: SoundArg::Holder(holder),
+                source,
+                volume,
+                pitch,
+            };
+            client_play(host, &call, args, Some(seed), emit)
+        }
 
         LevelSoundOp::LocalBlockPos {
             pos,
@@ -1649,32 +1709,23 @@ fn execute_client_level_call(
             pitch,
             distance_delay,
         } => {
-            let [bx, by, bz] = match block_pos_arg(pos) {
+            // `Level.playLocalSound(BlockPos, ...)` reads `pos.getX/Y/Z()` before
+            // `ClientLevel.playLocalSound(DDD, ...)` draws `this.random`.
+            let coords = match block_pos_arg(pos) {
                 BlockPosArg::Coords(coords) => coords,
-                BlockPosArg::Null => {
-                    return SoundCallOutcome::Exception(npe(
-                        r#"Cannot invoke "net.minecraft.core.BlockPos.getX()" because "pos" is null"#,
-                    ));
+                BlockPosArg::Null => return SoundCallOutcome::Exception(null_block_pos()),
+                BlockPosArg::Unmodelled => {
+                    host.mark_sound_stream_unknown(&level_random_stream(level_marker));
+                    return SoundCallOutcome::Unmodelled;
                 }
-                BlockPosArg::Unmodelled => return SoundCallOutcome::Unmodelled,
             };
-            let centered = [
-                f64::from(bx) + 0.5,
-                f64::from(by) + 0.5,
-                f64::from(bz) + 0.5,
-            ];
-            client_play_local_pos(
-                host,
-                dimension,
-                camera_pos,
-                centered,
+            let args = LocalSoundArgs {
                 sound,
                 source,
                 volume,
                 pitch,
-                distance_delay,
-                emit,
-            )
+            };
+            client_play_local_pos(host, &call, centred(coords), args, distance_delay, emit)
         }
 
         LevelSoundOp::LocalPos {
@@ -1684,18 +1735,15 @@ fn execute_client_level_call(
             volume,
             pitch,
             distance_delay,
-        } => client_play_local_pos(
-            host,
-            dimension,
-            camera_pos,
-            pos,
-            sound,
-            source,
-            volume,
-            pitch,
-            distance_delay,
-            emit,
-        ),
+        } => {
+            let args = LocalSoundArgs {
+                sound,
+                source,
+                volume,
+                pitch,
+            };
+            client_play_local_pos(host, &call, pos, args, distance_delay, emit)
+        }
 
         LevelSoundOp::LocalEntity {
             target,
@@ -1704,44 +1752,21 @@ fn execute_client_level_call(
             volume,
             pitch,
         } => {
-            let Some((sound_id, fixed_range)) = resolve_direct_sound_event(sound) else {
-                return SoundCallOutcome::Unmodelled;
-            };
-            let Some(source) = SoundSource::from_value(source) else {
-                return SoundCallOutcome::Unmodelled;
-            };
-            let TargetEntityArg::Entity {
-                entity_id,
-                position,
-            } = client_target_entity(target, frame, host)
-            else {
-                return SoundCallOutcome::Unmodelled;
-            };
+            // `ClientLevel.playLocalSound(Entity, ...)` evaluates
+            // `this.random.nextLong()` (offset 22) as the last argument of
+            // `new EntityBoundSoundInstance(...)`, before the constructor reads
+            // the sound or the entity.
             let Some(seed) = host.draw_client_local_seed() else {
                 return SoundCallOutcome::Unmodelled;
             };
-            emit(
-                host,
-                LevelSoundEffect {
-                    side: SoundSide::Client,
-                    dimension,
-                    sound_id,
-                    fixed_range,
-                    holder: None,
-                    target: SoundTarget::Entity {
-                        entity_id,
-                        position,
-                    },
-                    source,
-                    volume,
-                    pitch,
-                    except_player: None,
-                    seed,
-                    distance_delay: false,
-                    delay_ticks: 0,
-                },
-            );
-            SoundCallOutcome::Handled(Value::Void)
+            let args = LocalSoundArgs {
+                sound,
+                source,
+                volume,
+                pitch,
+            };
+            let effect = client_local_entity_effect(host, &call, target, args, seed);
+            finish_client_local(host, seed, effect, emit)
         }
 
         LevelSoundOp::PlayerSound {
@@ -1750,289 +1775,270 @@ fn execute_client_level_call(
             volume,
             pitch,
         } => {
-            // `ClientLevel.playPlayerSound`: checks `if (this.minecraft.player != null)` first.
-            // When `player == null`, returns without drawing `this.random` or reading sound.
-            if !has_local_player {
+            // `ClientLevel.playPlayerSound`: checks `if (this.minecraft.player != null)`
+            // first. When `player == null`, returns without drawing `this.random` or
+            // reading the sound. Otherwise it draws (offset 37) before
+            // `EntityBoundSoundInstance`'s constructor reads anything.
+            if !call.has_local_player {
                 return SoundCallOutcome::Handled(Value::Void);
             }
-            let Some((sound_id, fixed_range)) = resolve_direct_sound_event(sound) else {
-                return SoundCallOutcome::Unmodelled;
-            };
-            let Some(source) = SoundSource::from_value(source) else {
-                return SoundCallOutcome::Unmodelled;
-            };
-            let (entity_id, position) = if let Some(player) = frame.and_then(|f| f.player.as_ref())
-            {
-                (player.entity_id, Some(player.pos))
-            } else if let Some(facts) = host.level_sound.standalone_client_player.as_ref() {
-                let Some(entity_id) = facts.entity_id else {
-                    return SoundCallOutcome::Unmodelled;
-                };
-                (entity_id, facts.position)
-            } else {
-                return SoundCallOutcome::Unmodelled;
-            };
             let Some(seed) = host.draw_client_local_seed() else {
                 return SoundCallOutcome::Unmodelled;
             };
-            emit(
-                host,
-                LevelSoundEffect {
-                    side: SoundSide::Client,
-                    dimension,
-                    sound_id,
-                    fixed_range,
-                    holder: None,
-                    target: SoundTarget::Entity {
-                        entity_id,
-                        position,
-                    },
-                    source,
-                    volume,
-                    pitch,
-                    except_player: None,
-                    seed,
-                    distance_delay: false,
-                    delay_ticks: 0,
-                },
-            );
+            let args = LocalSoundArgs {
+                sound,
+                source,
+                volume,
+                pitch,
+            };
+            let effect = client_player_sound_effect(host, &call, args, seed);
+            finish_client_local(host, seed, effect, emit)
+        }
+    }
+}
+
+/// `Level.playSound` (`explicit_seed == None`) or `playSeededSound` on a
+/// `ClientLevel`.
+///
+/// An unseeded overload draws `this.soundSeedGenerator.nextLong()` first, as
+/// on a server (see [`server_play`]); `ClientLevel.playSeededSound` then
+/// returns at once unless `except == minecraft.player` (`if_acmpne`), so the
+/// draw happens whoever `except` is.
+fn client_play(
+    host: &mut StdHost,
+    call: &ClientLevelCall<'_>,
+    args: SeededArgs<'_>,
+    explicit_seed: Option<i64>,
+    emit: &mut dyn FnMut(&mut StdHost, LevelSoundEffect),
+) -> SoundCallOutcome {
+    let seed = match explicit_seed {
+        Some(seed) => SoundSeed::Explicit(seed),
+        None => match host.draw_level_sound_seed(client_surface::LEVEL, false) {
+            Some(seed) => seed,
+            None => return SoundCallOutcome::Unmodelled,
+        },
+    };
+    match client_seeded_effect(host, call, args, seed) {
+        Ok(Some(effect)) => {
+            emit(host, effect);
             SoundCallOutcome::Handled(Value::Void)
         }
+        Ok(None) => {
+            seed_not_delivered(host, CLIENT_LEVEL_SOUND_STREAM, seed);
+            SoundCallOutcome::Handled(Value::Void)
+        }
+        Err(outcome) => {
+            seed_not_delivered(host, CLIENT_LEVEL_SOUND_STREAM, seed);
+            outcome
+        }
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn client_play_seeded_or_unseeded_pos(
+/// `ClientLevel.playSeededSound`'s reads, in bytecode order. `Ok(None)` is
+/// the `except != minecraft.player` early return: nothing plays.
+///
+/// Both overloads unwrap `sound.value()` before anything reads the target:
+/// the position one hands it to the private `playSound`, the entity one to
+/// `EntityBoundSoundInstance`'s constructor, which then reads the entity.
+fn client_seeded_effect(
     host: &mut StdHost,
-    dimension: Option<String>,
-    has_local_player: bool,
-    except: &Value,
-    pos: [f64; 3],
-    sound_or_holder: &Value,
-    is_holder: bool,
-    source: &Value,
-    volume: f32,
-    pitch: f32,
-    explicit_seed: Option<i64>,
-    emit: &mut dyn FnMut(&mut StdHost, LevelSoundEffect),
-) -> SoundCallOutcome {
-    let Some(source) = SoundSource::from_value(source) else {
-        return SoundCallOutcome::Unmodelled;
-    };
-    let matches = client_except_matches(except, has_local_player);
-    match matches {
-        ClientExceptMatch::Unmodelled => return SoundCallOutcome::Unmodelled,
-        ClientExceptMatch::DoesNotMatch => {
-            if !is_holder && resolve_direct_sound_event(sound_or_holder).is_none() {
-                return SoundCallOutcome::Unmodelled;
-            }
-            // `Level.playSound` draws `soundSeedGenerator.nextLong()` BEFORE invoking
-            // `ClientLevel.playSeededSound`, which then checks `except == minecraft.player`.
-            if explicit_seed.is_none()
-                && host
-                    .draw_level_sound_seed(client_surface::LEVEL, false)
-                    .is_none()
-            {
-                return SoundCallOutcome::Unmodelled;
-            }
-            return SoundCallOutcome::Handled(Value::Void);
-        }
+    call: &ClientLevelCall<'_>,
+    args: SeededArgs<'_>,
+    seed: SoundSeed,
+) -> Result<Option<LevelSoundEffect>, SoundCallOutcome> {
+    match client_except_matches(args.except, call.has_local_player) {
+        ClientExceptMatch::Unmodelled => return Err(SoundCallOutcome::Unmodelled),
+        ClientExceptMatch::DoesNotMatch => return Ok(None),
         ClientExceptMatch::MatchesLocalPlayer => {}
     }
-    let resolved = if is_holder {
-        match resolve_sound_holder(host, sound_or_holder) {
-            Ok(Some(resolved)) => resolved,
-            Ok(None) => return SoundCallOutcome::Unmodelled,
-            Err(err) => {
-                if explicit_seed.is_none()
-                    && host
-                        .draw_level_sound_seed(client_surface::LEVEL, false)
-                        .is_none()
-                {
-                    return SoundCallOutcome::Unmodelled;
-                }
-                return SoundCallOutcome::Exception(err);
-            }
-        }
-    } else {
-        match wrap_sound_event_as_holder(host, sound_or_holder) {
-            Some(resolved) => resolved,
-            None => return SoundCallOutcome::Unmodelled,
-        }
-    };
-    let seed = match explicit_seed {
-        Some(seed) => SoundSeed::Explicit(seed),
-        None => match host.draw_level_sound_seed(client_surface::LEVEL, false) {
-            Some(seed) => seed,
-            None => return SoundCallOutcome::Unmodelled,
-        },
-    };
-    emit(
-        host,
-        LevelSoundEffect {
-            side: SoundSide::Client,
-            dimension,
-            sound_id: resolved.sound_id,
-            fixed_range: resolved.fixed_range,
-            holder: resolved.holder,
-            target: SoundTarget::Position(pos),
-            source,
-            volume,
-            pitch,
-            except_player: None,
-            seed,
-            distance_delay: false,
-            delay_ticks: 0,
-        },
-    );
-    SoundCallOutcome::Handled(Value::Void)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn client_play_seeded_or_unseeded_entity(
-    host: &mut StdHost,
-    frame: Option<&client_surface::ClientSnapshot>,
-    dimension: Option<String>,
-    has_local_player: bool,
-    except: &Value,
-    target: &Value,
-    sound_or_holder: &Value,
-    is_holder: bool,
-    source: &Value,
-    volume: f32,
-    pitch: f32,
-    explicit_seed: Option<i64>,
-    emit: &mut dyn FnMut(&mut StdHost, LevelSoundEffect),
-) -> SoundCallOutcome {
-    let Some(source) = SoundSource::from_value(source) else {
-        return SoundCallOutcome::Unmodelled;
-    };
-    let matches = client_except_matches(except, has_local_player);
-    match matches {
-        ClientExceptMatch::Unmodelled => return SoundCallOutcome::Unmodelled,
-        ClientExceptMatch::DoesNotMatch => {
-            if !is_holder && resolve_direct_sound_event(sound_or_holder).is_none() {
-                return SoundCallOutcome::Unmodelled;
-            }
-            if explicit_seed.is_none()
-                && host
-                    .draw_level_sound_seed(client_surface::LEVEL, false)
-                    .is_none()
-            {
-                return SoundCallOutcome::Unmodelled;
-            }
-            return SoundCallOutcome::Handled(Value::Void);
-        }
-        ClientExceptMatch::MatchesLocalPlayer => {}
-    }
-    let TargetEntityArg::Entity {
-        entity_id,
-        position,
-    } = client_target_entity(target, frame, host)
-    else {
-        return SoundCallOutcome::Unmodelled;
-    };
-    let resolved = if is_holder {
-        match resolve_sound_holder(host, sound_or_holder) {
-            Ok(Some(resolved)) => resolved,
-            Ok(None) => return SoundCallOutcome::Unmodelled,
-            Err(err) => {
-                if explicit_seed.is_none()
-                    && host
-                        .draw_level_sound_seed(client_surface::LEVEL, false)
-                        .is_none()
-                {
-                    return SoundCallOutcome::Unmodelled;
-                }
-                return SoundCallOutcome::Exception(err);
-            }
-        }
-    } else {
-        match wrap_sound_event_as_holder(host, sound_or_holder) {
-            Some(resolved) => resolved,
-            None => return SoundCallOutcome::Unmodelled,
-        }
-    };
-    let seed = match explicit_seed {
-        Some(seed) => SoundSeed::Explicit(seed),
-        None => match host.draw_level_sound_seed(client_surface::LEVEL, false) {
-            Some(seed) => seed,
-            None => return SoundCallOutcome::Unmodelled,
-        },
-    };
-    emit(
-        host,
-        LevelSoundEffect {
-            side: SoundSide::Client,
-            dimension,
-            sound_id: resolved.sound_id,
-            fixed_range: resolved.fixed_range,
-            holder: resolved.holder,
-            target: SoundTarget::Entity {
+    let resolved = resolve_sound_arg(host, args.sound)?;
+    let target = match args.at {
+        PlayAt::Position(pos) => SoundTarget::Position(pos),
+        PlayAt::Entity(target) => match client_target_entity(target, call.frame, host) {
+            TargetEntityArg::Entity {
+                entity_id,
+                position,
+            } => SoundTarget::Entity {
                 entity_id,
                 position,
             },
-            source,
-            volume,
-            pitch,
-            except_player: None,
-            seed,
-            distance_delay: false,
-            delay_ticks: 0,
+            TargetEntityArg::Unmodelled => return Err(SoundCallOutcome::Unmodelled),
         },
-    );
-    SoundCallOutcome::Handled(Value::Void)
+    };
+    let source = SoundSource::from_value(args.source).ok_or(SoundCallOutcome::Unmodelled)?;
+    Ok(Some(LevelSoundEffect {
+        side: SoundSide::Client,
+        dimension: call.dimension.clone(),
+        sound_id: resolved.sound_id,
+        fixed_range: resolved.fixed_range,
+        holder: resolved.holder,
+        target,
+        source,
+        volume: args.volume,
+        pitch: args.pitch,
+        except_player: None,
+        seed,
+        distance_delay: false,
+        delay_ticks: 0,
+    }))
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Emit a `Level.random`-seeded client effect, or note that its drawn seed
+/// was not delivered.
+fn finish_client_local(
+    host: &mut StdHost,
+    seed: SoundSeed,
+    effect: Result<LevelSoundEffect, SoundCallOutcome>,
+    emit: &mut dyn FnMut(&mut StdHost, LevelSoundEffect),
+) -> SoundCallOutcome {
+    match effect {
+        Ok(effect) => {
+            emit(host, effect);
+            SoundCallOutcome::Handled(Value::Void)
+        }
+        Err(outcome) => {
+            seed_not_delivered(host, &level_random_stream(client_surface::LEVEL), seed);
+            outcome
+        }
+    }
+}
+
+/// `ClientLevel.playLocalSound(DDD, ...)`: draws `this.random.nextLong()`
+/// (offset 19) before the private `playSound` reads the camera and builds the
+/// `SimpleSoundInstance` from the sound.
 fn client_play_local_pos(
     host: &mut StdHost,
-    dimension: Option<String>,
-    camera_pos: Option<[f64; 3]>,
+    call: &ClientLevelCall<'_>,
     pos: [f64; 3],
-    sound: &Value,
-    source: &Value,
-    volume: f32,
-    pitch: f32,
+    args: LocalSoundArgs<'_>,
     distance_delay: bool,
     emit: &mut dyn FnMut(&mut StdHost, LevelSoundEffect),
 ) -> SoundCallOutcome {
-    let Some((sound_id, fixed_range)) = resolve_direct_sound_event(sound) else {
-        return SoundCallOutcome::Unmodelled;
-    };
-    let Some(source) = SoundSource::from_value(source) else {
-        return SoundCallOutcome::Unmodelled;
-    };
-    let delay_ticks = if distance_delay {
-        let Some(cam) = camera_pos else {
-            return SoundCallOutcome::Unmodelled;
-        };
-        client_delay_ticks(cam, pos)
-    } else {
-        0
-    };
     let Some(seed) = host.draw_client_local_seed() else {
         return SoundCallOutcome::Unmodelled;
     };
-    emit(
-        host,
-        LevelSoundEffect {
-            side: SoundSide::Client,
-            dimension,
-            sound_id,
-            fixed_range,
-            holder: None,
-            target: SoundTarget::Position(pos),
-            source,
-            volume,
-            pitch,
-            except_player: None,
-            seed,
-            distance_delay,
-            delay_ticks,
+    let effect = client_local_pos_effect(call, pos, args, distance_delay, seed);
+    finish_client_local(host, seed, effect, emit)
+}
+
+fn client_local_pos_effect(
+    call: &ClientLevelCall<'_>,
+    pos: [f64; 3],
+    args: LocalSoundArgs<'_>,
+    distance_delay: bool,
+    seed: SoundSeed,
+) -> Result<LevelSoundEffect, SoundCallOutcome> {
+    let delay_ticks = if distance_delay {
+        let camera = call.camera_pos.ok_or(SoundCallOutcome::Unmodelled)?;
+        client_delay_ticks(camera, pos)
+    } else {
+        0
+    };
+    let (sound_id, fixed_range) =
+        resolve_direct_sound_event(args.sound).ok_or(SoundCallOutcome::Unmodelled)?;
+    let source = SoundSource::from_value(args.source).ok_or(SoundCallOutcome::Unmodelled)?;
+    Ok(LevelSoundEffect {
+        side: SoundSide::Client,
+        dimension: call.dimension.clone(),
+        sound_id,
+        fixed_range,
+        holder: None,
+        target: SoundTarget::Position(pos),
+        source,
+        volume: args.volume,
+        pitch: args.pitch,
+        except_player: None,
+        seed,
+        distance_delay,
+        delay_ticks,
+    })
+}
+
+/// `EntityBoundSoundInstance(sound, source, volume, pitch, entity, seed)` for
+/// `ClientLevel.playLocalSound(Entity, ...)`: reads the sound, then the entity.
+fn client_local_entity_effect(
+    host: &StdHost,
+    call: &ClientLevelCall<'_>,
+    target: &Value,
+    args: LocalSoundArgs<'_>,
+    seed: SoundSeed,
+) -> Result<LevelSoundEffect, SoundCallOutcome> {
+    let (sound_id, fixed_range) =
+        resolve_direct_sound_event(args.sound).ok_or(SoundCallOutcome::Unmodelled)?;
+    let TargetEntityArg::Entity {
+        entity_id,
+        position,
+    } = client_target_entity(target, call.frame, host)
+    else {
+        return Err(SoundCallOutcome::Unmodelled);
+    };
+    let source = SoundSource::from_value(args.source).ok_or(SoundCallOutcome::Unmodelled)?;
+    Ok(LevelSoundEffect {
+        side: SoundSide::Client,
+        dimension: call.dimension.clone(),
+        sound_id,
+        fixed_range,
+        holder: None,
+        target: SoundTarget::Entity {
+            entity_id,
+            position,
         },
-    );
-    SoundCallOutcome::Handled(Value::Void)
+        source,
+        volume: args.volume,
+        pitch: args.pitch,
+        except_player: None,
+        seed,
+        distance_delay: false,
+        delay_ticks: 0,
+    })
+}
+
+/// `ClientLevel.playPlayerSound` past its `player != null` check: an
+/// `EntityBoundSoundInstance` on the local player.
+fn client_player_sound_effect(
+    host: &StdHost,
+    call: &ClientLevelCall<'_>,
+    args: LocalSoundArgs<'_>,
+    seed: SoundSeed,
+) -> Result<LevelSoundEffect, SoundCallOutcome> {
+    let (sound_id, fixed_range) =
+        resolve_direct_sound_event(args.sound).ok_or(SoundCallOutcome::Unmodelled)?;
+    let (entity_id, position) = if let Some(player) = call.frame.and_then(|f| f.player.as_ref()) {
+        (player.entity_id, Some(player.pos))
+    } else if let Some(facts) = host.level_sound.standalone_client_player.as_ref() {
+        let entity_id = facts.entity_id.ok_or(SoundCallOutcome::Unmodelled)?;
+        (entity_id, facts.position)
+    } else {
+        return Err(SoundCallOutcome::Unmodelled);
+    };
+    let source = SoundSource::from_value(args.source).ok_or(SoundCallOutcome::Unmodelled)?;
+    Ok(LevelSoundEffect {
+        side: SoundSide::Client,
+        dimension: call.dimension.clone(),
+        sound_id,
+        fixed_range,
+        holder: None,
+        target: SoundTarget::Entity {
+            entity_id,
+            position,
+        },
+        source,
+        volume: args.volume,
+        pitch: args.pitch,
+        except_player: None,
+        seed,
+        distance_delay: false,
+        delay_ticks: 0,
+    })
+}
+
+/// The `soundSeedGenerator` an entity's `Level.playSound` draws from: its own
+/// level's, or (when Decaf does not know the entity's level) any server level's.
+fn entity_level_stream(dimension: Option<&str>) -> String {
+    dimension.map_or_else(
+        || ANY_SERVER_LEVEL_SOUND_STREAM.to_owned(),
+        server_level_sound_stream,
+    )
 }
 
 /// Dispatch `Entity.playSound`, `Player.playSound`, `Entity.getSoundSource`, and
@@ -2050,6 +2056,13 @@ fn execute_server_entity_call<H: Host + ?Sized>(
     sound_source: Option<SoundSource>,
     emit: &mut dyn FnMut(LevelSoundEffect),
 ) -> SoundCallOutcome {
+    let call = EntitySoundCall {
+        is_player,
+        player_uuid,
+        dimension,
+        position,
+        sound_source,
+    };
     match (r.name.as_str(), r.descriptor.as_str()) {
         ("getSoundSource", "()Lnet/minecraft/sounds/SoundSource;") => {
             let source = if is_player {
@@ -2066,10 +2079,12 @@ fn execute_server_entity_call<H: Host + ?Sized>(
             Some(silent) => SoundCallOutcome::Handled(Value::Int(i32::from(silent))),
             None => SoundCallOutcome::Unmodelled,
         },
-        // `Entity.playSound(SoundEvent)`: checks `!this.isSilent()` BEFORE calling
+        // `Entity.playSound(SoundEvent)`: checks `!isSilent()` BEFORE calling
         // virtual `this.playSound(sound, 1.0f, 1.0f)` (even on `Player`!).
         ("playSound", "(Lnet/minecraft/sounds/SoundEvent;)V") => {
             let Some(is_silent) = silent else {
+                // Whether the call reaches `Level.playSound`'s draw hangs on `isSilent()`.
+                host.mark_sound_stream_unknown(&entity_level_stream(dimension));
                 return SoundCallOutcome::Unmodelled;
             };
             if is_silent {
@@ -2078,24 +2093,14 @@ fn execute_server_entity_call<H: Host + ?Sized>(
             let Some(sound) = args.first() else {
                 return SoundCallOutcome::Unmodelled;
             };
-            server_entity_emit_play_sound(
-                host,
-                is_player,
-                player_uuid,
-                dimension,
-                position,
-                sound_source,
-                sound,
-                1.0,
-                1.0,
-                emit,
-            )
+            server_entity_emit_play_sound(host, &call, sound, 1.0, 1.0, emit)
         }
         // `Player.playSound(SoundEvent, float, float)` does NOT check `isSilent()`;
         // `Entity.playSound(SoundEvent, float, float)` DOES check `!isSilent()`.
         ("playSound", "(Lnet/minecraft/sounds/SoundEvent;FF)V") => {
             if !is_player {
                 let Some(is_silent) = silent else {
+                    host.mark_sound_stream_unknown(&entity_level_stream(dimension));
                     return SoundCallOutcome::Unmodelled;
                 };
                 if is_silent {
@@ -2107,66 +2112,90 @@ fn execute_server_entity_call<H: Host + ?Sized>(
             else {
                 return SoundCallOutcome::Unmodelled;
             };
-            server_entity_emit_play_sound(
-                host,
-                is_player,
-                player_uuid,
-                dimension,
-                position,
-                sound_source,
-                sound,
-                volume,
-                pitch,
-                emit,
-            )
+            server_entity_emit_play_sound(host, &call, sound, volume, pitch, emit)
         }
         _ => SoundCallOutcome::Unmodelled,
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn server_entity_emit_play_sound<H: Host + ?Sized>(
-    host: &mut H,
+/// The receiver facts `Entity.playSound` / `Player.playSound` hand to `Level.playSound`.
+struct EntitySoundCall<'a> {
     is_player: bool,
     player_uuid: Option<u128>,
-    dimension: Option<&str>,
+    dimension: Option<&'a str>,
     position: Option<[f64; 3]>,
     sound_source: Option<SoundSource>,
+}
+
+/// `Entity.playSound(SoundEvent, FF)` past its `isSilent()` check, or
+/// `Player.playSound(SoundEvent, FF)`.
+///
+/// Both read `level()`, `getX/Y/Z()` (final: they never throw) and
+/// `getSoundSource()` (virtual), then call `Level.playSound(except, x, y, z,
+/// sound, source, volume, pitch)`, which draws the level's
+/// `soundSeedGenerator` before anything else (see [`server_play`]). `except`
+/// is `null` for an entity and the player itself for a player.
+fn server_entity_emit_play_sound<H: Host + ?Sized>(
+    host: &mut H,
+    call: &EntitySoundCall<'_>,
     sound: &Value,
     volume: f32,
     pitch: f32,
     emit: &mut dyn FnMut(LevelSoundEffect),
 ) -> SoundCallOutcome {
-    let Some(dimension) = dimension else {
+    let Some(dimension) = call.dimension else {
+        // The draw happens on whichever level `level()` is: Decaf cannot name it.
+        host.mark_sound_stream_unknown(ANY_SERVER_LEVEL_SOUND_STREAM);
         return SoundCallOutcome::Unmodelled;
     };
-    let Some(pos) = position else {
-        return SoundCallOutcome::Unmodelled;
-    };
-    let source = if is_player {
+    let level_marker = server_level_sound_stream(dimension);
+    let source = if call.is_player {
         SoundSource::Players
     } else {
-        let Some(source) = sound_source else {
+        let Some(source) = call.sound_source else {
+            // An unknown `getSoundSource()` may be a mod's override that throws
+            // before the draw.
+            host.mark_sound_stream_unknown(&level_marker);
             return SoundCallOutcome::Unmodelled;
         };
         source
     };
-    let except_player = if is_player {
-        let Some(uuid) = player_uuid else {
-            return SoundCallOutcome::Unmodelled;
-        };
-        Some(uuid)
-    } else {
-        None
-    };
-    let Some(resolved) = wrap_sound_event_as_holder(host, sound) else {
-        return SoundCallOutcome::Unmodelled;
-    };
-    let level_marker = format!("game/level/{dimension}");
     let Some(seed) = host.draw_level_sound_seed(&level_marker, true) else {
         return SoundCallOutcome::Unmodelled;
     };
-    emit(LevelSoundEffect {
+    match server_entity_effect(host, call, dimension, source, sound, volume, pitch, seed) {
+        Ok(effect) => {
+            emit(effect);
+            SoundCallOutcome::Handled(Value::Void)
+        }
+        Err(outcome) => {
+            seed_not_delivered(host, &level_marker, seed);
+            outcome
+        }
+    }
+}
+
+/// What `ServerLevel.playSeededSound` reads after an entity's draw: `except
+/// instanceof Player` (the player itself, or `null`), then the sound.
+#[allow(clippy::too_many_arguments)]
+fn server_entity_effect<H: Host + ?Sized>(
+    host: &H,
+    call: &EntitySoundCall<'_>,
+    dimension: &str,
+    source: SoundSource,
+    sound: &Value,
+    volume: f32,
+    pitch: f32,
+    seed: SoundSeed,
+) -> Result<LevelSoundEffect, SoundCallOutcome> {
+    let pos = call.position.ok_or(SoundCallOutcome::Unmodelled)?;
+    let except_player = if call.is_player {
+        Some(call.player_uuid.ok_or(SoundCallOutcome::Unmodelled)?)
+    } else {
+        None
+    };
+    let resolved = wrap_sound_event_as_holder(host, sound).ok_or(SoundCallOutcome::Unmodelled)?;
+    Ok(LevelSoundEffect {
         side: SoundSide::Server,
         dimension: Some(dimension.to_owned()),
         sound_id: resolved.sound_id,
@@ -2180,8 +2209,7 @@ fn server_entity_emit_play_sound<H: Host + ?Sized>(
         seed,
         distance_delay: false,
         delay_ticks: 0,
-    });
-    SoundCallOutcome::Handled(Value::Void)
+    })
 }
 
 /// Dispatch `LocalPlayer.playSound`, `getSoundSource`, and `isSilent`.
@@ -2192,29 +2220,44 @@ fn execute_local_player_call(
     frame: Option<&client_surface::ClientSnapshot>,
     emit: &mut dyn FnMut(&mut StdHost, LevelSoundEffect),
 ) -> SoundCallOutcome {
-    let (has_level, dimension, pos, silent) = if let Some(frame) = frame {
-        let Some(player) = frame.player.as_ref() else {
-            return SoundCallOutcome::Unmodelled;
-        };
-        (
-            frame.level.is_some(),
-            frame
-                .level
-                .as_ref()
-                .map(|l| l.dimension.clone())
-                .filter(|d| !d.is_empty()),
-            Some(player.pos),
-            player.silent,
-        )
-    } else if let Some(facts) = host.level_sound.standalone_client_player.as_ref() {
-        (
-            facts.level.is_some(),
-            facts.level.clone(),
-            facts.position,
-            facts.silent,
-        )
-    } else {
+    let facts = match frame {
+        Some(frame) => frame.player.as_ref().map(|player| {
+            (
+                frame.level.is_some(),
+                frame
+                    .level
+                    .as_ref()
+                    .map(|l| l.dimension.clone())
+                    .filter(|d| !d.is_empty()),
+                Some(player.pos),
+                player.silent,
+            )
+        }),
+        None => host
+            .level_sound
+            .standalone_client_player
+            .as_ref()
+            .map(|facts| {
+                (
+                    facts.level.is_some(),
+                    facts.level.clone(),
+                    facts.position,
+                    facts.silent,
+                )
+            }),
+    };
+    let Some((has_level, dimension, pos, silent)) = facts else {
+        if r.name == "playSound" {
+            // A local player Decaf has no facts for may or may not reach
+            // `playLocalSound`'s `Level.random` draw.
+            host.mark_sound_stream_unknown(&level_random_stream(client_surface::LEVEL));
+        }
         return SoundCallOutcome::Unmodelled;
+    };
+    let player = LocalPlayerSound {
+        has_level,
+        dimension,
+        pos,
     };
     match (r.name.as_str(), r.descriptor.as_str()) {
         ("getSoundSource", "()Lnet/minecraft/sounds/SoundSource;") => {
@@ -2228,6 +2271,7 @@ fn execute_local_player_call(
         // virtual `LocalPlayer.playSound(sound, 1.0f, 1.0f)`.
         ("playSound", "(Lnet/minecraft/sounds/SoundEvent;)V") => {
             let Some(is_silent) = silent else {
+                host.mark_sound_stream_unknown(&level_random_stream(client_surface::LEVEL));
                 return SoundCallOutcome::Unmodelled;
             };
             if is_silent {
@@ -2236,7 +2280,7 @@ fn execute_local_player_call(
             let Some(sound) = args.first() else {
                 return SoundCallOutcome::Unmodelled;
             };
-            local_player_emit_play_sound(host, has_level, dimension, pos, sound, 1.0, 1.0, emit)
+            local_player_emit_play_sound(host, player, sound, 1.0, 1.0, emit)
         }
         // `LocalPlayer.playSound(SoundEvent, float, float)` does NOT check `isSilent()`,
         // and calls `level.playLocalSound(getX(), getY(), getZ(), sound, getSoundSource(), vol, pitch, false)`.
@@ -2246,56 +2290,68 @@ fn execute_local_player_call(
             else {
                 return SoundCallOutcome::Unmodelled;
             };
-            local_player_emit_play_sound(
-                host, has_level, dimension, pos, sound, volume, pitch, emit,
-            )
+            local_player_emit_play_sound(host, player, sound, volume, pitch, emit)
         }
         _ => SoundCallOutcome::Unmodelled,
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn local_player_emit_play_sound(
-    host: &mut StdHost,
+/// The local player facts `LocalPlayer.playSound` reads before its draw.
+struct LocalPlayerSound {
     has_level: bool,
     dimension: Option<String>,
     pos: Option<[f64; 3]>,
+}
+
+/// `LocalPlayer.playSound(SoundEvent, FF)`: `level().playLocalSound(getX(),
+/// getY(), getZ(), sound, getSoundSource(), volume, pitch, false)`. The
+/// position reads are final and never throw; `playLocalSound` then draws
+/// `Level.random` before anything reads the sound.
+fn local_player_emit_play_sound(
+    host: &mut StdHost,
+    player: LocalPlayerSound,
     sound: &Value,
     volume: f32,
     pitch: f32,
     emit: &mut dyn FnMut(&mut StdHost, LevelSoundEffect),
 ) -> SoundCallOutcome {
-    if !has_level {
+    if !player.has_level {
+        // A client level Decaf does not model: the draw may or may not happen.
+        host.mark_sound_stream_unknown(&level_random_stream(client_surface::LEVEL));
         return SoundCallOutcome::Unmodelled;
     }
-    let Some(pos) = pos else {
-        return SoundCallOutcome::Unmodelled;
-    };
-    let Some((sound_id, fixed_range)) = resolve_direct_sound_event(sound) else {
-        return SoundCallOutcome::Unmodelled;
-    };
     let Some(seed) = host.draw_client_local_seed() else {
         return SoundCallOutcome::Unmodelled;
     };
-    emit(
-        host,
-        LevelSoundEffect {
-            side: SoundSide::Client,
-            dimension,
-            sound_id,
-            fixed_range,
-            holder: None,
-            target: SoundTarget::Position(pos),
-            source: SoundSource::Players,
-            volume,
-            pitch,
-            except_player: None,
-            seed,
-            distance_delay: false,
-            delay_ticks: 0,
-        },
-    );
-    SoundCallOutcome::Handled(Value::Void)
+    let effect = local_player_effect(player, sound, volume, pitch, seed);
+    finish_client_local(host, seed, effect, emit)
+}
+
+fn local_player_effect(
+    player: LocalPlayerSound,
+    sound: &Value,
+    volume: f32,
+    pitch: f32,
+    seed: SoundSeed,
+) -> Result<LevelSoundEffect, SoundCallOutcome> {
+    let pos = player.pos.ok_or(SoundCallOutcome::Unmodelled)?;
+    let (sound_id, fixed_range) =
+        resolve_direct_sound_event(sound).ok_or(SoundCallOutcome::Unmodelled)?;
+    Ok(LevelSoundEffect {
+        side: SoundSide::Client,
+        dimension: player.dimension,
+        sound_id,
+        fixed_range,
+        holder: None,
+        target: SoundTarget::Position(pos),
+        source: SoundSource::Players,
+        volume,
+        pitch,
+        except_player: None,
+        seed,
+        distance_delay: false,
+        delay_ticks: 0,
+    })
 }
 
 /// Entry point for `client_surface.rs` inside an active `ClientSnapshot` frame.
@@ -2646,19 +2702,29 @@ impl StdHost {
 
     /// Seed `Level.random` (`Level.getRandom()`, and the seed stream used by
     /// `ClientLevel.playLocalSound` / `playPlayerSound`) for `level_marker`.
+    ///
+    /// Seeding makes the stream known again (see the module docs).
     pub fn seed_level_random(&mut self, level_marker: &str, seed: i64) {
         let handle = self.make_random_handle(random_source::legacy_state(seed));
         self.level_sound
             .level_random_handles
             .insert(level_marker.to_owned(), handle);
+        self.level_sound
+            .unknown_sound_streams
+            .remove(&level_random_stream(level_marker));
     }
 
     /// Seed `Level.soundSeedGenerator` (used by non-seeded `Level.playSound`
     /// overloads on both `ServerLevel` and `ClientLevel`) for `level_marker`.
+    ///
+    /// Seeding makes the stream known again, except while
+    /// [`ANY_SERVER_LEVEL_SOUND_STREAM`] is unknown: that stands for every
+    /// server level until [`Self::forget_unknown_server_sound_streams`].
     pub fn seed_level_sound_seeds(&mut self, level_marker: &str, seed: i64) {
         self.level_sound
             .level_sound_seeds
             .insert(level_marker.to_owned(), random_source::legacy_state(seed));
+        self.level_sound.unknown_sound_streams.remove(level_marker);
     }
 
     /// Seed both `random` and `soundSeedGenerator` for a server level dimension.
@@ -2713,6 +2779,85 @@ impl StdHost {
         self.level_sound.host_deferred_client_seeds = enabled;
     }
 
+    /// Mark a level sound stream ([`server_level_sound_stream`],
+    /// [`ANY_SERVER_LEVEL_SOUND_STREAM`], [`CLIENT_LEVEL_SOUND_STREAM`],
+    /// [`level_random_stream`]) unknown: Java drew, or may have drawn, from it
+    /// where neither Decaf nor the live host did. Every later draw from it
+    /// counts until it is seeded again.
+    ///
+    /// A seeded copy of the stream stops answering too: a `soundSeedGenerator`
+    /// copy is dropped, and a seeded `Level.random` handle (which the jar may
+    /// hold through `getRandom()`) forgets its state, so its draws count.
+    ///
+    /// While seeds are deferred to a live host, the mark widens to every
+    /// stream the host's one stream may stand for ([`host_sound_streams`]).
+    pub fn mark_sound_stream_unknown(&mut self, stream: &str) {
+        let deferred = if is_server_seed_generator(stream) {
+            self.level_sound.host_deferred_server_seeds
+        } else if stream.starts_with(client_surface::LEVEL) {
+            self.level_sound.host_deferred_client_seeds
+        } else {
+            false
+        };
+        if deferred {
+            for stream in host_sound_streams(stream) {
+                self.mark_one_sound_stream_unknown(&stream);
+            }
+        } else {
+            self.mark_one_sound_stream_unknown(stream);
+        }
+    }
+
+    fn mark_one_sound_stream_unknown(&mut self, stream: &str) {
+        if let Some(level_marker) = stream.strip_suffix(LEVEL_RANDOM_SUFFIX) {
+            if let Some(handle) = self
+                .level_sound
+                .level_random_handles
+                .get(level_marker)
+                .cloned()
+            {
+                self.forget_random_state(&handle);
+            }
+        } else if stream == ANY_SERVER_LEVEL_SOUND_STREAM {
+            self.level_sound
+                .level_sound_seeds
+                .retain(|marker, _| !marker.starts_with(SERVER_LEVEL_PREFIX));
+        } else {
+            self.level_sound.level_sound_seeds.remove(stream);
+        }
+        self.level_sound
+            .unknown_sound_streams
+            .insert(stream.to_owned());
+    }
+
+    /// Whether a draw from `stream` can still be answered exactly.
+    pub fn sound_stream_known(&self, stream: &str) -> bool {
+        sound_stream_known_in(&self.level_sound.unknown_sound_streams, stream)
+    }
+
+    /// The stream keys marked unknown on this host.
+    pub fn unknown_sound_streams(&self) -> &BTreeSet<String> {
+        &self.level_sound.unknown_sound_streams
+    }
+
+    /// A new server opens new levels, each with a fresh `soundSeedGenerator`
+    /// (and the live host's streams start fresh with them): forget which
+    /// server streams were unknown. A seeded copy dropped when its stream
+    /// went unknown stays dropped.
+    pub fn forget_unknown_server_sound_streams(&mut self) {
+        self.level_sound
+            .unknown_sound_streams
+            .retain(|stream| !stream.starts_with(SERVER_LEVEL_PREFIX));
+    }
+
+    /// A new client level has a fresh `random` and `soundSeedGenerator`:
+    /// forget which client streams were unknown.
+    pub fn forget_unknown_client_sound_streams(&mut self) {
+        self.level_sound
+            .unknown_sound_streams
+            .retain(|stream| !stream.starts_with(client_surface::LEVEL));
+    }
+
     /// Record optional sound facts for an entity or player marker (used by
     /// standalone calls and host bridges).
     pub fn set_entity_sound_facts(&mut self, marker: impl Into<String>, facts: EntitySoundFacts) {
@@ -2745,38 +2890,60 @@ impl StdHost {
         std::mem::take(&mut self.level_sound.played_sounds)
     }
 
+    /// Draw the client level's `Level.random.nextLong()` where Java does
+    /// (`ClientLevel.playLocalSound`, `playPlayerSound`). `None` counts the
+    /// call: the stream was already unknown, or Decaf cannot make this draw,
+    /// which makes it unknown (Java drew all the same).
     pub(crate) fn draw_client_local_seed(&mut self) -> Option<SoundSeed> {
-        if let Some(handle) = self
+        let stream = level_random_stream(client_surface::LEVEL);
+        let seed = if !self.sound_stream_known(&stream) {
+            None
+        } else if let Some(handle) = self
             .level_sound
             .level_random_handles
             .get(client_surface::LEVEL)
             .cloned()
-            && let Some(seed) = self.draw_random_handle_long(&handle)
         {
-            return Some(SoundSeed::LevelRandom(seed));
+            // A seeded handle is the stream: no deferring past it.
+            self.draw_random_handle_long(&handle)
+                .map(SoundSeed::LevelRandom)
+        } else {
+            self.level_sound
+                .host_deferred_client_seeds
+                .then_some(SoundSeed::HostDeferred)
+        };
+        if seed.is_none() {
+            self.mark_sound_stream_unknown(&stream);
         }
-        if self.level_sound.host_deferred_client_seeds {
-            return Some(SoundSeed::HostDeferred);
-        }
-        None
+        seed
     }
 
+    /// Draw `level_marker`'s `soundSeedGenerator.nextLong()` where Java does,
+    /// from a seeded copy or by deferring to a live host. `None` counts the
+    /// call, and the stream is (or stays) unknown: Java drew all the same.
     pub(crate) fn draw_level_sound_seed_impl(
         &mut self,
         level_marker: &str,
         server_side: bool,
     ) -> Option<SoundSeed> {
-        if let Some(state) = self.level_sound.level_sound_seeds.get_mut(level_marker) {
-            return Some(SoundSeed::LevelSeedGenerator(
+        let seed = if !self.sound_stream_known(level_marker) {
+            None
+        } else if let Some(state) = self.level_sound.level_sound_seeds.get_mut(level_marker) {
+            Some(SoundSeed::LevelSeedGenerator(
                 random_source::draw_next_long(state),
-            ));
-        }
-        let deferred = if server_side {
-            self.level_sound.host_deferred_server_seeds
+            ))
         } else {
-            self.level_sound.host_deferred_client_seeds
+            let deferred = if server_side {
+                self.level_sound.host_deferred_server_seeds
+            } else {
+                self.level_sound.host_deferred_client_seeds
+            };
+            deferred.then_some(SoundSeed::HostDeferred)
         };
-        deferred.then_some(SoundSeed::HostDeferred)
+        if seed.is_none() {
+            self.mark_sound_stream_unknown(level_marker);
+        }
+        seed
     }
 
     pub(crate) fn level_random_handle_impl(&self, level_marker: &str) -> Option<Value> {

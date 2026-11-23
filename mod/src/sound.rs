@@ -8,7 +8,16 @@
 //! past 1200 ticks, missing target level/entity/player, or host refusal) is
 //! reported to `on_unbridged` so the jar counts it as unknown instead of
 //! silently approximating or dropping it.
+//!
+//! Seed streams: Java draws a sound's seed from its level's stream at the
+//! call; Sunrise draws a deferred effect's seed only when the effect reaches
+//! it. A refused deferred effect therefore leaves Sunrise's stream one draw
+//! behind Java's. Sunrise keeps one such stream for the whole server (Java
+//! keeps one per level), so every level's stream is marked unknown for every
+//! jar, and every later deferred effect is counted instead of played with the
+//! wrong seed ([`deliver_in_order`], [`gather_unknown_sound_streams`]).
 
+use std::collections::BTreeSet;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use mod_api::{
@@ -17,6 +26,7 @@ use mod_api::{
 };
 
 use crate::runtime::events::{EventContext, EventFacade};
+use crate::runtime::level_sound::{host_sound_streams, sound_stream_known_in};
 use crate::runtime::{
     EntitySoundFacts, GameObject, GameObjectKind, LevelSoundEffect, SoundSeed, SoundSide,
     SoundSource as RuntimeSoundSource, SoundTarget,
@@ -205,176 +215,291 @@ pub(crate) fn enrich_game_object(host: &dyn ServerHost, mut object: GameObject) 
     object
 }
 
-/// Deliver recorded server sounds to a Sunrise [`ServerHost`] via
-/// `LevelRef::play_sound` and `EntityRef::play_bound_sound`.
-pub(crate) fn apply_server_sounds(
-    host: &mut dyn ServerHost,
-    sounds: &[LevelSoundEffect],
-    mut on_unbridged: impl FnMut(&str),
+/// The unknown level sound streams every jar's runtime host has marked (see
+/// the runtime's `level_sound` module docs).
+///
+/// A level's sound-seed stream is the level's, not a jar's: Java's
+/// `Level.soundSeedGenerator` (and Sunrise's stream standing in for it) is
+/// shared by every mod and by the game itself. So once any jar's host, or the
+/// bridge, finds a stream's position unknown, it is unknown for every jar.
+/// Each site that defers seeds to Sunrise gathers this ledger first and shares
+/// it with every jar's host ([`share_unknown_sound_streams`]); within a
+/// site, a jar's host is lent the ledger as it stands before that jar's Java
+/// code runs.
+///
+/// Each stream gathered widens to every stream Sunrise's one stream for it
+/// stands for ([`host_sound_streams`]): Sunrise draws every server sound's seed
+/// from one server-wide stream where Java keeps one per level, so a draw it
+/// missed on one level puts every level's later deferred seeds out of step.
+pub(crate) fn gather_unknown_sound_streams<'a>(
+    hosts: impl IntoIterator<Item = &'a crate::runtime::StdHost>,
+) -> BTreeSet<String> {
+    let mut ledger = BTreeSet::new();
+    for host in hosts {
+        for stream in host.unknown_sound_streams() {
+            note_unknown(&mut ledger, stream);
+        }
+    }
+    ledger
+}
+
+/// Add `stream`, widened by [`host_sound_streams`], to `ledger`.
+fn note_unknown(ledger: &mut BTreeSet<String>, stream: &str) {
+    ledger.extend(host_sound_streams(stream));
+}
+
+/// Mark every stream of `streams` unknown on each of `hosts`.
+pub(crate) fn share_unknown_sound_streams<'a>(
+    hosts: impl IntoIterator<Item = &'a mut crate::runtime::StdHost>,
+    streams: &BTreeSet<String>,
 ) {
-    for effect in sounds {
-        if effect.side != SoundSide::Server {
-            on_unbridged("level sound wrong side for server host");
-            continue;
-        }
-        if effect.fixed_range.is_some() {
-            on_unbridged("level sound fixed range unsupported by Sunrise ServerHost");
-            continue;
-        }
-        if effect.seed != SoundSeed::HostDeferred {
-            on_unbridged("level sound explicit seed unsupported by Sunrise ServerHost");
-            continue;
-        }
-        let source = to_api_source(effect.source);
-        match effect.target {
-            SoundTarget::Position(pos) => {
-                let Some(dimension) = effect.dimension.as_deref() else {
-                    on_unbridged("level sound missing dimension");
-                    continue;
-                };
-                let Some(level) = host.level(dimension) else {
-                    on_unbridged("level sound missing Sunrise level");
-                    continue;
-                };
-                let except = match effect.except_player {
-                    None => None,
-                    Some(uuid) => match host.player(uuid) {
-                        Some(player) => Some(player),
-                        None => {
-                            on_unbridged("level sound missing except player");
-                            continue;
-                        }
-                    },
-                };
-                if !level.play_sound(
-                    host,
-                    &effect.sound_id,
-                    pos,
-                    source,
-                    effect.volume,
-                    effect.pitch,
-                    except,
-                ) {
-                    on_unbridged("level sound refused by Sunrise LevelRef::play_sound");
-                }
-            }
-            SoundTarget::Entity { entity_id, .. } => {
-                if effect.except_player.is_some() {
-                    on_unbridged(
-                        "level sound entity-bound except player unsupported by Sunrise EntityRef::play_bound_sound",
-                    );
-                    continue;
-                }
-                let Ok(id) = u32::try_from(entity_id) else {
-                    on_unbridged("level sound invalid entity id");
-                    continue;
-                };
-                let Some(entity) = host.entity(id) else {
-                    on_unbridged("level sound missing Sunrise entity");
-                    continue;
-                };
-                if let Some(dim) = effect.dimension.as_deref()
-                    && let Ok(Some(entity_level)) =
-                        catch_unwind(AssertUnwindSafe(|| entity.level(host)))
-                    && entity_level.dimension_id() != dim
-                {
-                    on_unbridged("level sound entity dimension mismatch");
-                    continue;
-                }
-                if !entity.play_bound_sound(
-                    host,
-                    &effect.sound_id,
-                    source,
-                    effect.volume,
-                    effect.pitch,
-                ) {
-                    on_unbridged("level sound refused by Sunrise EntityRef::play_bound_sound");
-                }
+    for host in hosts {
+        for stream in streams {
+            // By key, not by `sound_stream_known`: a key the `game/level/*` wildcard already
+            // covers still goes in, so every jar holds the same ledger.
+            if !host.unknown_sound_streams().contains(stream) {
+                host.mark_sound_stream_unknown(stream);
             }
         }
     }
 }
 
+/// [`gather_unknown_sound_streams`] then [`share_unknown_sound_streams`] over
+/// the same hosts: afterwards every host holds the whole ledger, which this
+/// returns.
+pub(crate) fn sync_unknown_sound_streams<J>(
+    jars: &mut [J],
+    host: impl Fn(&mut J) -> &mut crate::runtime::StdHost,
+) -> BTreeSet<String> {
+    let mut ledger = BTreeSet::new();
+    for jar in jars.iter_mut() {
+        for stream in host(jar).unknown_sound_streams() {
+            note_unknown(&mut ledger, stream);
+        }
+    }
+    share_unknown_sound_streams(jars.iter_mut().map(host), &ledger);
+    ledger
+}
+
+/// The Sunrise stream a recorded effect's seed is deferred to: `Some` only
+/// for [`SoundSeed::HostDeferred`], whose seed Sunrise draws when (and only
+/// when) the effect reaches it.
+fn deferred_stream(effect: &LevelSoundEffect) -> Option<String> {
+    if effect.seed == SoundSeed::HostDeferred {
+        effect.seed_stream()
+    } else {
+        None
+    }
+}
+
+/// Deliver `sounds` in call order through `deliver`, which plays one effect
+/// or names why Sunrise cannot play it faithfully.
+///
+/// Java drew a deferred effect's seed when the call ran; Sunrise draws it only
+/// if the effect reaches it. So an effect `deliver` refuses leaves Sunrise's
+/// stream one draw behind Java's: the stream goes into `unknown`, and every
+/// later deferred effect on it, in this batch or a later one, is counted
+/// instead of played with a seed Java would not have drawn. The stream widens
+/// to every level's ([`note_unknown`]): Sunrise's is one for the server. (A
+/// `false` from Sunrise is a refusal too: `LevelRef::play_sound` draws only
+/// once its checks pass, but the other host calls do not say.)
+/// The pinned SDK has no call that advances a level's sound-seed stream
+/// without playing a sound, so the position cannot be put right.
+fn deliver_in_order(
+    sounds: &[LevelSoundEffect],
+    unknown: &mut BTreeSet<String>,
+    on_unbridged: &mut dyn FnMut(&str),
+    deliver: &mut dyn FnMut(&LevelSoundEffect) -> Result<(), &'static str>,
+) {
+    for effect in sounds {
+        let stream = deferred_stream(effect);
+        if let Some(stream) = &stream
+            && !sound_stream_known_in(unknown, stream)
+        {
+            on_unbridged(
+                "level sound seed stream position unknown: an earlier seed never reached Sunrise",
+            );
+            continue;
+        }
+        if let Err(reason) = deliver(effect) {
+            on_unbridged(reason);
+            if let Some(stream) = stream {
+                note_unknown(unknown, &stream);
+            }
+        }
+    }
+}
+
+/// Count recorded sounds that will never be delivered (their callback failed,
+/// or there is no Sunrise host to play them on), in call order and exactly as
+/// [`deliver_in_order`] counts a refusal: a deferred one leaves its stream
+/// unknown.
+pub(crate) fn count_undelivered_sounds(
+    sounds: &[LevelSoundEffect],
+    unknown: &mut BTreeSet<String>,
+    mut on_unbridged: impl FnMut(&str),
+    reason: &'static str,
+) {
+    deliver_in_order(sounds, unknown, &mut on_unbridged, &mut |_| Err(reason));
+}
+
+/// Deliver recorded server sounds to a Sunrise [`ServerHost`] via
+/// `LevelRef::play_sound` and `EntityRef::play_bound_sound`. See
+/// [`deliver_in_order`] for `unknown`.
+pub(crate) fn apply_server_sounds(
+    host: &mut dyn ServerHost,
+    sounds: &[LevelSoundEffect],
+    unknown: &mut BTreeSet<String>,
+    mut on_unbridged: impl FnMut(&str),
+) {
+    deliver_in_order(sounds, unknown, &mut on_unbridged, &mut |effect| {
+        deliver_server_sound(&mut *host, effect)
+    });
+}
+
+fn deliver_server_sound(
+    host: &mut dyn ServerHost,
+    effect: &LevelSoundEffect,
+) -> Result<(), &'static str> {
+    if effect.side != SoundSide::Server {
+        return Err("level sound wrong side for server host");
+    }
+    if effect.fixed_range.is_some() {
+        return Err("level sound fixed range unsupported by Sunrise ServerHost");
+    }
+    if effect.seed != SoundSeed::HostDeferred {
+        return Err("level sound explicit seed unsupported by Sunrise ServerHost");
+    }
+    let source = to_api_source(effect.source);
+    match effect.target {
+        SoundTarget::Position(pos) => {
+            let Some(dimension) = effect.dimension.as_deref() else {
+                return Err("level sound missing dimension");
+            };
+            let Some(level) = host.level(dimension) else {
+                return Err("level sound missing Sunrise level");
+            };
+            let except = match effect.except_player {
+                None => None,
+                Some(uuid) => match host.player(uuid) {
+                    Some(player) => Some(player),
+                    None => return Err("level sound missing except player"),
+                },
+            };
+            if !level.play_sound(
+                host,
+                &effect.sound_id,
+                pos,
+                source,
+                effect.volume,
+                effect.pitch,
+                except,
+            ) {
+                return Err("level sound refused by Sunrise LevelRef::play_sound");
+            }
+        }
+        SoundTarget::Entity { entity_id, .. } => {
+            if effect.except_player.is_some() {
+                return Err(
+                    "level sound entity-bound except player unsupported by Sunrise EntityRef::play_bound_sound",
+                );
+            }
+            let Ok(id) = u32::try_from(entity_id) else {
+                return Err("level sound invalid entity id");
+            };
+            let Some(entity) = host.entity(id) else {
+                return Err("level sound missing Sunrise entity");
+            };
+            if let Some(dim) = effect.dimension.as_deref()
+                && let Ok(Some(entity_level)) =
+                    catch_unwind(AssertUnwindSafe(|| entity.level(host)))
+                && entity_level.dimension_id() != dim
+            {
+                return Err("level sound entity dimension mismatch");
+            }
+            if !entity.play_bound_sound(host, &effect.sound_id, source, effect.volume, effect.pitch)
+            {
+                return Err("level sound refused by Sunrise EntityRef::play_bound_sound");
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Deliver recorded server sounds to a Sunrise [`LevelWriteHost`] (respecting
 /// Sunrise's transactional journaling: queued on open transaction, committed
-/// at root commit drawing `sound_seeds`, dropped on rollback).
+/// at root commit drawing `sound_seeds`, dropped on rollback). See
+/// [`deliver_in_order`] for `unknown`.
 #[allow(dead_code)]
 pub(crate) fn apply_level_write_sounds(
     level: &mut dyn LevelWriteHost,
     expected_dimension: Option<&str>,
     sounds: &[LevelSoundEffect],
+    unknown: &mut BTreeSet<String>,
     mut on_unbridged: impl FnMut(&str),
 ) {
-    for effect in sounds {
+    deliver_in_order(sounds, unknown, &mut on_unbridged, &mut |effect| {
         if effect.side != SoundSide::Server {
-            on_unbridged("level write sound wrong side");
-            continue;
+            return Err("level write sound wrong side");
         }
         if effect.fixed_range.is_some() {
-            on_unbridged("level write sound fixed range unsupported");
-            continue;
+            return Err("level write sound fixed range unsupported");
         }
         if effect.seed != SoundSeed::HostDeferred {
-            on_unbridged("level write sound explicit seed unsupported");
-            continue;
+            return Err("level write sound explicit seed unsupported");
         }
         if let Some(expected) = expected_dimension
             && effect.dimension.as_deref() != Some(expected)
         {
-            on_unbridged("level write sound dimension mismatch");
-            continue;
+            return Err("level write sound dimension mismatch");
         }
         if effect.except_player.is_some() {
-            on_unbridged("level write sound except player unsupported by LevelWriteHost");
-            continue;
+            return Err("level write sound except player unsupported by LevelWriteHost");
         }
         let SoundTarget::Position(pos) = effect.target else {
-            on_unbridged("level write sound entity-bound unsupported by LevelWriteHost");
-            continue;
+            return Err("level write sound entity-bound unsupported by LevelWriteHost");
         };
         let source = to_api_source(effect.source).index();
         if !level.play_sound(&effect.sound_id, pos, source, effect.volume, effect.pitch) {
-            on_unbridged("level write sound refused by Sunrise LevelWriteHost");
+            return Err("level write sound refused by Sunrise LevelWriteHost");
         }
-    }
+        Ok(())
+    });
 }
 
 /// Deliver recorded server sounds during a damage hook to a Sunrise [`HitHost`]
-/// via `HitHost::play_sound_at` and `HitHost::play_sound_from`.
+/// via `HitHost::play_sound_at` and `HitHost::play_sound_from`. See
+/// [`deliver_in_order`] for `unknown`.
 pub(crate) fn apply_hit_sounds(
     hit: &mut dyn HitHost,
     lent_entity: Option<(i32, EntityRef)>,
     sounds: &[LevelSoundEffect],
+    unknown: &mut BTreeSet<String>,
     mut on_unbridged: impl FnMut(&str),
 ) {
-    for effect in sounds {
+    deliver_in_order(sounds, unknown, &mut on_unbridged, &mut |effect| {
         if effect.side != SoundSide::Server {
-            on_unbridged("hit sound wrong side");
-            continue;
+            return Err("hit sound wrong side");
         }
         if effect.fixed_range.is_some() {
-            on_unbridged("hit sound fixed range unsupported by Sunrise HitHost");
-            continue;
+            return Err("hit sound fixed range unsupported by Sunrise HitHost");
         }
         if effect.seed != SoundSeed::HostDeferred {
-            on_unbridged("hit sound explicit seed unsupported by Sunrise HitHost");
-            continue;
+            return Err("hit sound explicit seed unsupported by Sunrise HitHost");
         }
         if effect.except_player.is_some() {
-            on_unbridged("hit sound except player unsupported by Sunrise HitHost");
-            continue;
+            return Err("hit sound except player unsupported by Sunrise HitHost");
         }
         let source = to_api_source(effect.source);
         match effect.target {
             SoundTarget::Position(pos) => {
                 if !hit.play_sound_at(&effect.sound_id, pos, source, effect.volume, effect.pitch) {
-                    on_unbridged("hit sound refused by Sunrise HitHost::play_sound_at");
+                    return Err("hit sound refused by Sunrise HitHost::play_sound_at");
                 }
             }
             SoundTarget::Entity { entity_id, .. } => {
                 let Some((_, entity)) = lent_entity.filter(|(id, _)| *id == entity_id) else {
-                    on_unbridged("hit sound entity not lent by Sunrise HitHost");
-                    continue;
+                    return Err("hit sound entity not lent by Sunrise HitHost");
                 };
                 if !hit.play_sound_from(
                     entity,
@@ -383,49 +508,54 @@ pub(crate) fn apply_hit_sounds(
                     effect.volume,
                     effect.pitch,
                 ) {
-                    on_unbridged("hit sound refused by Sunrise HitHost::play_sound_from");
+                    return Err("hit sound refused by Sunrise HitHost::play_sound_from");
                 }
             }
         }
-    }
+        Ok(())
+    });
 }
 
 /// Deliver recorded client sounds to a Sunrise [`ClientHost`] via
-/// `ClientHost::play_local_sound`.
-#[allow(dead_code)]
+/// `ClientHost::play_local_sound`. See [`deliver_in_order`] for `unknown`.
+///
+/// Only a [`SoundSeed::HostDeferred`] effect can play, and the client owner
+/// never turns client deferral on: `play_local_sound` draws its seed from
+/// Sunrise's audio random at the next audio update, where Java draws
+/// `ClientLevel.random` (or the client `soundSeedGenerator`, for
+/// `Level.playSound`) at the call, so the seed and the stream's order would
+/// both differ. A recorded client sound (an explicit `playSeededSound` seed,
+/// say) therefore drains here and is counted, never dropped.
 pub(crate) fn apply_client_sounds(
     host: &dyn ClientHost,
     sounds: &[LevelSoundEffect],
+    unknown: &mut BTreeSet<String>,
     mut on_unbridged: impl FnMut(&str),
 ) {
-    for effect in sounds {
+    deliver_in_order(sounds, unknown, &mut on_unbridged, &mut |effect| {
         if effect.side != SoundSide::Client {
-            on_unbridged("client sound wrong side");
-            continue;
+            return Err("client sound wrong side");
         }
         if effect.fixed_range.is_some() {
-            on_unbridged("client sound fixed range unsupported by Sunrise play_local_sound");
-            continue;
+            return Err("client sound fixed range unsupported by Sunrise play_local_sound");
         }
         if effect.seed != SoundSeed::HostDeferred {
-            on_unbridged("client sound explicit seed unsupported by Sunrise play_local_sound");
-            continue;
+            return Err("client sound explicit seed unsupported by Sunrise play_local_sound");
         }
         if effect.delay_ticks > MAX_CLIENT_DELAY_TICKS {
-            on_unbridged("client sound delay exceeds Sunrise 1200-tick limit");
-            continue;
+            return Err("client sound delay exceeds Sunrise 1200-tick limit");
         }
         let SoundTarget::Position(pos) = effect.target else {
-            on_unbridged("client sound entity-bound unsupported by Sunrise play_local_sound");
-            continue;
+            return Err("client sound entity-bound unsupported by Sunrise play_local_sound");
         };
         let play = SoundPlay::at(&effect.sound_id, to_api_source(effect.source), pos)
             .with_volume(effect.volume)
             .with_pitch(effect.pitch);
         if host.play_local_sound(&play, effect.delay_ticks).is_none() {
-            on_unbridged("client sound refused by Sunrise ClientHost::play_local_sound");
+            return Err("client sound refused by Sunrise ClientHost::play_local_sound");
         }
-    }
+        Ok(())
+    });
 }
 
 #[cfg(test)]
@@ -604,9 +734,12 @@ mod tests {
             RuntimeSoundSource::Blocks,
             Some(0xa1),
         );
-        apply_server_sounds(&mut fake, std::slice::from_ref(&pos_effect), |r| {
-            unbridged.push(r.to_owned());
-        });
+        apply_server_sounds(
+            &mut fake,
+            std::slice::from_ref(&pos_effect),
+            &mut BTreeSet::new(),
+            |r| unbridged.push(r.to_owned()),
+        );
         assert!(unbridged.is_empty());
         assert_eq!(fake.sounds.len(), 1);
         assert_eq!(fake.sounds[0].sound, "demo:chime");
@@ -658,6 +791,7 @@ mod tests {
                 missing_except,
                 missing_level,
             ],
+            &mut BTreeSet::new(),
             |reason| refused.push(reason.to_owned()),
         );
         assert_eq!(
@@ -778,6 +912,7 @@ mod tests {
             &mut level,
             Some("minecraft:overworld"),
             &[ok.clone(), with_except, fixed],
+            &mut BTreeSet::new(),
             |reason| refused.push(reason.to_owned()),
         );
         assert_eq!(refused.len(), 2);
@@ -795,9 +930,13 @@ mod tests {
         // 2. Open transaction -> committed -> published with exact source index.
         level.begin_tx();
         refused.clear();
-        apply_level_write_sounds(&mut level, Some("minecraft:overworld"), &[ok], |reason| {
-            refused.push(reason.to_owned());
-        });
+        apply_level_write_sounds(
+            &mut level,
+            Some("minecraft:overworld"),
+            &[ok],
+            &mut BTreeSet::new(),
+            |reason| refused.push(reason.to_owned()),
+        );
         assert!(refused.is_empty());
         assert!(level.committed.is_empty());
         level.commit_tx();
@@ -885,6 +1024,7 @@ mod tests {
             &mut hit,
             Some((55, lent)),
             &[pos, lent_bound, unlent_bound, with_except],
+            &mut BTreeSet::new(),
             |reason| refused.push(reason.to_owned()),
         );
         assert_eq!(
@@ -964,6 +1104,7 @@ mod tests {
         apply_client_sounds(
             &host,
             &[ok, too_late, entity_bound, fixed_range, explicit_seed],
+            &mut BTreeSet::new(),
             |reason| refused.push(reason.to_owned()),
         );
         let played = host.played.borrow();
@@ -981,7 +1122,210 @@ mod tests {
     }
 
     #[test]
-    fn fake_host_receives_sound_from_bridged_java_level_tick() {
+    fn refused_deferred_sound_leaves_its_stream_unknown_for_later_sounds() {
+        let mut host = SoundRecordingServerHost::new();
+        let ok = server_pos_effect("demo:a", [1.0, 2.0, 3.0], RuntimeSoundSource::Blocks, None);
+        // Sunrise's API has no fixed range, so this one is refused after Java drew its seed.
+        let fixed = LevelSoundEffect {
+            fixed_range: Some(32.0),
+            ..ok.clone()
+        };
+        // An explicit `playSeededSound` seed drew nothing: refusing it moves no stream.
+        let explicit = LevelSoundEffect {
+            seed: SoundSeed::Explicit(7),
+            ..ok.clone()
+        };
+        let nether = LevelSoundEffect {
+            dimension: Some("minecraft:the_nether".into()),
+            ..ok.clone()
+        };
+        let mut unknown = BTreeSet::new();
+        let mut refused = Vec::new();
+        apply_server_sounds(
+            &mut host,
+            &[explicit, ok.clone(), fixed, ok.clone(), nether],
+            &mut unknown,
+            |reason| refused.push(reason.to_owned()),
+        );
+        // Only the first deferred sound reached Sunrise. After the fixed-range refusal Sunrise's
+        // one server-wide stream is a draw behind, so later deferred sounds on every level are
+        // counted, not played.
+        assert_eq!(host.recorded.len(), 1, "{:?}", host.recorded);
+        assert_eq!(
+            refused,
+            vec![
+                "level sound explicit seed unsupported by Sunrise ServerHost",
+                "level sound fixed range unsupported by Sunrise ServerHost",
+                "level sound seed stream position unknown: an earlier seed never reached Sunrise",
+                "level sound seed stream position unknown: an earlier seed never reached Sunrise",
+            ]
+        );
+        assert_eq!(
+            unknown,
+            BTreeSet::from([
+                "game/level/*".to_owned(),
+                "game/level/minecraft:overworld".to_owned(),
+            ])
+        );
+        // A later batch against the same ledger counts the overworld sound as well.
+        refused.clear();
+        apply_server_sounds(&mut host, &[ok], &mut unknown, |reason| {
+            refused.push(reason.to_owned());
+        });
+        assert_eq!(host.recorded.len(), 1);
+        assert_eq!(refused.len(), 1);
+
+        // Client effects name their stream by how they were drawn: a holder means
+        // `Level.playSound` (`soundSeedGenerator`), none means `playLocalSound` (`Level.random`).
+        let client = RecordingClientHost::default();
+        let local = LevelSoundEffect {
+            side: SoundSide::Client,
+            dimension: Some("minecraft:overworld".into()),
+            sound_id: "demo:c".into(),
+            fixed_range: None,
+            holder: None,
+            target: SoundTarget::Position([0.0, 64.0, 0.0]),
+            source: RuntimeSoundSource::Blocks,
+            volume: 1.0,
+            pitch: 1.0,
+            except_player: None,
+            seed: SoundSeed::HostDeferred,
+            distance_delay: false,
+            delay_ticks: 0,
+        };
+        let local_entity_bound = LevelSoundEffect {
+            target: SoundTarget::Entity {
+                entity_id: 5,
+                position: None,
+            },
+            ..local.clone()
+        };
+        let level_sound = LevelSoundEffect {
+            holder: Some(crate::runtime::SoundHolderKind::Direct),
+            ..local.clone()
+        };
+        let mut client_unknown = BTreeSet::new();
+        refused.clear();
+        apply_client_sounds(
+            &client,
+            &[level_sound.clone(), local_entity_bound, local, level_sound],
+            &mut client_unknown,
+            |reason| refused.push(reason.to_owned()),
+        );
+        // Sunrise's `play_local_sound` draws every client mod sound's seed from one audio
+        // random, so a refused one leaves both client streams unknown.
+        assert_eq!(
+            client_unknown,
+            BTreeSet::from(["client/level".to_owned(), "client/level#random".to_owned()])
+        );
+        assert_eq!(refused.len(), 3, "{refused:?}");
+        let played = client.played.borrow();
+        assert_eq!(played.len(), 1);
+        assert_eq!(played[0].0.identifier, "demo:c");
+    }
+
+    #[test]
+    fn sync_shares_every_jars_unknown_streams() {
+        let mut hosts = [
+            crate::runtime::StdHost::new(),
+            crate::runtime::StdHost::new(),
+        ];
+        // Marked while no seed was deferred: Java's per-level streams, one level each.
+        hosts[0].mark_sound_stream_unknown("game/level/minecraft:overworld");
+        hosts[1].mark_sound_stream_unknown("client/level#random");
+        assert!(hosts[0].sound_stream_known("game/level/minecraft:the_end"));
+        let ledger = sync_unknown_sound_streams(&mut hosts, |host| host);
+        // Shared, and widened to what Sunrise's one stream per side stands for.
+        assert_eq!(
+            ledger,
+            BTreeSet::from([
+                "client/level".to_owned(),
+                "client/level#random".to_owned(),
+                "game/level/*".to_owned(),
+                "game/level/minecraft:overworld".to_owned(),
+            ])
+        );
+        for host in &hosts {
+            assert_eq!(host.unknown_sound_streams(), &ledger);
+            assert!(!host.sound_stream_known("game/level/minecraft:the_end"));
+            assert!(!host.sound_stream_known("client/level"));
+        }
+    }
+
+    /// Java stubs for a jar whose `ServerTickEvents.START_LEVEL_TICK` listener plays level
+    /// sounds. Only `demo/` classes ship in the jar.
+    const TICK_SOUND_STUBS: &[(&str, &str)] = &[
+        (
+            "net/fabricmc/fabric/api/event/Event.java",
+            "package net.fabricmc.fabric.api.event; public abstract class Event<T> { public abstract void register(T listener); }",
+        ),
+        (
+            "net/fabricmc/fabric/api/event/lifecycle/v1/ServerTickEvents.java",
+            "package net.fabricmc.fabric.api.event.lifecycle.v1; \
+             import net.fabricmc.fabric.api.event.Event; \
+             import net.minecraft.server.level.ServerLevel; \
+             public final class ServerTickEvents { \
+               public static Event<StartLevelTick> START_LEVEL_TICK; \
+               public interface StartLevelTick { void onStartTick(ServerLevel level); } \
+             }",
+        ),
+        (
+            "net/minecraft/resources/Identifier.java",
+            "package net.minecraft.resources; public final class Identifier { \
+               public static Identifier fromNamespaceAndPath(String ns, String p) { return null; } }",
+        ),
+        (
+            "net/minecraft/core/Vec3i.java",
+            "package net.minecraft.core; public class Vec3i { \
+               private int x, y, z; \
+               public Vec3i(int x, int y, int z) { this.x = x; this.y = y; this.z = z; } \
+               public int getX() { return x; } \
+               public int getY() { return y; } \
+               public int getZ() { return z; } }",
+        ),
+        (
+            "net/minecraft/core/BlockPos.java",
+            "package net.minecraft.core; public class BlockPos extends Vec3i { \
+               public BlockPos(int x, int y, int z) { super(x, y, z); } }",
+        ),
+        (
+            "net/minecraft/sounds/SoundEvent.java",
+            "package net.minecraft.sounds; import net.minecraft.resources.Identifier; \
+             public final class SoundEvent { \
+               public static SoundEvent createVariableRangeEvent(Identifier id) { return null; } \
+               public static SoundEvent createFixedRangeEvent(Identifier id, float r) { return null; } }",
+        ),
+        (
+            "net/minecraft/sounds/SoundSource.java",
+            "package net.minecraft.sounds; public enum SoundSource { \
+               MASTER, MUSIC, RECORDS, WEATHER, BLOCKS, HOSTILE, NEUTRAL, PLAYERS, AMBIENT, VOICE, UI }",
+        ),
+        (
+            "net/minecraft/world/entity/Entity.java",
+            "package net.minecraft.world.entity; public class Entity {}",
+        ),
+        (
+            "net/minecraft/world/level/Level.java",
+            "package net.minecraft.world.level; \
+             import net.minecraft.core.BlockPos; \
+             import net.minecraft.sounds.SoundEvent; \
+             import net.minecraft.sounds.SoundSource; \
+             import net.minecraft.world.entity.Entity; \
+             public abstract class Level { \
+               public void playSound(Entity e, BlockPos pos, SoundEvent s, SoundSource src, float v, float p) {} \
+             }",
+        ),
+        (
+            "net/minecraft/server/level/ServerLevel.java",
+            "package net.minecraft.server.level; import net.minecraft.world.level.Level; \
+             public class ServerLevel extends Level {}",
+        ),
+    ];
+
+    /// Compile a Fabric jar `mod_id` whose `START_LEVEL_TICK` listener runs `listener` (Java
+    /// statements over `level`, with `ok` the variable-range `demo:bell` and `fixed` a 64-block
+    /// fixed-range `demo:far`) and load it as the server owner does.
+    fn tick_sound_jar(mod_id: &str, listener: &str) -> crate::LoadedJar {
         use std::io::Write;
         use std::path::PathBuf;
         use std::process::Command;
@@ -989,102 +1333,36 @@ mod tests {
 
         use zip::write::SimpleFileOptions;
 
-        let root =
-            std::env::temp_dir().join(format!("horizon-java-mod-sound-e2e-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!(
+            "horizon-java-mod-sound-{mod_id}-{}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&root);
         let src = root.join("src");
         let classes = root.join("classes");
         std::fs::create_dir_all(&classes).unwrap();
 
-        let files: &[(&str, &str)] = &[
-            (
-                "net/fabricmc/fabric/api/event/Event.java",
-                "package net.fabricmc.fabric.api.event; public abstract class Event<T> { public abstract void register(T listener); }",
-            ),
-            (
-                "net/fabricmc/fabric/api/event/lifecycle/v1/ServerTickEvents.java",
-                "package net.fabricmc.fabric.api.event.lifecycle.v1; \
-                 import net.fabricmc.fabric.api.event.Event; \
-                 import net.minecraft.server.level.ServerLevel; \
-                 public final class ServerTickEvents { \
-                   public static Event<StartLevelTick> START_LEVEL_TICK; \
-                   public interface StartLevelTick { void onStartTick(ServerLevel level); } \
-                 }",
-            ),
-            (
-                "net/minecraft/resources/Identifier.java",
-                "package net.minecraft.resources; public final class Identifier { \
-                   public static Identifier fromNamespaceAndPath(String ns, String p) { return null; } }",
-            ),
-            (
-                "net/minecraft/core/Vec3i.java",
-                "package net.minecraft.core; public class Vec3i { \
-                   private int x, y, z; \
-                   public Vec3i(int x, int y, int z) { this.x = x; this.y = y; this.z = z; } \
-                   public int getX() { return x; } \
-                   public int getY() { return y; } \
-                   public int getZ() { return z; } }",
-            ),
-            (
-                "net/minecraft/core/BlockPos.java",
-                "package net.minecraft.core; public class BlockPos extends Vec3i { \
-                   public BlockPos(int x, int y, int z) { super(x, y, z); } }",
-            ),
-            (
-                "net/minecraft/sounds/SoundEvent.java",
-                "package net.minecraft.sounds; import net.minecraft.resources.Identifier; \
-                 public final class SoundEvent { \
-                   public static SoundEvent createVariableRangeEvent(Identifier id) { return null; } \
-                   public static SoundEvent createFixedRangeEvent(Identifier id, float r) { return null; } }",
-            ),
-            (
-                "net/minecraft/sounds/SoundSource.java",
-                "package net.minecraft.sounds; public enum SoundSource { \
-                   MASTER, MUSIC, RECORDS, WEATHER, BLOCKS, HOSTILE, NEUTRAL, PLAYERS, AMBIENT, VOICE, UI }",
-            ),
-            (
-                "net/minecraft/world/entity/Entity.java",
-                "package net.minecraft.world.entity; public class Entity {}",
-            ),
-            (
-                "net/minecraft/world/level/Level.java",
-                "package net.minecraft.world.level; \
-                 import net.minecraft.core.BlockPos; \
-                 import net.minecraft.sounds.SoundEvent; \
-                 import net.minecraft.sounds.SoundSource; \
-                 import net.minecraft.world.entity.Entity; \
-                 public abstract class Level { \
-                   public void playSound(Entity e, BlockPos pos, SoundEvent s, SoundSource src, float v, float p) {} \
-                 }",
-            ),
-            (
-                "net/minecraft/server/level/ServerLevel.java",
-                "package net.minecraft.server.level; import net.minecraft.world.level.Level; \
-                 public class ServerLevel extends Level {}",
-            ),
-            (
-                "demo/Main.java",
-                "package demo; \
-                 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents; \
-                 import net.minecraft.core.BlockPos; \
-                 import net.minecraft.resources.Identifier; \
-                 import net.minecraft.sounds.SoundEvent; \
-                 import net.minecraft.sounds.SoundSource; \
-                 public final class Main { \
-                   public void onInitialize() { \
-                     SoundEvent ok = SoundEvent.createVariableRangeEvent(Identifier.fromNamespaceAndPath(\"demo\", \"bell\")); \
-                     SoundEvent fixed = SoundEvent.createFixedRangeEvent(Identifier.fromNamespaceAndPath(\"demo\", \"far\"), 64.0f); \
-                     ServerTickEvents.START_LEVEL_TICK.register(level -> { \
-                       level.playSound(null, new BlockPos(4, 65, -2), ok, SoundSource.BLOCKS, 0.8f, 1.2f); \
-                       level.playSound(null, new BlockPos(0, 64, 0), fixed, SoundSource.BLOCKS, 1.0f, 1.0f); \
-                     }); \
-                   } \
-                 }",
-            ),
-        ];
-
+        let main = format!(
+            "package demo; \
+             import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents; \
+             import net.minecraft.core.BlockPos; \
+             import net.minecraft.resources.Identifier; \
+             import net.minecraft.sounds.SoundEvent; \
+             import net.minecraft.sounds.SoundSource; \
+             public final class Main {{ \
+               public void onInitialize() {{ \
+                 SoundEvent ok = SoundEvent.createVariableRangeEvent(Identifier.fromNamespaceAndPath(\"demo\", \"bell\")); \
+                 SoundEvent fixed = SoundEvent.createFixedRangeEvent(Identifier.fromNamespaceAndPath(\"demo\", \"far\"), 64.0f); \
+                 ServerTickEvents.START_LEVEL_TICK.register(level -> {{ {listener} }}); \
+               }} \
+             }}"
+        );
         let mut java_paths = Vec::new();
-        for (rel, body) in files {
+        for (rel, body) in TICK_SOUND_STUBS
+            .iter()
+            .copied()
+            .chain([("demo/Main.java", main.as_str())])
+        {
             let path = src.join(rel);
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(&path, body).unwrap();
@@ -1109,7 +1387,10 @@ mod tests {
             let opts = SimpleFileOptions::default();
             zip.start_file("fabric.mod.json", opts).unwrap();
             zip.write_all(
-                br#"{"id":"sounddemo","version":"1","entrypoints":{"main":["demo.Main"]}}"#,
+                format!(
+                    r#"{{"id":"{mod_id}","version":"1","entrypoints":{{"main":["demo.Main"]}}}}"#
+                )
+                .as_bytes(),
             )
             .unwrap();
             let class_path = classes.join("demo/Main.class");
@@ -1121,14 +1402,13 @@ mod tests {
 
         let jar = Arc::new(crate::runtime::NativeJar::from_bytes(&jar_bytes).unwrap());
         let imc = crate::runtime::neoforge_imc::ImcBus::default();
-        let Ok(loaded) = crate::load_jar("sounddemo.jar".into(), jar, &[], &imc, None) else {
-            panic!("sounddemo did not load");
+        let Ok(loaded) = crate::load_jar(format!("{mod_id}.jar"), jar, &[], &imc, None) else {
+            panic!("{mod_id} did not load");
         };
+        loaded
+    }
 
-        let java = crate::HorizonJava::default();
-        java.lock().jars.push(loaded);
-
-        let mut fake = FakeHost::new();
+    fn fire_level_tick(java: &crate::HorizonJava, fake: &mut FakeHost) {
         let overworld = fake.level.level();
         let context = crate::runtime::events::EventContext {
             level: Some(overworld.dimension_id().to_owned()),
@@ -1136,12 +1416,26 @@ mod tests {
             ..Default::default()
         };
         java.fire_event_with_server_sounds(
-            &mut fake,
+            fake,
             crate::runtime::events::GameEvent::LevelTickStart,
             true,
             context,
             |_| true,
         );
+    }
+
+    #[test]
+    fn fake_host_receives_sound_from_bridged_java_level_tick() {
+        let loaded = tick_sound_jar(
+            "sounddemo",
+            "level.playSound(null, new BlockPos(4, 65, -2), ok, SoundSource.BLOCKS, 0.8f, 1.2f); \
+             level.playSound(null, new BlockPos(0, 64, 0), fixed, SoundSource.BLOCKS, 1.0f, 1.0f);",
+        );
+        let java = crate::HorizonJava::default();
+        java.lock().jars.push(loaded);
+
+        let mut fake = FakeHost::new();
+        fire_level_tick(&java, &mut fake);
 
         assert_eq!(
             fake.sounds.len(),
@@ -1156,5 +1450,60 @@ mod tests {
         // Fixed-range sound was counted as an unknown game hook on the emitting jar!
         let state = java.lock();
         assert_eq!(state.jars[0].row.callback_unknown_host_calls, 1);
+    }
+
+    /// A refused sound's seed was drawn by Java but never by Sunrise, so the level's stream is
+    /// out of step for every jar, in this firing and every later one, until the server restarts.
+    #[test]
+    fn refused_sound_puts_every_jars_later_sounds_on_that_level_out_of_play() {
+        // Jar A plays a variable-range sound, then a fixed-range one Sunrise cannot take.
+        let first = tick_sound_jar(
+            "soundfirst",
+            "level.playSound(null, new BlockPos(4, 65, -2), ok, SoundSource.BLOCKS, 0.8f, 1.2f); \
+             level.playSound(null, new BlockPos(0, 64, 0), fixed, SoundSource.BLOCKS, 1.0f, 1.0f);",
+        );
+        // Jar B's listener runs after A's in the same firing: an ordinary sound.
+        let second = tick_sound_jar(
+            "soundsecond",
+            "level.playSound(null, new BlockPos(7, 70, 7), ok, SoundSource.AMBIENT, 1.0f, 1.0f);",
+        );
+        let java = crate::HorizonJava::default();
+        java.lock().jars.extend([first, second]);
+        let mut fake = FakeHost::new();
+        let overworld = "game/level/minecraft:overworld";
+
+        // Firing 1: A's first sound plays. Its fixed-range sound is refused, so B's sound, which
+        // Java would have played with the next seed, is counted instead of played with one
+        // Sunrise draws a step early.
+        fire_level_tick(&java, &mut fake);
+        assert_eq!(fake.sounds.len(), 1);
+        assert_eq!(fake.sounds[0].sound, "demo:bell");
+        assert_eq!(fake.sounds[0].at, [4.5, 65.5, -1.5]);
+        {
+            let state = java.lock();
+            assert_eq!(state.jars[0].row.callback_unknown_host_calls, 1);
+            assert_eq!(state.jars[1].row.callback_unknown_host_calls, 1);
+            for jar in &state.jars {
+                assert!(!jar.host.sound_stream_known(overworld));
+            }
+        }
+
+        // Firing 2: every jar's runtime now counts its overworld sound at the call.
+        fire_level_tick(&java, &mut fake);
+        assert_eq!(fake.sounds.len(), 1, "no sound plays on an unknown stream");
+        {
+            let state = java.lock();
+            assert_eq!(state.jars[0].row.callback_unknown_host_calls, 2);
+            assert_eq!(state.jars[1].row.callback_unknown_host_calls, 2);
+        }
+
+        // A new server: fresh levels, fresh streams.
+        java.lock().reset_server();
+        fire_level_tick(&java, &mut fake);
+        assert_eq!(fake.sounds.len(), 2);
+        assert_eq!(fake.sounds[1].sound, "demo:bell");
+        let state = java.lock();
+        assert_eq!(state.jars[0].row.callback_unknown_host_calls, 1);
+        assert_eq!(state.jars[1].row.callback_unknown_host_calls, 1);
     }
 }

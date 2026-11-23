@@ -826,6 +826,8 @@ impl Hooks for HorizonJava {
     ) -> Flow {
         let mut state = self.lock();
         let facade = state.facade();
+        // Every jar's host learns the level sound streams any jar found unknown (`sound.rs`).
+        sound::sync_unknown_sound_streams(&mut state.jars, |jar| &mut jar.host);
         for loaded in &mut state.jars {
             // One Java literal path can have several executable usages: the bare command and
             // each deeper argument node. The invocation carries the arguments it parsed, so the
@@ -885,6 +887,9 @@ impl Hooks for HorizonJava {
             if let Some(uuid) = source_player {
                 sound::seed_player_sound_facts(host, &facade, uuid, &mut loaded.host);
             }
+            // The streams as they stood before the command ran: its sounds are delivered in call
+            // order against these, so one the runtime counted later does not void earlier ones.
+            let mut sound_streams = loaded.host.unknown_sound_streams().clone();
             loaded.host.set_host_deferred_server_sound_seeds(true);
             let opened = attachments::open(
                 host,
@@ -909,9 +914,11 @@ impl Hooks for HorizonJava {
             loaded.host.set_host_deferred_server_sound_seeds(false);
             loaded.host.clear_entity_sound_facts();
             let played_sounds = loaded.host.take_played_sounds();
-            sound::apply_server_sounds(host, &played_sounds, |reason| {
+            sound::apply_server_sounds(host, &played_sounds, &mut sound_streams, |reason| {
                 loaded.host.note_unknown_game_hook(reason);
             });
+            // A refused sound's stream: the next site's sync hands it to every other jar.
+            sound::share_unknown_sound_streams([&mut loaded.host], &sound_streams);
             let unknown = loaded.host.unknown_host_call_count().saturating_sub(before);
             loaded.row.command_unknown_host_calls += unknown;
             attachments::close(
@@ -1745,7 +1752,7 @@ impl Hooks for HorizonJava {
     /// fires it. The client owner runs its resident jars here before the native setup notification
     /// returns; this owner hook does not claim to dispatch a second Java setup event.
     fn client_setup(&self, host: &mut dyn ClientHost, _event: &mut ClientSetupEvent) {
-        self.on_client_setup_with_version(Some(host.game_version()));
+        self.on_client_setup_with_version(Some(host.game_version()), Some(&*host));
     }
 
     /// Sunrise's client level load carries the newly-created level's borrowed dimension and fires
@@ -1816,12 +1823,21 @@ impl HorizonJava {
 
     #[cfg(test)]
     fn on_client_setup(&self) {
-        self.on_client_setup_with_version(None);
+        self.on_client_setup_with_version(None, None);
     }
 
-    fn on_client_setup_with_version(&self, game_version: Option<&str>) {
+    fn on_client_setup_with_version(
+        &self,
+        game_version: Option<&str>,
+        host: Option<&dyn ClientHost>,
+    ) {
         let mut client = self.lock_client();
         client.ensure_loaded_with_version(game_version);
+        // Client entrypoints and loading stages are Java code: what they recorded reaches
+        // Sunrise (or is counted) now.
+        if let Some(host) = host {
+            client.drain_client_sounds(host);
+        }
         let rows = client.report_rows().count();
         log::info!("{LOG}: stored {rows} client report row(s)");
         log::info!("{LOG} {}: client setup complete", env!("CARGO_PKG_VERSION"));
@@ -1974,6 +1990,10 @@ impl HorizonJava {
         // one `Event` field is in a real game), and the batches close after.
         let mut opened = Vec::with_capacity(state.jars.len());
         let mut before = Vec::with_capacity(state.jars.len());
+        // The level sound streams any jar found unknown, as they stand before any listener
+        // runs: the firing's sounds are delivered in call order against these (`sound.rs`).
+        let mut sound_streams =
+            sound::sync_unknown_sound_streams(&mut state.jars, |jar| &mut jar.host);
         for loaded in &mut state.jars {
             // Every jar's host hears about the level this firing names, whether or not it has a
             // listener for the event: `MinecraftServer.getAllLevels()` answers from what the
@@ -2002,17 +2022,44 @@ impl HorizonJava {
         }
         if let Some(host) = server.as_deref_mut().or(sound_server) {
             for (jar_idx, effect) in &recorded_sounds {
-                sound::apply_server_sounds(host, std::slice::from_ref(effect), |reason| {
-                    state.jars[*jar_idx].host.note_unknown_game_hook(reason);
-                });
+                sound::apply_server_sounds(
+                    host,
+                    std::slice::from_ref(effect),
+                    &mut sound_streams,
+                    |reason| {
+                        state.jars[*jar_idx].host.note_unknown_game_hook(reason);
+                    },
+                );
             }
         } else if let Some(hit) = hit_host {
             for (jar_idx, effect) in &recorded_sounds {
-                sound::apply_hit_sounds(hit, None, std::slice::from_ref(effect), |reason| {
-                    state.jars[*jar_idx].host.note_unknown_game_hook(reason);
-                });
+                sound::apply_hit_sounds(
+                    hit,
+                    None,
+                    std::slice::from_ref(effect),
+                    &mut sound_streams,
+                    |reason| {
+                        state.jars[*jar_idx].host.note_unknown_game_hook(reason);
+                    },
+                );
+            }
+        } else {
+            // No Sunrise host to play them on (seeds were not deferred, so these carry
+            // explicit seeds): counted, never dropped.
+            for (jar_idx, _) in &recorded_sounds {
+                state.jars[*jar_idx]
+                    .host
+                    .note_unknown_game_hook("level sound without a Sunrise host to play it");
             }
         }
+        // Streams the listeners' calls or the delivery above found unknown reach every jar.
+        sound_streams.extend(sound::gather_unknown_sound_streams(
+            state.jars.iter().map(|jar| &jar.host),
+        ));
+        sound::share_unknown_sound_streams(
+            state.jars.iter_mut().map(|jar| &mut jar.host),
+            &sound_streams,
+        );
         let (mut ran, mut failed, mut unknown) = (0, 0, 0);
         for (((loaded, opened), before), (jar_ran, jar_failed)) in
             state.jars.iter_mut().zip(opened).zip(before).zip(counts)
@@ -2177,7 +2224,7 @@ impl HorizonJava {
         site: &str,
         objects: impl FnOnce(&mut State) -> Option<(Option<GameObject>, Vec<Arg>)>,
     ) -> bool {
-        let fired = {
+        let (fired, mut sound_streams) = {
             let mut state = self.lock();
             if !state
                 .jars
@@ -2191,10 +2238,17 @@ impl HorizonJava {
                 game_hooks::unlisted(&mut state, site);
                 return false;
             };
-            game_hooks::fire_with_host(&mut state, host.as_deref(), site, receiver, args)
+            // The level sound streams any jar found unknown, before any callback runs: the
+            // callbacks' sounds are delivered in call order against these (`sound.rs`).
+            let sound_streams =
+                sound::sync_unknown_sound_streams(&mut state.jars, |jar| &mut jar.host);
+            let fired =
+                game_hooks::fire_with_host(&mut state, host.as_deref(), site, receiver, args);
+            (fired, sound_streams)
         };
+        let streams_before = sound_streams.len();
+        let mut unbridged = Vec::new();
         if let Some(host) = host {
-            let mut unbridged = Vec::new();
             for (jar_idx, effect) in fired.effects {
                 match effect {
                     GameHookEffect::SystemMessage { player, text } => {
@@ -2203,20 +2257,34 @@ impl HorizonJava {
                         }
                     }
                     GameHookEffect::PlaySound(effect) => {
-                        sound::apply_server_sounds(host, &[effect], |reason| {
+                        sound::apply_server_sounds(host, &[effect], &mut sound_streams, |reason| {
                             unbridged.push((jar_idx, reason.to_owned()));
                         });
                     }
                 }
             }
-            if !unbridged.is_empty() {
-                let mut state = self.lock();
-                for (jar_idx, reason) in unbridged {
-                    if let Some(loaded) = state.jars.get_mut(jar_idx) {
-                        loaded.host.note_unknown_game_hook(&reason);
-                    }
+        } else {
+            // No Sunrise host to play them on: counted, never dropped.
+            for (jar_idx, effect) in fired.effects {
+                if let GameHookEffect::PlaySound(_) = effect {
+                    unbridged.push((
+                        jar_idx,
+                        "level sound without a Sunrise host to play it".to_owned(),
+                    ));
                 }
             }
+        }
+        if !unbridged.is_empty() || sound_streams.len() != streams_before {
+            let mut state = self.lock();
+            for (jar_idx, reason) in unbridged {
+                if let Some(loaded) = state.jars.get_mut(jar_idx) {
+                    loaded.host.note_unknown_game_hook(&reason);
+                }
+            }
+            sound::share_unknown_sound_streams(
+                state.jars.iter_mut().map(|jar| &mut jar.host),
+                &sound_streams,
+            );
         }
         fired.cancelled
     }
@@ -2435,6 +2503,10 @@ fn run_listeners_with_sounds(
     let mut recorded_sounds = Vec::new();
     let event = firing.event;
     for &(at, slot) in order {
+        // Listeners of several jars interleave in one firing: a level sound stream any jar's
+        // call left unknown (this firing's or a nested one's) is unknown for this listener's jar
+        // too (`sound.rs`).
+        let sound_streams = sound::gather_unknown_sound_streams(jars.iter().map(|jar| &jar.host));
         let LoadedJar {
             row,
             jar,
@@ -2442,6 +2514,7 @@ fn run_listeners_with_sounds(
             listeners,
             ..
         } = &mut jars[at];
+        sound::share_unknown_sound_streams([&mut *host], &sound_streams);
         let (id, listener) = (&row.id, &listeners[slot]);
         let sounds_before = firing.sounds.len();
         let outcome = caught(&format!("{} listener from {}", id, listener.source), || {
@@ -2923,6 +2996,9 @@ impl State {
             jar.row.commands_refused_at_registration = 0;
             // No player value carries into another server's world.
             jar.host.reset_attachment_values();
+            // Nor a level sound stream: the new server's levels (and Sunrise's streams for them)
+            // start fresh.
+            jar.host.forget_unknown_server_sound_streams();
         }
         self.leavers.clear();
     }

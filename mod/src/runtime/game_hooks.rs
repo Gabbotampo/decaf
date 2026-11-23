@@ -1773,6 +1773,10 @@ impl<H: Host> Host for GameHookHost<'_, H> {
         self.inner.draw_level_sound_seed(level_marker, server_side)
     }
 
+    fn mark_sound_stream_unknown(&mut self, stream: &str) {
+        self.inner.mark_sound_stream_unknown(stream);
+    }
+
     fn construct_sound_event(&mut self, r: &MethodRef, args: &[Value]) -> Option<Value> {
         self.inner.construct_sound_event(r, args)
     }

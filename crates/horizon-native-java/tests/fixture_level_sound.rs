@@ -1632,3 +1632,518 @@ public final class Probe {
     // Sanity-check the registered entry matched `RuneCrafting.SOUND`
     assert_eq!(entry.id, "runes:crafting");
 }
+
+// Java 25 oracle, drawn with the real 26.3 classes from `server-26.3.jar`:
+// `new ThreadSafeLegacyRandomSource(42)` (a `Level.soundSeedGenerator`) and
+// `RandomSource.create(987654321)` (a `Level.random`), six `nextLong()` each.
+const SOUND_SEEDS_42: [i64; 6] = [
+    -5_025_562_857_975_149_833,
+    -5_843_495_416_241_995_736,
+    5_694_868_678_511_409_995,
+    5_111_195_811_822_994_797,
+    -6_169_532_649_852_302_182,
+    -1_782_466_964_123_969_572,
+];
+const LEVEL_RANDOM_987654321: [i64; 6] = [
+    5_643_591_630_821_615_871,
+    -3_342_970_523_933_462_541,
+    842_562_190_649_680_514,
+    -5_427_006_930_497_216_603,
+    179_179_319_810_873_421,
+    -5_983_975_103_086_941_246,
+];
+
+const ODD_BLOCK_POS: &str = r#"package demo;
+import net.minecraft.core.BlockPos;
+public final class OddBlockPos extends BlockPos {
+    public OddBlockPos(int x, int y, int z) { super(x, y, z); }
+    @Override
+    public int getX() { return super.getX() + 100; }
+}"#;
+
+// Every call below that passes `null` throws a NullPointerException in the real game AFTER its
+// seed draw (`Level.playSound` draws `soundSeedGenerator.nextLong()` before `playSeededSound`
+// reads the sound, holder or target; `ClientLevel.playLocalSound` / `playPlayerSound` draw
+// `Level.random.nextLong()` before the sound instance reads the sound or the entity). Decaf
+// counts those calls instead of modelling the throw; either way the seed is gone.
+const DRAW_ORDER_PROBE: &str = r#"package demo;
+import net.minecraft.client.multiplayer.ClientLevel;
+import net.minecraft.client.player.LocalPlayer;
+import net.minecraft.core.BlockPos;
+import net.minecraft.core.Holder;
+import net.minecraft.resources.Identifier;
+import net.minecraft.sounds.SoundEvent;
+import net.minecraft.sounds.SoundSource;
+import net.minecraft.world.entity.Entity;
+import net.minecraft.world.level.Level;
+
+public final class DrawOrder {
+    public void onInitialize() {}
+
+    static SoundEvent ok() {
+        return SoundEvent.createVariableRangeEvent(Identifier.fromNamespaceAndPath("demo", "ok"));
+    }
+
+    // One call per unseeded overload: BlockPos, (DDD, SoundEvent), (DDD, Holder),
+    // (Entity, SoundEvent), (Entity, Holder). Then a valid one.
+    public static void unresolvableThenValid(Level level, Entity mob) {
+        SoundEvent ok = ok();
+        try { level.playSound(null, new BlockPos(1, 2, 3), (SoundEvent) null, SoundSource.BLOCKS, 1.0f, 1.0f); } catch (NullPointerException e) {}
+        try { level.playSound(null, 1.0, 2.0, 3.0, (SoundEvent) null, SoundSource.BLOCKS, 1.0f, 1.0f); } catch (NullPointerException e) {}
+        try { level.playSound(null, 1.0, 2.0, 3.0, (Holder<SoundEvent>) null, SoundSource.BLOCKS, 1.0f, 1.0f); } catch (NullPointerException e) {}
+        try { level.playSound(null, (Entity) null, ok, SoundSource.NEUTRAL, 1.0f, 1.0f); } catch (NullPointerException e) {}
+        try { level.playSound(null, mob, (Holder<SoundEvent>) null, SoundSource.NEUTRAL, 1.0f, 1.0f); } catch (NullPointerException e) {}
+        level.playSound(null, 4.0, 5.0, 6.0, ok, SoundSource.BLOCKS, 1.0f, 1.0f);
+    }
+
+    public static void valid(Level level) {
+        level.playSound(null, 4.0, 5.0, 6.0, ok(), SoundSource.BLOCKS, 1.0f, 1.0f);
+    }
+
+    public static void nullSound(Level level) {
+        try { level.playSound(null, 1.0, 2.0, 3.0, (SoundEvent) null, SoundSource.BLOCKS, 1.0f, 1.0f); } catch (NullPointerException e) {}
+    }
+
+    public static void oddBlockPos(Level level) {
+        level.playSound(null, new OddBlockPos(1, 2, 3), ok(), SoundSource.BLOCKS, 1.0f, 1.0f);
+    }
+
+    public static void entitySound(Entity entity) {
+        entity.playSound(ok(), 1.0f, 1.0f);
+    }
+
+    public static void clientNullSound(ClientLevel level, Entity localPlayer) {
+        level.playSound(localPlayer, 1.0, 2.0, 3.0, (SoundEvent) null, SoundSource.BLOCKS, 1.0f, 1.0f);
+    }
+
+    // `except` is not the local player: `ClientLevel.playSeededSound` returns before it reads
+    // the sound, so this one does not throw in Java and is not counted here.
+    public static void clientOtherNullSound(ClientLevel level, Entity other) {
+        level.playSound(other, 1.0, 2.0, 3.0, (SoundEvent) null, SoundSource.BLOCKS, 1.0f, 1.0f);
+    }
+
+    public static void clientValid(ClientLevel level, Entity localPlayer) {
+        level.playSound(localPlayer, 4.0, 5.0, 6.0, ok(), SoundSource.BLOCKS, 1.0f, 1.0f);
+    }
+
+    public static void clientNullLocal(ClientLevel level) {
+        level.playLocalSound(1.0, 2.0, 3.0, (SoundEvent) null, SoundSource.BLOCKS, 1.0f, 1.0f, false);
+    }
+
+    public static void clientNullLocalEntity(ClientLevel level, Entity localPlayer) {
+        level.playLocalSound(localPlayer, (SoundEvent) null, SoundSource.NEUTRAL, 1.0f, 1.0f);
+    }
+
+    public static void clientNullPlayerSound(ClientLevel level) {
+        level.playPlayerSound((SoundEvent) null, SoundSource.PLAYERS, 1.0f, 1.0f);
+    }
+
+    public static void localPlayerNull(LocalPlayer player) {
+        player.playSound((SoundEvent) null, 1.0f, 1.0f);
+    }
+
+    public static void clientValidLocal(ClientLevel level) {
+        level.playLocalSound(7.0, 8.0, 9.0, ok(), SoundSource.BLOCKS, 1.0f, 1.0f, false);
+    }
+
+    public static void clientOddLocal(ClientLevel level) {
+        level.playLocalSound(new OddBlockPos(1, 2, 3), ok(), SoundSource.BLOCKS, 1.0f, 1.0f, false);
+    }
+
+    public static long clientRandom(ClientLevel level) {
+        return level.getRandom().nextLong();
+    }
+}"#;
+
+const LEVEL_DESC: &str = "(Lnet/minecraft/world/level/Level;)V";
+const CLIENT_LEVEL_DESC: &str = "(Lnet/minecraft/client/multiplayer/ClientLevel;)V";
+const CLIENT_LEVEL_ENTITY_DESC: &str =
+    "(Lnet/minecraft/client/multiplayer/ClientLevel;Lnet/minecraft/world/entity/Entity;)V";
+
+fn draw_order_fixture(test: &str) -> Fixture {
+    Fixture::build(
+        test,
+        &with_stubs(&[
+            ("demo/OddBlockPos.java", ODD_BLOCK_POS),
+            ("demo/DrawOrder.java", DRAW_ORDER_PROBE),
+        ]),
+    )
+}
+
+fn draw_order_call(
+    fixture: &Fixture,
+    host: &mut StdHost,
+    method: &str,
+    descriptor: &str,
+    args: &[Value],
+) -> Result<Value, NativeError> {
+    fixture
+        .jar
+        .invoke_method_with_args("demo/DrawOrder", method, descriptor, None, args, host)
+}
+
+fn draw_order_client_frame() -> Arc<ClientSnapshot> {
+    Arc::new(ClientSnapshot {
+        level: Some(ClientLevel {
+            dimension: "minecraft:overworld".into(),
+            ..ClientLevel::default()
+        }),
+        player: Some(ClientPlayer {
+            uuid: 1,
+            name: "Local".into(),
+            entity_id: 55,
+            pos: [3.0, 64.0, -2.0],
+            silent: Some(false),
+            ..ClientPlayer::default()
+        }),
+        camera: Some(ClientCamera {
+            pos: [0.0, 0.0, 0.0],
+            ..ClientCamera::default()
+        }),
+        ..ClientSnapshot::default()
+    })
+}
+
+#[test]
+fn server_unseeded_overloads_draw_before_resolving_their_arguments() {
+    let fixture = draw_order_fixture("level_sound_server_draw_order");
+    let level = StdHost::server_level_handle("minecraft:overworld");
+    // Lenient: a counted call returns and the probe goes on, as Java's `catch` does.
+    let mut host = StdHost::new();
+    host.seed_server_level_sound_seeds("minecraft:overworld", 42);
+    draw_order_call(
+        &fixture,
+        &mut host,
+        "unresolvableThenValid",
+        "(Lnet/minecraft/world/level/Level;Lnet/minecraft/world/entity/Entity;)V",
+        &[level, entity_handle(202)],
+    )
+    .unwrap();
+    // One counted call per unseeded overload, each AFTER its draw: the valid sound gets Java's
+    // sixth `soundSeedGenerator` seed, not its first.
+    assert_eq!(host.unknown_host_call_count(), 5);
+    let sounds = host.take_played_sounds();
+    assert_eq!(sounds.len(), 1, "{sounds:#?}");
+    assert_eq!(sounds[0].sound_id, "demo:ok");
+    assert_eq!(sounds[0].target, SoundTarget::Position([4.0, 5.0, 6.0]));
+    assert_eq!(
+        sounds[0].seed,
+        SoundSeed::LevelSeedGenerator(SOUND_SEEDS_42[5])
+    );
+    // Every draw was Decaf's own: the stream's position is still known.
+    assert!(host.sound_stream_known("game/level/minecraft:overworld"));
+}
+
+#[test]
+fn client_unseeded_calls_draw_before_resolving_their_arguments() {
+    let fixture = draw_order_fixture("level_sound_client_draw_order");
+    let level = StdHost::client_level_handle();
+    let me = StdHost::client_player_handle();
+    let mut host = StdHost::new();
+    host.seed_client_level_randoms(987_654_321, 42);
+    host.begin_client_frame(draw_order_client_frame(), &[]);
+
+    // `soundSeedGenerator` #0: a call that counts after its draw (a client frame refuses it).
+    let counted = draw_order_call(
+        &fixture,
+        &mut host,
+        "clientNullSound",
+        CLIENT_LEVEL_ENTITY_DESC,
+        &[level.clone(), me.clone()],
+    );
+    assert!(matches!(counted, Err(NativeError::UnknownHostCall(_))));
+    // #1: `except` is another entity, so nothing reads the null sound: not counted, still drawn.
+    draw_order_call(
+        &fixture,
+        &mut host,
+        "clientOtherNullSound",
+        CLIENT_LEVEL_ENTITY_DESC,
+        &[level.clone(), entity_handle(999)],
+    )
+    .unwrap();
+    // #2: the valid sound.
+    draw_order_call(
+        &fixture,
+        &mut host,
+        "clientValid",
+        CLIENT_LEVEL_ENTITY_DESC,
+        &[level.clone(), me.clone()],
+    )
+    .unwrap();
+
+    // `Level.random` #0..#3: `playLocalSound(DDD)`, `playLocalSound(Entity)`,
+    // `playPlayerSound` and `LocalPlayer.playSound`, each counted after its draw.
+    for (method, descriptor, args) in [
+        ("clientNullLocal", CLIENT_LEVEL_DESC, vec![level.clone()]),
+        (
+            "clientNullLocalEntity",
+            CLIENT_LEVEL_ENTITY_DESC,
+            vec![level.clone(), me.clone()],
+        ),
+        (
+            "clientNullPlayerSound",
+            CLIENT_LEVEL_DESC,
+            vec![level.clone()],
+        ),
+        (
+            "localPlayerNull",
+            "(Lnet/minecraft/client/player/LocalPlayer;)V",
+            vec![me.clone()],
+        ),
+    ] {
+        let counted = draw_order_call(&fixture, &mut host, method, descriptor, &args);
+        assert!(
+            matches!(counted, Err(NativeError::UnknownHostCall(_))),
+            "{method}: {counted:?}"
+        );
+    }
+    // #4: the valid one.
+    draw_order_call(
+        &fixture,
+        &mut host,
+        "clientValidLocal",
+        CLIENT_LEVEL_DESC,
+        &[level],
+    )
+    .unwrap();
+
+    let out = host.end_client_frame();
+    assert_eq!(host.unknown_host_call_count(), 5);
+    assert_eq!(out.sounds.len(), 2, "{:#?}", out.sounds);
+    assert_eq!(
+        out.sounds[0].seed,
+        SoundSeed::LevelSeedGenerator(SOUND_SEEDS_42[2])
+    );
+    assert_eq!(out.sounds[0].target, SoundTarget::Position([4.0, 5.0, 6.0]));
+    assert_eq!(
+        out.sounds[1].seed,
+        SoundSeed::LevelRandom(LEVEL_RANDOM_987654321[4])
+    );
+    assert_eq!(out.sounds[1].target, SoundTarget::Position([7.0, 8.0, 9.0]));
+}
+
+#[test]
+fn unknown_sound_streams_count_every_later_draw_until_seeded_again() {
+    let fixture = draw_order_fixture("level_sound_unknown_streams");
+    let overworld = StdHost::server_level_handle("minecraft:overworld");
+    let nether = StdHost::server_level_handle("minecraft:the_nether");
+    let overworld_stream = "game/level/minecraft:overworld";
+    let nether_stream = "game/level/minecraft:the_nether";
+
+    // 1. A `BlockPos` Decaf cannot read (a jar override of `getX`) may or may not throw before
+    //    the draw: the stream's position is unknown, and the next sound counts too.
+    let mut host = StdHost::new();
+    host.seed_server_level_sound_seeds("minecraft:overworld", 42);
+    draw_order_call(
+        &fixture,
+        &mut host,
+        "oddBlockPos",
+        LEVEL_DESC,
+        std::slice::from_ref(&overworld),
+    )
+    .unwrap();
+    assert!(!host.sound_stream_known(overworld_stream));
+    draw_order_call(
+        &fixture,
+        &mut host,
+        "valid",
+        LEVEL_DESC,
+        std::slice::from_ref(&overworld),
+    )
+    .unwrap();
+    assert_eq!(host.unknown_host_call_count(), 2);
+    assert!(host.played_sounds().is_empty());
+    // Seeding the stream again makes it known again.
+    host.seed_server_level_sound_seeds("minecraft:overworld", 42);
+    draw_order_call(
+        &fixture,
+        &mut host,
+        "valid",
+        LEVEL_DESC,
+        std::slice::from_ref(&overworld),
+    )
+    .unwrap();
+    assert_eq!(host.unknown_host_call_count(), 2);
+    assert_eq!(
+        host.take_played_sounds()[0].seed,
+        SoundSeed::LevelSeedGenerator(SOUND_SEEDS_42[0])
+    );
+
+    // 2. A seed deferred to a live host whose call then counts never reaches the host, which
+    //    draws only for a sound it plays: the host's stream is now one draw behind Java's.
+    let mut host = StdHost::new();
+    host.set_host_deferred_server_sound_seeds(true);
+    draw_order_call(
+        &fixture,
+        &mut host,
+        "nullSound",
+        LEVEL_DESC,
+        std::slice::from_ref(&overworld),
+    )
+    .unwrap();
+    assert_eq!(host.unknown_host_call_count(), 1);
+    assert!(!host.sound_stream_known(overworld_stream));
+    draw_order_call(
+        &fixture,
+        &mut host,
+        "valid",
+        LEVEL_DESC,
+        std::slice::from_ref(&overworld),
+    )
+    .unwrap();
+    assert_eq!(host.unknown_host_call_count(), 2);
+    assert!(host.played_sounds().is_empty());
+    // Java's nether stream did not move, but a live host may draw every level's seeds from one
+    // stream (Sunrise does): while seeds are deferred, the nether's position is unknown too.
+    assert!(!host.sound_stream_known(nether_stream));
+    draw_order_call(
+        &fixture,
+        &mut host,
+        "valid",
+        LEVEL_DESC,
+        std::slice::from_ref(&nether),
+    )
+    .unwrap();
+    assert_eq!(host.unknown_host_call_count(), 3);
+    assert!(host.played_sounds().is_empty());
+    // A new server's levels start fresh streams.
+    host.forget_unknown_server_sound_streams();
+    for level in [&overworld, &nether] {
+        draw_order_call(
+            &fixture,
+            &mut host,
+            "valid",
+            LEVEL_DESC,
+            std::slice::from_ref(level),
+        )
+        .unwrap();
+    }
+    assert_eq!(host.unknown_host_call_count(), 3);
+    let sounds = host.take_played_sounds();
+    assert_eq!(sounds.len(), 2);
+    assert!(
+        sounds
+            .iter()
+            .all(|sound| sound.seed == SoundSeed::HostDeferred)
+    );
+
+    // 3. An entity whose `isSilent()` Decaf does not know may or may not reach the draw.
+    let mut host = StdHost::new();
+    host.seed_server_level_sound_seeds("minecraft:overworld", 42);
+    host.set_entity_sound_facts(
+        "game/entity/10",
+        EntitySoundFacts {
+            entity_id: Some(10),
+            level: Some("minecraft:overworld".into()),
+            position: Some([1.0, 2.0, 3.0]),
+            silent: None,
+            sound_source: Some(SoundSource::Hostile),
+            is_player: false,
+            player_uuid: None,
+        },
+    );
+    let _ = draw_order_call(
+        &fixture,
+        &mut host,
+        "entitySound",
+        "(Lnet/minecraft/world/entity/Entity;)V",
+        &[entity_handle(10)],
+    );
+    assert_eq!(host.unknown_host_call_count(), 1);
+    assert!(!host.sound_stream_known(overworld_stream));
+
+    // 4. An entity on a level Decaf cannot name drew on some server level: every server
+    //    level's stream is unknown.
+    let mut host = StdHost::new();
+    host.seed_server_level_sound_seeds("minecraft:overworld", 42);
+    host.seed_server_level_sound_seeds("minecraft:the_nether", 42);
+    host.set_entity_sound_facts(
+        "game/entity/11",
+        EntitySoundFacts {
+            entity_id: Some(11),
+            level: None,
+            position: Some([1.0, 2.0, 3.0]),
+            silent: Some(false),
+            sound_source: Some(SoundSource::Hostile),
+            is_player: false,
+            player_uuid: None,
+        },
+    );
+    let _ = draw_order_call(
+        &fixture,
+        &mut host,
+        "entitySound",
+        "(Lnet/minecraft/world/entity/Entity;)V",
+        &[entity_handle(11)],
+    );
+    assert_eq!(host.unknown_host_call_count(), 1);
+    assert!(!host.sound_stream_known(overworld_stream));
+    assert!(!host.sound_stream_known(nether_stream));
+    for level in [&overworld, &nether] {
+        draw_order_call(
+            &fixture,
+            &mut host,
+            "valid",
+            LEVEL_DESC,
+            std::slice::from_ref(level),
+        )
+        .unwrap();
+    }
+    assert_eq!(host.unknown_host_call_count(), 3);
+    assert!(host.played_sounds().is_empty());
+
+    // 5. Client `Level.random`: a `BlockPos` Decaf cannot read before `playLocalSound` draws
+    //    leaves it unknown, so the seeded handle the jar holds through `getRandom()` stops
+    //    answering, and later local sounds count.
+    let client_level = StdHost::client_level_handle();
+    let mut host = StdHost::new();
+    host.seed_client_level_randoms(987_654_321, 42);
+    host.begin_client_frame(draw_order_client_frame(), &[]);
+    let counted = draw_order_call(
+        &fixture,
+        &mut host,
+        "clientOddLocal",
+        CLIENT_LEVEL_DESC,
+        std::slice::from_ref(&client_level),
+    );
+    assert!(matches!(counted, Err(NativeError::UnknownHostCall(_))));
+    assert!(!host.sound_stream_known("client/level#random"));
+    let before = host.unknown_host_call_count();
+    let drawn = draw_order_call(
+        &fixture,
+        &mut host,
+        "clientRandom",
+        "(Lnet/minecraft/client/multiplayer/ClientLevel;)J",
+        std::slice::from_ref(&client_level),
+    );
+    assert_ne!(
+        drawn.ok(),
+        Some(Value::Long(LEVEL_RANDOM_987654321[0])),
+        "an unknown Level.random must not answer"
+    );
+    assert!(host.unknown_host_call_count() > before);
+    let counted = draw_order_call(
+        &fixture,
+        &mut host,
+        "clientValidLocal",
+        CLIENT_LEVEL_DESC,
+        std::slice::from_ref(&client_level),
+    );
+    assert!(matches!(counted, Err(NativeError::UnknownHostCall(_))));
+    // Seeded again: known again.
+    host.seed_client_level_random(987_654_321);
+    draw_order_call(
+        &fixture,
+        &mut host,
+        "clientValidLocal",
+        CLIENT_LEVEL_DESC,
+        std::slice::from_ref(&client_level),
+    )
+    .unwrap();
+    let out = host.end_client_frame();
+    assert_eq!(out.sounds.len(), 1);
+    assert_eq!(
+        out.sounds[0].seed,
+        SoundSeed::LevelRandom(LEVEL_RANDOM_987654321[0])
+    );
+}
