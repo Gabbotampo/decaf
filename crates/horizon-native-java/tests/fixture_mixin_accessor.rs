@@ -131,7 +131,7 @@ fn checks(host: &StdHost) -> BTreeMap<String, bool> {
     host.invocations()
         .iter()
         .filter(|invocation| {
-            invocation.method.owner == "demo/Probe" && invocation.method.name == "check"
+            invocation.method.owner == "demoprobe/Probe" && invocation.method.name == "check"
         })
         .filter_map(|invocation| match invocation.args.as_slice() {
             [Value::Ref(Some(label)), Value::Int(flag)] => Some((label.clone(), *flag != 0)),
@@ -146,16 +146,16 @@ fn checks(host: &StdHost) -> BTreeMap<String, bool> {
 fn accessors_and_invokers_run_the_generated_contract() {
     let mut sources = annotation_sources();
     sources.insert(
-        "demo/Probe.java",
-        r#"package demo;
+        "demoprobe/Probe.java",
+        r#"package demoprobe;
 public final class Probe {
     public static void check(String label, boolean value) {}
 }
 "#,
     );
     sources.insert(
-        "demo/Target.java",
-        r#"package demo;
+        "demoprobe/Target.java",
+        r#"package demoprobe;
 public class Target {
     private int value;
     private int twice(int argument) { return argument * 2; }
@@ -165,6 +165,7 @@ public class Target {
     sources.insert(
         "demo/TargetAccessor.java",
         r#"package demo;
+import demoprobe.Target;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.gen.Accessor;
 import org.spongepowered.asm.mixin.gen.Invoker;
@@ -179,8 +180,9 @@ public interface TargetAccessor {
 "#,
     );
     sources.insert(
-        "demo/Main.java",
-        r#"package demo;
+        "demoprobe/Main.java",
+        r#"package demoprobe;
+import demo.TargetAccessor;
 public final class Main {
     public static void main() {
         Target target = new Target();
@@ -201,7 +203,7 @@ public final class Main {
             r#"{"required":true,"package":"demo","mixins":["TargetAccessor"]}"#,
         )],
         &[
-            "demo/Probe.class",
+            "demoprobe/Probe.class",
             "org/spongepowered/asm/mixin/Mixin.class",
             "org/spongepowered/asm/mixin/gen/Accessor.class",
             "org/spongepowered/asm/mixin/gen/Invoker.class",
@@ -249,7 +251,7 @@ public final class Main {
     );
 
     let mut host = StdHost::new();
-    jar.execute("demo.Main", Some("main"), "main", &mut host)
+    jar.execute("demoprobe.Main", Some("main"), "main", &mut host)
         .unwrap();
     assert_eq!(
         checks(&host),
@@ -276,8 +278,8 @@ public class Player {}
 "#,
     );
     sources.insert(
-        "demo/Probe.java",
-        r#"package demo;
+        "demoprobe/Probe.java",
+        r#"package demoprobe;
 public final class Probe {
     public static void check(String label, boolean value) {}
 }
@@ -304,8 +306,9 @@ public interface PlayerAccessor {
     // `Player` that interface; a plain `Object` here would be the JVM's
     // `ClassCastException`.
     sources.insert(
-        "demo/Main.java",
-        r#"package demo;
+        "demoprobe/Main.java",
+        r#"package demoprobe;
+import demo.PlayerAccessor;
 public final class Main {
     public static void main() {
         Object player = PlayerFactory.create();
@@ -318,8 +321,8 @@ public final class Main {
 "#,
     );
     sources.insert(
-        "demo/PlayerFactory.java",
-        r#"package demo;
+        "demoprobe/PlayerFactory.java",
+        r#"package demoprobe;
 public final class PlayerFactory {
     public static Object create() { return new net.minecraft.world.entity.player.Player(); }
 }
@@ -333,7 +336,7 @@ public final class PlayerFactory {
             r#"{"required":true,"package":"demo","mixins":["PlayerAccessor"]}"#,
         )],
         &[
-            "demo/Probe.class",
+            "demoprobe/Probe.class",
             "net/minecraft/world/entity/player/Player.class",
             "org/spongepowered/asm/mixin/Mixin.class",
             "org/spongepowered/asm/mixin/gen/Accessor.class",
@@ -345,7 +348,7 @@ public final class PlayerFactory {
     // The host owns the game object, so it hands the fixture a marker. The
     // field table is receiver-keyed, which is what the accessor reads.
     host = host.with_mod("demo", "1");
-    jar.execute("demo.Main", Some("main"), "main", &mut host)
+    jar.execute("demoprobe.Main", Some("main"), "main", &mut host)
         .unwrap();
     assert_eq!(
         checks(&host),
@@ -369,8 +372,8 @@ public class ArgumentTypeInfos {}
 "#,
     );
     sources.insert(
-        "demo/Probe.java",
-        r#"package demo;
+        "demoprobe/Probe.java",
+        r#"package demoprobe;
 public final class Probe {
     public static void check(String label, boolean value) {}
 }
@@ -395,8 +398,9 @@ public interface InfosAccessor {
 "#,
     );
     sources.insert(
-        "demo/Main.java",
-        r#"package demo;
+        "demoprobe/Main.java",
+        r#"package demoprobe;
+import demo.InfosAccessor;
 import java.util.Map;
 public final class Main {
     public static void main() {
@@ -418,7 +422,7 @@ public final class Main {
             r#"{"required":true,"package":"demo","mixins":["InfosAccessor"]}"#,
         )],
         &[
-            "demo/Probe.class",
+            "demoprobe/Probe.class",
             "net/minecraft/commands/synchronization/ArgumentTypeInfos.class",
             "org/spongepowered/asm/mixin/Mixin.class",
             "org/spongepowered/asm/mixin/gen/Accessor.class",
@@ -427,7 +431,7 @@ public final class Main {
     );
     let jar = NativeJar::from_path(&jar_path).unwrap();
     let mut host = StdHost::new();
-    jar.execute("demo.Main", Some("main"), "main", &mut host)
+    jar.execute("demoprobe.Main", Some("main"), "main", &mut host)
         .unwrap();
     assert_eq!(
         checks(&host),

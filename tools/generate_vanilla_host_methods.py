@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
 """Generate `crates/horizon-native-java/src/vanilla_host_methods.tsv` from 26.3 jars.
 
-Only class/interface names, hierarchy edges, and non-private non-static method
-`(name, descriptor)` signatures are recorded — no code. The runtime uses this
-table to enforce JVMS §5.4.3.3 when an interface-injection Mixin adds an
-interface with a `default` method onto a host-modelled vanilla class: any
-method already declared by the target class hierarchy (or a vanilla interface
-default on it) wins over the injected interface's `default` method and routes
-through host dispatch (answering when modelled, or counting/refusing when not).
+Only class/interface names, hierarchy edges, non-private non-static method
+`(name, descriptor)` signatures and every declared field's `(name, descriptor)`
+are recorded — no code, no values. The runtime uses this table to enforce JVMS
+§5.4.3.3 when an interface-injection Mixin adds an interface with a `default`
+method onto a host-modelled vanilla class: any method already declared by the
+target class hierarchy (or a vanilla interface default on it) wins over the
+injected interface's `default` method and routes through host dispatch
+(answering when modelled, or counting/refusing when not). The field rows let it
+tell when a mixin's own static field, which Mixin merges onto the game class,
+collides with a field that class already declares (Mixin renames, discards or
+rejects it then, which the runtime counts instead of modelling).
 
 Reproducing the committed TSV byte-for-byte
 -------------------------------------------
@@ -106,7 +110,9 @@ ACC_INTERFACE = 0x0200
 ACC_ABSTRACT = 0x0400
 
 
-def parse_class(data: bytes) -> tuple[bool, str, list[str], list[tuple[str, str]]]:
+def parse_class(
+    data: bytes,
+) -> tuple[bool, str, list[str], list[tuple[str, str]], list[tuple[str, str]]]:
     magic = struct.unpack_from(">I", data, 0)[0]
     if magic != 0xCAFEBABE:
         raise ValueError("not a class file")
@@ -150,8 +156,11 @@ def parse_class(data: bytes) -> tuple[bool, str, list[str], list[tuple[str, str]
         ifaces.append(str(cp[int(cp[ic])]))
     fcount = struct.unpack_from(">H", data, off)[0]
     off += 2
+    fields: set[tuple[str, str]] = set()
     for _ in range(fcount):
+        _fa, fn, fd = struct.unpack_from(">HHH", data, off)
         off += 6
+        fields.add((str(cp[fn]), str(cp[fd])))
         ac = struct.unpack_from(">H", data, off)[0]
         off += 2
         for _ in range(ac):
@@ -178,7 +187,7 @@ def parse_class(data: bytes) -> tuple[bool, str, list[str], list[tuple[str, str]
         # On an interface: only concrete (`default`) methods can shadow/conflict with one.
         if not is_iface or not (ma & ACC_ABSTRACT):
             methods.add((name, desc))
-    return is_iface, super_name, ifaces, sorted(methods)
+    return is_iface, super_name, ifaces, sorted(methods), sorted(fields)
 
 
 JRT_READER_JAVA = """import java.io.*;
@@ -287,7 +296,10 @@ def main() -> int:
                 if name.endswith(".class") and name not in entries:
                     entries[name] = (z, name)
 
-        parsed: dict[str, tuple[bool, str, list[str], list[tuple[str, str]]]] = {}
+        parsed: dict[
+            str,
+            tuple[bool, str, list[str], list[tuple[str, str]], list[tuple[str, str]]],
+        ] = {}
         pending: set[str] = set()
         unresolved: set[str] = set()
 
@@ -307,8 +319,8 @@ def main() -> int:
                 hit = entries.get(cname + ".class")
                 if hit is not None:
                     z, entry = hit
-                    is_i, sup, ifaces, methods = parse_class(z.read(entry))
-                    parsed[cname] = (is_i, sup, ifaces, methods)
+                    parsed[cname] = parse_class(z.read(entry))
+                    sup, ifaces = parsed[cname][1], parsed[cname][2]
                     enqueue(sup)
                     for iface in ifaces:
                         enqueue(iface)
@@ -321,8 +333,8 @@ def main() -> int:
                     if data is None:
                         unresolved.add(cname)
                         continue
-                    is_i, sup, ifaces, methods = parse_class(data)
-                    parsed[cname] = (is_i, sup, ifaces, methods)
+                    parsed[cname] = parse_class(data)
+                    sup, ifaces = parsed[cname][1], parsed[cname][2]
                     enqueue(sup)
                     for iface in ifaces:
                         enqueue(iface)
@@ -342,22 +354,27 @@ def main() -> int:
             "# C<tab>class<tab>super<tab>iface1,iface2,...",
             "# I<tab>interface<tab><tab>super_iface1,...",
             "# M<tab>owner<tab>name<tab>descriptor",
+            "# F<tab>owner<tab>name<tab>descriptor (every declared field)",
         ]
         for cname in sorted(parsed):
-            is_i, sup, ifaces, _methods = parsed[cname]
+            is_i, sup, ifaces, _methods, _fields = parsed[cname]
             if is_i:
                 lines.append(f"I\t{cname}\t\t{','.join(ifaces)}")
             else:
                 lines.append(f"C\t{cname}\t{sup}\t{','.join(ifaces)}")
         for cname in sorted(parsed):
-            _is_i, _sup, _ifaces, methods = parsed[cname]
+            _is_i, _sup, _ifaces, methods, _fields = parsed[cname]
             for name, desc in methods:
                 lines.append(f"M\t{cname}\t{name}\t{desc}")
+        for cname in sorted(parsed):
+            for name, desc in parsed[cname][4]:
+                lines.append(f"F\t{cname}\t{name}\t{desc}")
 
         args.output.write_text("\n".join(lines) + "\n", encoding="utf-8")
         print(
             f"wrote {args.output}: {len(parsed)} types, "
-            f"{sum(len(v[3]) for v in parsed.values())} method signatures"
+            f"{sum(len(v[3]) for v in parsed.values())} method signatures, "
+            f"{sum(len(v[4]) for v in parsed.values())} fields"
         )
         return 0
     finally:

@@ -4021,7 +4021,7 @@ mod tests {
         out
     }
 
-    /// A Fabric jar with a `main` stage (class `demo.Main`) and a `server` stage
+    /// A Fabric jar with a `main` stage (class `demoprobe.Main`) and a `server` stage
     /// (`demo.Server`). `None` leaves that class out of the jar, so its stage fails to load;
     /// `Some(fails)` ships it, failing at runtime or not.
     fn two_stage_jar(main: Option<bool>, server: Option<bool>) -> Arc<NativeJar> {
@@ -4033,12 +4033,12 @@ mod tests {
             zip.start_file("fabric.mod.json", options).unwrap();
             zip.write_all(
                 br#"{"schemaVersion":1,"id":"demo","version":"1",
-                    "entrypoints":{"main":["demo.Main"],"server":["demo.Server"]}}"#,
+                    "entrypoints":{"main":["demoprobe.Main"],"server":["demo.Server"]}}"#,
             )
             .unwrap();
             let stages = [
                 (
-                    "demo/Main",
+                    "demoprobe/Main",
                     "net/fabricmc/api/ModInitializer",
                     "onInitialize",
                     main,
@@ -4222,7 +4222,7 @@ mod tests {
         assert_eq!(verdict, "ran-partial");
         let reason = reason.unwrap();
         assert!(
-            reason.starts_with("entrypoint(s) failed: demo.Main: "),
+            reason.starts_with("entrypoint(s) failed: demoprobe.Main: "),
             "{reason}"
         );
         assert!(!reason.contains("demo.Server"), "{reason}");
@@ -4232,7 +4232,7 @@ mod tests {
         assert_eq!(verdict, "ran-partial");
         let reason = reason.unwrap();
         assert!(
-            reason.contains("demo.Main: uncaught exception java/lang/NumberFormatException"),
+            reason.contains("demoprobe.Main: uncaught exception java/lang/NumberFormatException"),
             "{reason}"
         );
         assert!(!reason.contains("demo.Server"), "{reason}");
@@ -4241,7 +4241,7 @@ mod tests {
         let (verdict, reason) = load_verdict(two_stage_jar(None, Some(true)));
         assert_eq!(verdict, "refused");
         let reason = reason.unwrap();
-        assert!(reason.contains("demo.Main: "), "{reason}");
+        assert!(reason.contains("demoprobe.Main: "), "{reason}");
         assert!(
             reason.contains("demo.Server: uncaught exception java/lang/NumberFormatException"),
             "{reason}"
@@ -4423,20 +4423,20 @@ mod tests {
                 "package net.fabricmc.api;\npublic interface ClientModInitializer { void onInitializeClient(); }\n",
             ),
             (
-                "demo/ClientInit.java",
-                "package demo;\nimport net.fabricmc.api.ClientModInitializer;\npublic class ClientInit implements ClientModInitializer { @Override public void onInitializeClient() {} }\n",
+                "demoprobe/ClientInit.java",
+                "package demoprobe;\nimport net.fabricmc.api.ClientModInitializer;\npublic class ClientInit implements ClientModInitializer { @Override public void onInitializeClient() {} }\n",
             ),
             (
-                "demo/ClientTag.java",
-                "package demo;\npublic interface ClientTag { int getTag(); void setTag(int v); }\n",
+                "demoprobe/ClientTag.java",
+                "package demoprobe;\npublic interface ClientTag { int getTag(); void setTag(int v); }\n",
             ),
             (
                 "demo/LocalPlayerMixin.java",
-                "package demo;\nimport net.minecraft.world.entity.player.Player;\nimport org.spongepowered.asm.mixin.Mixin;\nimport org.spongepowered.asm.mixin.Unique;\n@Mixin(Player.class)\npublic class LocalPlayerMixin implements ClientTag {\n    @Unique private int tag = 7;\n    @Override public int getTag() { return this.tag; }\n    @Override public void setTag(int v) { this.tag = v; }\n}\n",
+                "package demo;\nimport demoprobe.ClientTag;\nimport net.minecraft.world.entity.player.Player;\nimport org.spongepowered.asm.mixin.Mixin;\nimport org.spongepowered.asm.mixin.Unique;\n@Mixin(Player.class)\npublic class LocalPlayerMixin implements ClientTag {\n    @Unique private int tag = 7;\n    @Override public int getTag() { return this.tag; }\n    @Override public void setTag(int v) { this.tag = v; }\n}\n",
             ),
             (
-                "demo/ClientProbe.java",
-                "package demo;\nimport net.minecraft.client.Minecraft;\npublic final class ClientProbe {\n    public static int read() { return ((ClientTag) (Object) Minecraft.getInstance().player).getTag(); }\n    public static void write(int v) { ((ClientTag) (Object) Minecraft.getInstance().player).setTag(v); }\n}\n",
+                "demoprobe/ClientProbe.java",
+                "package demoprobe;\nimport net.minecraft.client.Minecraft;\npublic final class ClientProbe {\n    public static int read() { return ((ClientTag) (Object) Minecraft.getInstance().player).getTag(); }\n    public static void write(int v) { ((ClientTag) (Object) Minecraft.getInstance().player).setTag(v); }\n}\n",
             ),
         ];
         let mut java_paths = Vec::new();
@@ -4475,7 +4475,7 @@ mod tests {
             let opts = zip::write::SimpleFileOptions::default();
             zip.start_file("fabric.mod.json", opts).unwrap();
             zip.write_all(
-                br#"{"schemaVersion":1,"id":"clientmixin","version":"1.0","entrypoints":{"client":["demo.ClientInit"]},"mixins":["demo.mixins.json"]}"#,
+                br#"{"schemaVersion":1,"id":"clientmixin","version":"1.0","entrypoints":{"client":["demoprobe.ClientInit"]},"mixins":["demo.mixins.json"]}"#,
             )
             .unwrap();
             zip.start_file("demo.mixins.json", opts).unwrap();
@@ -4535,7 +4535,7 @@ mod tests {
             java.lock_client().with_first_jar_mut(|jar, host| {
                 host.begin_client_frame(Arc::clone(&snapshot), &[]);
                 let val = jar
-                    .invoke_method("demo.ClientProbe", "read", "()I", None, host)
+                    .invoke_method("demoprobe.ClientProbe", "read", "()I", None, host)
                     .unwrap();
                 host.end_client_frame();
                 match val {
@@ -4548,7 +4548,7 @@ mod tests {
             java.lock_client().with_first_jar_mut(|jar, host| {
                 host.begin_client_frame(Arc::clone(&snapshot), &[]);
                 jar.invoke_method_with_args(
-                    "demo.ClientProbe",
+                    "demoprobe.ClientProbe",
                     "write",
                     "(I)V",
                     None,
@@ -4776,28 +4776,28 @@ mod tests {
                 "package net.minecraft.world.level.block; public final class Blocks { public static final Block STONE = null; }",
             ),
             (
-                "demo/StoneBlock.java",
-                "package demo; import net.minecraft.world.item.context.BlockPlaceContext; import net.minecraft.world.level.block.*; import net.minecraft.world.level.block.state.BlockState; public class StoneBlock extends Block { @Override public BlockState getStateForPlacement(BlockPlaceContext c) { return Blocks.STONE.defaultBlockState(); } }",
+                "demoprobe/StoneBlock.java",
+                "package demoprobe; import net.minecraft.world.item.context.BlockPlaceContext; import net.minecraft.world.level.block.*; import net.minecraft.world.level.block.state.BlockState; public class StoneBlock extends Block { @Override public BlockState getStateForPlacement(BlockPlaceContext c) { return Blocks.STONE.defaultBlockState(); } }",
             ),
             (
-                "demo/UnregisteredBlock.java",
-                "package demo; import net.minecraft.world.item.context.BlockPlaceContext; import net.minecraft.world.level.block.*; import net.minecraft.world.level.block.state.BlockState; public class UnregisteredBlock extends Block { private static final Block UNREGISTERED = new Block(); @Override public BlockState getStateForPlacement(BlockPlaceContext c) { return UNREGISTERED.defaultBlockState(); } }",
+                "demoprobe/UnregisteredBlock.java",
+                "package demoprobe; import net.minecraft.world.item.context.BlockPlaceContext; import net.minecraft.world.level.block.*; import net.minecraft.world.level.block.state.BlockState; public class UnregisteredBlock extends Block { private static final Block UNREGISTERED = new Block(); @Override public BlockState getStateForPlacement(BlockPlaceContext c) { return UNREGISTERED.defaultBlockState(); } }",
             ),
             (
-                "demo/MissingEngineBlock.java",
-                "package demo; import net.minecraft.world.item.context.BlockPlaceContext; import net.minecraft.world.level.block.*; import net.minecraft.world.level.block.state.BlockState; public class MissingEngineBlock extends Block { public static final Block TARGET = new Block(); @Override public BlockState getStateForPlacement(BlockPlaceContext c) { return TARGET.defaultBlockState(); } }",
+                "demoprobe/MissingEngineBlock.java",
+                "package demoprobe; import net.minecraft.world.item.context.BlockPlaceContext; import net.minecraft.world.level.block.*; import net.minecraft.world.level.block.state.BlockState; public class MissingEngineBlock extends Block { public static final Block TARGET = new Block(); @Override public BlockState getStateForPlacement(BlockPlaceContext c) { return TARGET.defaultBlockState(); } }",
             ),
             (
-                "demo/PlayerDependentBlock.java",
-                "package demo; import net.minecraft.world.item.context.BlockPlaceContext; import net.minecraft.world.level.block.*; import net.minecraft.world.level.block.state.BlockState; public class PlayerDependentBlock extends Block { @Override public BlockState getStateForPlacement(BlockPlaceContext c) { if (c.isSecondaryUseActive()) { return Blocks.STONE.defaultBlockState(); } return defaultBlockState(); } }",
+                "demoprobe/PlayerDependentBlock.java",
+                "package demoprobe; import net.minecraft.world.item.context.BlockPlaceContext; import net.minecraft.world.level.block.*; import net.minecraft.world.level.block.state.BlockState; public class PlayerDependentBlock extends Block { @Override public BlockState getStateForPlacement(BlockPlaceContext c) { if (c.isSecondaryUseActive()) { return Blocks.STONE.defaultBlockState(); } return defaultBlockState(); } }",
             ),
             (
-                "demo/RefusingBlock.java",
-                "package demo; import net.minecraft.core.Direction; import net.minecraft.world.item.context.BlockPlaceContext; import net.minecraft.world.level.block.*; import net.minecraft.world.level.block.state.BlockState; public class RefusingBlock extends Block { @Override public BlockState getStateForPlacement(BlockPlaceContext c) { return c.getClickedFace() == Direction.DOWN ? null : defaultBlockState(); } }",
+                "demoprobe/RefusingBlock.java",
+                "package demoprobe; import net.minecraft.core.Direction; import net.minecraft.world.item.context.BlockPlaceContext; import net.minecraft.world.level.block.*; import net.minecraft.world.level.block.state.BlockState; public class RefusingBlock extends Block { @Override public BlockState getStateForPlacement(BlockPlaceContext c) { return c.getClickedFace() == Direction.DOWN ? null : defaultBlockState(); } }",
             ),
             (
-                "demo/Main.java",
-                "package demo; import net.minecraft.core.Registry; import net.minecraft.core.registries.BuiltInRegistries; import net.minecraft.resources.Identifier; public final class Main { public void onInitialize() { Registry.register(BuiltInRegistries.BLOCK, Identifier.fromNamespaceAndPath(\"demo\", \"stone_placer\"), new StoneBlock()); Registry.register(BuiltInRegistries.BLOCK, Identifier.fromNamespaceAndPath(\"demo\", \"unregistered_placer\"), new UnregisteredBlock()); Registry.register(BuiltInRegistries.BLOCK, Identifier.fromNamespaceAndPath(\"demo\", \"missing_in_engine\"), MissingEngineBlock.TARGET); Registry.register(BuiltInRegistries.BLOCK, Identifier.fromNamespaceAndPath(\"demo\", \"missing_engine_placer\"), new MissingEngineBlock()); Registry.register(BuiltInRegistries.BLOCK, Identifier.fromNamespaceAndPath(\"demo\", \"player_dep\"), new PlayerDependentBlock()); Registry.register(BuiltInRegistries.BLOCK, Identifier.fromNamespaceAndPath(\"demo\", \"refusing\"), new RefusingBlock()); } }",
+                "demoprobe/Main.java",
+                "package demoprobe; import net.minecraft.core.Registry; import net.minecraft.core.registries.BuiltInRegistries; import net.minecraft.resources.Identifier; public final class Main { public void onInitialize() { Registry.register(BuiltInRegistries.BLOCK, Identifier.fromNamespaceAndPath(\"demo\", \"stone_placer\"), new StoneBlock()); Registry.register(BuiltInRegistries.BLOCK, Identifier.fromNamespaceAndPath(\"demo\", \"unregistered_placer\"), new UnregisteredBlock()); Registry.register(BuiltInRegistries.BLOCK, Identifier.fromNamespaceAndPath(\"demo\", \"missing_in_engine\"), MissingEngineBlock.TARGET); Registry.register(BuiltInRegistries.BLOCK, Identifier.fromNamespaceAndPath(\"demo\", \"missing_engine_placer\"), new MissingEngineBlock()); Registry.register(BuiltInRegistries.BLOCK, Identifier.fromNamespaceAndPath(\"demo\", \"player_dep\"), new PlayerDependentBlock()); Registry.register(BuiltInRegistries.BLOCK, Identifier.fromNamespaceAndPath(\"demo\", \"refusing\"), new RefusingBlock()); } }",
             ),
         ];
 
@@ -4830,8 +4830,10 @@ mod tests {
         let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut bytes));
         let options = zip::write::SimpleFileOptions::default();
         zip.start_file("fabric.mod.json", options).unwrap();
-        zip.write_all(br#"{"id":"placedemo","version":"1","entrypoints":{"main":["demo.Main"]}}"#)
-            .unwrap();
+        zip.write_all(
+            br#"{"id":"placedemo","version":"1","entrypoints":{"main":["demoprobe.Main"]}}"#,
+        )
+        .unwrap();
         for name in [
             "Main",
             "StoneBlock",
@@ -4840,8 +4842,8 @@ mod tests {
             "PlayerDependentBlock",
             "RefusingBlock",
         ] {
-            let path = classes.join(format!("demo/{name}.class"));
-            zip.start_file(format!("demo/{name}.class"), options)
+            let path = classes.join(format!("demoprobe/{name}.class"));
+            zip.start_file(format!("demoprobe/{name}.class"), options)
                 .unwrap();
             zip.write_all(&std::fs::read(path).unwrap()).unwrap();
         }
@@ -4850,7 +4852,7 @@ mod tests {
 
         let jar = Arc::new(NativeJar::from_bytes(&bytes).expect("parse jar"));
         let mut host = jar.seed_host(StdHost::new().with_environment_type("SERVER"));
-        jar.execute("demo.Main", None, "main", &mut host)
+        jar.execute("demoprobe.Main", None, "main", &mut host)
             .expect("run entrypoint");
         let loaded = LoadedJar {
             row: JarRow::refused("placedemo.jar", "placedemo".to_owned(), String::new()),

@@ -6,9 +6,9 @@
 //! `plan_load_time_weave_with_game_hooks`, bind the callbacks with
 //! `register_game_hooks`, then fire each host hook point with `run_game_hook`.
 //!
-//! `demo/HookSink` is compile-only, so every `HookSink.mark` call crosses the
+//! `demoprobe/HookSink` is compile-only, so every `HookSink.mark` call crosses the
 //! host boundary and `StdHost` records it: a callback that ran is visible in the
-//! host's invocation log, not in a Rust-side stub. `demo/HookSink.ticks` is a
+//! host's invocation log, not in a Rust-side stub. `demoprobe/HookSink.ticks` is a
 //! jar static, so the same test checks that the state a callback writes survives
 //! to the next firing, exactly as a woven callback's would.
 //!
@@ -89,7 +89,7 @@ public class CallbackInfo {
 "#;
 
 /// Compile-only: the callback boundary records every call here.
-const HOOK_SINK: &str = r#"package demo;
+const HOOK_SINK: &str = r#"package demoprobe;
 public final class HookSink {
     public static void mark(String point) {}
 }
@@ -97,7 +97,7 @@ public final class HookSink {
 
 /// Shipped in the jar: the counter a callback writes, so the test can check
 /// that a callback's static state survives to the next firing.
-const COUNTER: &str = r#"package demo;
+const COUNTER: &str = r#"package demoprobe;
 public final class Counter {
     public static int ticks;
 }
@@ -124,7 +124,7 @@ const LEVEL: &str = r#"package net.minecraft.world.level;
 public class Level {}
 "#;
 
-const MAIN: &str = r#"package demo;
+const MAIN: &str = r#"package demoprobe;
 public final class Main {
     public static void onInitialize() {}
 }
@@ -138,6 +138,8 @@ fn tick_mixin(callback: &str, at: &str, cancellable: bool, class_name: &str) -> 
     };
     format!(
         r#"package demo;
+import demoprobe.Counter;
+import demoprobe.HookSink;
 import net.minecraft.server.level.ServerPlayer;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
@@ -157,6 +159,7 @@ public class {class_name} {{
 }
 
 const PICKUP_MIXIN: &str = r#"package demo;
+import demoprobe.HookSink;
 import net.minecraft.world.entity.item.ItemEntity;
 import net.minecraft.world.entity.player.Player;
 import org.spongepowered.asm.mixin.Mixin;
@@ -175,6 +178,7 @@ public class PickupMixin {
 "#;
 
 const UNMAPPED_MIXIN: &str = r#"package demo;
+import demoprobe.HookSink;
 import net.minecraft.world.level.Level;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
@@ -195,6 +199,7 @@ public class UnmappedMixin {
 /// `playerTouch(Player)` but a callback that does not mirror the player
 /// argument: the hook cannot hand the callback what it asks for.
 const WRONG_ARGS_MIXIN: &str = r#"package demo;
+import demoprobe.HookSink;
 import net.minecraft.world.entity.item.ItemEntity;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
@@ -218,7 +223,7 @@ const COMPILE_ONLY: &[&str] = &[
     "org/spongepowered/asm/mixin/injection/At.class",
     "org/spongepowered/asm/mixin/injection/Inject.class",
     "org/spongepowered/asm/mixin/injection/callback/CallbackInfo.class",
-    "demo/HookSink.class",
+    "demoprobe/HookSink.class",
     "net/minecraft/world/entity/player/Player.class",
     "net/minecraft/server/level/ServerPlayer.class",
     "net/minecraft/world/entity/item/ItemEntity.class",
@@ -233,7 +238,7 @@ struct Fixture {
 impl Fixture {
     fn build(name: &str) -> Self {
         let sources: BTreeMap<&str, String> = BTreeMap::from([
-            ("demo/Counter.java", COUNTER.into()),
+            ("demoprobe/Counter.java", COUNTER.into()),
             (
                 "net/minecraft/world/entity/player/Player.java",
                 PLAYER.into(),
@@ -281,8 +286,8 @@ impl Fixture {
         )
     }
 
-    /// Compile `extra` beside the Mixin stubs, `demo/HookSink` and
-    /// `demo/Main`, and pack every class but `compile_only` with a config
+    /// Compile `extra` beside the Mixin stubs, `demoprobe/HookSink` and
+    /// `demoprobe/Main`, and pack every class but `compile_only` with a config
     /// listing `mixins`.
     fn build_with(
         name: &str,
@@ -308,8 +313,8 @@ impl Fixture {
                 "org/spongepowered/asm/mixin/injection/callback/CallbackInfo.java",
                 CALLBACK_INFO.into(),
             ),
-            ("demo/HookSink.java", HOOK_SINK.into()),
-            ("demo/Main.java", MAIN.into()),
+            ("demoprobe/HookSink.java", HOOK_SINK.into()),
+            ("demoprobe/Main.java", MAIN.into()),
         ]);
         sources.extend(extra);
         let mut paths = Vec::new();
@@ -329,7 +334,7 @@ impl Fixture {
             .unwrap();
         assert!(status.success(), "javac failed for {name}");
 
-        let metadata = r#"{"id":"game-hook-tier","version":"1.0","entrypoints":{"main":["demo.Main"]},"mixins":["demo.mixins.json"]}"#;
+        let metadata = r#"{"id":"game-hook-tier","version":"1.0","entrypoints":{"main":["demoprobe.Main"]},"mixins":["demo.mixins.json"]}"#;
         let config = serde_json::json!({ "package": "demo", "mixins": mixins }).to_string();
         let jar = root.join(format!("{name}.jar"));
         let options = SimpleFileOptions::default();
@@ -487,7 +492,7 @@ fn game_hook_plans_register_and_run_at_the_host_point() {
     assert_eq!(
         host.invocations()
             .iter()
-            .filter(|call| call.method.owner == "demo/HookSink" && call.method.name == "mark")
+            .filter(|call| call.method.owner == "demoprobe/HookSink" && call.method.name == "mark")
             .map(|call| call.args.clone())
             .collect::<Vec<_>>(),
         [vec![Value::Ref(Some("tick".into()))]]
@@ -498,7 +503,7 @@ fn game_hook_plans_register_and_run_at_the_host_point() {
     let ticks = |host: &StdHost| {
         host.persistent_class_state()
             .0
-            .get("demo/Counter#ticksI")
+            .get("demoprobe/Counter#ticksI")
             .cloned()
     };
     assert_eq!(ticks(&host), Some(Value::Int(1)));
@@ -525,7 +530,7 @@ fn game_hook_plans_register_and_run_at_the_host_point() {
     assert_eq!(run.ran, 1);
     assert!(run.cancelled);
     assert!(host.invocations().iter().any(|call| {
-        call.method.owner == "demo/HookSink"
+        call.method.owner == "demoprobe/HookSink"
             && call.args == [Value::Ref(Some("item_picked_up".into()))]
     }));
 
@@ -641,7 +646,7 @@ const RECEIVER_GAME: &[(&str, &str)] = &[
 
 /// An interface the tick Mixin adds to every `ServerPlayer`, as real mods add
 /// `...Access` interfaces to reach their own fields on another player.
-const TICKS_ACCESS: &str = r#"package demo;
+const TICKS_ACCESS: &str = r#"package demoprobe;
 public interface TicksAccess {
     int demo$ticks();
 }
@@ -651,6 +656,8 @@ public interface TicksAccess {
 /// to the game class, a `@Shadow` member, a field the Mixin adds (with an
 /// initialiser), and an interface the Mixin implements on the target.
 const PLAYER_TICK_MIXIN: &str = r#"package demo;
+import demoprobe.HookSink;
+import demoprobe.TicksAccess;
 import net.minecraft.server.level.ServerPlayer;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Shadow;
@@ -687,6 +694,7 @@ public abstract class PlayerTickMixin implements TicksAccess {
 
 /// A cancellable HEAD callback that decides from its argument.
 const ATTACK_MIXIN: &str = r#"package demo;
+import demoprobe.HookSink;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.player.Player;
 import org.spongepowered.asm.mixin.Mixin;
@@ -709,6 +717,7 @@ public class AttackMixin {
 /// Two callbacks that reach what the model does not hold: a game method it
 /// does not answer, and a `@Shadow` field of the game object.
 const DEATH_MIXIN: &str = r#"package demo;
+import demoprobe.HookSink;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.damagesource.DamageSource;
 import org.spongepowered.asm.mixin.Mixin;
@@ -728,6 +737,7 @@ public class DeathMixin {
 "#;
 
 const JUMP_MIXIN: &str = r#"package demo;
+import demoprobe.HookSink;
 import net.minecraft.world.entity.LivingEntity;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Shadow;
@@ -749,7 +759,7 @@ public class JumpMixin {
 fn marks(host: &StdHost) -> Vec<String> {
     host.invocations()
         .iter()
-        .filter(|call| call.method.owner == "demo/HookSink" && call.method.name == "mark")
+        .filter(|call| call.method.owner == "demoprobe/HookSink" && call.method.name == "mark")
         .filter_map(|call| match call.args.first() {
             Some(Value::Ref(Some(text))) => Some(text.clone()),
             _ => None,
@@ -764,7 +774,7 @@ fn game_hook_callbacks_see_a_modelled_receiver_and_refuse_the_rest() {
         .map(|(path, body)| (*path, (*body).to_owned()))
         .collect();
     sources.insert("org/spongepowered/asm/mixin/Shadow.java", SHADOW.into());
-    sources.insert("demo/TicksAccess.java", TICKS_ACCESS.into());
+    sources.insert("demoprobe/TicksAccess.java", TICKS_ACCESS.into());
     sources.insert("demo/PlayerTickMixin.java", PLAYER_TICK_MIXIN.into());
     sources.insert("demo/AttackMixin.java", ATTACK_MIXIN.into());
     sources.insert("demo/DeathMixin.java", DEATH_MIXIN.into());
@@ -1001,6 +1011,7 @@ const CASES_GAME: &[(&str, &str)] = &[
 /// Casts and `instanceof` the firing's description answers (a mob is a
 /// `LivingEntity`), and one it cannot (is this mob a `ServerPlayer`?).
 const CAST_MIXIN: &str = r#"package demo;
+import demoprobe.HookSink;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.entity.LivingEntity;
 import org.spongepowered.asm.mixin.Mixin;
@@ -1019,6 +1030,7 @@ public abstract class CastMixin {
 "#;
 
 const ITEM_CAST_MIXIN: &str = r#"package demo;
+import demoprobe.HookSink;
 import net.minecraft.world.entity.item.ItemEntity;
 import net.minecraft.world.entity.player.Player;
 import org.spongepowered.asm.mixin.Mixin;
@@ -1039,6 +1051,7 @@ public abstract class ItemCastMixin {
 /// The server and the damage source are what the firing says they are; a
 /// player's `toString` needs its level and position, which no firing holds.
 const DIE_MIXIN: &str = r#"package demo;
+import demoprobe.HookSink;
 import net.minecraft.server.dedicated.DedicatedServer;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.damagesource.DamageSource;
@@ -1068,6 +1081,7 @@ public abstract class DieMixin {
 /// makes them one entry, `IdentityHashMap` two. Each life's `ticks` array
 /// is its own, and survives the heap's collections.
 const COLL_MIXIN: &str = r#"package demo;
+import demoprobe.HookSink;
 import java.util.*;
 import net.minecraft.server.level.ServerPlayer;
 import org.spongepowered.asm.mixin.Mixin;
@@ -1247,6 +1261,8 @@ fn hook_tier_casts_hash_tables_and_text_answer_as_java_or_count() {
 }
 
 const HELD_MIXIN: &str = r#"package demo;
+import demoprobe.Box;
+import demoprobe.HookSink;
 import java.util.Map;
 import java.util.Optional;
 import java.util.function.Supplier;
@@ -1280,7 +1296,7 @@ public abstract class HeldMixin {
 }
 "#;
 
-const HELD_BOX: &str = r#"package demo;
+const HELD_BOX: &str = r#"package demoprobe;
 public final class Box {
     int v; String name;
     public Box(int v, String name) { this.v = v; this.name = name; }
@@ -1302,7 +1318,7 @@ fn game_object_fields_keep_every_kind_of_handle_across_collections() {
         .map(|(path, body)| (*path, (*body).to_owned()))
         .collect();
     sources.insert("demo/HeldMixin.java", HELD_MIXIN.into());
-    sources.insert("demo/Box.java", HELD_BOX.into());
+    sources.insert("demoprobe/Box.java", HELD_BOX.into());
     let compile_only: Vec<&str> = COMPILE_ONLY
         .iter()
         .copied()
@@ -1350,6 +1366,7 @@ const FIELD_MIXINS: &[(&str, &str)] = &[
     (
         "ReadMixin",
         r#"package demo;
+import demoprobe.HookSink;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.damagesource.DamageSource;
 import org.spongepowered.asm.mixin.Mixin;
@@ -1370,6 +1387,7 @@ public abstract class ReadMixin {
     (
         "WriteMixin",
         r#"package demo;
+import demoprobe.HookSink;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.damagesource.DamageSource;
 import org.spongepowered.asm.mixin.Mixin;
@@ -1390,6 +1408,7 @@ public abstract class WriteMixin {
     (
         "HeirMixin",
         r#"package demo;
+import demoprobe.HookSink;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.damagesource.DamageSource;
 import net.minecraft.world.entity.player.Player;

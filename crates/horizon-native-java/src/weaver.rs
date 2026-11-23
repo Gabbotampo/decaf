@@ -4609,7 +4609,7 @@ fn constant_type(pool: &[Cp], index: u16) -> Result<ValueType, String> {
         Some(Cp::Float(_)) => ValueType::Float,
         Some(Cp::String(_)) => ValueType::Object("java/lang/String".to_owned()),
         Some(Cp::Class(_)) => ValueType::Object("java/lang/Class".to_owned()),
-        Some(Cp::MethodType) => ValueType::Object("java/lang/invoke/MethodType".to_owned()),
+        Some(Cp::MethodType { .. }) => ValueType::Object("java/lang/invoke/MethodType".to_owned()),
         Some(Cp::MethodHandle { .. }) => {
             ValueType::Object("java/lang/invoke/MethodHandle".to_owned())
         }

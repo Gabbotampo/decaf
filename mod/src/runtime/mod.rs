@@ -211,6 +211,7 @@ mod list_equality;
 mod map_compute;
 mod menu_models;
 mod method_handles;
+mod mixin_class_loading;
 mod mixin_extras;
 mod mixin_plugins;
 mod mod_config_register;
@@ -20577,7 +20578,11 @@ enum Cp {
         reference_kind: u8,
         reference_index: u16,
     },
-    MethodType,
+    /// A `CONSTANT_MethodType`: resolving it resolves every class its descriptor names
+    /// (JVMS §5.4.3.5).
+    MethodType {
+        descriptor: u16,
+    },
     InvokeDynamic {
         bootstrap: u16,
         nt: u16,
@@ -24302,6 +24307,15 @@ impl NativeJar {
         };
         if !runtime.classes.contains_key(&class_name) {
             return Err(NativeError::MissingMethod(format!("class {class}")));
+        }
+        // The loader loads an entrypoint class by name; one in a Mixin config's package
+        // fails that load in real Fabric (`mixin_class_loading.rs`), and the loader does
+        // not get past a failed entrypoint, so the entrypoint is refused.
+        if runtime.is_unloadable_by_name(&class_name) {
+            return Err(NativeError::Metadata(format!(
+                "entrypoint {class} is in a Mixin config's package: Mixin refuses to load it (IllegalClassLoadError) and Fabric's Knot fails the load (\"Mixin transformation of {} failed\")",
+                class_name.replace('/', ".")
+            )));
         }
         // The objects an earlier entrypoint of this jar built are this one's
         // too, and what this one builds outlives it for the callbacks it
@@ -28283,11 +28297,6 @@ impl<H: Host> Runtime<'_, H> {
         desc: &str,
         at: usize,
     ) -> Result<(Value, bool), NativeError> {
-        // A `@Mixin` class this frame is not merged with cannot load in real Fabric.
-        if self.is_unmerged_mixin_reference(class, &symbolic.owner) {
-            self.host.unknown_operand_call(symbolic)?;
-            return Ok((Value::default_for(&symbolic.descriptor), false));
-        }
         let field = MethodRef {
             owner: self.field_owner(symbolic),
             ..symbolic.clone()
@@ -28384,11 +28393,6 @@ impl<H: Host> Runtime<'_, H> {
         desc: &str,
         at: usize,
     ) -> Result<(), NativeError> {
-        // A `@Mixin` class this frame is not merged with cannot load in real Fabric.
-        if self.is_unmerged_mixin_reference(class, &symbolic.owner) {
-            self.host.unknown_operand_call(symbolic)?;
-            return Ok(());
-        }
         let field = MethodRef {
             owner: self.field_owner(symbolic),
             ..symbolic.clone()
@@ -29381,6 +29385,10 @@ impl<H: Host> Runtime<'_, H> {
                     frame: None,
                 })
             };
+        }
+        // A class real Fabric refuses to load (`mixin_class_loading.rs`).
+        if let Some(counted) = self.count_unloadable_class_by_name(&internal)? {
+            return Ok(counted);
         }
         if self.has_class(&internal) {
             let initialize = match r.descriptor.as_str() {
@@ -37741,6 +37749,8 @@ impl<H: Host> Runtime<'_, H> {
                 }
             };
         }
+        // The pool entries this frame's code may not resolve (`mixin_class_loading.rs`).
+        let unloadable_pool = self.unloadable_pool_entries(class, file);
         while pc < code.len() {
             budget_ticks = budget_ticks.wrapping_add(1);
             self.instructions = self.instructions.saturating_add(1);
@@ -37758,6 +37768,14 @@ impl<H: Host> Runtime<'_, H> {
             pc += 1;
             if self.check_shape_probes {
                 invoke_or_catch!(at, self.check_shape_probe_opcode(op, code, pc, &stack));
+            }
+            // A class real Fabric refuses to load for this code (`mixin_class_loading.rs`).
+            if let Some(refused) = &unloadable_pool
+                && let Some(next) = self
+                    .skip_unloadable_instruction(refused, class, file, op, code, pc, &mut stack)?
+            {
+                pc = next;
+                continue;
             }
             match op {
                 0x00 => {}
@@ -38874,9 +38892,8 @@ impl<H: Host> Runtime<'_, H> {
                         }
                     }
                     let mut r = file.method_ref(i)?;
-                    // Mixin's rewrite of a static `@Shadow` call to its target; a call
-                    // naming a `@Mixin` class this frame is not merged with is counted.
-                    let unmerged_mixin = self.rewrite_static_shadow_call(op, class, &mut r);
+                    // Mixin's rewrite of a merged method's static `@Shadow` call.
+                    self.rewrite_static_shadow_call(op, class, &mut r);
                     let n = arg_count(&r.descriptor);
                     let mut args = (0..n)
                         .map(|_| pop(&mut stack, class, method, at))
@@ -38899,15 +38916,12 @@ impl<H: Host> Runtime<'_, H> {
                     {
                         frame_modified_identity = true;
                     }
-                    if unmerged_mixin
-                        || self.check_shape_probes
-                            && (receiver.as_ref().is_some_and(is_shape_probe)
-                                || args.iter().any(is_shape_probe))
-                            && !self.is_allowed_shape_probe_invoke(op, &r, receiver.as_ref(), &args)
+                    if self.check_shape_probes
+                        && (receiver.as_ref().is_some_and(is_shape_probe)
+                            || args.iter().any(is_shape_probe))
+                        && !self.is_allowed_shape_probe_invoke(op, &r, receiver.as_ref(), &args)
                     {
-                        if !unmerged_mixin {
-                            self.host.note_retained_shape_probe();
-                        }
+                        self.host.note_retained_shape_probe();
                         let value = invoke_or_catch!(at, self.host.unknown_operand_call(&r));
                         if value != Value::Void {
                             stack.push(value);
@@ -40330,16 +40344,6 @@ impl<H: Host> Runtime<'_, H> {
                         continue;
                     }
                     let target = file.invoke_dynamic_target(index)?;
-                    // A handle naming a `@Mixin` class this frame is not merged with:
-                    // counted, and its placeholder stands for the lambda.
-                    if let Some(counted) =
-                        self.count_unmerged_mixin_handle(class, target.as_ref())?
-                    {
-                        if return_desc(&descriptor) != "V" {
-                            stack.push(counted);
-                        }
-                        continue;
-                    }
                     // The call site's own type is the functional interface the
                     // lambda's class implements, with `altMetafactory`'s
                     // markers after it (`callback_marker.rs`).
@@ -42157,10 +42161,9 @@ fn read_pool(r: &mut Reader<'_>) -> Result<Vec<Cp>, NativeError> {
                     reference_index: r.u2()?,
                 }
             }
-            16 => {
-                let _ = r.u2()?;
-                Cp::MethodType
-            }
+            16 => Cp::MethodType {
+                descriptor: r.u2()?,
+            },
             19 | 20 => {
                 r.skip(2)?;
                 Cp::Empty

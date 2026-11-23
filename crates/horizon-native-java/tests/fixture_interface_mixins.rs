@@ -295,8 +295,8 @@ fn server_player(uuid: u128, name: &str, session: u32, life: u32, id: i32) -> Va
 fn interface_mixin_on_host_objects_casts_dispatches_isolates_and_roots_through_gc() {
     let mut sources = mixin_stubs();
     sources.insert(
-        "demo/Box.java",
-        r#"package demo;
+        "demoprobe/Box.java",
+        r#"package demoprobe;
 public final class Box {
     private final int id;
     private final String label;
@@ -311,8 +311,8 @@ public final class Box {
 "#,
     );
     sources.insert(
-        "demo/CooldownCarrier.java",
-        r#"package demo;
+        "demoprobe/CooldownCarrier.java",
+        r#"package demoprobe;
 public interface CooldownCarrier {
     int getLastTick();
     void setLastTick(int tick);
@@ -326,8 +326,8 @@ public interface CooldownCarrier {
 "#,
     );
     sources.insert(
-        "demo/ExtendedCarrier.java",
-        r#"package demo;
+        "demoprobe/ExtendedCarrier.java",
+        r#"package demoprobe;
 public interface ExtendedCarrier extends CooldownCarrier {
     int getSeed();
     String getTag();
@@ -341,8 +341,8 @@ public interface ExtendedCarrier extends CooldownCarrier {
 "#,
     );
     sources.insert(
-        "demo/LevelTag.java",
-        r#"package demo;
+        "demoprobe/LevelTag.java",
+        r#"package demoprobe;
 public interface LevelTag {
     int getWorldTag();
     void setWorldTag(int tag);
@@ -352,6 +352,8 @@ public interface LevelTag {
     sources.insert(
         "demo/PlayerCarrierMixin.java",
         r#"package demo;
+import demoprobe.Box;
+import demoprobe.ExtendedCarrier;
 import net.minecraft.world.entity.player.Player;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Unique;
@@ -421,6 +423,7 @@ public class PlayerCarrierMixin implements ExtendedCarrier {
     sources.insert(
         "demo/LevelTagMixin.java",
         r#"package demo;
+import demoprobe.LevelTag;
 import net.minecraft.world.level.Level;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Unique;
@@ -443,8 +446,8 @@ public class LevelTagMixin implements LevelTag {
 "#,
     );
     sources.insert(
-        "demo/Harness.java",
-        r#"package demo;
+        "demoprobe/Harness.java",
+        r#"package demoprobe;
 import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.level.Level;
 
@@ -550,7 +553,7 @@ public final class Harness {
         player_plan.target,
         "net/minecraft/world/entity/player/Player"
     );
-    assert_eq!(player_plan.interfaces, vec!["demo/ExtendedCarrier"]);
+    assert_eq!(player_plan.interfaces, vec!["demoprobe/ExtendedCarrier"]);
     assert!(player_plan.has_initializer);
     assert_eq!(player_plan.added_fields.len(), 4);
 
@@ -566,7 +569,7 @@ public final class Harness {
     // 1. instanceof, checkcast, Class.isInstance, <init>()V, default & overridden methods.
     let v = jar
         .invoke_method_with_args(
-            "demo.Harness",
+            "demoprobe.Harness",
             "inspectAndCast",
             "(Ljava/lang/Object;)Ljava/lang/String;",
             None,
@@ -582,7 +585,7 @@ public final class Harness {
     // 2. Default interface methods delegating to mixin getter/setter.
     let v = jar
         .invoke_method_with_args(
-            "demo.Harness",
+            "demoprobe.Harness",
             "exerciseCooldown",
             "(Lnet/minecraft/world/entity/player/Player;IIII)Ljava/lang/String;",
             None,
@@ -600,7 +603,7 @@ public final class Harness {
 
     // 3. Store primitive + jar object on Alice, different state on Bob.
     jar.invoke_method_with_args(
-        "demo.Harness",
+        "demoprobe.Harness",
         "storeState",
         "(Lnet/minecraft/world/entity/player/Player;ILjava/lang/String;ILjava/lang/String;)V",
         None,
@@ -618,7 +621,7 @@ public final class Harness {
     // Bob starts completely clean and gets his own state.
     let v = jar
         .invoke_method_with_args(
-            "demo.Harness",
+            "demoprobe.Harness",
             "readState",
             "(Lnet/minecraft/world/entity/player/Player;I)Ljava/lang/String;",
             None,
@@ -629,7 +632,7 @@ public final class Harness {
     assert_eq!(v, Value::Ref(Some("0|7|init|null|12".into())));
 
     jar.invoke_method_with_args(
-        "demo.Harness",
+        "demoprobe.Harness",
         "storeState",
         "(Lnet/minecraft/world/entity/player/Player;ILjava/lang/String;ILjava/lang/String;)V",
         None,
@@ -647,7 +650,7 @@ public final class Harness {
     // 4. Non-player host object (Level) also supports interface-injection mixins.
     let v = jar
         .invoke_method_with_args(
-            "demo.Harness",
+            "demoprobe.Harness",
             "exerciseLevel",
             "(Lnet/minecraft/world/level/Level;I)Ljava/lang/String;",
             None,
@@ -660,7 +663,7 @@ public final class Harness {
     // 5. Force multiple GC collections by churning >3,000 short-lived objects across calls.
     for _ in 0..3 {
         jar.invoke_method_with_args(
-            "demo.Harness",
+            "demoprobe.Harness",
             "churnGarbage",
             "(I)I",
             None,
@@ -673,7 +676,7 @@ public final class Harness {
     // Both Alice and Bob's primitive fields AND jar objects survived GC intact!
     let alice_after = jar
         .invoke_method_with_args(
-            "demo.Harness",
+            "demoprobe.Harness",
             "readState",
             "(Lnet/minecraft/world/entity/player/Player;I)Ljava/lang/String;",
             None,
@@ -688,7 +691,7 @@ public final class Harness {
 
     let bob_after = jar
         .invoke_method_with_args(
-            "demo.Harness",
+            "demoprobe.Harness",
             "readState",
             "(Lnet/minecraft/world/entity/player/Player;I)Ljava/lang/String;",
             None,
@@ -704,7 +707,7 @@ public final class Harness {
     // Level state also survived GC.
     let level_after = jar
         .invoke_method_with_args(
-            "demo.Harness",
+            "demoprobe.Harness",
             "exerciseLevel",
             "(Lnet/minecraft/world/level/Level;I)Ljava/lang/String;",
             None,
@@ -717,7 +720,7 @@ public final class Harness {
     // 6. Respawn (new life) starts fresh.
     let respawned = jar
         .invoke_method_with_args(
-            "demo.Harness",
+            "demoprobe.Harness",
             "readState",
             "(Lnet/minecraft/world/entity/player/Player;I)Ljava/lang/String;",
             None,
@@ -735,7 +738,7 @@ public final class Harness {
     host.forget_game_object(&alice_marker);
     let alice_forgotten = jar
         .invoke_method_with_args(
-            "demo.Harness",
+            "demoprobe.Harness",
             "readState",
             "(Lnet/minecraft/world/entity/player/Player;I)Ljava/lang/String;",
             None,
@@ -759,8 +762,8 @@ public final class Harness {
 fn linked_jar_interface_mixin_applies_to_host_player() {
     let mut provider_sources = mixin_stubs();
     provider_sources.insert(
-        "lib/Counter.java",
-        r#"package lib;
+        "libprobe/Counter.java",
+        r#"package libprobe;
 public interface Counter {
     int get();
     void set(int v);
@@ -775,6 +778,7 @@ public interface Counter {
     provider_sources.insert(
         "lib/PlayerCounterMixin.java",
         r#"package lib;
+import libprobe.Counter;
 import net.minecraft.world.entity.player.Player;
 import org.spongepowered.asm.mixin.Mixin;
 
@@ -805,8 +809,8 @@ public class PlayerCounterMixin implements Counter {
 
     let mut consumer_sources = mixin_stubs();
     consumer_sources.insert(
-        "lib/Counter.java",
-        r#"package lib;
+        "libprobe/Counter.java",
+        r#"package libprobe;
 public interface Counter {
     int get();
     void set(int v);
@@ -817,7 +821,7 @@ public interface Counter {
     consumer_sources.insert(
         "app/UseCounter.java",
         r#"package app;
-import lib.Counter;
+import libprobe.Counter;
 import net.minecraft.world.entity.player.Player;
 
 public final class UseCounter {
@@ -829,7 +833,7 @@ public final class UseCounter {
 "#,
     );
     let mut consumer_excluded = COMPILE_ONLY_STUBS.to_vec();
-    consumer_excluded.push("lib/Counter.class");
+    consumer_excluded.push("libprobe/Counter.class");
     let consumer_path = build_jar(
         "linked-consumer",
         consumer_sources,
@@ -899,8 +903,8 @@ public class Minecraft {
 "#,
     );
     sources.insert(
-        "demo/PlayerState.java",
-        r#"package demo;
+        "demoprobe/PlayerState.java",
+        r#"package demoprobe;
 public interface PlayerState {
     int getCounter();
     void setCounter(int v);
@@ -910,6 +914,7 @@ public interface PlayerState {
     sources.insert(
         "demo/PlayerStateMixin.java",
         r#"package demo;
+import demoprobe.PlayerState;
 import net.minecraft.world.entity.player.Player;
 import org.spongepowered.asm.mixin.Mixin;
 
@@ -924,6 +929,7 @@ public class PlayerStateMixin implements PlayerState {
     sources.insert(
         "demo/TickHookMixin.java",
         r#"package demo;
+import demoprobe.PlayerState;
 import net.minecraft.server.level.ServerPlayer;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
@@ -941,8 +947,8 @@ public abstract class TickHookMixin {
 "#,
     );
     sources.insert(
-        "demo/Bridge.java",
-        r#"package demo;
+        "demoprobe/Bridge.java",
+        r#"package demoprobe;
 import net.minecraft.client.Minecraft;
 import net.minecraft.world.entity.player.Player;
 
@@ -1001,7 +1007,7 @@ public final class Bridge {
     client_host.begin_client_frame(snapshot, &[]);
     let c1 = jar
         .invoke_method(
-            "demo.Bridge",
+            "demoprobe.Bridge",
             "bumpClientPlayer",
             "()I",
             None,
@@ -1010,7 +1016,7 @@ public final class Bridge {
         .unwrap();
     let c2 = jar
         .invoke_method(
-            "demo.Bridge",
+            "demoprobe.Bridge",
             "bumpClientPlayer",
             "()I",
             None,
@@ -1041,7 +1047,7 @@ public final class Bridge {
 
     // Write via StdHost invocation -> 20
     jar.invoke_method_with_args(
-        "demo.Bridge",
+        "demoprobe.Bridge",
         "writeServer",
         "(Lnet/minecraft/world/entity/player/Player;I)V",
         None,
@@ -1068,7 +1074,7 @@ public final class Bridge {
     // Read back via StdHost -> sees 30!
     let after = jar
         .invoke_method_with_args(
-            "demo.Bridge",
+            "demoprobe.Bridge",
             "readServer",
             "(Lnet/minecraft/world/entity/player/Player;)I",
             None,
@@ -1086,8 +1092,8 @@ public final class Bridge {
 fn unsupported_mixin_forms_are_skipped_counted_or_refused() {
     let mut sources = mixin_stubs();
     sources.insert(
-        "demo/ShadowDuck.java",
-        r#"package demo;
+        "demoprobe/ShadowDuck.java",
+        r#"package demoprobe;
 public interface ShadowDuck {
     int readShadow();
     void writeShadow(int v);
@@ -1096,32 +1102,32 @@ public interface ShadowDuck {
 "#,
     );
     sources.insert(
-        "demo/UnlistedDuck.java",
-        r#"package demo;
+        "demoprobe/UnlistedDuck.java",
+        r#"package demoprobe;
 public interface UnlistedDuck { int ping(); }
 "#,
     );
     sources.insert(
-        "demo/ClientOnlyDuck.java",
-        r#"package demo;
+        "demoprobe/ClientOnlyDuck.java",
+        r#"package demoprobe;
 public interface ClientOnlyDuck { int clientPing(); }
 "#,
     );
     sources.insert(
-        "demo/ChunkDuck.java",
-        r#"package demo;
+        "demoprobe/ChunkDuck.java",
+        r#"package demoprobe;
 public interface ChunkDuck { int chunkTag(); }
 "#,
     );
     sources.insert(
-        "demo/ConflictDuck.java",
-        r#"package demo;
+        "demoprobe/ConflictDuck.java",
+        r#"package demoprobe;
 public interface ConflictDuck { int clash(); }
 "#,
     );
     sources.insert(
-        "demo/BadSuperDuck.java",
-        r#"package demo;
+        "demoprobe/BadSuperDuck.java",
+        r#"package demoprobe;
 public interface BadSuperDuck { int getVal(); }
 "#,
     );
@@ -1171,6 +1177,7 @@ public interface ChunkAccessor {
     sources.insert(
         "demo/ChunkDuckMixin.java",
         r#"package demo;
+import demoprobe.ChunkDuck;
 import net.minecraft.world.level.chunk.LevelChunk;
 import org.spongepowered.asm.mixin.Mixin;
 
@@ -1185,6 +1192,7 @@ public class ChunkDuckMixin implements ChunkDuck {
     sources.insert(
         "demo/ShadowMixin.java",
         r#"package demo;
+import demoprobe.ShadowDuck;
 import net.minecraft.world.entity.player.Player;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Shadow;
@@ -1204,6 +1212,7 @@ public abstract class ShadowMixin implements ShadowDuck {
     sources.insert(
         "demo/UnlistedMixin.java",
         r#"package demo;
+import demoprobe.UnlistedDuck;
 import net.minecraft.world.entity.player.Player;
 import org.spongepowered.asm.mixin.Mixin;
 
@@ -1216,6 +1225,7 @@ public class UnlistedMixin implements UnlistedDuck {
     sources.insert(
         "demo/ClientOnlyMixin.java",
         r#"package demo;
+import demoprobe.ClientOnlyDuck;
 import net.minecraft.world.entity.player.Player;
 import org.spongepowered.asm.mixin.Mixin;
 
@@ -1229,6 +1239,7 @@ public class ClientOnlyMixin implements ClientOnlyDuck {
     sources.insert(
         "demo/ConflictAMixin.java",
         r#"package demo;
+import demoprobe.ConflictDuck;
 import net.minecraft.world.entity.player.Player;
 import org.spongepowered.asm.mixin.Mixin;
 
@@ -1241,6 +1252,7 @@ public class ConflictAMixin implements ConflictDuck {
     sources.insert(
         "demo/ConflictBMixin.java",
         r#"package demo;
+import demoprobe.ConflictDuck;
 import net.minecraft.world.entity.player.Player;
 import org.spongepowered.asm.mixin.Mixin;
 
@@ -1254,6 +1266,7 @@ public class ConflictBMixin implements ConflictDuck {
     sources.insert(
         "demo/BadSuperMixin.java",
         r#"package demo;
+import demoprobe.BadSuperDuck;
 import net.minecraft.world.entity.LivingEntity;
 import net.minecraft.world.entity.player.Player;
 import org.spongepowered.asm.mixin.Mixin;
@@ -1266,8 +1279,9 @@ public abstract class BadSuperMixin extends LivingEntity implements BadSuperDuck
 "#,
     );
     sources.insert(
-        "demo/NegativeProbe.java",
-        r#"package demo;
+        "demoprobe/NegativeProbe.java",
+        r#"package demoprobe;
+import demo.ChunkAccessor;
 import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.chunk.LevelChunk;
@@ -1440,7 +1454,7 @@ public final class NegativeProbe {
     ] {
         let mut lenient = StdHost::new().with_environment_type("SERVER");
         let outcome = jar.invoke_method_with_args(
-            "demo.NegativeProbe",
+            "demoprobe.NegativeProbe",
             method,
             desc,
             None,
@@ -1457,7 +1471,7 @@ public final class NegativeProbe {
             .with_environment_type("SERVER")
             .with_strict_unknown_host_calls();
         let err = jar.invoke_method_with_args(
-            "demo.NegativeProbe",
+            "demoprobe.NegativeProbe",
             method,
             desc,
             None,
@@ -1473,7 +1487,7 @@ public final class NegativeProbe {
     // Shadow write on lenient host must NOT fake-persist a field that a subsequent read returns.
     let mut shadow_host = StdHost::new().with_environment_type("SERVER");
     jar.invoke_method_with_args(
-        "demo.NegativeProbe",
+        "demoprobe.NegativeProbe",
         "writeShadow",
         "(Lnet/minecraft/world/entity/player/Player;I)V",
         None,
@@ -1483,7 +1497,7 @@ public final class NegativeProbe {
     .unwrap();
     let read_back = jar
         .invoke_method_with_args(
-            "demo.NegativeProbe",
+            "demoprobe.NegativeProbe",
             "readShadow",
             "(Lnet/minecraft/world/entity/player/Player;)I",
             None,
@@ -1502,7 +1516,7 @@ public final class NegativeProbe {
     let mut accessor_host = StdHost::new().with_environment_type("SERVER");
     let chunk = jar
         .invoke_method(
-            "demo.NegativeProbe",
+            "demoprobe.NegativeProbe",
             "makeChunk",
             "()Ljava/lang/Object;",
             None,
@@ -1511,7 +1525,7 @@ public final class NegativeProbe {
         .unwrap();
     let before = accessor_host.unknown_host_call_count();
     jar.invoke_method_with_args(
-        "demo.NegativeProbe",
+        "demoprobe.NegativeProbe",
         "readChunkAccessor",
         "(Ljava/lang/Object;)I",
         None,
@@ -1765,20 +1779,22 @@ public final class RunesProbe {
 fn configless_jar_preserves_jar_local_woven_interface_but_gates_host_game_object() {
     let mut sources = mixin_stubs();
     sources.insert(
-        "demo/LocalDuck.java",
-        "package demo;\npublic interface LocalDuck {}\n",
+        "demoprobe/LocalDuck.java",
+        "package demoprobe;\npublic interface LocalDuck {}\n",
     );
     sources.insert(
-        "demo/HostDuck.java",
-        "package demo;\npublic interface HostDuck { int value(); }\n",
+        "demoprobe/HostDuck.java",
+        "package demoprobe;\npublic interface HostDuck { int value(); }\n",
     );
     sources.insert(
-        "demo/LocalTarget.java",
-        "package demo;\npublic class LocalTarget {}\n",
+        "demoprobe/LocalTarget.java",
+        "package demoprobe;\npublic class LocalTarget {}\n",
     );
     sources.insert(
         "demo/LocalTargetMixin.java",
         r#"package demo;
+import demoprobe.LocalDuck;
+import demoprobe.LocalTarget;
 import org.spongepowered.asm.mixin.Mixin;
 
 @Mixin(LocalTarget.class)
@@ -1788,6 +1804,7 @@ public abstract class LocalTargetMixin implements LocalDuck {}
     sources.insert(
         "demo/UnconfiguredPlayerMixin.java",
         r#"package demo;
+import demoprobe.HostDuck;
 import net.minecraft.world.entity.player.Player;
 import org.spongepowered.asm.mixin.Mixin;
 
@@ -1798,8 +1815,8 @@ public class UnconfiguredPlayerMixin implements HostDuck {
 "#,
     );
     sources.insert(
-        "demo/ConfiglessProbe.java",
-        r#"package demo;
+        "demoprobe/ConfiglessProbe.java",
+        r#"package demoprobe;
 import net.minecraft.world.entity.player.Player;
 
 public final class ConfiglessProbe {
@@ -1827,7 +1844,7 @@ public final class ConfiglessProbe {
     let mut host = StdHost::new().with_environment_type("SERVER");
     let local = jar
         .invoke_method(
-            "demo.ConfiglessProbe",
+            "demoprobe.ConfiglessProbe",
             "checkLocal",
             "()Ljava/lang/String;",
             None,
@@ -1843,7 +1860,7 @@ public final class ConfiglessProbe {
         .with_environment_type("SERVER")
         .with_strict_unknown_host_calls();
     let err = jar.invoke_method_with_args(
-        "demo.ConfiglessProbe",
+        "demoprobe.ConfiglessProbe",
         "checkHost",
         "(Lnet/minecraft/world/entity/player/Player;)Z",
         None,
@@ -1878,7 +1895,7 @@ fn injected_interface_default_does_not_override_concrete_target_method_matches_j
     fs::create_dir_all(&oracle_classes).unwrap();
     fs::write(
         &oracle_src,
-        r#"package demo;
+        r#"package demoprobe;
 public final class JdkOracle {
     public interface Duck {
         default int getId() { return 7; }
@@ -1915,7 +1932,7 @@ public final class JdkOracle {
     let run = Command::new(java_bin())
         .arg("-cp")
         .arg(&oracle_classes)
-        .arg("demo.JdkOracle")
+        .arg("demoprobe.JdkOracle")
         .output()
         .unwrap();
     assert!(
@@ -1941,8 +1958,8 @@ public final class JdkOracle {
         "package net.minecraft.client;\nimport net.minecraft.client.player.LocalPlayer;\npublic class Minecraft { public LocalPlayer player; public static Minecraft getInstance() { return null; } }\n",
     );
     sources.insert(
-        "demo/Duck.java",
-        r#"package demo;
+        "demoprobe/Duck.java",
+        r#"package demoprobe;
 public interface Duck {
     default int getId() { return 7; }
     default int getScore() { return 7; }
@@ -1954,6 +1971,8 @@ public interface Duck {
     sources.insert(
         "demo/PlayerDuckMixin.java",
         r#"package demo;
+import demoprobe.DefaultProbe;
+import demoprobe.Duck;
 import net.minecraft.world.entity.player.Player;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
@@ -1976,6 +1995,7 @@ public class PlayerDuckMixin implements Duck {
     sources.insert(
         "demo/LevelDuckMixin.java",
         r#"package demo;
+import demoprobe.Duck;
 import net.minecraft.world.level.Level;
 import org.spongepowered.asm.mixin.Mixin;
 
@@ -1984,8 +2004,8 @@ public class LevelDuckMixin implements Duck {}
 "#,
     );
     sources.insert(
-        "demo/DefaultProbe.java",
-        r#"package demo;
+        "demoprobe/DefaultProbe.java",
+        r#"package demoprobe;
 import net.minecraft.client.Minecraft;
 import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.level.Level;
@@ -2067,7 +2087,7 @@ public final class DefaultProbe {
     )));
     let modelled = jar
         .invoke_method_with_args(
-            "demo.DefaultProbe",
+            "demoprobe.DefaultProbe",
             "probeModelled",
             "(Lnet/minecraft/world/entity/player/Player;Lnet/minecraft/world/level/Level;)Ljava/lang/String;",
             None,
@@ -2084,7 +2104,7 @@ public final class DefaultProbe {
 
     // - On a server player handle, StdHost's server façade refuses unmodelled Player#getScore()I loudly.
     let firing_err = jar.invoke_method_with_args(
-        "demo.DefaultProbe",
+        "demoprobe.DefaultProbe",
         "probeUnmodelledScore",
         "(Lnet/minecraft/world/entity/player/Player;)I",
         None,
@@ -2122,7 +2142,7 @@ public final class DefaultProbe {
     client_host.begin_client_frame(Arc::clone(&client_snap), &[]);
     let client_mod = jar
         .invoke_method(
-            "demo.DefaultProbe",
+            "demoprobe.DefaultProbe",
             "probeClientModelled",
             "()Ljava/lang/String;",
             None,
@@ -2132,7 +2152,7 @@ public final class DefaultProbe {
     assert_eq!(client_mod, Value::Ref(Some("42,99".into())));
     assert_eq!(client_host.unknown_host_call_count(), 0);
     let client_score_err = jar.invoke_method(
-        "demo.DefaultProbe",
+        "demoprobe.DefaultProbe",
         "probeClientUnmodelledScore",
         "()I",
         None,
@@ -2175,7 +2195,7 @@ public final class DefaultProbe {
     .unwrap();
     let observed = jar
         .invoke_method(
-            "demo.DefaultProbe",
+            "demoprobe.DefaultProbe",
             "readHookObserved",
             "()Ljava/lang/String;",
             None,
@@ -2187,7 +2207,7 @@ public final class DefaultProbe {
 
     // Calling unmodelled concrete Player#getScore()I inside the game hook refuses loudly.
     jar.invoke_method_with_args(
-        "demo.DefaultProbe",
+        "demoprobe.DefaultProbe",
         "setCallScoreInHook",
         "(Z)V",
         None,
@@ -2255,8 +2275,8 @@ public interface IMixinConfigPlugin {
 "#,
     );
     sources.insert(
-        "demo/DemoPlugin.java",
-        r#"package demo;
+        "demoprobe/DemoPlugin.java",
+        r#"package demoprobe;
 import java.util.List;
 import java.util.Set;
 import org.objectweb.asm.tree.ClassNode;
@@ -2277,24 +2297,29 @@ public class DemoPlugin implements IMixinConfigPlugin {
 "#,
     );
     sources.insert(
-        "demo/ActiveDuck.java",
-        "package demo;\npublic interface ActiveDuck { int activeVal(); }\n",
+        "demoprobe/ActiveDuck.java",
+        "package demoprobe;\npublic interface ActiveDuck { int activeVal(); }\n",
     );
     sources.insert(
-        "demo/UnlistedDuck.java",
-        "package demo;\npublic interface UnlistedDuck { int val(); }\n",
+        "demoprobe/UnlistedDuck.java",
+        "package demoprobe;\npublic interface UnlistedDuck { int val(); }\n",
     );
     sources.insert(
-        "demo/ClientOnlyDuck.java",
-        "package demo;\npublic interface ClientOnlyDuck { int val(); }\n",
+        "demoprobe/ClientOnlyDuck.java",
+        "package demoprobe;\npublic interface ClientOnlyDuck { int val(); }\n",
     );
     sources.insert(
-        "demo/PluginDeclinedDuck.java",
-        "package demo;\npublic interface PluginDeclinedDuck { int val(); }\n",
+        "demoprobe/PluginDeclinedDuck.java",
+        "package demoprobe;\npublic interface PluginDeclinedDuck { int val(); }\n",
     );
     sources.insert(
         "demo/ServerActiveMixin.java",
         r#"package demo;
+import demoprobe.ActiveDuck;
+import demoprobe.ClientOnlyDuck;
+import demoprobe.HookGateProbe;
+import demoprobe.PluginDeclinedDuck;
+import demoprobe.UnlistedDuck;
 import net.minecraft.world.entity.player.Player;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
@@ -2328,6 +2353,7 @@ public class ServerActiveMixin implements ActiveDuck {
     sources.insert(
         "demo/UnlistedHookMixin.java",
         r#"package demo;
+import demoprobe.UnlistedDuck;
 import net.minecraft.world.entity.player.Player;
 import org.spongepowered.asm.mixin.Mixin;
 
@@ -2340,6 +2366,7 @@ public class UnlistedHookMixin implements UnlistedDuck {
     sources.insert(
         "demo/ClientOnlyHookMixin.java",
         r#"package demo;
+import demoprobe.ClientOnlyDuck;
 import net.minecraft.world.entity.player.Player;
 import org.spongepowered.asm.mixin.Mixin;
 
@@ -2352,6 +2379,7 @@ public class ClientOnlyHookMixin implements ClientOnlyDuck {
     sources.insert(
         "demo/PluginDeclinedMixin.java",
         r#"package demo;
+import demoprobe.PluginDeclinedDuck;
 import net.minecraft.world.entity.player.Player;
 import org.spongepowered.asm.mixin.Mixin;
 
@@ -2362,8 +2390,8 @@ public class PluginDeclinedMixin implements PluginDeclinedDuck {
 "#,
     );
     sources.insert(
-        "demo/HookGateProbe.java",
-        r#"package demo;
+        "demoprobe/HookGateProbe.java",
+        r#"package demoprobe;
 import net.minecraft.world.entity.player.Player;
 
 public final class HookGateProbe {
@@ -2393,7 +2421,7 @@ public final class HookGateProbe {
             ),
             (
                 "demo.mixins.json",
-                r#"{"required":true,"package":"demo","plugin":"demo.DemoPlugin","mixins":["ServerActiveMixin","PluginDeclinedMixin"],"client":["ClientOnlyHookMixin"]}"#,
+                r#"{"required":true,"package":"demo","plugin":"demoprobe.DemoPlugin","mixins":["ServerActiveMixin","PluginDeclinedMixin"],"client":["ClientOnlyHookMixin"]}"#,
             ),
         ],
         &excluded,
@@ -2422,7 +2450,7 @@ public final class HookGateProbe {
     .unwrap();
     let report = jar
         .invoke_method(
-            "demo.HookGateProbe",
+            "demoprobe.HookGateProbe",
             "readReport",
             "()Ljava/lang/String;",
             None,
@@ -2438,12 +2466,12 @@ public final class HookGateProbe {
     // Calling any gated interface method inside the server hook must refuse loudly rather than
     // dispatching to UnlistedHookMixin, ClientOnlyHookMixin, or PluginDeclinedMixin.
     for (mode, expected_iface) in [
-        (1, "demo/UnlistedDuck#val()I"),
-        (2, "demo/ClientOnlyDuck#val()I"),
-        (3, "demo/PluginDeclinedDuck#val()I"),
+        (1, "demoprobe/UnlistedDuck#val()I"),
+        (2, "demoprobe/ClientOnlyDuck#val()I"),
+        (3, "demoprobe/PluginDeclinedDuck#val()I"),
     ] {
         jar.invoke_method_with_args(
-            "demo.HookGateProbe",
+            "demoprobe.HookGateProbe",
             "setCallMode",
             "(I)V",
             None,
@@ -2482,7 +2510,7 @@ public final class HookGateProbe {
     let p = server_player(12, "HookTester", 1, 0, 5);
     let active = jar
         .invoke_method_with_args(
-            "demo.HookGateProbe",
+            "demoprobe.HookGateProbe",
             "readActive",
             "(Lnet/minecraft/world/entity/player/Player;)I",
             None,
@@ -2496,7 +2524,7 @@ public final class HookGateProbe {
         .with_environment_type("SERVER")
         .with_strict_unknown_host_calls();
     let declined_err = jar.invoke_method_with_args(
-        "demo.HookGateProbe",
+        "demoprobe.HookGateProbe",
         "checkPluginDeclined",
         "(Lnet/minecraft/world/entity/player/Player;)Z",
         None,
@@ -2531,16 +2559,17 @@ fn entity_respawn_same_id_and_client_player_rejoin_reset_mixin_fields() {
         "package net.minecraft.client;\nimport net.minecraft.client.player.LocalPlayer;\npublic class Minecraft { public LocalPlayer player; public static Minecraft getInstance() { return null; } }\n",
     );
     sources.insert(
-        "demo/EntityTag.java",
-        "package demo;\npublic interface EntityTag { int getCounter(); void setCounter(int v); int readId(); }\n",
+        "demoprobe/EntityTag.java",
+        "package demoprobe;\npublic interface EntityTag { int getCounter(); void setCounter(int v); int readId(); }\n",
     );
     sources.insert(
-        "demo/PlayerTag.java",
-        "package demo;\npublic interface PlayerTag { int getTag(); void setTag(int v); }\n",
+        "demoprobe/PlayerTag.java",
+        "package demoprobe;\npublic interface PlayerTag { int getTag(); void setTag(int v); }\n",
     );
     sources.insert(
         "demo/EntityTagMixin.java",
         r#"package demo;
+import demoprobe.EntityTag;
 import net.minecraft.world.entity.Entity;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Shadow;
@@ -2560,6 +2589,7 @@ public abstract class EntityTagMixin implements EntityTag {
     sources.insert(
         "demo/ClientPlayerTagMixin.java",
         r#"package demo;
+import demoprobe.PlayerTag;
 import net.minecraft.world.entity.player.Player;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Unique;
@@ -2573,8 +2603,8 @@ public class ClientPlayerTagMixin implements PlayerTag {
 "#,
     );
     sources.insert(
-        "demo/LifetimeProbe.java",
-        r#"package demo;
+        "demoprobe/LifetimeProbe.java",
+        r#"package demoprobe;
 import net.minecraft.client.Minecraft;
 import net.minecraft.world.entity.Entity;
 
@@ -2631,7 +2661,7 @@ public final class LifetimeProbe {
         .value();
     assert_eq!(
         jar.invoke_method_with_args(
-            "demo.LifetimeProbe",
+            "demoprobe.LifetimeProbe",
             "readEntity",
             "(Lnet/minecraft/world/entity/Entity;)I",
             None,
@@ -2643,7 +2673,7 @@ public final class LifetimeProbe {
     );
     assert_eq!(
         jar.invoke_method_with_args(
-            "demo.LifetimeProbe",
+            "demoprobe.LifetimeProbe",
             "readEntityId",
             "(Lnet/minecraft/world/entity/Entity;)I",
             None,
@@ -2654,7 +2684,7 @@ public final class LifetimeProbe {
         Value::Int(42)
     );
     jar.invoke_method_with_args(
-        "demo.LifetimeProbe",
+        "demoprobe.LifetimeProbe",
         "writeEntity",
         "(Lnet/minecraft/world/entity/Entity;I)V",
         None,
@@ -2664,7 +2694,7 @@ public final class LifetimeProbe {
     .unwrap();
     assert_eq!(
         jar.invoke_method_with_args(
-            "demo.LifetimeProbe",
+            "demoprobe.LifetimeProbe",
             "readEntity",
             "(Lnet/minecraft/world/entity/Entity;)I",
             None,
@@ -2696,7 +2726,7 @@ public final class LifetimeProbe {
         .value();
     assert_eq!(
         jar.invoke_method_with_args(
-            "demo.LifetimeProbe",
+            "demoprobe.LifetimeProbe",
             "readEntity",
             "(Lnet/minecraft/world/entity/Entity;)I",
             None,
@@ -2709,7 +2739,7 @@ public final class LifetimeProbe {
     );
     assert_eq!(
         jar.invoke_method_with_args(
-            "demo.LifetimeProbe",
+            "demoprobe.LifetimeProbe",
             "readEntityId",
             "(Lnet/minecraft/world/entity/Entity;)I",
             None,
@@ -2722,7 +2752,7 @@ public final class LifetimeProbe {
     );
     // Even without calling forget, a fresh incarnation 3 on id=42 cannot alias incarnation 2.
     jar.invoke_method_with_args(
-        "demo.LifetimeProbe",
+        "demoprobe.LifetimeProbe",
         "writeEntity",
         "(Lnet/minecraft/world/entity/Entity;I)V",
         None,
@@ -2735,7 +2765,7 @@ public final class LifetimeProbe {
         .value();
     assert_eq!(
         jar.invoke_method_with_args(
-            "demo.LifetimeProbe",
+            "demoprobe.LifetimeProbe",
             "readEntity",
             "(Lnet/minecraft/world/entity/Entity;)I",
             None,
@@ -2769,7 +2799,7 @@ public final class LifetimeProbe {
     client.begin_client_frame(frame_with(7, 100), &[]);
     assert_eq!(
         jar.invoke_method(
-            "demo.LifetimeProbe",
+            "demoprobe.LifetimeProbe",
             "readLocalPlayer",
             "()I",
             None,
@@ -2779,7 +2809,7 @@ public final class LifetimeProbe {
         Value::Int(7)
     );
     jar.invoke_method_with_args(
-        "demo.LifetimeProbe",
+        "demoprobe.LifetimeProbe",
         "writeLocalPlayer",
         "(I)V",
         None,
@@ -2793,7 +2823,7 @@ public final class LifetimeProbe {
     client.begin_client_frame(frame_with(7, 100), &[]);
     assert_eq!(
         jar.invoke_method(
-            "demo.LifetimeProbe",
+            "demoprobe.LifetimeProbe",
             "readLocalPlayer",
             "()I",
             None,
@@ -2810,7 +2840,7 @@ public final class LifetimeProbe {
     client.begin_client_frame(frame_with(7, 100), &[]);
     assert_eq!(
         jar.invoke_method(
-            "demo.LifetimeProbe",
+            "demoprobe.LifetimeProbe",
             "readLocalPlayer",
             "()I",
             None,
@@ -2821,7 +2851,7 @@ public final class LifetimeProbe {
         "rejoined LocalPlayer must start with default Mixin fields"
     );
     jar.invoke_method_with_args(
-        "demo.LifetimeProbe",
+        "demoprobe.LifetimeProbe",
         "writeLocalPlayer",
         "(I)V",
         None,
@@ -2835,7 +2865,7 @@ public final class LifetimeProbe {
     client.begin_client_frame(frame_with(7, 101), &[]);
     assert_eq!(
         jar.invoke_method(
-            "demo.LifetimeProbe",
+            "demoprobe.LifetimeProbe",
             "readLocalPlayer",
             "()I",
             None,
@@ -2846,7 +2876,7 @@ public final class LifetimeProbe {
         "LocalPlayer with new entity_id must start with default Mixin fields"
     );
     jar.invoke_method_with_args(
-        "demo.LifetimeProbe",
+        "demoprobe.LifetimeProbe",
         "writeLocalPlayer",
         "(I)V",
         None,
@@ -2861,7 +2891,7 @@ public final class LifetimeProbe {
     client.begin_client_frame(frame_with(7, 101), &[]);
     assert_eq!(
         jar.invoke_method(
-            "demo.LifetimeProbe",
+            "demoprobe.LifetimeProbe",
             "readLocalPlayer",
             "()I",
             None,
@@ -2881,16 +2911,18 @@ public final class LifetimeProbe {
 fn multi_target_shadow_resolves_per_receiver_and_refuses_ambiguous() {
     let mut sources = mixin_stubs();
     sources.insert(
-        "demo/MultiDuck.java",
-        "package demo;\npublic interface MultiDuck { boolean checkClient(); int checkId(); }\n",
+        "demoprobe/MultiDuck.java",
+        "package demoprobe;\npublic interface MultiDuck { boolean checkClient(); int checkId(); }\n",
     );
     sources.insert(
-        "demo/AmbiguousDuck.java",
-        "package demo;\npublic interface AmbiguousDuck { int ambiguousId(); }\n",
+        "demoprobe/AmbiguousDuck.java",
+        "package demoprobe;\npublic interface AmbiguousDuck { int ambiguousId(); }\n",
     );
     sources.insert(
         "demo/MultiShadowMixin.java",
         r#"package demo;
+import demoprobe.MultiDuck;
+import demoprobe.ShadowProbe;
 import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.level.Level;
 import org.spongepowered.asm.mixin.Mixin;
@@ -2919,6 +2951,8 @@ public abstract class MultiShadowMixin implements MultiDuck {
     sources.insert(
         "demo/AmbiguousShadowMixin.java",
         r#"package demo;
+import demoprobe.AmbiguousDuck;
+import demoprobe.ShadowProbe;
 import java.util.function.IntSupplier;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.entity.player.Player;
@@ -2946,8 +2980,8 @@ public abstract class AmbiguousShadowMixin implements AmbiguousDuck {
 "#,
     );
     sources.insert(
-        "demo/ShadowProbe.java",
-        r#"package demo;
+        "demoprobe/ShadowProbe.java",
+        r#"package demoprobe;
 import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.level.Level;
 
@@ -3003,7 +3037,7 @@ public final class ShadowProbe {
     )));
     let both = jar
         .invoke_method_with_args(
-            "demo.ShadowProbe",
+            "demoprobe.ShadowProbe",
             "checkBoth",
             "(Lnet/minecraft/world/entity/player/Player;Lnet/minecraft/world/level/Level;)Ljava/lang/String;",
             None,
@@ -3023,7 +3057,7 @@ public final class ShadowProbe {
     // must count on lenient host and refuse loudly on strict host instead of guessing targets.first().
     let ambig = jar
         .invoke_method_with_args(
-            "demo.ShadowProbe",
+            "demoprobe.ShadowProbe",
             "checkAmbiguous",
             "(Lnet/minecraft/world/entity/player/Player;)I",
             None,
@@ -3048,7 +3082,7 @@ public final class ShadowProbe {
         EventContext::default(),
     )));
     let err = jar.invoke_method_with_args(
-        "demo.ShadowProbe",
+        "demoprobe.ShadowProbe",
         "checkAmbiguous",
         "(Lnet/minecraft/world/entity/player/Player;)I",
         None,
@@ -3070,7 +3104,7 @@ public final class ShadowProbe {
     let mut hook_host = StdHost::new().with_environment_type("SERVER");
     let mut hook_state = GameHookState::default();
     jar.invoke_method_with_args(
-        "demo.ShadowProbe",
+        "demoprobe.ShadowProbe",
         "configureHook",
         "(I)V",
         None,
@@ -3097,7 +3131,7 @@ public final class ShadowProbe {
     .unwrap();
     assert_eq!(
         jar.invoke_method(
-            "demo.ShadowProbe",
+            "demoprobe.ShadowProbe",
             "readHookResult",
             "()I",
             None,
@@ -3114,7 +3148,7 @@ public final class ShadowProbe {
         let mut lenient = StdHost::new().with_environment_type("SERVER");
         let mut state_l = GameHookState::default();
         jar.invoke_method_with_args(
-            "demo.ShadowProbe",
+            "demoprobe.ShadowProbe",
             "configureHook",
             "(I)V",
             None,
@@ -3141,7 +3175,7 @@ public final class ShadowProbe {
         .unwrap();
         let got = jar
             .invoke_method(
-                "demo.ShadowProbe",
+                "demoprobe.ShadowProbe",
                 "readHookResult",
                 "()I",
                 None,
@@ -3165,7 +3199,7 @@ public final class ShadowProbe {
             .with_strict_unknown_host_calls();
         let mut state_s = GameHookState::default();
         jar.invoke_method_with_args(
-            "demo.ShadowProbe",
+            "demoprobe.ShadowProbe",
             "configureHook",
             "(I)V",
             None,
@@ -3406,8 +3440,8 @@ fn jdk_interface_defaults_and_unrelated_default_conflicts_match_jdk25() {
         "package net.minecraft.client;\nimport net.minecraft.client.player.LocalPlayer;\npublic class Minecraft { public LocalPlayer player; public static Minecraft getInstance() { return null; } }\n",
     );
     sources.insert(
-        "demo/ForEachDuck.java",
-        r#"package demo;
+        "demoprobe/ForEachDuck.java",
+        r#"package demoprobe;
 import java.util.Spliterator;
 import java.util.function.Consumer;
 import net.minecraft.world.item.ItemStack;
@@ -3424,8 +3458,8 @@ public interface ForEachDuck {
 "#,
     );
     sources.insert(
-        "demo/SubIterableDuck.java",
-        r#"package demo;
+        "demoprobe/SubIterableDuck.java",
+        r#"package demoprobe;
 import java.util.function.Consumer;
 import net.minecraft.world.item.ItemStack;
 
@@ -3439,6 +3473,7 @@ public interface SubIterableDuck extends Iterable<ItemStack> {
     sources.insert(
         "demo/InvConflictMixin.java",
         r#"package demo;
+import demoprobe.ForEachDuck;
 import net.minecraft.world.entity.player.Inventory;
 import org.spongepowered.asm.mixin.Mixin;
 
@@ -3449,6 +3484,7 @@ public abstract class InvConflictMixin implements ForEachDuck {}
     sources.insert(
         "demo/InvSubMixin.java",
         r#"package demo;
+import demoprobe.SubIterableDuck;
 import net.minecraft.world.entity.player.Inventory;
 import org.spongepowered.asm.mixin.Mixin;
 
@@ -3457,16 +3493,17 @@ public abstract class InvSubMixin implements SubIterableDuck {}
 "#,
     );
     sources.insert(
-        "demo/PingA.java",
-        "package demo;\npublic interface PingA { default int ping() { return 1; } }\n",
+        "demoprobe/PingA.java",
+        "package demoprobe;\npublic interface PingA { default int ping() { return 1; } }\n",
     );
     sources.insert(
-        "demo/PingB.java",
-        "package demo;\npublic interface PingB { default int ping() { return 2; } }\n",
+        "demoprobe/PingB.java",
+        "package demoprobe;\npublic interface PingB { default int ping() { return 2; } }\n",
     );
     sources.insert(
         "demo/PingAMixin.java",
         r#"package demo;
+import demoprobe.PingA;
 import net.minecraft.world.entity.player.Player;
 import org.spongepowered.asm.mixin.Mixin;
 
@@ -3477,6 +3514,7 @@ public abstract class PingAMixin implements PingA {}
     sources.insert(
         "demo/PingBMixin.java",
         r#"package demo;
+import demoprobe.PingB;
 import net.minecraft.world.entity.player.Player;
 import org.spongepowered.asm.mixin.Mixin;
 
@@ -3485,8 +3523,8 @@ public abstract class PingBMixin implements PingB {}
 "#,
     );
     sources.insert(
-        "demo/JdkDefaultProbe.java",
-        r#"package demo;
+        "demoprobe/JdkDefaultProbe.java",
+        r#"package demoprobe;
 import net.minecraft.client.Minecraft;
 import net.minecraft.world.entity.player.Player;
 
@@ -3564,7 +3602,7 @@ public final class JdkDefaultProbe {
 
     // 2a. `ForEachDuck.forEach` conflicts with `java/lang/Iterable.forEach` -> IncompatibleClassChangeError.
     let foreach_err = jar_conflict.invoke_method(
-        "demo.JdkDefaultProbe",
+        "demoprobe.JdkDefaultProbe",
         "callInvForEach",
         "()V",
         None,
@@ -3576,14 +3614,14 @@ public final class JdkDefaultProbe {
             Err(NativeError::UncaughtException { class, message: Some(msg), .. })
                 if class == "java/lang/IncompatibleClassChangeError"
                     && msg.contains("java/lang/Iterable.forEach")
-                    && msg.contains("demo/ForEachDuck.forEach")
+                    && msg.contains("demoprobe/ForEachDuck.forEach")
         ),
         "expected IncompatibleClassChangeError between Iterable.forEach and ForEachDuck.forEach, got: {foreach_err:?}"
     );
 
     // 2b. `ForEachDuck.spliterator` conflicts with `java/lang/Iterable.spliterator` -> IncompatibleClassChangeError.
     let split_err = jar_conflict.invoke_method(
-        "demo.JdkDefaultProbe",
+        "demoprobe.JdkDefaultProbe",
         "callInvSpliterator",
         "()Ljava/lang/Object;",
         None,
@@ -3595,14 +3633,14 @@ public final class JdkDefaultProbe {
             Err(NativeError::UncaughtException { class, message: Some(msg), .. })
                 if class == "java/lang/IncompatibleClassChangeError"
                     && msg.contains("java/lang/Iterable.spliterator")
-                    && msg.contains("demo/ForEachDuck.spliterator")
+                    && msg.contains("demoprobe/ForEachDuck.spliterator")
         ),
         "expected IncompatibleClassChangeError between Iterable.spliterator and ForEachDuck.spliterator, got: {split_err:?}"
     );
     assert_eq!(
         jar_conflict
             .invoke_method(
-                "demo.JdkDefaultProbe",
+                "demoprobe.JdkDefaultProbe",
                 "didRunUnrelatedDuck",
                 "()Z",
                 None,
@@ -3618,7 +3656,7 @@ public final class JdkDefaultProbe {
     let mut server = StdHost::new().with_environment_type("SERVER");
     let player = server_player(1, "ConflictHero", 1, 0, 42);
     let pair_err = jar_conflict.invoke_method_with_args(
-        "demo.JdkDefaultProbe",
+        "demoprobe.JdkDefaultProbe",
         "callUnrelatedPlayerDefaults",
         "(Lnet/minecraft/world/entity/player/Player;)I",
         None,
@@ -3630,8 +3668,8 @@ public final class JdkDefaultProbe {
             &pair_err,
             Err(NativeError::UncaughtException { class, message: Some(msg), .. })
                 if class == "java/lang/IncompatibleClassChangeError"
-                    && msg.contains("demo/PingA.ping")
-                    && msg.contains("demo/PingB.ping")
+                    && msg.contains("demoprobe/PingA.ping")
+                    && msg.contains("demoprobe/PingB.ping")
         ),
         "expected IncompatibleClassChangeError between PingA.ping and PingB.ping, got: {pair_err:?}"
     );
@@ -3657,7 +3695,7 @@ public final class JdkDefaultProbe {
     sub_client.begin_client_frame(frame, &[]);
     let sub_out = jar_sub
         .invoke_method(
-            "demo.JdkDefaultProbe",
+            "demoprobe.JdkDefaultProbe",
             "callInvSubForEach",
             "()Ljava/lang/String;",
             None,
@@ -3749,8 +3787,8 @@ public class Level {
     // Jar-local target: a mutable static, a non-final static a shadow calls `@Final`, and a
     // really final (non-constant) static.
     sources.insert(
-        "demo/StaticTarget.java",
-        r#"package demo;
+        "demoprobe/StaticTarget.java",
+        r#"package demoprobe;
 public class StaticTarget {
     public static int count = 10;
     public static int loose = 3;
@@ -3762,6 +3800,7 @@ public class StaticTarget {
     sources.insert(
         "demo/JarStaticShadowMixin.java",
         r#"package demo;
+import demoprobe.StaticTarget;
 import org.spongepowered.asm.mixin.Final;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Shadow;
@@ -3787,8 +3826,8 @@ public abstract class JarStaticShadowMixin {
     );
     // `@Mutable` clears the target field's ACC_FINAL, so it gets its own target.
     sources.insert(
-        "demo/MutableTarget.java",
-        r#"package demo;
+        "demoprobe/MutableTarget.java",
+        r#"package demoprobe;
 public class MutableTarget {
     public static final int LOCKED = initLocked();
     private static int initLocked() { return 55; }
@@ -3798,6 +3837,7 @@ public class MutableTarget {
     sources.insert(
         "demo/MutableStaticShadowMixin.java",
         r#"package demo;
+import demoprobe.MutableTarget;
 import org.spongepowered.asm.mixin.Final;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Mutable;
@@ -3901,6 +3941,7 @@ public abstract class AmbiguousStaticMixin {
     sources.insert(
         "demo/PlayerStaticHookMixin.java",
         r#"package demo;
+import demoprobe.StaticShadowProbe;
 import net.minecraft.world.entity.player.Player;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Shadow;
@@ -3934,8 +3975,9 @@ public abstract class PlayerStaticHookMixin {
 "#,
     );
     sources.insert(
-        "demo/StaticShadowProbe.java",
-        r#"package demo;
+        "demoprobe/StaticShadowProbe.java",
+        r#"package demoprobe;
+import demo.JarStaticShadowMixin;
 public final class StaticShadowProbe {
     public static int mode = 0;
     public static String report = "";
@@ -3994,7 +4036,12 @@ public final class StaticShadowProbe {
     );
     put("demo.JarStaticShadowMixin", "writeCount", 25, &mut host).unwrap();
     assert_eq!(
-        int("demo.StaticShadowProbe", "directTargetCount", &mut host).unwrap(),
+        int(
+            "demoprobe.StaticShadowProbe",
+            "directTargetCount",
+            &mut host
+        )
+        .unwrap(),
         Value::Int(25)
     );
     // `@Final` on a target field that is not final: a log line in real Mixin, the write
@@ -4005,7 +4052,12 @@ public final class StaticShadowProbe {
     );
     put("demo.JarStaticShadowMixin", "writeLoose", 8, &mut host).unwrap();
     assert_eq!(
-        int("demo.StaticShadowProbe", "directTargetLoose", &mut host).unwrap(),
+        int(
+            "demoprobe.StaticShadowProbe",
+            "directTargetLoose",
+            &mut host
+        )
+        .unwrap(),
         Value::Int(8)
     );
     // A really final target field: HotSpot's IllegalAccessError, LOCKED unchanged.
@@ -4020,7 +4072,7 @@ public final class StaticShadowProbe {
         &mut host,
     );
     let expected_message =
-        final_static_update_message("demo.StaticTarget", "LOCKED", "writeLockedIllegal");
+        final_static_update_message("demoprobe.StaticTarget", "LOCKED", "writeLockedIllegal");
     assert!(
         matches!(
             &illegal,
@@ -4030,7 +4082,12 @@ public final class StaticShadowProbe {
         "a write to a really final target field outside <clinit> must throw HotSpot's IllegalAccessError, got: {illegal:?}"
     );
     assert_eq!(
-        int("demo.StaticShadowProbe", "directTargetLocked", &mut host).unwrap(),
+        int(
+            "demoprobe.StaticShadowProbe",
+            "directTargetLocked",
+            &mut host
+        )
+        .unwrap(),
         Value::Int(55)
     );
     // `@Mutable` cleared ACC_FINAL on MutableTarget.LOCKED.
@@ -4046,7 +4103,12 @@ public final class StaticShadowProbe {
     )
     .unwrap();
     assert_eq!(
-        int("demo.StaticShadowProbe", "directMutableLocked", &mut host).unwrap(),
+        int(
+            "demoprobe.StaticShadowProbe",
+            "directMutableLocked",
+            &mut host
+        )
+        .unwrap(),
         Value::Int(99)
     );
     // A mixin-owned static is the target's (merged) static.
@@ -4227,7 +4289,7 @@ public final class StaticShadowProbe {
     let mut outside = StdHost::new().with_environment_type("SERVER");
     assert_eq!(
         int(
-            "demo.StaticShadowProbe",
+            "demoprobe.StaticShadowProbe",
             "readCountThroughMixin",
             &mut outside
         )
@@ -4237,14 +4299,14 @@ public final class StaticShadowProbe {
     );
     assert_eq!(
         outside.unknown_host_calls(),
-        vec![("demo/JarStaticShadowMixin#readCount()I".to_owned(), 1)]
+        vec![("demo/JarStaticShadowMixin#<load>()I".to_owned(), 1)]
     );
 
     // === 5. `run_game_hook_in`: the hook mixin's own merged code ===
     let weave = jar.plan_load_time_weave_with_game_hooks(MixinSide::Server);
     let registrations = jar.register_game_hooks(&weave).unwrap();
     let run_mode = |mode: i32, hook_host: &mut StdHost, hook_state: &mut GameHookState| {
-        put("demo.StaticShadowProbe", "setMode", mode, hook_host).unwrap();
+        put("demoprobe.StaticShadowProbe", "setMode", mode, hook_host).unwrap();
         let mut ctx = GameHookContext::new();
         let p = ctx.insert(
             GameObject::player(7, "StaticHook")
@@ -4263,7 +4325,7 @@ public final class StaticShadowProbe {
         )
     };
     let read_int =
-        |hook_host: &mut StdHost| int("demo.StaticShadowProbe", "readIntResult", hook_host);
+        |hook_host: &mut StdHost| int("demoprobe.StaticShadowProbe", "readIntResult", hook_host);
 
     // Mode 1 twice: the @Unique static merged into Player is one slot across firings.
     let mut hook_host = StdHost::new().with_environment_type("SERVER");
@@ -4300,7 +4362,7 @@ public final class StaticShadowProbe {
     assert_eq!(read_int(&mut hook_cross).unwrap(), Value::Int(0));
     assert_eq!(
         hook_cross.unknown_host_calls(),
-        vec![("demo/JarStaticShadowMixin#readCount()I".to_owned(), 1)]
+        vec![("demo/JarStaticShadowMixin#<load>()I".to_owned(), 1)]
     );
 }
 
@@ -4319,8 +4381,8 @@ fn mixin_static_initializer_runs_after_the_jar_target_initializer() {
     let mut sources = mixin_stubs();
     insert_final_mutable_stubs(&mut sources);
     sources.insert(
-        "demo/ClinitTarget.java",
-        r#"package demo;
+        "demoprobe/ClinitTarget.java",
+        r#"package demoprobe;
 public class ClinitTarget {
     public static int COUNT = 7;
     public static String TRACE = "target";
@@ -4332,6 +4394,7 @@ public class ClinitTarget {
     sources.insert(
         "demo/ClinitShadowMixin.java",
         r#"package demo;
+import demoprobe.ClinitTarget;
 import org.spongepowered.asm.mixin.Final;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Shadow;
@@ -4352,12 +4415,13 @@ public abstract class ClinitShadowMixin {
 "#,
     );
     sources.insert(
-        "demo/NoClinitTarget.java",
-        "package demo;\npublic class NoClinitTarget {\n    public static int VALUE;\n}\n",
+        "demoprobe/NoClinitTarget.java",
+        "package demoprobe;\npublic class NoClinitTarget {\n    public static int VALUE;\n}\n",
     );
     sources.insert(
         "demo/NoClinitShadowMixin.java",
         r#"package demo;
+import demoprobe.NoClinitTarget;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Shadow;
 
@@ -4369,8 +4433,8 @@ public abstract class NoClinitShadowMixin {
 "#,
     );
     sources.insert(
-        "demo/ClinitProbe.java",
-        r#"package demo;
+        "demoprobe/ClinitProbe.java",
+        r#"package demoprobe;
 public final class ClinitProbe {
     public static int targetCount() { return ClinitTarget.COUNT; }
     public static String targetTrace() { return ClinitTarget.TRACE; }
@@ -4418,16 +4482,16 @@ public final class ClinitProbe {
         report
     );
     assert_eq!(
-        int("demo.ClinitProbe", "targetCount", &mut mixin_first),
+        int("demoprobe.ClinitProbe", "targetCount", &mut mixin_first),
         Value::Int(0)
     );
     assert_eq!(
-        int("demo.ClinitProbe", "targetFinal", &mut mixin_first),
+        int("demoprobe.ClinitProbe", "targetFinal", &mut mixin_first),
         Value::Int(99),
         "the merged <clinit> may write the target's final field"
     );
     assert_eq!(
-        string("demo.ClinitProbe", "targetTrace", &mut mixin_first),
+        string("demoprobe.ClinitProbe", "targetTrace", &mut mixin_first),
         trace
     );
     assert_eq!(mixin_first.unknown_host_call_count(), 0);
@@ -4435,11 +4499,11 @@ public final class ClinitProbe {
     // The target is touched first: the same single initialisation.
     let mut target_first = StdHost::new().with_environment_type("SERVER");
     assert_eq!(
-        int("demo.ClinitProbe", "targetCount", &mut target_first),
+        int("demoprobe.ClinitProbe", "targetCount", &mut target_first),
         Value::Int(0)
     );
     assert_eq!(
-        string("demo.ClinitProbe", "targetTrace", &mut target_first),
+        string("demoprobe.ClinitProbe", "targetTrace", &mut target_first),
         trace
     );
     assert_eq!(
@@ -4451,7 +4515,7 @@ public final class ClinitProbe {
     // A target with no `<clinit>` takes the mixin's: VALUE = 4 either way round.
     let mut no_clinit = StdHost::new().with_environment_type("SERVER");
     assert_eq!(
-        int("demo.ClinitProbe", "noClinitValue", &mut no_clinit),
+        int("demoprobe.ClinitProbe", "noClinitValue", &mut no_clinit),
         Value::Int(4)
     );
     assert_eq!(
@@ -4469,7 +4533,7 @@ public final class ClinitProbe {
     );
     assert_eq!(
         int(
-            "demo.ClinitProbe",
+            "demoprobe.ClinitProbe",
             "noClinitValue",
             &mut no_clinit_mixin_first
         ),
@@ -4492,12 +4556,13 @@ public final class ClinitProbe {
 fn prefixed_shadow_fields_reject_the_mixin_and_shadow_method_prefixes_resolve() {
     let mut sources = mixin_stubs();
     sources.insert(
-        "demo/StaticTarget.java",
-        "package demo;\npublic class StaticTarget {\n    public static int count = 10;\n}\n",
+        "demoprobe/StaticTarget.java",
+        "package demoprobe;\npublic class StaticTarget {\n    public static int count = 10;\n}\n",
     );
     sources.insert(
         "demo/PrefixedFieldMixin.java",
         r#"package demo;
+import demoprobe.StaticTarget;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Shadow;
 
@@ -4512,6 +4577,7 @@ public abstract class PrefixedFieldMixin {
     sources.insert(
         "demo/CustomPrefixFieldMixin.java",
         r#"package demo;
+import demoprobe.StaticTarget;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Shadow;
 
@@ -4527,6 +4593,7 @@ public abstract class CustomPrefixFieldMixin {
     sources.insert(
         "demo/PackageStaticMixin.java",
         r#"package demo;
+import demoprobe.StaticTarget;
 import org.spongepowered.asm.mixin.Mixin;
 
 @Mixin(StaticTarget.class)
@@ -4539,6 +4606,7 @@ public abstract class PackageStaticMixin {
     sources.insert(
         "demo/UniquePublicStaticMixin.java",
         r#"package demo;
+import demoprobe.StaticTarget;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Unique;
 
@@ -4549,12 +4617,13 @@ public abstract class UniquePublicStaticMixin {
 "#,
     );
     sources.insert(
-        "demo/Shape.java",
-        "package demo;\npublic interface Shape { int sides(); }\n",
+        "demoprobe/Shape.java",
+        "package demoprobe;\npublic interface Shape { int sides(); }\n",
     );
     sources.insert(
         "demo/ShapeConstantMixin.java",
         r#"package demo;
+import demoprobe.Shape;
 import org.spongepowered.asm.mixin.Mixin;
 
 @Mixin(Shape.class)
@@ -4565,12 +4634,13 @@ public interface ShapeConstantMixin {
     );
     // An enum-extension mixin's enum constant may carry neither @Shadow nor @Unique.
     sources.insert(
-        "demo/Colour.java",
-        "package demo;\npublic enum Colour { RED }\n",
+        "demoprobe/Colour.java",
+        "package demoprobe;\npublic enum Colour { RED }\n",
     );
     sources.insert(
         "demo/ColourConstantMixin.java",
         r#"package demo;
+import demoprobe.Colour;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Shadow;
 
@@ -4581,13 +4651,14 @@ public enum ColourConstantMixin {
 "#,
     );
     sources.insert(
-        "demo/PrefixedDuck.java",
-        "package demo;\npublic interface PrefixedDuck { int prefixedExtra(); }\n",
+        "demoprobe/PrefixedDuck.java",
+        "package demoprobe;\npublic interface PrefixedDuck { int prefixedExtra(); }\n",
     );
     // Not even a shadow: `validateField` checks every field against the default prefix.
     sources.insert(
         "demo/UniquePrefixedDuckMixin.java",
         r#"package demo;
+import demoprobe.PrefixedDuck;
 import net.minecraft.world.entity.player.Player;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Unique;
@@ -4600,12 +4671,14 @@ public abstract class UniquePrefixedDuckMixin implements PrefixedDuck {
 "#,
     );
     sources.insert(
-        "demo/PrefixIds.java",
-        "package demo;\npublic interface PrefixIds { String prefixIds(); }\n",
+        "demoprobe/PrefixIds.java",
+        "package demoprobe;\npublic interface PrefixIds { String prefixIds(); }\n",
     );
     sources.insert(
         "demo/ShadowPrefixMethodMixin.java",
         r#"package demo;
+import demoprobe.PrefixIds;
+import demoprobe.PrefixProbe;
 import net.minecraft.world.entity.player.Player;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Shadow;
@@ -4628,8 +4701,8 @@ public abstract class ShadowPrefixMethodMixin implements PrefixIds {
 "#,
     );
     sources.insert(
-        "demo/PrefixProbe.java",
-        r#"package demo;
+        "demoprobe/PrefixProbe.java",
+        r#"package demoprobe;
 import net.minecraft.world.entity.player.Player;
 
 public final class PrefixProbe {
@@ -4669,12 +4742,12 @@ public final class PrefixProbe {
     for (mixin, targets, reason) in [
         (
             "PrefixedFieldMixin",
-            vec!["demo/StaticTarget"],
+            vec!["demoprobe/StaticTarget"],
             MixinSkipReason::InvalidMixin(prefix("PrefixedFieldMixin", "shadow$count")),
         ),
         (
             "CustomPrefixFieldMixin",
-            vec!["demo/StaticTarget"],
+            vec!["demoprobe/StaticTarget"],
             MixinSkipReason::InvalidMixin(prefix("CustomPrefixFieldMixin", "vanilla$count")),
         ),
         (
@@ -4684,14 +4757,14 @@ public final class PrefixProbe {
         ),
         (
             "PackageStaticMixin",
-            vec!["demo/StaticTarget"],
+            vec!["demoprobe/StaticTarget"],
             MixinSkipReason::InvalidMixin(
                 "Mixin demo.PackageStaticMixin contains non-private static field calls:I".into(),
             ),
         ),
         (
             "UniquePublicStaticMixin",
-            vec!["demo/StaticTarget"],
+            vec!["demoprobe/StaticTarget"],
             MixinSkipReason::InvalidMixin(
                 "Mixin demo.UniquePublicStaticMixin contains non-private static field TOTAL:I"
                     .into(),
@@ -4699,14 +4772,14 @@ public final class PrefixProbe {
         ),
         (
             "ShapeConstantMixin",
-            vec!["demo/Shape"],
+            vec!["demoprobe/Shape"],
             MixinSkipReason::InvalidMixin(
                 "Interface mixin demo.ShapeConstantMixin contains a non-shadow field: LIMIT".into(),
             ),
         ),
         (
             "ColourConstantMixin",
-            vec!["demo/Colour"],
+            vec!["demoprobe/Colour"],
             MixinSkipReason::InvalidMixin(
                 "Enum constant RED in demo.ColourConstantMixin has @Shadow annotation. This is not allowed."
                     .into(),
@@ -4778,7 +4851,7 @@ public final class PrefixProbe {
     )));
     assert_eq!(
         jar.invoke_method_with_args(
-            "demo.PrefixProbe",
+            "demoprobe.PrefixProbe",
             "ids",
             "(Lnet/minecraft/world/entity/player/Player;)Ljava/lang/String;",
             None,
@@ -4800,7 +4873,7 @@ public final class PrefixProbe {
     // counted rather than claimed.
     assert_eq!(
         jar.invoke_method_with_args(
-            "demo.PrefixProbe",
+            "demoprobe.PrefixProbe",
             "isPrefixedDuck",
             "(Lnet/minecraft/world/entity/player/Player;)Z",
             None,
@@ -4814,7 +4887,7 @@ public final class PrefixProbe {
     assert_eq!(
         host.unknown_host_calls(),
         vec![(
-            "demo/PrefixedDuck#<instanceof>(Ljava/lang/Object;)Z".to_owned(),
+            "demoprobe/PrefixedDuck#<instanceof>(Ljava/lang/Object;)Z".to_owned(),
             1
         )]
     );
@@ -4853,8 +4926,14 @@ public final class PrefixProbe {
     );
     assert_eq!(host.unknown_host_call_count(), 4);
     assert_eq!(
-        jar.invoke_method("demo.PrefixProbe", "targetCount", "()I", None, &mut host)
-            .unwrap(),
+        jar.invoke_method(
+            "demoprobe.PrefixProbe",
+            "targetCount",
+            "()I",
+            None,
+            &mut host
+        )
+        .unwrap(),
         Value::Int(10),
         "a rejected mixin's shadow write never reaches the target, and a non-required \
          config's rejection leaves the target loading normally"
@@ -4896,7 +4975,7 @@ public final class PrefixProbe {
     .unwrap();
     assert_eq!(
         jar.invoke_method(
-            "demo.PrefixProbe",
+            "demoprobe.PrefixProbe",
             "readHookIds",
             "()Ljava/lang/String;",
             None,
@@ -4943,8 +5022,8 @@ public final class Identifier {
 "#,
     );
     sources.insert(
-        "demo/MethodTarget.java",
-        r#"package demo;
+        "demoprobe/MethodTarget.java",
+        r#"package demoprobe;
 public class MethodTarget {
     public static int VISIBLE = 9;
     public static int twice(int v) { return v * 2; }
@@ -4956,6 +5035,7 @@ public class MethodTarget {
     sources.insert(
         "demo/StaticMethodShadowMixin.java",
         r#"package demo;
+import demoprobe.MethodTarget;
 import java.util.function.IntUnaryOperator;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Shadow;
@@ -4980,6 +5060,7 @@ public abstract class StaticMethodShadowMixin {
     sources.insert(
         "demo/MissingShadowMethodMixin.java",
         r#"package demo;
+import demoprobe.MethodTarget;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Shadow;
 
@@ -4993,6 +5074,7 @@ public abstract class MissingShadowMethodMixin {
     sources.insert(
         "demo/StaticMismatchShadowMixin.java",
         r#"package demo;
+import demoprobe.MethodTarget;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Shadow;
 
@@ -5040,6 +5122,7 @@ public abstract class IdentifierShadowMixin {
     sources.insert(
         "demo/PlayerShadowMethodHookMixin.java",
         r#"package demo;
+import demoprobe.ShadowMethodProbe;
 import net.minecraft.world.entity.player.Player;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Shadow;
@@ -5065,8 +5148,9 @@ public abstract class PlayerShadowMethodHookMixin {
 "#,
     );
     sources.insert(
-        "demo/ShadowMethodProbe.java",
-        r#"package demo;
+        "demoprobe/ShadowMethodProbe.java",
+        r#"package demoprobe;
+import demo.StaticMethodShadowMixin;
 import java.util.function.IntUnaryOperator;
 
 public final class ShadowMethodProbe {
@@ -5179,13 +5263,13 @@ public final class ShadowMethodProbe {
         // `IllegalClassLoadError`, rethrown by Knot): neither the placeholder (-1) nor the
         // target (2v, 9) answers.
         (
-            "demo.ShadowMethodProbe",
+            "demoprobe.ShadowMethodProbe",
             "callTwiceDirectly",
             "(I)I",
             vec![Value::Int(21)],
         ),
         (
-            "demo.ShadowMethodProbe",
+            "demoprobe.ShadowMethodProbe",
             "readVisibleDirectly",
             "()I",
             vec![],
@@ -5234,20 +5318,26 @@ public final class ShadowMethodProbe {
     // A method reference created outside the mixin resolves the mixin class too: the
     // lambda is counted when it is made and never runs the target.
     let before = host.unknown_host_call_count();
+    // The counted placeholder stands for the lambda, so what the code then does with it
+    // (here a `NullPointerException` from `applyAsInt`) follows a counted load.
     let referenced = call_int(
-        "demo.ShadowMethodProbe",
+        "demoprobe.ShadowMethodProbe",
         "referenceFromOutside",
         "(I)I",
         &[Value::Int(5)],
         &mut host,
     )
-    .unwrap();
-    assert_ne!(referenced, Value::Int(10), "the target never runs");
-    assert_ne!(referenced, Value::Int(-1), "the placeholder never runs");
+    .ok();
+    assert_ne!(referenced, Some(Value::Int(10)), "the target never runs");
+    assert_ne!(
+        referenced,
+        Some(Value::Int(-1)),
+        "the placeholder never runs"
+    );
     assert!(
         host.unknown_host_calls()
             .iter()
-            .any(|(call, _)| call == "demo/StaticMethodShadowMixin#twice(I)I"),
+            .any(|(call, _)| call.starts_with("demo/StaticMethodShadowMixin#<load>")),
         "{:?}",
         host.unknown_host_calls()
     );
@@ -5258,7 +5348,7 @@ public final class ShadowMethodProbe {
     let registrations = jar.register_game_hooks(&weave).unwrap();
     let run_mode = |mode: i32, hook_host: &mut StdHost| {
         call_int(
-            "demo.ShadowMethodProbe",
+            "demoprobe.ShadowMethodProbe",
             "setHookMode",
             "(I)V",
             &[Value::Int(mode)],
@@ -5298,7 +5388,7 @@ public final class ShadowMethodProbe {
     run_mode(2, &mut hook_cross).unwrap();
     assert_eq!(
         call_int(
-            "demo.ShadowMethodProbe",
+            "demoprobe.ShadowMethodProbe",
             "readHookInt",
             "()I",
             &[],
@@ -5309,7 +5399,7 @@ public final class ShadowMethodProbe {
     );
     assert_eq!(
         hook_cross.unknown_host_calls(),
-        vec![("demo/StaticMethodShadowMixin#twice(I)I".to_owned(), 1)]
+        vec![("demo/StaticMethodShadowMixin#<load>()I".to_owned(), 1)]
     );
 }
 
@@ -5329,12 +5419,12 @@ fn required_mixin_configs_fail_the_target_and_others_drop_the_mixin() {
     let build = |name: &str, targets: &str, required: Option<bool>| {
         let mut sources = mixin_stubs();
         sources.insert(
-            "demo/RequiredTarget.java",
-            "package demo;\npublic class RequiredTarget {\n    public static int VALUE = 6;\n}\n",
+            "demoprobe/RequiredTarget.java",
+            "package demoprobe;\npublic class RequiredTarget {\n    public static int VALUE = 6;\n}\n",
         );
         sources.insert(
-            "demo/RequiredProbe.java",
-            r#"package demo;
+            "demoprobe/RequiredProbe.java",
+            r#"package demoprobe;
 public final class RequiredProbe {
     public static int plain() { return 1; }
     public static int targetValue() { return RequiredTarget.VALUE; }
@@ -5343,6 +5433,7 @@ public final class RequiredProbe {
         );
         let mixin = format!(
             r#"package demo;
+import demoprobe.RequiredTarget;
 import net.minecraft.world.entity.player.Player;
 import org.spongepowered.asm.mixin.Mixin;
 
@@ -5386,7 +5477,7 @@ public abstract class RejectedMixin {{
     };
     let int = |jar: &NativeJar, method: &str| {
         let mut host = StdHost::new().with_environment_type("SERVER");
-        jar.invoke_method("demo.RequiredProbe", method, "()I", None, &mut host)
+        jar.invoke_method("demoprobe.RequiredProbe", method, "()I", None, &mut host)
     };
 
     // A non-required config (omitted `required`): dropped, the target loads.
@@ -5395,7 +5486,7 @@ public abstract class RejectedMixin {{
     assert_eq!(
         rows(&dropped),
         [(
-            "demo/RequiredTarget".to_owned(),
+            "demoprobe/RequiredTarget".to_owned(),
             MixinSkipReason::InvalidMixin(detail.into())
         )]
     );
@@ -5407,7 +5498,7 @@ public abstract class RejectedMixin {{
     assert_eq!(
         rows(&jar_only),
         [(
-            "demo/RequiredTarget".to_owned(),
+            "demoprobe/RequiredTarget".to_owned(),
             MixinSkipReason::RequiredMixinFailed(detail.into())
         )]
     );
@@ -5418,9 +5509,9 @@ public abstract class RejectedMixin {{
             matches!(
                 &refused,
                 Err(NativeError::Metadata(message))
-                    if message.contains("jar class demo/RequiredTarget fails to load")
+                    if message.contains("jar class demoprobe/RequiredTarget fails to load")
                         && message.contains("demo.mixins.json")
-                        && message.contains("Mixin transformation of demo.RequiredTarget failed")
+                        && message.contains("Mixin transformation of demoprobe.RequiredTarget failed")
             ),
             "{refused:?}"
         );
@@ -5437,7 +5528,7 @@ public abstract class RejectedMixin {{
         rows(&game),
         [
             (
-                "demo/RequiredTarget".to_owned(),
+                "demoprobe/RequiredTarget".to_owned(),
                 MixinSkipReason::RequiredMixinFailed(detail.into())
             ),
             (
@@ -5477,8 +5568,59 @@ fn merged_mixin_statics_are_one_slot_on_the_target() {
         "package net.minecraft.world.item;\npublic class ItemStack {}\n",
     );
     sources.insert(
-        "demo/SharedTarget.java",
-        "package demo;\npublic class SharedTarget {\n    public static int base = 1;\n}\n",
+        "net/minecraft/resources/Identifier.java",
+        "package net.minecraft.resources;\npublic final class Identifier {}\n",
+    );
+    // Vanilla 26.3's ItemStack declares `EMPTY` as an `ItemStack`
+    // (`vanilla_host_methods.tsv`): a mixin static of that name and type collides
+    // (Mixin renames, discards or takes it for the target's own, none modelled), while
+    // the same name with another type is simply a second field.
+    sources.insert(
+        "demo/VanillaCollisionMixin.java",
+        r#"package demo;
+import net.minecraft.world.item.ItemStack;
+import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.Unique;
+
+@Mixin(ItemStack.class)
+public abstract class VanillaCollisionMixin {
+    @Unique private static ItemStack EMPTY;
+    public static int probe() { return EMPTY == null ? 0 : 1; }
+}
+"#,
+    );
+    sources.insert(
+        "demo/VanillaSameNameMixin.java",
+        r#"package demo;
+import net.minecraft.world.item.ItemStack;
+import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.Unique;
+
+@Mixin(ItemStack.class)
+public abstract class VanillaSameNameMixin {
+    @Unique private static int EMPTY = 12;
+    public static int readEmpty() { return EMPTY; }
+}
+"#,
+    );
+    // A game class outside the table: its fields are not known.
+    sources.insert(
+        "demo/UnknownGameTargetMixin.java",
+        r#"package demo;
+import net.minecraft.resources.Identifier;
+import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.Unique;
+
+@Mixin(Identifier.class)
+public abstract class UnknownGameTargetMixin {
+    @Unique private static int COUNTER = 3;
+    public static int readCounter() { return COUNTER; }
+}
+"#,
+    );
+    sources.insert(
+        "demoprobe/SharedTarget.java",
+        "package demoprobe;\npublic class SharedTarget {\n    public static int base = 1;\n}\n",
     );
     for (name, target, import) in [
         ("SharedWriterMixin", "SharedTarget", ""),
@@ -5490,6 +5632,7 @@ fn merged_mixin_statics_are_one_slot_on_the_target() {
     ] {
         let source = format!(
             r#"package demo;
+import demoprobe.SharedTarget;
 {import}import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Unique;
 
@@ -5519,6 +5662,7 @@ public abstract class {name} {{
     ] {
         let source = format!(
             r#"package demo;
+import demoprobe.SharedTarget;
 {import}import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Shadow;
 
@@ -5536,7 +5680,10 @@ public abstract class {name} {{
         );
     }
     let mut excluded = COMPILE_ONLY_STUBS.to_vec();
-    excluded.push("net/minecraft/world/item/ItemStack.class");
+    excluded.extend([
+        "net/minecraft/world/item/ItemStack.class",
+        "net/minecraft/resources/Identifier.class",
+    ]);
     let jar_path = build_jar(
         "merged-statics",
         sources,
@@ -5547,7 +5694,7 @@ public abstract class {name} {{
             ),
             (
                 "demo.mixins.json",
-                r#"{"package":"demo","mixins":["SharedWriterMixin","SharedReaderMixin","EarlyReaderMixin","HostWriterMixin","HostReaderMixin"]}"#,
+                r#"{"package":"demo","mixins":["SharedWriterMixin","SharedReaderMixin","EarlyReaderMixin","HostWriterMixin","HostReaderMixin","VanillaCollisionMixin","VanillaSameNameMixin","UnknownGameTargetMixin"]}"#,
             ),
         ],
         &excluded,
@@ -5616,5 +5763,304 @@ public abstract class {name} {{
     assert_eq!(
         early.unknown_host_calls(),
         vec![("demo/EarlyReaderMixin#SHAREDI".to_owned(), 1)],
+    );
+
+    // Same name and descriptor as vanilla ItemStack.EMPTY, and a game class the table does
+    // not hold: counted. The same name with another type merges exactly (12).
+    let mut vanilla = StdHost::new().with_environment_type("SERVER");
+    let int = |class: &str, method: &str, host: &mut StdHost| {
+        jar.invoke_method(class, method, "()I", None, host).unwrap()
+    };
+    assert_eq!(
+        int("demo.VanillaSameNameMixin", "readEmpty", &mut vanilla),
+        Value::Int(12)
+    );
+    assert_eq!(vanilla.unknown_host_call_count(), 0);
+    int("demo.VanillaCollisionMixin", "probe", &mut vanilla);
+    assert_eq!(
+        vanilla.unknown_host_calls(),
+        vec![(
+            "demo/VanillaCollisionMixin#EMPTYLnet/minecraft/world/item/ItemStack;".to_owned(),
+            1
+        )]
+    );
+    assert_eq!(
+        int("demo.UnknownGameTargetMixin", "readCounter", &mut vanilla),
+        Value::Int(0),
+        "never 3 from a slot the game class might already hold"
+    );
+    assert!(
+        vanilla
+            .unknown_host_calls()
+            .iter()
+            .any(|(call, _)| call == "demo/UnknownGameTargetMixin#COUNTERI"),
+        "{:?}",
+        vanilla.unknown_host_calls()
+    );
+}
+
+/// Real Fabric refuses to load any class in a selected Mixin config's package from code
+/// not merged with it: sponge-mixin 0.17.5's `MixinProcessor.applyMixins` throws
+/// `IllegalClassLoadError` for a `packageMatch` (the config's `package` plus `.`), and
+/// fabric-loader 0.20.1's Knot rethrows it from the class load. Exempt: an accessor
+/// mixin a config lists (`MixinCoprocessorPassthrough`, `SubType.Accessor.isLoadable`),
+/// and `InjectionPoint` / `ITargetSelectorDynamic` subtypes.
+///
+/// Every bytecode class reference resolves a constant-pool entry, so one point covers
+/// `new`, `instanceof`, `checkcast`, a class literal, an array of the class, static and
+/// instance fields and method calls: each is counted and nothing it names runs (a strict
+/// host refuses). `Class.forName` takes the same rule, with no merged exemption. An
+/// entrypoint the loader would load from the package is refused. `instanceof` /
+/// `checkcast` of `null` resolve nothing and run as usual.
+#[test]
+fn mixin_package_classes_load_only_from_merged_code() {
+    let mut sources = mixin_stubs();
+    sources.insert(
+        "org/spongepowered/asm/mixin/injection/InjectionPoint.java",
+        "package org.spongepowered.asm.mixin.injection;\npublic abstract class InjectionPoint {}\n",
+    );
+    sources.insert(
+        "demoprobe/LoadTarget.java",
+        "package demoprobe;\npublic class LoadTarget {\n    private int hidden = 11;\n}\n",
+    );
+    sources.insert(
+        "demo/LoadMixin.java",
+        r#"package demo;
+import demoprobe.LoadTarget;
+import org.spongepowered.asm.mixin.Mixin;
+
+@Mixin(LoadTarget.class)
+public abstract class LoadMixin {
+    public static int ping() { return 7; }
+}
+"#,
+    );
+    sources.insert(
+        "demo/LoadAccessor.java",
+        r#"package demo;
+import demoprobe.LoadTarget;
+import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.gen.Accessor;
+
+@Mixin(LoadTarget.class)
+public interface LoadAccessor {
+    @Accessor("hidden") int getHidden();
+}
+"#,
+    );
+    // Not a mixin, but in the mixin package: Mixin refuses it all the same.
+    sources.insert(
+        "demo/HelperInPackage.java",
+        r#"package demo;
+public class HelperInPackage {
+    public static int VALUE = 3;
+    public int field = 4;
+    public static int get() { return 5; }
+}
+"#,
+    );
+    sources.insert(
+        "demo/CustomPoint.java",
+        "package demo;\nimport org.spongepowered.asm.mixin.injection.InjectionPoint;\npublic class CustomPoint extends InjectionPoint {}\n",
+    );
+    sources.insert(
+        "demo/EntryInPackage.java",
+        "package demo;\npublic class EntryInPackage {\n    public void onInitialize() {}\n}\n",
+    );
+    sources.insert(
+        "demoprobe/EntryOutside.java",
+        "package demoprobe;\npublic class EntryOutside {\n    public void onInitialize() {}\n}\n",
+    );
+    sources.insert(
+        "demoprobe/LoadProbe.java",
+        r#"package demoprobe;
+import demo.CustomPoint;
+import demo.HelperInPackage;
+import demo.LoadAccessor;
+import demo.LoadMixin;
+
+public final class LoadProbe {
+    public static int staticCall() { return HelperInPackage.get(); }
+    public static int staticField() { return HelperInPackage.VALUE; }
+    public static int instanceField() { return new HelperInPackage().field; }
+    public static boolean instanceOf(Object o) { return o instanceof HelperInPackage; }
+    public static boolean checkCast(Object o) { return ((HelperInPackage) o) == null; }
+    public static String classLiteral() { return HelperInPackage.class.getName(); }
+    public static int arrayOf() { return new HelperInPackage[2].length; }
+    public static String forName() throws Exception {
+        return Class.forName("demo.HelperInPackage").getName();
+    }
+    public static String forNameMixin() throws Exception {
+        return Class.forName("demo.LoadMixin").getName();
+    }
+    public static int mixinCall() { return LoadMixin.ping(); }
+    // Loadable: a listed accessor mixin and an InjectionPoint subclass.
+    public static int accessor() { return ((LoadAccessor) (Object) new LoadTarget()).getHidden(); }
+    public static String accessorForName() throws Exception {
+        return Class.forName("demo.LoadAccessor").getName();
+    }
+    public static String injectionPoint() { return CustomPoint.class.getName(); }
+}
+"#,
+    );
+    let mut excluded = COMPILE_ONLY_STUBS.to_vec();
+    excluded.push("org/spongepowered/asm/mixin/injection/InjectionPoint.class");
+    let jar_path = build_jar(
+        "mixin-package-loading",
+        sources,
+        &[
+            (
+                "fabric.mod.json",
+                r#"{"id":"mixinpackage","version":"1.0","entrypoints":{"main":["demo.EntryInPackage","demoprobe.EntryOutside"]},"mixins":["demo.mixins.json"]}"#,
+            ),
+            (
+                "demo.mixins.json",
+                r#"{"package":"demo","mixins":["LoadMixin","LoadAccessor"]}"#,
+            ),
+        ],
+        &excluded,
+    );
+    let jar = NativeJar::from_path(&jar_path).unwrap();
+    let probe = |method: &str, desc: &str, args: &[Value], host: &mut StdHost| {
+        jar.invoke_method_with_args("demoprobe.LoadProbe", method, desc, None, args, host)
+    };
+    let null = Value::Ref(None);
+
+    // Loadable from anywhere: 0 unknowns, real answers.
+    let mut host = StdHost::new().with_environment_type("SERVER");
+    assert_eq!(
+        probe("accessor", "()I", &[], &mut host).unwrap(),
+        Value::Int(11)
+    );
+    assert_eq!(
+        probe("accessorForName", "()Ljava/lang/String;", &[], &mut host).unwrap(),
+        Value::Ref(Some("demo.LoadAccessor".into()))
+    );
+    assert_eq!(
+        probe("injectionPoint", "()Ljava/lang/String;", &[], &mut host).unwrap(),
+        Value::Ref(Some("demo.CustomPoint".into()))
+    );
+    // `instanceof` / `checkcast` of null resolve nothing.
+    assert_eq!(
+        probe(
+            "instanceOf",
+            "(Ljava/lang/Object;)Z",
+            std::slice::from_ref(&null),
+            &mut host
+        )
+        .unwrap(),
+        Value::Int(0)
+    );
+    assert_eq!(
+        probe(
+            "checkCast",
+            "(Ljava/lang/Object;)Z",
+            std::slice::from_ref(&null),
+            &mut host
+        )
+        .unwrap(),
+        Value::Int(1)
+    );
+    assert_eq!(
+        host.unknown_host_call_count(),
+        0,
+        "{:?}",
+        host.unknown_host_calls()
+    );
+
+    // Every other reference to the package: counted, never the real answer; refused on a
+    // strict host.
+    let object = jar
+        .invoke_method(
+            "demoprobe.LoadProbe",
+            "classLiteral",
+            "()Ljava/lang/String;",
+            None,
+            &mut StdHost::new().with_environment_type("SERVER"),
+        )
+        .ok();
+    assert_ne!(
+        object,
+        Some(Value::Ref(Some("demo.HelperInPackage".into())))
+    );
+    // Any non-null value makes the instruction resolve its class; the real JVM then throws
+    // from the load, so only the count is checked for these two (`impossible`).
+    let jar_object = Value::Ref(Some("a string".into()));
+    let impossible = Value::Int(-99);
+    for (method, desc, args, real) in [
+        ("staticCall", "()I", vec![], Value::Int(5)),
+        ("staticField", "()I", vec![], Value::Int(3)),
+        ("instanceField", "()I", vec![], Value::Int(4)),
+        (
+            "instanceOf",
+            "(Ljava/lang/Object;)Z",
+            vec![jar_object.clone()],
+            impossible.clone(),
+        ),
+        (
+            "checkCast",
+            "(Ljava/lang/Object;)Z",
+            vec![jar_object.clone()],
+            impossible.clone(),
+        ),
+        (
+            "classLiteral",
+            "()Ljava/lang/String;",
+            vec![],
+            Value::Ref(Some("demo.HelperInPackage".into())),
+        ),
+        ("arrayOf", "()I", vec![], Value::Int(2)),
+        (
+            "forName",
+            "()Ljava/lang/String;",
+            vec![],
+            Value::Ref(Some("demo.HelperInPackage".into())),
+        ),
+        (
+            "forNameMixin",
+            "()Ljava/lang/String;",
+            vec![],
+            Value::Ref(Some("demo.LoadMixin".into())),
+        ),
+        ("mixinCall", "()I", vec![], Value::Int(7)),
+    ] {
+        let mut lenient = StdHost::new().with_environment_type("SERVER");
+        let outcome = probe(method, desc, &args, &mut lenient);
+        assert!(
+            outcome.as_ref().map_or(true, |value| *value != real),
+            "{method} must not give the real answer: {outcome:?}"
+        );
+        assert!(
+            lenient
+                .unknown_host_calls()
+                .iter()
+                .any(|(call, _)| call.starts_with("demo/") && call.contains("#<load>")),
+            "{method}: {:?}",
+            lenient.unknown_host_calls()
+        );
+        let mut strict = StdHost::new()
+            .with_environment_type("SERVER")
+            .with_strict_unknown_host_calls();
+        assert!(
+            probe(method, desc, &args, &mut strict).is_err(),
+            "{method} must refuse on a strict host"
+        );
+    }
+
+    // The loader's entrypoint load: refused in the mixin package, fine outside it.
+    let mut entry_host = StdHost::new().with_environment_type("SERVER");
+    let refused = jar.execute("demo.EntryInPackage", None, "main", &mut entry_host);
+    assert!(
+        matches!(
+            &refused,
+            Err(NativeError::Metadata(message))
+                if message.contains("is in a Mixin config's package")
+                    && message.contains("Mixin transformation of demo.EntryInPackage failed")
+        ),
+        "{refused:?}"
+    );
+    assert!(
+        jar.execute("demoprobe.EntryOutside", None, "main", &mut entry_host)
+            .is_ok()
     );
 }

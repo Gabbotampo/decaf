@@ -336,6 +336,8 @@ struct VanillaTypeInfo {
     super_name: &'static str,
     interfaces: Vec<&'static str>,
     methods: BTreeSet<(&'static str, &'static str)>,
+    /// Every field the type declares, `(name, descriptor)`.
+    fields: BTreeSet<(&'static str, &'static str)>,
 }
 
 #[derive(Default)]
@@ -384,7 +386,7 @@ impl VanillaHostMethods {
                         VanillaTypeInfo {
                             super_name,
                             interfaces,
-                            methods: BTreeSet::new(),
+                            ..VanillaTypeInfo::default()
                         },
                     );
                 }
@@ -404,7 +406,7 @@ impl VanillaHostMethods {
                         VanillaTypeInfo {
                             super_name: "",
                             interfaces,
-                            methods: BTreeSet::new(),
+                            ..VanillaTypeInfo::default()
                         },
                     );
                 }
@@ -420,10 +422,32 @@ impl VanillaHostMethods {
                         info.methods.insert((name, desc));
                     }
                 }
+                Some("F") => {
+                    let (Some(owner), Some(name), Some(desc)) =
+                        (parts.next(), parts.next(), parts.next())
+                    else {
+                        continue;
+                    };
+                    if let Some(info) = table.classes.get_mut(owner) {
+                        info.fields.insert((name, desc));
+                    } else if let Some(info) = table.interfaces.get_mut(owner) {
+                        info.fields.insert((name, desc));
+                    }
+                }
                 _ => {}
             }
         }
         table
+    }
+
+    /// Whether game class `class` itself declares field `name descriptor`, or `None` when
+    /// `class` is not in the table.
+    fn declares_field(&self, class: &str, name: &str, descriptor: &str) -> Option<bool> {
+        let info = self
+            .classes
+            .get(class)
+            .or_else(|| self.interfaces.get(class))?;
+        Some(info.fields.contains(&(name, descriptor)))
     }
 
     /// Whether `iface` equals or transitively extends `wanted` within the vanilla/JDK table.
@@ -653,15 +677,21 @@ pub(crate) fn active_host_mixin_targets(
 /// Per-`Runtime` mixin configuration gate and lazy index.
 #[derive(Debug, Default)]
 pub(crate) struct RuntimeMixinState {
-    configs: Vec<MixinConfig>,
-    config_sides: BTreeMap<String, MixinSide>,
+    pub(crate) configs: Vec<MixinConfig>,
+    pub(crate) config_sides: BTreeMap<String, MixinSide>,
     plugins: ConfigPlugins,
-    side: Option<MixinSide>,
+    pub(crate) side: Option<MixinSide>,
     require_config: bool,
     /// Jar classes a `required` config's rejected mixin fails to load, with why
     /// ([`NativeJar::failed_required_targets`]).
     failed_required_targets: BTreeMap<String, String>,
     index: OnceCell<RuntimeMixinIndex>,
+    /// The selected Mixin configs' packages as internal-name prefixes
+    /// (`mixin_class_loading.rs`).
+    pub(crate) package_prefixes: OnceCell<Vec<String>>,
+    /// Per class: the pool entries its code may not resolve (`mixin_class_loading.rs`).
+    pub(crate) unloadable_pools:
+        std::cell::RefCell<BTreeMap<String, Option<std::rc::Rc<BTreeSet<u16>>>>>,
 }
 
 impl RuntimeMixinState {
@@ -681,6 +711,8 @@ impl RuntimeMixinState {
             require_config: true,
             failed_required_targets: jar.failed_required_targets(side).clone(),
             index: OnceCell::new(),
+            package_prefixes: OnceCell::new(),
+            unloadable_pools: Default::default(),
         }
     }
 
@@ -696,6 +728,8 @@ impl RuntimeMixinState {
             require_config: false,
             failed_required_targets: BTreeMap::new(),
             index: OnceCell::new(),
+            package_prefixes: OnceCell::new(),
+            unloadable_pools: Default::default(),
         }
     }
 
@@ -2120,9 +2154,11 @@ impl<H: Host> Runtime<'_, H> {
     /// - a mixin applied to two or more targets has one copy of the field per target,
     ///   which its code reaches through whichever target it was merged into: no single
     ///   slot holds that, so the access is unresolved;
-    /// - on a jar target that already declares a field of that name, Mixin renames a
-    ///   private `@Unique` field, discards a public one or rejects the class, none of
-    ///   which is modelled: unresolved.
+    /// - on a target that already declares a field of that name and descriptor (a jar
+    ///   class's fields, a game class's from `vanilla_host_methods.tsv`), Mixin renames a
+    ///   private `@Unique` field, discards a public one, or takes a plain field for the
+    ///   target's own: none of that is modelled, so the access is unresolved, as it is on
+    ///   a game class the table does not hold.
     fn resolve_own_mixin_static(&self, field: &MethodRef) -> StaticShadowResolution {
         let Some(declared) = self.class(&field.owner).and_then(|file| {
             file.fields
@@ -2154,13 +2190,25 @@ impl<H: Host> Runtime<'_, H> {
             [target] if targets.len() == 1 => (*target).clone(),
             _ => return StaticShadowResolution::Unresolved,
         };
-        if self
-            .class(&target)
-            .is_some_and(|file| file.fields.iter().any(|f| f.name == field.name))
-        {
+        if self.target_declares_field(&target, field) != Some(false) {
             return StaticShadowResolution::Unresolved;
         }
         self.merged_static(&target, &field.owner, field, declared)
+    }
+
+    /// Whether `target`'s own class declares a field with `field`'s name and descriptor
+    /// (what `TargetClassContext.findAliasedField` matches): the jar class's fields, or a
+    /// game class's from `vanilla_host_methods.tsv` (`None` when the table does not hold
+    /// that game class, which then has no exact answer).
+    fn target_declares_field(&self, target: &str, field: &MethodRef) -> Option<bool> {
+        match self.class(target) {
+            Some(file) => Some(
+                file.fields
+                    .iter()
+                    .any(|f| f.name == field.name && f.descriptor == field.descriptor),
+            ),
+            None => vanilla_host_methods().declares_field(target, &field.name, &field.descriptor),
+        }
     }
 
     /// The shared slot of `field` when a mixin applied to `target` before the one whose
@@ -2209,7 +2257,10 @@ impl<H: Host> Runtime<'_, H> {
             if !own {
                 continue;
             }
-            if (key(&mixin), mixin.as_str()) < (shadow_key, field.owner.as_str()) {
+            // The declaring mixin's own field must itself merge as one slot.
+            if (key(&mixin), mixin.as_str()) < (shadow_key, field.owner.as_str())
+                && self.target_declares_field(target, field) == Some(false)
+            {
                 return Some(self.merged_static(target, &mixin, field, access));
             }
             return Some(StaticShadowResolution::Unresolved);
@@ -2242,94 +2293,6 @@ impl<H: Host> Runtime<'_, H> {
             slot,
             init: declaring.to_owned(),
             write,
-        }
-    }
-
-    /// Whether code in `frame_class` referencing class `owner` names a `@Mixin` class it is
-    /// not merged with, which real Fabric cannot load.
-    ///
-    /// Mixin rewrites only a merged method's references to its own mixin class
-    /// (`MixinTargetContext.transformMethodRef` / `transformFieldRef`: owner equal to
-    /// `getClassRef()` becomes the target). Any other reference names the mixin class
-    /// itself, and loading it fails: `MixinProcessor.applyMixins` throws
-    /// `IllegalClassLoadError` ("... cannot be referenced directly") for a class in a mixin
-    /// config's package, which Knot rethrows as `RuntimeException: Mixin transformation of
-    /// <class> failed`. Whether a later reference retries the load the same way is not
-    /// modelled, so callers count the reference instead of running anything.
-    ///
-    /// Treated as merged here: the mixin's own frames and its nested classes (Decaf's woven
-    /// callback bridges are `M$$HorizonBridge$...`), a target's frames (Decaf's woven
-    /// callback calls stand where Mixin merged the callback), and a subclass (mixin
-    /// inheritance). Interface and accessor mixins are loadable (a coprocessor passes them
-    /// through) and never count. A `@Mixin` class no config lists is an ordinary class.
-    #[inline(never)]
-    pub(crate) fn is_unmerged_mixin_reference(&self, frame_class: &str, owner: &str) -> bool {
-        if frame_class == owner {
-            return false;
-        }
-        let Some(file) = self.class(owner) else {
-            return false;
-        };
-        if !file
-            .annotations
-            .iter()
-            .any(|annotation| annotation.descriptor == crate::runtime::MIXIN_ANNOTATION_DESCRIPTOR)
-            || class_access(file).is_some_and(|access| access & ACC_INTERFACE != 0)
-        {
-            return false;
-        }
-        if frame_class
-            .strip_prefix(owner)
-            .is_some_and(|rest| rest.starts_with('$'))
-        {
-            return false;
-        }
-        let targets_frame = self
-            .runtime_mixin_index()
-            .meta
-            .get(owner)
-            .is_some_and(|meta| meta.targets.iter().any(|target| target == frame_class));
-        if targets_frame || self.extends_class(frame_class, owner) {
-            return false;
-        }
-        crate::runtime::mixin_config_lists_any_side(&self.mixin_index.configs, owner)
-            || self
-                .linked
-                .mixin_config_sets()
-                .iter()
-                .any(|set| set.classes.iter().any(|class| class == owner))
-    }
-
-    /// Whether jar class `class`'s superclass chain includes `ancestor`.
-    fn extends_class(&self, class: &str, ancestor: &str) -> bool {
-        let mut current = self.class(class).map(|file| file.super_name.clone());
-        for _ in 0..crate::runtime::MAX_SUPERCLASS_WALK {
-            let Some(name) = current else {
-                return false;
-            };
-            if name == ancestor {
-                return true;
-            }
-            current = self.class(&name).map(|file| file.super_name.clone());
-        }
-        false
-    }
-
-    /// Count a lambda or method reference whose implementation method belongs to a
-    /// `@Mixin` class the creating code is not merged with: the `invokedynamic` resolves
-    /// that class, which real Fabric cannot load ([`Self::is_unmerged_mixin_reference`]).
-    /// Returns the counted placeholder that stands for the lambda, so nothing runs it.
-    #[inline(never)]
-    pub(crate) fn count_unmerged_mixin_handle(
-        &mut self,
-        frame_class: &str,
-        target: Option<&MethodRef>,
-    ) -> Result<Option<Value>, NativeError> {
-        match target {
-            Some(target) if self.is_unmerged_mixin_reference(frame_class, &target.owner) => {
-                self.host.unknown_operand_call(target).map(Some)
-            }
-            _ => Ok(None),
         }
     }
 
@@ -2398,36 +2361,35 @@ impl<H: Host> Runtime<'_, H> {
         })
     }
 
-    /// Mixin's view of a call instruction in `frame_class` naming `r`. Returns whether the
-    /// call names a `@Mixin` class the frame is not merged with
-    /// ([`Self::is_unmerged_mixin_reference`]); the caller then counts it and runs nothing.
-    ///
-    /// A merged method's own `invokestatic M.method` of a static `@Shadow` method is
-    /// rewritten to its target, as `MixinTargetContext.transformMethodRef` rewrites it (the
-    /// renamed, prefix-free name included), so the call then takes the ordinary path of a
-    /// call to that target ([`Self::resolve_static_shadow_method`]). An unresolved shadow
-    /// is left for [`Self::invoke_static_shadow_body`] to count.
+    /// Mixin's rewrite of a merged method's `invokestatic M.method` of its own static
+    /// `@Shadow` method (`MixinTargetContext.transformMethodRef`, the renamed,
+    /// prefix-free name included) to the target, so the call then takes the ordinary path
+    /// of a call to that target ([`Self::resolve_static_shadow_method`]). Only the mixin's
+    /// own code (or its nested classes) is rewritten: any other code naming the mixin class
+    /// cannot load it (`mixin_class_loading.rs`). An unresolved shadow is left for
+    /// [`Self::invoke_static_shadow_body`] to count.
     #[inline(never)]
-    pub(crate) fn rewrite_static_shadow_call(
-        &self,
-        op: u8,
-        frame_class: &str,
-        r: &mut MethodRef,
-    ) -> bool {
+    pub(crate) fn rewrite_static_shadow_call(&self, op: u8, frame_class: &str, r: &mut MethodRef) {
         let merged_self = frame_class == r.owner
             || frame_class
                 .strip_prefix(r.owner.as_str())
                 .is_some_and(|rest| rest.starts_with('$'));
-        if !merged_self {
-            return self.is_unmerged_mixin_reference(frame_class, &r.owner);
-        }
-        if op == 0xb8
+        if merged_self
+            && op == 0xb8
             && let StaticShadowCall::Target(target) =
                 self.resolve_static_shadow_method(&r.owner, &r.name, &r.descriptor)
         {
             *r = target;
         }
-        false
+    }
+
+    /// The targets `@Mixin` class `mixin` names (applied or not), from the index.
+    pub(crate) fn mixin_targets(&self, mixin: &str) -> Vec<String> {
+        self.runtime_mixin_index()
+            .meta
+            .get(mixin)
+            .map(|meta| meta.targets.clone())
+            .unwrap_or_default()
     }
 
     /// Never run a static `@Shadow` method's placeholder body: a frame about to run one
@@ -2952,6 +2914,35 @@ mod tests {
         assert!(!is_host_modelled_game_target(
             "net/minecraft/world/level/chunk/LevelChunk"
         ));
+    }
+
+    #[test]
+    fn vanilla_host_methods_table_records_declared_fields() {
+        let table = vanilla_host_methods();
+        // Vanilla 26.3's own `ItemStack.EMPTY` and `Player`'s fields are in the table; a
+        // name the class does not declare is not; a class outside it has no answer.
+        let stack = "net/minecraft/world/item/ItemStack";
+        assert_eq!(
+            table.declares_field(stack, "EMPTY", "Lnet/minecraft/world/item/ItemStack;"),
+            Some(true)
+        );
+        assert_eq!(table.declares_field(stack, "EMPTY", "I"), Some(false));
+        assert_eq!(table.declares_field(stack, "SHARED", "I"), Some(false));
+        assert_eq!(
+            table.declares_field(
+                "net/minecraft/resources/Identifier",
+                "path",
+                "Ljava/lang/String;"
+            ),
+            None
+        );
+        let fields: usize = table
+            .classes
+            .values()
+            .chain(table.interfaces.values())
+            .map(|info| info.fields.len())
+            .sum();
+        assert!(fields > 1000, "{fields}");
     }
 
     #[test]

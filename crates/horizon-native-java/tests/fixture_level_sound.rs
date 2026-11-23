@@ -305,8 +305,8 @@ const SEED_987654321_LONGS: [i64; 3] = [
 #[test]
 fn server_level_all_play_sound_overloads_and_seed_order() {
     let sources = with_stubs(&[(
-        "demo/Probe.java",
-        r#"package demo;
+        "demoprobe/Probe.java",
+        r#"package demoprobe;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Holder;
 import net.minecraft.core.Registry;
@@ -409,7 +409,7 @@ public final class Probe {
     let level_random_first = fixture
         .jar
         .invoke_method_with_args(
-            "demo/Probe",
+            "demoprobe/Probe",
             "exerciseAll",
             "(Lnet/minecraft/world/level/Level;Lnet/minecraft/world/entity/Entity;Lnet/minecraft/world/entity/Entity;Lnet/minecraft/core/BlockPos;)J",
             None,
@@ -542,8 +542,8 @@ public final class Probe {
 #[test]
 fn client_level_dispatch_except_distance_delay_and_rng_streams() {
     let sources = with_stubs(&[(
-        "demo/Probe.java",
-        r#"package demo;
+        "demoprobe/Probe.java",
+        r#"package demoprobe;
 import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Holder;
@@ -639,7 +639,7 @@ public final class Probe {
     fixture
         .jar
         .invoke_method_with_args(
-            "demo/Probe",
+            "demoprobe/Probe",
             "exerciseClient",
             "(Lnet/minecraft/client/multiplayer/ClientLevel;Lnet/minecraft/world/entity/Entity;Lnet/minecraft/world/entity/Entity;)V",
             None,
@@ -758,7 +758,7 @@ public final class Probe {
     let next_long = fixture
         .jar
         .invoke_method_with_args(
-            "demo/Probe",
+            "demoprobe/Probe",
             "exerciseNullPlayer",
             "(Lnet/minecraft/client/multiplayer/ClientLevel;)J",
             None,
@@ -781,8 +781,8 @@ public final class Probe {
 #[test]
 fn entity_player_and_local_player_play_sound_and_sound_source() {
     let sources = with_stubs(&[(
-        "demo/Probe.java",
-        r#"package demo;
+        "demoprobe/Probe.java",
+        r#"package demoprobe;
 import net.minecraft.client.player.LocalPlayer;
 import net.minecraft.resources.Identifier;
 import net.minecraft.server.level.ServerPlayer;
@@ -893,7 +893,7 @@ public final class Probe {
     fixture
         .jar
         .invoke_method_with_args(
-            "demo/Probe",
+            "demoprobe/Probe",
             "exerciseServerEntities",
             "(Lnet/minecraft/world/entity/Entity;Lnet/minecraft/world/entity/Entity;Lnet/minecraft/server/level/ServerPlayer;Lnet/minecraft/server/level/ServerPlayer;)V",
             None,
@@ -967,7 +967,7 @@ public final class Probe {
     fixture
         .jar
         .invoke_method_with_args(
-            "demo/Probe",
+            "demoprobe/Probe",
             "exerciseLocalPlayer",
             "(Lnet/minecraft/client/player/LocalPlayer;)V",
             None,
@@ -994,7 +994,7 @@ public final class Probe {
     let mut lenient_host = StdHost::new();
     let rabbit = entity_handle(77);
     let _ = fixture.jar.invoke_method_with_args(
-        "demo/Probe",
+        "demoprobe/Probe",
         "checkRabbitSource",
         "(Lnet/minecraft/world/entity/Entity;)Ljava/lang/String;",
         None,
@@ -1010,8 +1010,8 @@ public final class Probe {
 #[test]
 fn sound_event_variable_vs_fixed_range_and_holders() {
     let sources = with_stubs(&[(
-        "demo/Probe.java",
-        r#"package demo;
+        "demoprobe/Probe.java",
+        r#"package demoprobe;
 import java.util.Optional;
 import net.minecraft.core.Holder;
 import net.minecraft.core.Registry;
@@ -1082,7 +1082,7 @@ public final class Probe {
     let summary = fixture
         .jar
         .invoke_method_with_args(
-            "demo/Probe",
+            "demoprobe/Probe",
             "exerciseRanges",
             "(Lnet/minecraft/world/level/Level;)Ljava/lang/String;",
             None,
@@ -1133,8 +1133,8 @@ public final class Probe {
 fn unmodelled_sound_calls_and_missing_facts_are_counted() {
     let sources = with_stubs(&[
         (
-            "demo/DynamicBlockPos.java",
-            r#"package demo;
+            "demoprobe/DynamicBlockPos.java",
+            r#"package demoprobe;
 import net.minecraft.core.BlockPos;
 public final class DynamicBlockPos extends BlockPos {
     public DynamicBlockPos(int x, int y, int z) { super(x, y, z); }
@@ -1143,8 +1143,8 @@ public final class DynamicBlockPos extends BlockPos {
 }"#,
         ),
         (
-            "demo/Probe.java",
-            r#"package demo;
+            "demoprobe/Probe.java",
+            r#"package demoprobe;
 import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.resources.Identifier;
 import net.minecraft.sounds.SoundEvent;
@@ -1190,7 +1190,7 @@ public final class Probe {
     fixture
         .jar
         .invoke_method_with_args(
-            "demo/Probe",
+            "demoprobe/Probe",
             "unseededServer",
             "(Lnet/minecraft/world/level/Level;)V",
             None,
@@ -1207,7 +1207,7 @@ public final class Probe {
     fixture
         .jar
         .invoke_method_with_args(
-            "demo/Probe",
+            "demoprobe/Probe",
             "unmodelledOverload",
             "(Lnet/minecraft/world/level/Level;)V",
             None,
@@ -1224,7 +1224,7 @@ public final class Probe {
     fixture
         .jar
         .invoke_method_with_args(
-            "demo/Probe",
+            "demoprobe/Probe",
             "overriddenBlockPos",
             "(Lnet/minecraft/world/level/Level;)V",
             None,
@@ -1250,7 +1250,7 @@ public final class Probe {
         &[],
     );
     let err = fixture.jar.invoke_method_with_args(
-        "demo/Probe",
+        "demoprobe/Probe",
         "clientMissingCamera",
         "(Lnet/minecraft/client/multiplayer/ClientLevel;)V",
         None,
@@ -1267,7 +1267,7 @@ public final class Probe {
     fixture
         .jar
         .invoke_method_with_args(
-            "demo/Probe",
+            "demoprobe/Probe",
             "clientUnseededLocal",
             "(Lnet/minecraft/client/multiplayer/ClientLevel;)V",
             None,
@@ -1324,8 +1324,8 @@ public @interface At { String value(); }"#,
 public class CallbackInfo { public void cancel() {} }"#,
         ),
         (
-            "demo/Probe.java",
-            r#"package demo;
+            "demoprobe/Probe.java",
+            r#"package demoprobe;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
 import net.minecraft.resources.Identifier;
 import net.minecraft.sounds.SoundEvent;
@@ -1365,7 +1365,7 @@ public class PlayerSoundMixin {
 }"#,
         ),
     ]);
-    let mod_json = r#"{"id":"demo","version":"1","entrypoints":{"main":["demo.Probe"]},"mixins":["demo.mixins.json"]}"#;
+    let mod_json = r#"{"id":"demo","version":"1","entrypoints":{"main":["demoprobe.Probe"]},"mixins":["demo.mixins.json"]}"#;
     let mixins_json = br#"{"package":"demo","mixins":["PlayerSoundMixin"]}"#;
     let fixture = Fixture::build_with_mod_json_and_extra(
         "level_sound_event_and_hook",
@@ -1508,8 +1508,8 @@ public class RuneCrafting {
 }"#,
         ),
         (
-            "demo/Probe.java",
-            r#"package demo;
+            "demoprobe/Probe.java",
+            r#"package demoprobe;
 import net.minecraft.core.Holder;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.sounds.SoundEvent;
@@ -1589,7 +1589,7 @@ public final class Probe {
     let before_unknowns = host.unknown_host_call_count();
     let result = runes
         .invoke_method_with_args(
-            "demo/Probe",
+            "demoprobe/Probe",
             "playRunesCrafting",
             "(Lnet/minecraft/world/level/Level;Lnet/minecraft/world/entity/player/Player;)Ljava/lang/String;",
             None,
@@ -1653,7 +1653,7 @@ const LEVEL_RANDOM_987654321: [i64; 6] = [
     -5_983_975_103_086_941_246,
 ];
 
-const ODD_BLOCK_POS: &str = r#"package demo;
+const ODD_BLOCK_POS: &str = r#"package demoprobe;
 import net.minecraft.core.BlockPos;
 public final class OddBlockPos extends BlockPos {
     public OddBlockPos(int x, int y, int z) { super(x, y, z); }
@@ -1666,7 +1666,7 @@ public final class OddBlockPos extends BlockPos {
 // reads the sound, holder or target; `ClientLevel.playLocalSound` / `playPlayerSound` draw
 // `Level.random.nextLong()` before the sound instance reads the sound or the entity). Decaf
 // counts those calls instead of modelling the throw; either way the seed is gone.
-const DRAW_ORDER_PROBE: &str = r#"package demo;
+const DRAW_ORDER_PROBE: &str = r#"package demoprobe;
 import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.client.player.LocalPlayer;
 import net.minecraft.core.BlockPos;
@@ -1764,8 +1764,8 @@ fn draw_order_fixture(test: &str) -> Fixture {
     Fixture::build(
         test,
         &with_stubs(&[
-            ("demo/OddBlockPos.java", ODD_BLOCK_POS),
-            ("demo/DrawOrder.java", DRAW_ORDER_PROBE),
+            ("demoprobe/OddBlockPos.java", ODD_BLOCK_POS),
+            ("demoprobe/DrawOrder.java", DRAW_ORDER_PROBE),
         ]),
     )
 }
@@ -1779,7 +1779,7 @@ fn draw_order_call(
 ) -> Result<Value, NativeError> {
     fixture
         .jar
-        .invoke_method_with_args("demo/DrawOrder", method, descriptor, None, args, host)
+        .invoke_method_with_args("demoprobe/DrawOrder", method, descriptor, None, args, host)
 }
 
 fn draw_order_client_frame() -> Arc<ClientSnapshot> {
