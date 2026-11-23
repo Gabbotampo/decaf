@@ -13,7 +13,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicPtr, Ordering};
-use std::sync::{Arc, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use mod_api::ServerHost;
 
@@ -168,7 +168,10 @@ pub(crate) fn matches_method(
 }
 
 struct ActiveFrame {
-    owner: *const HorizonJava,
+    /// Whose state the frame holds: the address of the owner's `state` mutex. Each
+    /// `HorizonJava` has exactly one, and a [`StateHandle`] shares it, so a command executor
+    /// finds the same frame its owner's hooks do. Compared only, never dereferenced.
+    owner: *const Mutex<State>,
     state: std::cell::UnsafeCell<State>,
     nested_entries: std::cell::Cell<u32>,
     refused_reentries: std::cell::Cell<u32>,
@@ -228,7 +231,35 @@ impl DerefMut for StateGuard<'_> {
 }
 
 pub(crate) fn lock_state(owner: &HorizonJava) -> StateGuard<'_> {
-    let owner_ptr = owner as *const HorizonJava;
+    lock_parts(&owner.state, &owner.dispatch_gate)
+}
+
+/// The mod's state as a `'static` callback reaches it: a server command executor
+/// (`Command::executes`) outlives any `&HorizonJava` borrow, so it holds the owner's state and
+/// gate themselves and locks them exactly as [`lock_state`] does.
+#[derive(Clone)]
+pub(crate) struct StateHandle {
+    state: Arc<Mutex<State>>,
+    gate: Arc<Mutex<()>>,
+}
+
+impl StateHandle {
+    pub(crate) fn new(owner: &HorizonJava) -> Self {
+        Self {
+            state: Arc::clone(&owner.state),
+            gate: Arc::clone(&owner.dispatch_gate),
+        }
+    }
+
+    pub(crate) fn lock(&self) -> StateGuard<'_> {
+        lock_parts(&self.state, &self.gate)
+    }
+}
+
+/// The active frame's state if this thread is inside a dispatch for this state, else the gate
+/// then the state mutex.
+fn lock_parts<'a>(state: &'a Arc<Mutex<State>>, gate: &'a Mutex<()>) -> StateGuard<'a> {
+    let owner_ptr = Arc::as_ptr(state);
     let active = ACTIVE_FRAMES.with(|frames| {
         let frames = frames.borrow();
         let frame = frames.last().filter(|frame| frame.0.owner == owner_ptr)?;
@@ -244,12 +275,8 @@ pub(crate) fn lock_state(owner: &HorizonJava) -> StateGuard<'_> {
             _marker: std::marker::PhantomData,
         };
     }
-    let gate = owner
-        .dispatch_gate
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let state = owner
-        .state
+    let gate = gate.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let state = state
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     StateGuard::Locked { _gate: gate, state }
@@ -294,7 +321,7 @@ impl HorizonJava {
         if !self.plan_bits.maybe_contains(dispatch.method.0) {
             return Ok(DispatchAnswer::default());
         }
-        let owner = self as *const HorizonJava;
+        let owner = Arc::as_ptr(&self.state);
         let refused = ACTIVE_FRAMES.with(|frames| {
             let frames = frames.borrow();
             let Some(frame) = frames.last().filter(|frame| frame.0.owner == owner) else {
@@ -1015,7 +1042,7 @@ mod tests {
             let mut locked = java.lock();
             std::mem::take(&mut *locked)
         };
-        let owner = &java as *const HorizonJava;
+        let owner = Arc::as_ptr(&java.state);
         ACTIVE_FRAMES.with(|frames| {
             frames
                 .borrow_mut()
@@ -1070,7 +1097,7 @@ mod tests {
             let mut locked = java.lock();
             std::mem::take(&mut *locked)
         };
-        let owner = &java as *const HorizonJava;
+        let owner = Arc::as_ptr(&java.state);
         ACTIVE_FRAMES.with(|frames| {
             frames
                 .borrow_mut()

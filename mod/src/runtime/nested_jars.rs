@@ -1901,7 +1901,7 @@ mod tests {
         // an ordinary V1 metadata document by the time ModDiscoverer parses
         // it: its id/version are selected like every other candidate, while
         // its generated marker does not add provides or dependencies.
-        let expected = include_str!("generated_nested_real_java25.txt");
+        let expected = crate::runtime::vendored_generated_nested_real_java25_txt::VENDORED_DATA;
         let generated = |version: &str, marker: &str| {
             jar(&[
                 (
@@ -1984,7 +1984,7 @@ mod tests {
         // Captured by the real Fabric Loader 0.19.5 ModDiscoverer on JDK 25.
         // Fabric selects the older copy for the three constrained shapes and
         // the newer copy when two top-level roots bundle the same path.
-        let rows = include_str!("review579_nested_real_java25.txt");
+        let rows = crate::runtime::vendored_review579_nested_real_java25_txt::VENDORED_DATA;
         let child = |id: &str, version: &str, extra: Option<&str>| {
             let suffix = extra.unwrap_or("");
             jar(&[(
@@ -2234,7 +2234,7 @@ mod tests {
 
     #[test]
     fn fabric_selection_matches_the_java25_mod_prio_oracle() {
-        for case in include_str!("nested_jars_cases.txt").lines() {
+        for case in crate::runtime::vendored_nested_jars_cases_txt::VENDORED_DATA.lines() {
             let (name, specs) = case.split_once('|').unwrap();
             let mut parsed = Vec::new();
             for (order, raw) in specs.split(';').filter(|raw| !raw.is_empty()).enumerate() {
@@ -2319,7 +2319,7 @@ mod tests {
                 })
                 .collect();
             let actual = select_fabric_candidates(candidates);
-            let expected = include_str!("nested_jars_java25.txt")
+            let expected = crate::runtime::vendored_nested_jars_java25_txt::VENDORED_DATA
                 .lines()
                 .find_map(|line| {
                     let mut fields = line.splitn(4, '|');
@@ -2460,7 +2460,7 @@ mod tests {
     fn fabric_predicates_match_the_jdk25_oracle() {
         let mut wrong = Vec::new();
         let mut refused = Vec::new();
-        for line in include_str!("nested_jars_predicate_java25.txt").lines() {
+        for line in crate::runtime::vendored_nested_jars_predicate_java25_txt::VENDORED_DATA.lines() {
             let row: serde_json::Value = serde_json::from_str(line).unwrap();
             let predicate = row["predicate"].as_str().unwrap();
             let version = row["version"].as_str().unwrap();
@@ -2527,7 +2527,7 @@ mod tests {
 
     #[test]
     fn maven_comparison_matches_the_jdk25_oracle() {
-        for line in include_str!("jarjar_version_java25.txt").lines() {
+        for line in crate::runtime::vendored_jarjar_version_java25_txt::VENDORED_DATA.lines() {
             let mut fields = line.split('|');
             if fields.next() != Some("cmp") {
                 continue;
@@ -2565,7 +2565,7 @@ mod tests {
 
     #[test]
     fn maven_ranges_and_restrictions_match_the_jdk25_oracle() {
-        for line in include_str!("jarjar_version_java25.txt").lines() {
+        for line in crate::runtime::vendored_jarjar_version_java25_txt::VENDORED_DATA.lines() {
             let fields = line.split('|').collect::<Vec<_>>();
             match fields.first().copied() {
                 Some("range") => {
