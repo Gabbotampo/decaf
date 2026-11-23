@@ -15,12 +15,13 @@ OpenJDK Runtime Environment (build 25.0.5.1)
 OpenJDK 64-Bit Server VM (build 25.0.5.1, mixed mode, sharing)
 ```
 
-Two probes, both JDK-only (java.util.concurrent), both committed:
+Three probes, all JDK-only (java.util.concurrent), all committed:
 
 ```sh
-$J/javac -d classes demo/Probe.java demo/Pending.java
+$J/javac -d classes demo/Probe.java demo/Pending.java demo/Late.java
 $J/java -cp classes demo.Probe > java25.txt
 $J/java -cp classes demo.Pending > java25-counted.txt
+$J/java -cp classes demo.Late > java25-late.txt
 ```
 
 `java25.txt` (`Probe`) is what the runtime answers, and the test compares the
@@ -47,3 +48,15 @@ exact either.
 A pool only answers a setter or getter once its constructor passed the checks
 the oracle shows (`ctor-*` rows: size first, then the factory, then the handler);
 a constructor that refused leaves nothing to answer from.
+
+`java25-late.txt` (`Late`) is the other order: a task call first (a delayed
+`schedule`, a zero-delay one, `execute`, `submit`), a policy setter or getter after
+it, on the same pool. The runtime ran that task at once and ignored the delay, so
+Java's answers (a cancel that succeeds, a pool that is not terminated, a task run
+on the factory's thread `W`, one task still pending at `shutdownNow`) differ from
+what it answers. Upstream counted the setter or getter, so a pool a task call
+reached keeps counting them (`policy_calls_after_a_task_are_counted`: each of the
+8 rows must reach the unknown-call list through a `ScheduledThreadPoolExecutor#set..`
+or `#get..` call). The marker is per pool (`a_task_on_another_pool_does_not_count_the_setter`).
+A setter or getter on a pool no task call has reached is answered, with the
+`java25.txt` rows as the oracle.

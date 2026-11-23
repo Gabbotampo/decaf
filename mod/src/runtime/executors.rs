@@ -30,8 +30,11 @@
 //!   or getter on a pool, every `execute`, `submit` and `schedule` on it is a
 //!   counted unknown host call (it was the setter that was counted before), and
 //!   so is one on a pool built with a handler once the pool is shut down (the
-//!   pool never calls the handler). A pool no policy call touched keeps the
-//!   older answers, which are the departures above.
+//!   pool never calls the handler). The other order is closed the same way: once
+//!   a task call reached such a pool, a later policy setter or getter on it is
+//!   counted as before (the earlier task ran at once and ignored the flag). A
+//!   pool no policy call touched keeps the older answers, which are the
+//!   departures above.
 
 use super::*;
 
@@ -57,6 +60,11 @@ const STPE_REMOVE_ON_CANCEL: &str = "#stpeRemoveOnCancel";
 const STPE_CONSTRUCTED: &str = "#stpeConstructed";
 /// Set once a jar called a policy setter or getter on the pool.
 const STPE_POLICY_USED: &str = "#stpePolicyUsed";
+/// Set once an `execute`, `submit` or `schedule` was answered on the pool (or
+/// reached the answer path): from then on a policy setter or getter on it stays
+/// counted, as upstream counted it, because the task was answered without the
+/// pool's thread, queue or policies and the call is the only marker left.
+const STPE_TASK_ANSWERED: &str = "#stpeTaskAnswered";
 /// Set when the pool was built with a `RejectedExecutionHandler` of the jar's.
 const STPE_HANDLER: &str = "#stpeHandler";
 const EXECUTOR_SERVICE: &str = "java/util/concurrent/ExecutorService";
@@ -283,10 +291,19 @@ fn invoke_executor<H: Host>(
     let Some(marker) = state_marker(rt, receiver, HostKind::Executor)? else {
         return Ok(None);
     };
-    if matches!(r.name.as_str(), "execute" | "submit" | "schedule")
-        && stpe_task_calls_counted(rt, &marker)
-    {
-        return Ok(None);
+    if matches!(r.name.as_str(), "execute" | "submit" | "schedule") {
+        if stpe_task_calls_counted(rt, &marker) {
+            return Ok(None);
+        }
+        // Marked before the call is answered or refused: a later policy call on
+        // this pool is then counted, whatever this call turns out to do.
+        if rt
+            .fields
+            .contains_key(&format!("{marker}|{STPE_CONSTRUCTED}"))
+        {
+            rt.fields
+                .insert(format!("{marker}|{STPE_TASK_ANSWERED}"), Value::Int(1));
+        }
     }
     let value = match (r.name.as_str(), r.descriptor.as_str()) {
         ("execute", "(Ljava/lang/Runnable;)V") => {
@@ -420,6 +437,16 @@ fn invoke_scheduled_pool<H: Host>(
         return Ok(Some(Value::Void));
     }
     if !rt.fields.contains_key(&constructed) {
+        return Ok(None);
+    }
+    // A task this pool already took was answered at once, in the caller's thread
+    // (a delayed one too): what the flag would have changed for it (a cancelled
+    // task left queued, a delayed task dropped at `shutdown`, the thread's name)
+    // is not shown, so the call that used to be counted stays counted.
+    if rt
+        .fields
+        .contains_key(&format!("{key}|{STPE_TASK_ANSWERED}"))
+    {
         return Ok(None);
     }
     let (field, default) = match r.name.as_str() {

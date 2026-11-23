@@ -109,3 +109,87 @@ fn tasks_on_a_policy_or_handler_pool_are_counted() {
         );
     }
 }
+
+const LATE_ORACLE: &str = include_str!("fixtures/stpe_policies/java25-late.txt");
+const LATE: &str = include_str!("fixtures/stpe_policies/demo/Late.java");
+
+/// A task call first, a policy setter or getter after it, on the same pool: the
+/// task was answered at once (the delay and the pool's thread ignored), so Java's
+/// answers (`java25-late.txt`) differ and the setter or getter must stay counted,
+/// as upstream counted it. The runtime's own answer is not compared.
+#[test]
+fn policy_calls_after_a_task_are_counted() {
+    let fixture = javac_fixture::Fixture::build("stpe_policies_late", &[("demo/Late.java", LATE)]);
+    let names: Vec<&str> = LATE_ORACLE
+        .lines()
+        .filter_map(|line| line.split(' ').next())
+        .collect();
+    assert_eq!(names.len(), 8, "{names:?}");
+    for name in names {
+        let mut host = fixture.jar.seed_host(horizon_native_java::StdHost::new());
+        let _ = fixture.jar.invoke_method_with_args(
+            "demo/Late",
+            "row",
+            "(Ljava/lang/String;)Ljava/lang/String;",
+            None,
+            &[horizon_native_java::Value::Ref(Some(name.to_string()))],
+            &mut host,
+        );
+        let counted = format!("{:?}", host.unknown_host_calls());
+        assert!(
+            [
+                "ScheduledThreadPoolExecutor#set",
+                "ScheduledThreadPoolExecutor#get"
+            ]
+            .iter()
+            .any(|call| counted.contains(call)),
+            "{name}: {counted}"
+        );
+    }
+}
+
+/// The marker is per pool: a task on one pool does not make another pool's setter
+/// counted, and a setter before any task is still answered.
+const OTHER_POOL: &str = r#"package demo;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledThreadPoolExecutor;
+public class OtherPool {
+    public static String run() throws Exception {
+        ScheduledThreadPoolExecutor a = new ScheduledThreadPoolExecutor(1);
+        ScheduledThreadPoolExecutor b = new ScheduledThreadPoolExecutor(1);
+        ScheduledExecutorService svc = a;
+        svc.execute(() -> { });
+        b.setRemoveOnCancelPolicy(true);
+        return "ran " + b.getRemoveOnCancelPolicy() + " " + b.getExecuteExistingDelayedTasksAfterShutdownPolicy();
+    }
+}
+"#;
+
+#[test]
+fn a_task_on_another_pool_does_not_count_the_setter() {
+    let fixture = javac_fixture::Fixture::build(
+        "stpe_policies_other",
+        &[("demo/OtherPool.java", OTHER_POOL)],
+    );
+    let mut host = fixture.jar.seed_host(horizon_native_java::StdHost::new());
+    let answer = fixture
+        .jar
+        .invoke_method_with_args(
+            "demo/OtherPool",
+            "run",
+            "()Ljava/lang/String;",
+            None,
+            &[],
+            &mut host,
+        )
+        .unwrap();
+    assert_eq!(
+        answer,
+        horizon_native_java::Value::Ref(Some("ran true true".into()))
+    );
+    assert!(
+        host.unknown_host_calls().is_empty(),
+        "{:?}",
+        host.unknown_host_calls()
+    );
+}
