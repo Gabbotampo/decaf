@@ -8,7 +8,7 @@ use std::{collections::BTreeMap, path::Path};
 
 use horizon_native_java::{
     BlockHitData, BlockUseContext, BlockUsePlayerData, BlockUseSide, InteractionItemContext,
-    InteractionResultValue, NativeJar, StdHost, SwingSource,
+    InteractionResultValue, MenuEffect, NativeJar, PlayerContainer, StdHost, SwingSource,
 };
 use serde_json::json;
 
@@ -44,6 +44,8 @@ fn run_runes_crafting_altar_test(jar_path: &str) {
             .expect("run Runes main");
     }
 
+    // The player just joined: a new `ServerPlayer`, `containerCounter` 0.
+    host.server_player_created(1, 1, 0);
     let pos = [12, 65, -7];
     let server_ctx = BlockUseContext {
         side: BlockUseSide::Server,
@@ -70,16 +72,17 @@ fn run_runes_crafting_altar_test(jar_path: &str) {
         item_on.result,
         Some(InteractionResultValue::TryEmptyHandInteraction)
     );
-    assert!(item_on.open_menus.is_empty());
+    assert!(item_on.menu_effects.is_empty());
 
     // 2. Server-side useWithoutItem -> CONSUME + typed OpenMenuEffect for `runes:crafting`.
+    //    `ServerPlayer.initMenu` (the slot listener and synchronizer) is the one counted call.
     let server = jar
         .block_use_without_item(&mut host, &server_ctx)
         .expect("run server useWithoutItem");
     assert_eq!(
-        server.unknown_host_call_count, 0,
-        "unexpected unknowns in server useWithoutItem: {:?}",
-        server.unknown_host_calls
+        server.unknown_host_calls,
+        BTreeMap::from([(INIT_MENU.to_owned(), 1)]),
+        "unexpected unknowns in server useWithoutItem"
     );
     assert_eq!(
         server.result,
@@ -91,8 +94,8 @@ fn run_runes_crafting_altar_test(jar_path: &str) {
             },
         })
     );
-    assert_eq!(server.open_menus.len(), 1);
-    let effect = &server.open_menus[0];
+    assert_eq!(server.menu_effects.len(), 1);
+    let effect = server.open_menus().next().unwrap();
     assert_eq!(effect.container_id, 1);
     assert_eq!(effect.menu_type_id.as_deref(), Some("runes:crafting"));
     assert_eq!(
@@ -101,6 +104,32 @@ fn run_runes_crafting_altar_test(jar_path: &str) {
     );
     assert_eq!(effect.access_pos, Some(pos));
     assert!(effect.constructor.is_some());
+    // Decaf holds it as the player's `containerMenu`.
+    assert_eq!(
+        host.player_open_menu(1).map(|m| m.menu.clone()),
+        Some(effect.menu.clone())
+    );
+
+    // A second click while the window shows menu 1 closes it first: `ItemCombinerMenu.removed`
+    // (which hands the inputs back) is counted, then menu 2 is built.
+    let mut showing = server_ctx.clone();
+    showing.player.container = PlayerContainer::Open(1);
+    let again = jar
+        .block_use_without_item(&mut host, &showing)
+        .expect("run second server useWithoutItem");
+    assert!(matches!(
+        again.menu_effects.as_slice(),
+        [MenuEffect::Closed { container_id: 1 }, MenuEffect::Opened(open)] if open.container_id == 2
+    ));
+    assert!(
+        again
+            .unknown_host_calls
+            .keys()
+            .any(|k| k.contains("#removed")),
+        "{:?}",
+        again.unknown_host_calls
+    );
+    assert_eq!(host.player_open_menu(1).map(|m| m.container_id), Some(2));
 
     // 3. Client-side useWithoutItem -> SUCCESS + 0 open-menu effects + 0 unknowns.
     let mut client_ctx = server_ctx;
@@ -123,5 +152,7 @@ fn run_runes_crafting_altar_test(jar_path: &str) {
             },
         })
     );
-    assert!(client.open_menus.is_empty());
+    assert!(client.menu_effects.is_empty());
 }
+
+const INIT_MENU: &str = "net/minecraft/server/level/ServerPlayer#initMenu(Lnet/minecraft/world/inventory/AbstractContainerMenu;)V";

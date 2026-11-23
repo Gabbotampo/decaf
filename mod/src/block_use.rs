@@ -5,19 +5,27 @@
 //! [`mod_api::InteractionResult`], and every Java `openMenu` effect either opens a registered
 //! Sunrise mod menu via [`mod_api::PlayerRef::open_mod_menu`] or records and counts a named
 //! refusal without opening a stand-in window.
+//!
+//! The jar's host holds at most one Java menu per player, the one vanilla would have as the
+//! `ServerPlayer`'s `containerMenu`, and only while Sunrise shows it under the same window id:
+//! a refused open drops it at once, a close (`menu_closed`) runs its `removed` and drops it, and
+//! logout and a new server drop it ([`crate::runtime::StdHost::player_open_menu`]). Sunrise's
+//! window ids are the real `containerCounter`, so every open Sunrise reports
+//! (`player_container_open`) keeps each jar's counter in step.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use mod_api::{
     BlockClick, BlockPart, Hand, InteractionResult, LogicalSide, MenuReplace, OpenMenuError,
-    ServerHost, UseItemOnEvent, UseWithoutItemEvent,
+    PlayerRef, ServerHost, UseItemOnEvent, UseWithoutItemEvent,
 };
 use serde_json::json;
 
 use crate::runtime::{
-    BlockHitData, BlockUseContext, BlockUsePlayerData, BlockUseSide, ExecutionBudget,
-    InteractionResultValue, OpenMenuEffect, SwingSource,
+    BlockHitData, BlockUseContext, BlockUseOutcome, BlockUsePlayerData, BlockUseSide,
+    ExecutionBudget, InteractionResultValue, MenuEffect, OpenMenuEffect, PlayerContainer,
+    SwingSource,
 };
 use crate::{JAR_BUDGET, LOG, LoadedJar, State, caught, dimension_id};
 
@@ -53,18 +61,6 @@ impl Tally {
     }
 }
 
-/// An open-menu effect captured during a Java block-use, kept alongside its Sunrise outcome
-/// (and with its Java values GC-retained on the jar's host) so W11 can drive the live menu.
-#[derive(Clone, Debug)]
-#[allow(dead_code)]
-pub(crate) struct RecordedOpenMenu {
-    pub(crate) player: u128,
-    pub(crate) container_id: i32,
-    pub(crate) sunrise_window_id: Option<i32>,
-    pub(crate) effect: OpenMenuEffect,
-    pub(crate) refusal: Option<String>,
-}
-
 /// Scoped Sunrise [`BlockPart`] attached to a Java mod block at `Hooks::register`.
 pub(crate) struct JavaBlockUsePart {
     state: Arc<Mutex<State>>,
@@ -83,6 +79,109 @@ impl JavaBlockUsePart {
         click: &BlockClick<'_>,
         with_item: bool,
     ) -> Option<InteractionResult> {
+        // The Java run holds the state lock; Sunrise's menu calls run without it, since
+        // opening and closing a window fires `player_container_open` and `menu_closed`, which
+        // this mod listens to and which take the lock themselves.
+        let (jar_index, jar_id, outcome) =
+            self.run_java(&mut *host, state_val, click, with_item)?;
+        let hook_name = if with_item {
+            "useItemOn"
+        } else {
+            "useWithoutItem"
+        };
+        let applied = match &outcome {
+            Ok(outcome) => apply_menu_effects(host, click.player, &outcome.menu_effects),
+            Err(_) => Vec::new(),
+        };
+
+        let mut guard = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let jar = guard
+            .jars
+            .get_mut(jar_index)
+            .filter(|jar| jar.row.id == jar_id)?;
+        match outcome {
+            Ok(outcome) => {
+                jar.row.block_use.uses_ran += 1;
+                jar.row.block_use.unknown_host_calls += outcome.unknown_host_call_count;
+                if outcome.unknown_host_call_count > 0 {
+                    log::warn!(
+                        "{LOG}: {}: {} {} leaned on {} unmodelled host call(s): {:?}",
+                        jar.row.id,
+                        self.block_id,
+                        hook_name,
+                        outcome.unknown_host_call_count,
+                        outcome.unknown_host_calls
+                    );
+                }
+                for applied in applied {
+                    record_menu_outcome(jar, click.player, applied);
+                }
+                match outcome.result {
+                    Some(ref result) => {
+                        if let InteractionResultValue::Success { item_context, .. } = result {
+                            if item_context.held_item_transformed_to.is_some() {
+                                jar.host.note_unknown_game_hook(
+                                    "sunrise#block_use:held_item_transformed_to",
+                                );
+                                log::warn!(
+                                    "{LOG}: {}: {} {} returned heldItemTransformedTo stack; Sunrise BlockPart::use_* cannot rewrite the held stack",
+                                    jar.row.id,
+                                    self.block_id,
+                                    hook_name
+                                );
+                            }
+                            if !item_context.was_item_interaction {
+                                jar.host.note_unknown_game_hook(
+                                    "sunrise#block_use:without_item_context",
+                                );
+                                log::warn!(
+                                    "{LOG}: {}: {} {} returned InteractionResult.Success.withoutItem(); Sunrise InteractionResult does not carry ItemContext.NONE",
+                                    jar.row.id,
+                                    self.block_id,
+                                    hook_name
+                                );
+                            }
+                        }
+                        Some(map_interaction_result(result))
+                    }
+                    None => {
+                        let reason = format!(
+                            "{}: {} returned null or unmodelled InteractionResult",
+                            self.block_id, hook_name
+                        );
+                        jar.row.block_use.uses_failed += 1;
+                        jar.host
+                            .note_unknown_game_hook("block-use:unmodelled-interaction-result");
+                        log::warn!("{LOG}: {}: {reason}", jar.row.id);
+                        None
+                    }
+                }
+            }
+            Err(error) => {
+                jar.row.block_use.uses_failed += 1;
+                log::warn!(
+                    "{LOG}: {}: {} {} {error}",
+                    jar.row.id,
+                    self.block_id,
+                    hook_name
+                );
+                None
+            }
+        }
+    }
+
+    /// Run the jar's `useItemOn`/`useWithoutItem` for this click under the state lock: the
+    /// jar's index and id, and its outcome or why it has none (an error or a panic).
+    fn run_java(
+        &self,
+        host: &mut dyn ServerHost,
+        state_val: mod_api::BlockState,
+        click: &BlockClick<'_>,
+        with_item: bool,
+    ) -> Option<(usize, String, Result<BlockUseOutcome, String>)> {
         let state_str = host.block_state_string(state_val);
         let (resolved_block_id, state_properties) = match state_str.as_deref() {
             Some(raw) => {
@@ -100,7 +199,9 @@ impl JavaBlockUsePart {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
 
-        let (session, life) = guard.lives.get(&click.player).copied().unwrap_or((1, 0));
+        // Which `ServerPlayer` object this is (a login's session, a respawn's life); `None`
+        // for a player whose login this mod never heard, whose object it can't name.
+        let incarnation = guard.lives.get(&click.player).copied();
         let facade_name = guard
             .players
             .iter()
@@ -118,6 +219,7 @@ impl JavaBlockUsePart {
         let spectator = player_ref
             .and_then(|p| p.is_spectator(&*host))
             .unwrap_or(false);
+        let container = player_container(&*host, player_ref);
 
         let jar_index = guard
             .jars
@@ -163,8 +265,8 @@ impl JavaBlockUsePart {
                 uuid: click.player,
                 name: player_name,
                 entity_id: Some(click.player_entity_id),
-                session,
-                life,
+                incarnation,
+                container,
                 sneaking,
                 spectator,
                 main_hand,
@@ -195,86 +297,25 @@ impl JavaBlockUsePart {
         for line in stdout.lines() {
             log::info!("{LOG}: {}: {line}", jar.row.id);
         }
+        let outcome = match outcome {
+            Ok(Ok(outcome)) => Ok(outcome),
+            Ok(Err(error)) => Err(format!("failed: {error}")),
+            Err(panic) => Err(format!("panicked: {panic}")),
+        };
+        Some((jar_index, jar.row.id.clone(), outcome))
+    }
+}
 
-        match outcome {
-            Ok(Ok(outcome)) => {
-                jar.row.block_use.uses_ran += 1;
-                jar.row.block_use.unknown_host_calls += outcome.unknown_host_call_count;
-                if outcome.unknown_host_call_count > 0 {
-                    log::warn!(
-                        "{LOG}: {}: {} {} leaned on {} unmodelled host call(s): {:?}",
-                        jar.row.id,
-                        self.block_id,
-                        hook_name,
-                        outcome.unknown_host_call_count,
-                        outcome.unknown_host_calls
-                    );
-                }
-                for effect in outcome.open_menus {
-                    apply_open_menu_effect(host, jar, click.player, effect);
-                }
-                match outcome.result {
-                    Some(ref result) => {
-                        if let InteractionResultValue::Success { item_context, .. } = result {
-                            if item_context.held_item_transformed_to.is_some() {
-                                jar.host.note_unknown_game_hook(
-                                    "sunrise#block_use:held_item_transformed_to",
-                                );
-                                log::warn!(
-                                    "{LOG}: {}: {} {} returned heldItemTransformedTo stack; Sunrise BlockPart::use_* cannot rewrite the held stack",
-                                    jar.row.id,
-                                    self.block_id,
-                                    hook_name
-                                );
-                            }
-                            if !item_context.was_item_interaction {
-                                jar.host.note_unknown_game_hook(
-                                    "sunrise#block_use:without_item_context",
-                                );
-                                log::warn!(
-                                    "{LOG}: {}: {} {} returned InteractionResult.Success.withoutItem(); Sunrise InteractionResult does not carry ItemContext.NONE",
-                                    jar.row.id,
-                                    self.block_id,
-                                    hook_name
-                                );
-                            }
-                        }
-                        Some(map_interaction_result(result))
-                    }
-                    None => {
-                        let reason = format!(
-                            "{}: {} returned null or unmodelled InteractionResult",
-                            self.block_id, hook_name
-                        );
-                        jar.row.block_use.uses_failed += 1;
-                        jar.host
-                            .note_unknown_game_hook("block-use:unmodelled-interaction-result");
-                        log::warn!("{LOG}: {}: {reason}", jar.row.id);
-                        None
-                    }
-                }
-            }
-            Ok(Err(error)) => {
-                jar.row.block_use.uses_failed += 1;
-                log::warn!(
-                    "{LOG}: {}: {} {} failed: {error}",
-                    jar.row.id,
-                    self.block_id,
-                    hook_name
-                );
-                None
-            }
-            Err(panic) => {
-                jar.row.block_use.uses_failed += 1;
-                log::warn!(
-                    "{LOG}: {}: {} {} panicked: {panic}",
-                    jar.row.id,
-                    self.block_id,
-                    hook_name
-                );
-                None
-            }
-        }
+/// The player's open container as Sunrise reports it: the inventory menu is container 0. A
+/// menu Sunrise has no handle for (crafting tables, merchants, workstations) is unknown.
+fn player_container(host: &dyn ServerHost, player: Option<PlayerRef>) -> PlayerContainer {
+    match player
+        .and_then(|player| player.container_menu(host))
+        .and_then(|menu| menu.container_id(host))
+    {
+        Some(0) => PlayerContainer::Inventory,
+        Some(id) => PlayerContainer::Open(id),
+        None => PlayerContainer::Unknown,
     }
 }
 
@@ -350,36 +391,220 @@ pub(crate) fn face_to_direction(face: [i32; 3]) -> &'static str {
     }
 }
 
-/// Map an [`OpenMenuEffect`] onto Sunrise's [`mod_api::PlayerRef::open_mod_menu`] seam.
-///
-/// Where the pinned SDK cannot express the menu yet (for example, a Java mod's blockless
-/// processing menu type before upstream #4007/#4008, an unregistered `MenuType`, or
-/// `OpenMenuError::NotModMenu`), this records and counts a named refusal and never opens a
-/// stand-in chest window.
-pub(crate) fn apply_open_menu_effect(
-    host: &mut dyn ServerHost,
-    jar: &mut LoadedJar,
-    player_uuid: u128,
-    effect: OpenMenuEffect,
-) {
-    // Keep the Java MenuType, Component, MenuConstructor lambda, MenuProvider, and live
-    // AbstractContainerMenu alive across subsequent GC cycles for W11.
-    jar.host.retain_open_menu_effect(&effect);
+/// What Sunrise made of one of a use's [`MenuEffect`]s.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum MenuApplied {
+    /// Java opened menu `container_id`; Sunrise opened it or refused.
+    Opened {
+        container_id: i32,
+        attempt: SunriseMenuAttempt,
+    },
+    /// Java closed menu `container_id` and opened nothing after it: whether Sunrise closed the
+    /// window too.
+    Closed { container_id: i32, closed: bool },
+}
 
-    let container_id = effect.container_id;
-    let outcome = try_open_sunrise_menu(host, player_uuid, &effect);
-    let (sunrise_window_id, refusal) = record_open_menu_outcome(jar, &effect, outcome);
-    jar.open_menus.push(RecordedOpenMenu {
-        player: player_uuid,
-        container_id,
-        sunrise_window_id,
-        effect,
-        refusal,
-    });
+/// Carry a use's menu effects out on Sunrise, in order, without the state lock. A close
+/// followed by an open needs nothing of its own: the open's [`MenuReplace::CloseFirst`] closes
+/// the window as `ServerPlayer.closeContainer` would have. A close with no open after it closes
+/// the window (`MenuRef::close_container`).
+pub(crate) fn apply_menu_effects(
+    host: &mut dyn ServerHost,
+    player_uuid: u128,
+    effects: &[MenuEffect],
+) -> Vec<MenuApplied> {
+    let mut applied = Vec::new();
+    for (index, effect) in effects.iter().enumerate() {
+        match effect {
+            MenuEffect::Opened(open) => applied.push(MenuApplied::Opened {
+                container_id: open.container_id,
+                attempt: try_open_sunrise_menu(host, player_uuid, open),
+            }),
+            MenuEffect::Closed { container_id } => {
+                if matches!(effects.get(index + 1), Some(MenuEffect::Opened(_))) {
+                    continue;
+                }
+                let window = host
+                    .player(player_uuid)
+                    .and_then(|player| player.container_menu(&*host))
+                    .filter(|menu| menu.container_id(&*host) == Some(*container_id));
+                let closed = window.is_some_and(|menu| menu.close_container(host));
+                applied.push(MenuApplied::Closed {
+                    container_id: *container_id,
+                    closed,
+                });
+            }
+        }
+    }
+    applied
+}
+
+/// Record what Sunrise did with one effect on the jar: tallies, counted refusals, and the
+/// jar's hold on the menu, which it keeps only while Sunrise shows it under the id Java gave it.
+pub(crate) fn record_menu_outcome(jar: &mut LoadedJar, player_uuid: u128, applied: MenuApplied) {
+    match applied {
+        MenuApplied::Opened {
+            container_id,
+            attempt: SunriseMenuAttempt::Opened(window),
+        } => {
+            jar.row.block_use.menus_opened += 1;
+            log::info!(
+                "{LOG}: {}: opened Sunrise menu window {window} for container {container_id}",
+                jar.row.id
+            );
+            if window != container_id {
+                // Java built its menu with an id the client won't use: nothing can bridge it.
+                jar.host
+                    .note_unknown_game_hook("sunrise#openModMenu:container_id_mismatch");
+                log::warn!(
+                    "{LOG}: {}: Sunrise opened window {window} for Java container {container_id}",
+                    jar.row.id
+                );
+                jar.host.refuse_open_menu(player_uuid, container_id);
+            }
+            // Sunrise's window id is the `ServerPlayer`'s `containerCounter` now.
+            jar.host
+                .server_player_container_opened(player_uuid, Some(window));
+        }
+        MenuApplied::Opened {
+            container_id,
+            attempt: SunriseMenuAttempt::Refused { hook_tag, reason },
+        } => {
+            jar.row.block_use.note_refusal(reason.clone());
+            jar.host.note_unknown_game_hook(hook_tag);
+            log::warn!("{LOG}: {}: {reason}", jar.row.id);
+            // Nothing shows the menu: the jar stops holding it, and its counter (Java advanced
+            // it, Sunrise didn't) is no longer known.
+            jar.host.refuse_open_menu(player_uuid, container_id);
+        }
+        MenuApplied::Closed {
+            container_id,
+            closed,
+        } => {
+            if !closed {
+                jar.host
+                    .note_unknown_game_hook("sunrise#closeContainer:window_not_closed");
+                log::warn!(
+                    "{LOG}: {}: Java closed container {container_id}, but Sunrise did not close its window",
+                    jar.row.id
+                );
+            }
+        }
+    }
+}
+
+/// `menu_closed`: a window a mod opened closed (the player closed it, something replaced it, or
+/// the player left). A jar that holds its Java menu runs the menu's close
+/// (`ServerPlayer.doCloseContainer`: its `removed(player)`) and stops holding it.
+pub(crate) fn menu_closed(
+    state: &mut crate::State,
+    host: &mut dyn ServerHost,
+    player_uuid: u128,
+    window: i32,
+) {
+    let holders: Vec<usize> = state
+        .jars
+        .iter()
+        .enumerate()
+        .filter(|(_, jar)| {
+            jar.host
+                .player_open_menu(player_uuid)
+                .is_some_and(|open| open.container_id == window)
+        })
+        .map(|(index, _)| index)
+        .collect();
+    if holders.is_empty() {
+        return;
+    }
+    let player_ref = host.player(player_uuid);
+    let facade = state.players.iter().find(|p| p.uuid == player_uuid);
+    let dimension = player_ref
+        .and_then(|player| player.entity().level(&*host))
+        .map(|level| level.dimension_id().to_owned())
+        .or_else(|| facade.and_then(|p| p.level.clone()));
+    let player = BlockUsePlayerData {
+        uuid: player_uuid,
+        name: player_ref
+            .and_then(|p| p.name(&*host))
+            .or_else(|| facade.map(|p| p.name.clone()))
+            .unwrap_or_else(|| "Player".to_owned()),
+        entity_id: player_ref
+            .map(|p| p.entity().id() as i32)
+            .or_else(|| facade.and_then(|p| p.entity_id)),
+        incarnation: state.lives.get(&player_uuid).copied(),
+        container: PlayerContainer::Open(window),
+        sneaking: player_ref
+            .and_then(|p| p.entity().is_shift_key_down(&*host))
+            .unwrap_or(false),
+        spectator: player_ref
+            .and_then(|p| p.is_spectator(&*host))
+            .unwrap_or(false),
+        main_hand: None,
+        off_hand: None,
+    };
+    for index in holders {
+        let jar = &mut state.jars[index];
+        let Some(dimension) = dimension.as_deref() else {
+            // No level to hand `removed`: the close can't run here, so it is counted. The jar
+            // keeps the menu until the player's next block use counts the missed close, or
+            // their logout drops it.
+            jar.host
+                .note_unknown_game_hook("sunrise#menu_closed:unknown_level");
+            continue;
+        };
+        let budget = ExecutionBudget::within(JAR_BUDGET);
+        let label = format!("{} menu {window} close", jar.row.id);
+        let closed = caught(&label, || {
+            jar.jar
+                .close_player_menu(&mut jar.host, &player, dimension, window, &budget)
+        });
+        match closed {
+            Ok(Ok(Some(outcome))) => {
+                jar.row.block_use.unknown_host_calls += outcome.unknown_host_call_count;
+                if outcome.unknown_host_call_count > 0 {
+                    log::warn!(
+                        "{LOG}: {}: closing menu {window} leaned on {} unmodelled host call(s): {:?}",
+                        jar.row.id,
+                        outcome.unknown_host_call_count,
+                        outcome.unknown_host_calls
+                    );
+                }
+            }
+            Ok(Ok(None)) => {}
+            Ok(Err(error)) => {
+                jar.row.block_use.uses_failed += 1;
+                log::warn!(
+                    "{LOG}: {}: closing menu {window} failed: {error}",
+                    jar.row.id
+                );
+            }
+            Err(panic) => {
+                jar.row.block_use.uses_failed += 1;
+                log::warn!(
+                    "{LOG}: {}: closing menu {window} panicked: {panic}",
+                    jar.row.id
+                );
+            }
+        }
+    }
+}
+
+/// `player_container_open`: a menu opened for the player (any opener). Its container id is the
+/// `ServerPlayer`'s `containerCounter` now, in every jar; a menu Sunrise has no handle for
+/// leaves the counter unknown.
+pub(crate) fn container_opened(
+    state: &mut crate::State,
+    player_uuid: u128,
+    container_id: Option<i32>,
+) {
+    for jar in &mut state.jars {
+        jar.host
+            .server_player_container_opened(player_uuid, container_id);
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
-enum SunriseMenuAttempt {
+pub(crate) enum SunriseMenuAttempt {
     Opened(i32),
     Refused {
         hook_tag: &'static str,
@@ -486,45 +711,16 @@ fn classify_open_mod_menu_result(
     }
 }
 
-fn record_open_menu_outcome(
-    jar: &mut LoadedJar,
-    effect: &OpenMenuEffect,
-    outcome: SunriseMenuAttempt,
-) -> (Option<i32>, Option<String>) {
-    match outcome {
-        SunriseMenuAttempt::Opened(window_id) => {
-            jar.row.block_use.menus_opened += 1;
-            log::info!(
-                "{LOG}: {}: opened Sunrise menu {:?} (window={}, container_id={}, pos={:?})",
-                jar.row.id,
-                effect.menu_type_id,
-                window_id,
-                effect.container_id,
-                effect.access_pos
-            );
-            (Some(window_id), None)
-        }
-        SunriseMenuAttempt::Refused { hook_tag, reason } => {
-            jar.row.block_use.note_refusal(reason.clone());
-            jar.host.note_unknown_game_hook(hook_tag);
-            log::warn!("{LOG}: {}: {reason}", jar.row.id);
-            (None, Some(reason))
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::path::Path;
 
+    use crate::runtime::{InteractionItemContext, NativeJar, StdHost};
     use mod_api::{
         Backend, BackendMut, BlockHit, BlockKey, BlockState, BlockStateRecord, EntityRef, Host,
         LevelDimension, PlayerRef, Text, WorldEpoch,
     };
-    use serde_json::json;
-
-    use crate::runtime::{InteractionItemContext, NativeJar, StdHost};
 
     struct BlockUseTestHost {
         state_string: Option<String>,
@@ -598,9 +794,28 @@ mod tests {
             Some(false)
         }
     }
+    /// The player has only their inventory menu open (container 0).
+    impl mod_api::prelude::PlayerMenusBackend for BlockUseTestHost {
+        fn player_container_menu(&self, player: PlayerRef) -> Option<mod_api::MenuRef> {
+            (player.uuid() == self.player_uuid)
+                .then(|| mod_api::__private::game::menu_ref(player, 0, 1))
+        }
+    }
+    impl mod_api::prelude::MenusBackend for BlockUseTestHost {
+        fn menu_container_id(&self, _menu: mod_api::MenuRef) -> Option<i32> {
+            Some(0)
+        }
+    }
+    impl mod_api::prelude::MenusClientBackend for BlockUseTestHost {}
     mod_api::impl_backend_areas!(
         BlockUseTestHost,
-        except(player_session, entity_stance, player_modes)
+        except(
+            player_session,
+            entity_stance,
+            player_modes,
+            player_menus,
+            menus
+        )
     );
     impl Backend for BlockUseTestHost {}
     mod_api::impl_backend_mut_areas!(BlockUseTestHost);
@@ -764,7 +979,13 @@ mod tests {
                 .expect("run Runes main");
         }
 
+        // The player joined: this mod counted their session, and the jar's host knows their
+        // new `ServerPlayer` (`HorizonJava::next_life`).
+        let player_uuid = 0x2a_u128;
+        host.server_player_created(player_uuid, 1, 0);
+        let baseline = host.retained_count();
         let mut state = State::default();
+        state.lives.insert(player_uuid, (1, 0));
         state.jars.push(LoadedJar {
             row: crate::JarRow::refused("runes.jar", "runes".to_owned(), String::new()),
             jar,
@@ -778,7 +999,6 @@ mod tests {
             failures: Vec::new(),
             hooks: crate::runtime::GameHookRegistrations::default(),
             hook_state: crate::runtime::GameHookState::default(),
-            open_menus: Vec::new(),
         });
         let shared = Arc::new(Mutex::new(state));
         let part = JavaBlockUsePart::new(Arc::clone(&shared), "runes:crafting_altar".to_owned());
@@ -791,40 +1011,60 @@ mod tests {
         let item_answer = part.dispatch(&mut server_host, block_state, &click, true);
         assert_eq!(item_answer, Some(InteractionResult::TryWithEmptyHand));
 
-        // 2. use_without_item -> Consume, 1 OpenMenuEffect recorded for `runes:crafting`,
-        //    and counted named Sunrise refusal (not yet registered as a Sunrise content menu).
+        // 2. use_without_item -> Consume. Java opened `runes:crafting` (only `initMenu` is
+        //    counted); Sunrise has no such content menu yet, so the named refusal is counted and
+        //    the jar stops holding the menu at once.
         let empty_answer = part.dispatch(&mut server_host, block_state, &click, false);
         assert_eq!(empty_answer, Some(InteractionResult::Consume));
+        {
+            let guard = shared.lock().unwrap();
+            let loaded = &guard.jars[0];
+            assert_eq!(loaded.row.block_use.uses_ran, 2);
+            assert_eq!(loaded.row.block_use.uses_failed, 0);
+            assert_eq!(
+                loaded.row.block_use.unknown_host_calls, 1,
+                "ServerPlayer.initMenu"
+            );
+            assert_eq!(loaded.row.block_use.menus_opened, 0);
+            assert_eq!(loaded.row.block_use.menus_refused, 1);
+            let (reason, count) = loaded
+                .row
+                .block_use
+                .refusals
+                .iter()
+                .next()
+                .expect("one refusal");
+            assert_eq!(*count, 1);
+            assert!(
+                reason.contains("runes:crafting") && reason.contains("#4007/#4008"),
+                "unexpected refusal: {reason}"
+            );
+            assert!(loaded.host.player_open_menu(player_uuid).is_none());
+            assert_eq!(loaded.host.retained_count(), baseline);
+        }
 
+        // 3. N more right-clicks: every one refused, and still no menu held and no retain hold
+        //    left behind (#629 review P1 1). The counter is unknown after a refusal (Java
+        //    advanced it, Sunrise didn't), so each later open counts it.
+        for _ in 0..8 {
+            let answer = part.dispatch(&mut server_host, block_state, &click, false);
+            assert_eq!(answer, Some(InteractionResult::Consume));
+        }
         let guard = shared.lock().unwrap();
         let loaded = &guard.jars[0];
-        assert_eq!(loaded.row.block_use.uses_ran, 2);
-        assert_eq!(loaded.row.block_use.uses_failed, 0);
-        assert_eq!(loaded.row.block_use.unknown_host_calls, 0);
-        assert_eq!(loaded.row.block_use.menus_opened, 0);
-        assert_eq!(loaded.row.block_use.menus_refused, 1);
-        assert_eq!(loaded.open_menus.len(), 1);
-        let recorded = &loaded.open_menus[0];
-        assert_eq!(recorded.player, server_host.player_uuid);
-        assert_eq!(recorded.container_id, 1);
-        assert_eq!(recorded.sunrise_window_id, None);
+        assert_eq!(loaded.row.block_use.menus_refused, 9);
+        assert!(loaded.host.player_open_menu(player_uuid).is_none());
+        assert_eq!(loaded.host.retained_count(), baseline);
         assert_eq!(
-            recorded.effect.menu_type_id.as_deref(),
-            Some("runes:crafting")
-        );
-        assert_eq!(
-            recorded.effect.title_json,
-            Some(json!({ "translate": "gui.runes.rune_crafting" }))
-        );
-        assert_eq!(recorded.effect.access_pos, Some([8, 65, -3]));
-        assert!(recorded.effect.constructor.is_some());
-        assert!(
-            recorded
-                .refusal
-                .as_deref()
-                .is_some_and(|r| r.contains("runes:crafting") && r.contains("#4007/#4008")),
-            "unexpected refusal: {:?}",
-            recorded.refusal
+            loaded
+                .host
+                .unknown_host_calls()
+                .into_iter()
+                .find(|(key, _)| key.ends_with("#nextContainerCounter()V")),
+            Some((
+                "net/minecraft/server/level/ServerPlayer#nextContainerCounter()V".to_owned(),
+                8
+            ))
         );
     }
 }

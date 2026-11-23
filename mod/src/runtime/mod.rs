@@ -41,7 +41,8 @@ mod block_item_id;
 mod block_use;
 pub use block_use::{
     BlockHitData, BlockUseContext, BlockUseOutcome, BlockUsePlayerData, BlockUseSide,
-    InteractionItemContext, InteractionResultValue, OpenMenuEffect, SwingSource,
+    InteractionItemContext, InteractionResultValue, MenuCloseOutcome, MenuEffect, OpenMenuEffect,
+    PlayerContainer, SwingSource,
 };
 mod boxed;
 pub mod brigadier;
@@ -289,6 +290,7 @@ mod vanilla_block_items;
 mod vanilla_block_shapes;
 mod vanilla_block_state_definers;
 mod vanilla_block_state_properties;
+mod vanilla_block_use_methods;
 mod vanilla_blocks;
 mod vanilla_entity_types;
 mod vanilla_holders;

@@ -9,8 +9,9 @@ mod javac_fixture;
 use std::collections::BTreeMap;
 
 use horizon_native_java::{
-    BlockHitData, BlockUseContext, BlockUsePlayerData, BlockUseSide, Host, InteractionItemContext,
-    InteractionResultValue, StdHost, SwingSource, Value,
+    BlockHitData, BlockUseContext, BlockUseOutcome, BlockUsePlayerData, BlockUseSide,
+    ExecutionBudget, Host, InteractionItemContext, InteractionResultValue, MenuEffect,
+    PlayerContainer, StdHost, SwingSource, Value,
 };
 use serde_json::json;
 
@@ -226,6 +227,7 @@ const MC_STUBS: &[(&str, &str)] = &[
          public abstract class AbstractContainerMenu {\n\
            protected AbstractContainerMenu(MenuType<?> type, int id) {}\n\
            public MenuType<?> getType() { return null; }\n\
+           public void removed(Player player) {}\n\
            public abstract boolean stillValid(Player player);\n\
          }",
     ),
@@ -363,6 +365,27 @@ const MC_STUBS: &[(&str, &str)] = &[
          }",
     ),
     (
+        "net/minecraft/world/level/block/BaseEntityBlock.java",
+        "package net.minecraft.world.level.block;\n\
+         public abstract class BaseEntityBlock extends Block {\n\
+           protected BaseEntityBlock(Properties props) { super(props); }\n\
+         }",
+    ),
+    (
+        "net/minecraft/world/level/block/AbstractFurnaceBlock.java",
+        "package net.minecraft.world.level.block;\n\
+         public abstract class AbstractFurnaceBlock extends BaseEntityBlock {\n\
+           protected AbstractFurnaceBlock(Properties props) { super(props); }\n\
+         }",
+    ),
+    (
+        "net/minecraft/world/level/block/FurnaceBlock.java",
+        "package net.minecraft.world.level.block;\n\
+         public class FurnaceBlock extends AbstractFurnaceBlock {\n\
+           public FurnaceBlock(Properties props) { super(props); }\n\
+         }",
+    ),
+    (
         "net/minecraft/world/level/block/CraftingTableBlock.java",
         "package net.minecraft.world.level.block;\n\
          public class CraftingTableBlock extends Block {\n\
@@ -494,6 +517,8 @@ fn block_use_opens_combiner_menu_via_simple_menu_provider() {
         .execute("demo.Probe", None, "main", &mut host)
         .unwrap();
     assert_eq!(host.unknown_host_call_count(), 0);
+    // The player's `ServerPlayer` was just built: `containerCounter` is 0.
+    host.server_player_created(1, 1, 0);
 
     // 1. Inherited BlockBehaviour.useItemOn -> TRY_WITH_EMPTY_HAND (0 unknowns).
     let ctx = default_context("demo:altar", BlockUseSide::Server, [10, 64, -5]);
@@ -503,11 +528,12 @@ fn block_use_opens_combiner_menu_via_simple_menu_provider() {
         item_on.result,
         Some(InteractionResultValue::TryEmptyHandInteraction)
     );
-    assert!(item_on.open_menus.is_empty());
+    assert!(item_on.menu_effects.is_empty());
 
-    // 2. Server-side useWithoutItem -> CONSUME + typed OpenMenuEffect.
+    // 2. Server-side useWithoutItem -> CONSUME + typed OpenMenuEffect. `initMenu` (the
+    //    player's slot listener and synchronizer) is the one counted call.
     let server = fixture.jar.block_use_without_item(&mut host, &ctx).unwrap();
-    assert_eq!(server.unknown_host_call_count, 0);
+    assert_only_unknown(&server, &[INIT_MENU]);
     assert_eq!(
         server.result,
         Some(InteractionResultValue::Success {
@@ -518,8 +544,8 @@ fn block_use_opens_combiner_menu_via_simple_menu_provider() {
             },
         })
     );
-    assert_eq!(server.open_menus.len(), 1);
-    let effect = &server.open_menus[0];
+    assert_eq!(server.menu_effects.len(), 1);
+    let effect = server.open_menus().next().unwrap();
     assert_eq!(effect.container_id, 1);
     assert_eq!(effect.menu_type_id.as_deref(), Some("demo:combiner"));
     assert_eq!(
@@ -528,12 +554,11 @@ fn block_use_opens_combiner_menu_via_simple_menu_provider() {
     );
     assert_eq!(effect.access_pos, Some([10, 64, -5]));
     assert!(effect.constructor.is_some());
-    // Retain & release for W11 live-menu lifetime tracking must balance cleanly.
-    let retained_before = host.retained_count();
-    host.retain_open_menu_effect(effect);
-    assert!(host.retained_count() > retained_before);
-    host.release_open_menu_effect(effect);
-    assert_eq!(host.retained_count(), retained_before);
+    // Decaf holds the menu as the player's `containerMenu`, constructor and live menu included.
+    let held = host.player_open_menu(1).expect("held menu");
+    assert_eq!(held.container_id, 1);
+    assert_eq!(held.menu, effect.menu);
+    assert_eq!(held.constructor, effect.constructor);
     let statics = host.persistent_class_state().0;
     assert_eq!(
         statics.get("demo/AltarBlock#lastReturnedContainerIdI"),
@@ -548,11 +573,35 @@ fn block_use_opens_combiner_menu_via_simple_menu_provider() {
         Some(&Value::Int(1))
     );
 
-    // Second server click increments per-player containerCounter to 2.
-    let second = fixture.jar.block_use_without_item(&mut host, &ctx).unwrap();
-    assert_eq!(second.unknown_host_call_count, 0);
-    assert_eq!(second.open_menus.len(), 1);
-    assert_eq!(second.open_menus[0].container_id, 2);
+    // A second click while the window shows menu 1: `openMenu` closes it first (its vanilla
+    // `ItemCombinerMenu.removed` returns the inputs, which Decaf counts), then builds menu 2.
+    let mut showing = ctx.clone();
+    showing.player.container = PlayerContainer::Open(1);
+    let second = fixture
+        .jar
+        .block_use_without_item(&mut host, &showing)
+        .unwrap();
+    assert!(
+        second
+            .unknown_host_calls
+            .keys()
+            .any(|k| k.contains("#removed")),
+        "the combiner's vanilla removed() should count: {:?}",
+        second.unknown_host_calls
+    );
+    assert!(
+        !second
+            .unknown_host_calls
+            .keys()
+            .any(|k| k.contains("closeContainer")),
+        "Decaf held menu 1, so its close ran: {:?}",
+        second.unknown_host_calls
+    );
+    assert!(matches!(
+        second.menu_effects.as_slice(),
+        [MenuEffect::Closed { container_id: 1 }, MenuEffect::Opened(open)] if open.container_id == 2
+    ));
+    assert_eq!(host.player_open_menu(1).map(|m| m.container_id), Some(2));
 
     // 3. Client-side useWithoutItem -> SUCCESS + 0 open-menu effects.
     let client_ctx = default_context("demo:altar", BlockUseSide::Client, [10, 64, -5]);
@@ -571,7 +620,7 @@ fn block_use_opens_combiner_menu_via_simple_menu_provider() {
             },
         })
     );
-    assert!(client.open_menus.is_empty());
+    assert!(client.menu_effects.is_empty());
 }
 
 #[test]
@@ -807,7 +856,7 @@ fn block_use_client_side_only_and_client_open_menu_noop() {
         .unwrap();
     assert_eq!(server.unknown_host_call_count, 0);
     assert_eq!(server.result, Some(InteractionResultValue::Pass));
-    assert!(server.open_menus.is_empty());
+    assert!(server.menu_effects.is_empty());
 
     let client = fixture
         .jar
@@ -827,7 +876,7 @@ fn block_use_client_side_only_and_client_open_menu_noop() {
             },
         })
     );
-    assert!(client.open_menus.is_empty());
+    assert!(client.menu_effects.is_empty());
     assert_eq!(
         host.persistent_class_state()
             .0
@@ -923,6 +972,7 @@ fn block_use_counts_unmodelled_calls_and_unmodelled_superclasses() {
         .jar
         .execute("demo.Probe", None, "main", &mut host)
         .unwrap();
+    host.server_player_created(1, 1, 0);
 
     // 1. Unmodelled calls inside useWithoutItem COUNT.
     let unk = fixture
@@ -948,8 +998,8 @@ fn block_use_counts_unmodelled_calls_and_unmodelled_superclasses() {
         unk.unknown_host_calls
     );
 
-    // 2. Inherited CraftingTableBlock.useItemOn is allow-listed (0 unknowns),
-    //    but CraftingTableBlock.useWithoutItem is NOT allow-listed -> COUNTED.
+    // 2. CraftingTableBlock inherits BlockBehaviour.useItemOn (answered, 0 unknowns) but
+    //    declares its own useWithoutItem, which opens a crafting menu -> COUNTED.
     let craft_item = fixture
         .jar
         .block_use_item_on(
@@ -999,6 +1049,525 @@ fn block_use_counts_unmodelled_calls_and_unmodelled_superclasses() {
         )
         .unwrap();
     assert_eq!(null_menu.unknown_host_call_count, 0);
-    assert!(null_menu.open_menus.is_empty());
+    assert!(null_menu.menu_effects.is_empty());
     assert_eq!(null_menu.result, Some(InteractionResultValue::Pass));
+}
+
+/// `ServerPlayer.openMenu` offsets 102-104: the player's slot listener and synchronizer, which
+/// no model runs for a Java menu yet.
+const INIT_MENU: &str = "net/minecraft/server/level/ServerPlayer#initMenu(Lnet/minecraft/world/inventory/AbstractContainerMenu;)V";
+const CLOSE_CONTAINER: &str = "net/minecraft/server/level/ServerPlayer#closeContainer()V";
+const DO_CLOSE_CONTAINER: &str = "net/minecraft/server/level/ServerPlayer#doCloseContainer()V";
+const NEXT_CONTAINER_COUNTER: &str =
+    "net/minecraft/server/level/ServerPlayer#nextContainerCounter()V";
+
+/// Assert the use counted exactly `expected` (each once) and nothing else.
+fn assert_only_unknown(outcome: &BlockUseOutcome, expected: &[&str]) {
+    let wanted: BTreeMap<String, usize> = expected.iter().map(|k| ((*k).to_owned(), 1)).collect();
+    assert_eq!(
+        outcome.unknown_host_calls, wanted,
+        "unexpected unknown host calls"
+    );
+}
+
+/// A menu that logs, as three decimal digits per event, each construction (`1xx`) and each
+/// `removed` (`2xx`) with its container id, so a test reads the exact order.
+const ORDER_SOURCES: &[(&str, &str)] = &[
+    (
+        "demo/OrderMenu.java",
+        "package demo;\n\
+         import net.minecraft.world.entity.player.Inventory;\n\
+         import net.minecraft.world.entity.player.Player;\n\
+         import net.minecraft.world.flag.FeatureFlags;\n\
+         import net.minecraft.world.inventory.AbstractContainerMenu;\n\
+         import net.minecraft.world.inventory.MenuType;\n\
+         public class OrderMenu extends AbstractContainerMenu {\n\
+           public static final MenuType<OrderMenu> TYPE = new MenuType<>(OrderMenu::new, FeatureFlags.VANILLA_SET);\n\
+           public static long log = 0;\n\
+           private final int id;\n\
+           public OrderMenu(int id, Inventory inv) {\n\
+             super(TYPE, id);\n\
+             this.id = id;\n\
+             log = log * 1000 + 100 + id;\n\
+           }\n\
+           public static int lastRemoved = -1;\n\
+           @Override public void removed(Player player) { log = log * 1000 + 200 + id; lastRemoved = id; }\n\
+           @Override public boolean stillValid(Player player) { return true; }\n\
+         }",
+    ),
+    (
+        "demo/OrderBlock.java",
+        "package demo;\n\
+         import net.minecraft.core.BlockPos;\n\
+         import net.minecraft.network.chat.Component;\n\
+         import net.minecraft.world.InteractionResult;\n\
+         import net.minecraft.world.SimpleMenuProvider;\n\
+         import net.minecraft.world.entity.player.Player;\n\
+         import net.minecraft.world.level.Level;\n\
+         import net.minecraft.world.level.block.Block;\n\
+         import net.minecraft.world.level.block.state.BlockState;\n\
+         import net.minecraft.world.phys.BlockHitResult;\n\
+         public class OrderBlock extends Block {\n\
+           public static int lastId = -1;\n\
+           public OrderBlock(Properties props) { super(props); }\n\
+           @Override\n\
+           protected InteractionResult useWithoutItem(BlockState state, Level level, BlockPos pos, Player player, BlockHitResult hit) {\n\
+             lastId = player.openMenu(new SimpleMenuProvider((id, inv, p) -> new OrderMenu(id, inv), Component.literal(\"Order\"))).orElse(-1);\n\
+             return InteractionResult.SUCCESS;\n\
+           }\n\
+         }",
+    ),
+    (
+        "demo/Probe.java",
+        "package demo;\n\
+         import net.fabricmc.api.ModInitializer;\n\
+         import net.minecraft.core.Registry;\n\
+         import net.minecraft.core.registries.BuiltInRegistries;\n\
+         import net.minecraft.resources.Identifier;\n\
+         import net.minecraft.world.level.block.state.BlockBehaviour;\n\
+         public class Probe implements ModInitializer {\n\
+           @Override public void onInitialize() {\n\
+             Registry.register(BuiltInRegistries.MENU, Identifier.fromNamespaceAndPath(\"demo\", \"order\"), OrderMenu.TYPE);\n\
+             Registry.register(BuiltInRegistries.BLOCK, Identifier.fromNamespaceAndPath(\"demo\", \"order\"), new OrderBlock(BlockBehaviour.Properties.of()));\n\
+           }\n\
+         }",
+    ),
+];
+
+fn order_fixture(test: &str) -> (javac_fixture::Fixture, StdHost) {
+    let mut sources = MC_STUBS.to_vec();
+    sources.extend_from_slice(ORDER_SOURCES);
+    let fixture = javac_fixture::Fixture::build(test, &sources);
+    let mut host = StdHost::new();
+    fixture
+        .jar
+        .execute("demo.Probe", None, "main", &mut host)
+        .unwrap();
+    assert_eq!(host.unknown_host_call_count(), 0);
+    (fixture, host)
+}
+
+fn order_log(host: &StdHost) -> i64 {
+    match host.persistent_class_state().0.get("demo/OrderMenu#logJ") {
+        Some(Value::Long(log)) => *log,
+        Some(Value::Int(log)) => i64::from(*log),
+        other => panic!("OrderMenu.log is {other:?}"),
+    }
+}
+
+/// One server right-click on `demo:order` by `player`.
+fn click_order(
+    fixture: &javac_fixture::Fixture,
+    host: &mut StdHost,
+    player: &BlockUsePlayerData,
+) -> BlockUseOutcome {
+    let mut ctx = default_context("demo:order", BlockUseSide::Server, [4, 64, 4]);
+    ctx.player = player.clone();
+    fixture.jar.block_use_without_item(host, &ctx).unwrap()
+}
+
+fn opened_ids(outcome: &BlockUseOutcome) -> Vec<i32> {
+    outcome.open_menus().map(|open| open.container_id).collect()
+}
+
+/// #629 review P1 4: `ServerPlayer.openMenu` closes the open menu (offsets 8-20) before it
+/// advances the counter (23) and builds the new menu (27-42), so the old menu's `removed` runs
+/// before the new constructor; a menu Decaf can't close is counted.
+#[test]
+fn open_menu_closes_the_held_menu_before_building_the_next() {
+    let (fixture, mut host) = order_fixture("block_use_close_order");
+    host.server_player_created(1, 1, 0);
+    let mut player = BlockUsePlayerData::default();
+
+    // Nothing open: no close, menu 1 built.
+    let first = click_order(&fixture, &mut host, &player);
+    assert_only_unknown(&first, &[INIT_MENU]);
+    assert_eq!(opened_ids(&first), [1]);
+    assert_eq!(order_log(&host), 101);
+
+    // The window shows menu 1: its `removed` runs, then menu 2's constructor.
+    player.container = PlayerContainer::Open(1);
+    let second = click_order(&fixture, &mut host, &player);
+    assert_only_unknown(&second, &[INIT_MENU]);
+    assert!(matches!(
+        second.menu_effects.as_slice(),
+        [MenuEffect::Closed { container_id: 1 }, MenuEffect::Opened(open)] if open.container_id == 2
+    ));
+    assert_eq!(order_log(&host), 101_201_102);
+
+    // A container Decaf doesn't hold is open (a chest the embedder owns): its close is counted,
+    // and what Decaf held is no longer the player's menu.
+    player.container = PlayerContainer::Open(55);
+    let foreign = click_order(&fixture, &mut host, &player);
+    assert_only_unknown(&foreign, &[CLOSE_CONTAINER, INIT_MENU]);
+    assert_eq!(opened_ids(&foreign), [3]);
+    assert_eq!(order_log(&host), 101_201_102_103);
+
+    // The embedder can't name the open menu: counted too.
+    player.container = PlayerContainer::Unknown;
+    let unknown = click_order(&fixture, &mut host, &player);
+    assert_only_unknown(&unknown, &[CLOSE_CONTAINER, INIT_MENU]);
+    assert_eq!(opened_ids(&unknown), [4]);
+
+    // The embedder closed menu 4 without telling Decaf (no `close_player_menu`): the missed
+    // `doCloseContainer` is counted, and nothing more is closed.
+    player.container = PlayerContainer::Inventory;
+    let missed = click_order(&fixture, &mut host, &player);
+    assert_only_unknown(&missed, &[DO_CLOSE_CONTAINER, INIT_MENU]);
+    assert_eq!(opened_ids(&missed), [5]);
+    assert_eq!(order_log(&host), 101_201_102_103_104_105);
+}
+
+/// #629 review P1 1: Decaf holds at most one menu per player (the `containerMenu`), replaces
+/// it on the next open and drops it on close, refusal, logout and reset, with every retain
+/// hold released.
+#[test]
+fn open_menu_holds_one_menu_per_player_and_releases_it() {
+    let (fixture, mut host) = order_fixture("block_use_menu_lifetime");
+    let baseline = host.retained_count();
+    host.server_player_created(1, 1, 0);
+    let mut player = BlockUsePlayerData::default();
+
+    let first = click_order(&fixture, &mut host, &player);
+    assert_eq!(opened_ids(&first), [1]);
+    let one_menu = host.retained_count() - baseline;
+    assert!(one_menu > 0, "the held menu's values are retained");
+
+    // N clicks while each window shows: one held menu, the last, and one menu's holds.
+    for id in 2..=12 {
+        player.container = PlayerContainer::Open(id - 1);
+        let outcome = click_order(&fixture, &mut host, &player);
+        assert_eq!(opened_ids(&outcome), [id]);
+        assert_eq!(host.player_open_menu(1).map(|m| m.container_id), Some(id));
+        assert_eq!(host.retained_count(), baseline + one_menu);
+    }
+    // The window closed: the menu's `removed` runs and its holds go.
+    player.container = PlayerContainer::Open(12);
+    let closed = fixture
+        .jar
+        .close_player_menu(
+            &mut host,
+            &player,
+            "minecraft:overworld",
+            12,
+            &ExecutionBudget::UNBOUNDED,
+        )
+        .unwrap()
+        .expect("menu 12 is held");
+    assert_eq!(closed.container_id, 12);
+    assert_eq!(
+        closed.unknown_host_call_count, 0,
+        "{:?}",
+        closed.unknown_host_calls
+    );
+    assert_eq!(
+        host.persistent_class_state()
+            .0
+            .get("demo/OrderMenu#lastRemovedI"),
+        Some(&Value::Int(12))
+    );
+    assert!(host.player_open_menu(1).is_none());
+    assert_eq!(host.retained_count(), baseline);
+    // A second close of the same window finds nothing.
+    assert!(
+        fixture
+            .jar
+            .close_player_menu(
+                &mut host,
+                &player,
+                "minecraft:overworld",
+                12,
+                &ExecutionBudget::UNBOUNDED,
+            )
+            .unwrap()
+            .is_none()
+    );
+
+    // Refused by the embedder: dropped, and the counter is no longer trusted.
+    player.container = PlayerContainer::Inventory;
+    assert_eq!(opened_ids(&click_order(&fixture, &mut host, &player)), [13]);
+    assert_eq!(host.retained_count(), baseline + one_menu);
+    assert!(host.refuse_open_menu(1, 13));
+    assert!(host.player_open_menu(1).is_none());
+    assert_eq!(host.retained_count(), baseline);
+    let after_refusal = click_order(&fixture, &mut host, &player);
+    assert_only_unknown(&after_refusal, &[NEXT_CONTAINER_COUNTER, INIT_MENU]);
+    assert_eq!(host.retained_count(), baseline + one_menu);
+
+    // Logout drops what the player held.
+    host.server_player_removed(1);
+    assert!(host.player_open_menu(1).is_none());
+    assert_eq!(host.retained_count(), baseline);
+
+    // Two players each hold their own menu; a new server drops both.
+    host.server_player_created(1, 2, 0);
+    player.incarnation = Some((2, 0));
+    let other = BlockUsePlayerData {
+        uuid: 2,
+        name: "Other".to_owned(),
+        entity_id: Some(2),
+        ..BlockUsePlayerData::default()
+    };
+    host.server_player_created(2, 1, 0);
+    assert_eq!(opened_ids(&click_order(&fixture, &mut host, &player)), [1]);
+    assert_eq!(opened_ids(&click_order(&fixture, &mut host, &other)), [1]);
+    assert!(host.player_open_menu(1).is_some() && host.player_open_menu(2).is_some());
+    assert_ne!(
+        host.player_open_menu(1).map(|m| &m.menu),
+        host.player_open_menu(2).map(|m| &m.menu)
+    );
+    assert!(host.retained_count() > baseline + one_menu);
+    host.reset_player_menus();
+    assert!(host.player_open_menu(1).is_none() && host.player_open_menu(2).is_none());
+    assert_eq!(host.retained_count(), baseline);
+}
+
+/// #629 review P1 2: `containerCounter` belongs to one `ServerPlayer` object. A login and
+/// `PlayerList.respawn` build a new one (`restoreFrom` doesn't copy the counter,
+/// `server-26.3.jar`), so the first id is 1 again; it wraps 100 -> 1; and Decaf counts it when
+/// it doesn't know the object or the counter.
+#[test]
+fn container_counter_lives_as_long_as_the_server_player() {
+    let (fixture, mut host) = order_fixture("block_use_container_counter");
+    let mut player = BlockUsePlayerData::default();
+    let click = |host: &mut StdHost, player: &mut BlockUsePlayerData| {
+        let outcome = click_order(&fixture, host, player);
+        let ids = opened_ids(&outcome);
+        assert_eq!(ids.len(), 1, "{outcome:?}");
+        player.container = PlayerContainer::Open(ids[0]);
+        (ids[0], outcome)
+    };
+
+    host.server_player_created(1, 1, 0);
+    assert_eq!(click(&mut host, &mut player).0, 1);
+    assert_eq!(click(&mut host, &mut player).0, 2);
+
+    // Reconnect: a new session's object starts at 0 again.
+    host.server_player_removed(1);
+    host.server_player_created(1, 2, 0);
+    player.incarnation = Some((2, 0));
+    player.container = PlayerContainer::Inventory;
+    let (id, relog) = click(&mut host, &mut player);
+    assert_eq!(id, 1);
+    assert_only_unknown(&relog, &[INIT_MENU]);
+    assert_eq!(click(&mut host, &mut player).0, 2);
+
+    // Respawn: `PlayerList.respawn` builds a new object; `restoreFrom` leaves its counter 0.
+    host.server_player_created(1, 2, 1);
+    player.incarnation = Some((2, 1));
+    player.container = PlayerContainer::Inventory;
+    assert_eq!(click(&mut host, &mut player).0, 1);
+
+    // Wraps at 100: `containerCounter % 100 + 1`.
+    for expected in 2..=100 {
+        assert_eq!(click(&mut host, &mut player).0, expected);
+    }
+    assert_eq!(click(&mut host, &mut player).0, 1);
+
+    // Another opener (a chest, another jar) took id 41 on a new object: the counter follows.
+    host.server_player_created(1, 3, 0);
+    player.incarnation = Some((3, 0));
+    player.container = PlayerContainer::Inventory;
+    host.server_player_container_opened(1, Some(41));
+    let (id, after_chest) = click(&mut host, &mut player);
+    assert_eq!(id, 42);
+    assert_only_unknown(&after_chest, &[INIT_MENU]);
+    // An open whose id the embedder can't read: the counter is unknown, so it is counted.
+    host.server_player_container_opened(1, None);
+    let (_, unread) = click(&mut host, &mut player);
+    assert!(
+        unread
+            .unknown_host_calls
+            .contains_key(NEXT_CONTAINER_COUNTER)
+    );
+
+    // An object Decaf was not told was created, or one it can't name at all: counted.
+    let mut untold_player = BlockUsePlayerData {
+        uuid: 7,
+        incarnation: Some((5, 0)),
+        ..BlockUsePlayerData::default()
+    };
+    let (_, untold) = click(&mut host, &mut untold_player);
+    assert!(
+        untold
+            .unknown_host_calls
+            .contains_key(NEXT_CONTAINER_COUNTER)
+    );
+    let mut nameless = BlockUsePlayerData {
+        uuid: 8,
+        incarnation: None,
+        ..BlockUsePlayerData::default()
+    };
+    let (_, unnamed) = click(&mut host, &mut nameless);
+    assert!(
+        unnamed
+            .unknown_host_calls
+            .contains_key(NEXT_CONTAINER_COUNTER)
+    );
+    assert!(
+        host.player_open_menu(8).is_none(),
+        "no object to hold it on"
+    );
+}
+
+/// A block whose `useItemOn` reads its menu provider through the state and through `this`,
+/// then defers to `super` for both hooks, so every inherited body is reached.
+fn inherited_probe(class: &str, parent: &str) -> String {
+    format!(
+        "package demo;\n\
+         import net.minecraft.core.BlockPos;\n\
+         import net.minecraft.world.InteractionHand;\n\
+         import net.minecraft.world.InteractionResult;\n\
+         import net.minecraft.world.MenuProvider;\n\
+         import net.minecraft.world.entity.player.Player;\n\
+         import net.minecraft.world.item.ItemStack;\n\
+         import net.minecraft.world.level.Level;\n\
+         import net.minecraft.world.level.block.*;\n\
+         import net.minecraft.world.level.block.state.BlockState;\n\
+         import net.minecraft.world.phys.BlockHitResult;\n\
+         public class {class} extends {parent} {{\n\
+           public static int providerNull = -1;\n\
+           public {class}(Properties props) {{ super(props); }}\n\
+           @Override\n\
+           protected InteractionResult useItemOn(ItemStack stack, BlockState state, Level level, BlockPos pos, Player player, InteractionHand hand, BlockHitResult hit) {{\n\
+             MenuProvider viaState = state.getMenuProvider(level, pos);\n\
+             MenuProvider viaThis = this.getMenuProvider(state, level, pos);\n\
+             providerNull = (viaState == null ? 1 : 0) + (viaThis == null ? 2 : 0);\n\
+             return super.useItemOn(stack, state, level, pos, player, hand, hit);\n\
+           }}\n\
+           @Override\n\
+           protected InteractionResult useWithoutItem(BlockState state, Level level, BlockPos pos, Player player, BlockHitResult hit) {{\n\
+             return super.useWithoutItem(state, level, pos, player, hit);\n\
+           }}\n\
+         }}"
+    )
+}
+
+/// #629 review P1 3: an inherited block-use method runs the body of the nearest vanilla class
+/// that declares it (`server-26.3.jar`): answered for `BlockBehaviour`'s, counted for any
+/// other (`AbstractFurnaceBlock.useWithoutItem`, `BaseEntityBlock.getMenuProvider`,
+/// `CraftingTableBlock`'s two).
+#[test]
+fn inherited_block_methods_follow_the_vanilla_declaring_class() {
+    const FURNACE_USE: &str = "net/minecraft/world/level/block/AbstractFurnaceBlock#useWithoutItem(Lnet/minecraft/world/level/block/state/BlockState;Lnet/minecraft/world/level/Level;Lnet/minecraft/core/BlockPos;Lnet/minecraft/world/entity/player/Player;Lnet/minecraft/world/phys/BlockHitResult;)Lnet/minecraft/world/InteractionResult;";
+    const ENTITY_PROVIDER: &str = "net/minecraft/world/level/block/BaseEntityBlock#getMenuProvider(Lnet/minecraft/world/level/block/state/BlockState;Lnet/minecraft/world/level/Level;Lnet/minecraft/core/BlockPos;)Lnet/minecraft/world/MenuProvider;";
+    const CRAFTING_USE: &str = "net/minecraft/world/level/block/CraftingTableBlock#useWithoutItem(Lnet/minecraft/world/level/block/state/BlockState;Lnet/minecraft/world/level/Level;Lnet/minecraft/core/BlockPos;Lnet/minecraft/world/entity/player/Player;Lnet/minecraft/world/phys/BlockHitResult;)Lnet/minecraft/world/InteractionResult;";
+    const CRAFTING_PROVIDER: &str = "net/minecraft/world/level/block/CraftingTableBlock#getMenuProvider(Lnet/minecraft/world/level/block/state/BlockState;Lnet/minecraft/world/level/Level;Lnet/minecraft/core/BlockPos;)Lnet/minecraft/world/MenuProvider;";
+
+    let furnace_probe = inherited_probe("FurnaceProbe", "FurnaceBlock");
+    let crafting_probe = inherited_probe("CraftingProbe", "CraftingTableBlock");
+    let plain_probe = inherited_probe("PlainProbe", "Block");
+    let mut sources = MC_STUBS.to_vec();
+    sources.push(("demo/FurnaceProbe.java", &furnace_probe));
+    sources.push(("demo/CraftingProbe.java", &crafting_probe));
+    sources.push(("demo/PlainProbe.java", &plain_probe));
+    sources.push((
+        "demo/PlainFurnace.java",
+        "package demo;\n\
+         import net.minecraft.world.level.block.FurnaceBlock;\n\
+         public class PlainFurnace extends FurnaceBlock {\n\
+           public PlainFurnace(Properties props) { super(props); }\n\
+         }",
+    ));
+    sources.push((
+        "demo/Probe.java",
+        "package demo;\n\
+         import net.fabricmc.api.ModInitializer;\n\
+         import net.minecraft.core.Registry;\n\
+         import net.minecraft.core.registries.BuiltInRegistries;\n\
+         import net.minecraft.resources.Identifier;\n\
+         import net.minecraft.world.level.block.state.BlockBehaviour;\n\
+         public class Probe implements ModInitializer {\n\
+           @Override public void onInitialize() {\n\
+             Registry.register(BuiltInRegistries.BLOCK, Identifier.fromNamespaceAndPath(\"demo\", \"furnace_probe\"), new FurnaceProbe(BlockBehaviour.Properties.of()));\n\
+             Registry.register(BuiltInRegistries.BLOCK, Identifier.fromNamespaceAndPath(\"demo\", \"crafting_probe\"), new CraftingProbe(BlockBehaviour.Properties.of()));\n\
+             Registry.register(BuiltInRegistries.BLOCK, Identifier.fromNamespaceAndPath(\"demo\", \"plain_probe\"), new PlainProbe(BlockBehaviour.Properties.of()));\n\
+             Registry.register(BuiltInRegistries.BLOCK, Identifier.fromNamespaceAndPath(\"demo\", \"plain_furnace\"), new PlainFurnace(BlockBehaviour.Properties.of()));\n\
+           }\n\
+         }",
+    ));
+    let fixture = javac_fixture::Fixture::build("block_use_inherited", &sources);
+    let mut host = StdHost::new();
+    fixture
+        .jar
+        .execute("demo.Probe", None, "main", &mut host)
+        .unwrap();
+    // Registration counts only `FurnaceBlock`'s own constructor and state definition (its
+    // FACING and LIT properties), which no model builds; the uses below are measured alone.
+    assert!(
+        host.unknown_host_calls().iter().all(|(key, _)| {
+            key.starts_with("net/minecraft/world/level/block/FurnaceBlock#<init>")
+                || key.starts_with(
+                    "net/minecraft/world/level/block/FurnaceBlock#createBlockStateDefinition",
+                )
+        }),
+        "{:?}",
+        host.unknown_host_calls()
+    );
+    let run = |host: &mut StdHost, id: &str, with_item: bool| {
+        let ctx = default_context(id, BlockUseSide::Server, [3, 3, 3]);
+        if with_item {
+            fixture.jar.block_use_item_on(host, &ctx).unwrap()
+        } else {
+            fixture.jar.block_use_without_item(host, &ctx).unwrap()
+        }
+    };
+
+    // FurnaceBlock: `super.useItemOn` is BlockBehaviour's (answered); both getMenuProvider
+    // calls reach BaseEntityBlock's (counted twice).
+    let furnace_item = run(&mut host, "demo:furnace_probe", true);
+    assert_eq!(
+        furnace_item.result,
+        Some(InteractionResultValue::TryEmptyHandInteraction)
+    );
+    assert_eq!(
+        furnace_item.unknown_host_calls,
+        BTreeMap::from([(ENTITY_PROVIDER.to_owned(), 2)])
+    );
+    // `super.useWithoutItem` is AbstractFurnaceBlock's, which opens the furnace: counted.
+    assert_only_unknown(&run(&mut host, "demo:furnace_probe", false), &[FURNACE_USE]);
+    // The same with no override at all (the entry point's own virtual dispatch).
+    let plain_furnace_item = run(&mut host, "demo:plain_furnace", true);
+    assert_eq!(plain_furnace_item.unknown_host_call_count, 0);
+    assert_eq!(
+        plain_furnace_item.result,
+        Some(InteractionResultValue::TryEmptyHandInteraction)
+    );
+    assert_only_unknown(&run(&mut host, "demo:plain_furnace", false), &[FURNACE_USE]);
+
+    // CraftingTableBlock declares useWithoutItem and getMenuProvider, not useItemOn.
+    let crafting_item = run(&mut host, "demo:crafting_probe", true);
+    assert_eq!(
+        crafting_item.result,
+        Some(InteractionResultValue::TryEmptyHandInteraction)
+    );
+    assert_eq!(
+        crafting_item.unknown_host_calls,
+        BTreeMap::from([(CRAFTING_PROVIDER.to_owned(), 2)])
+    );
+    assert_only_unknown(
+        &run(&mut host, "demo:crafting_probe", false),
+        &[CRAFTING_USE],
+    );
+
+    // A plain Block inherits all three from BlockBehaviour: every answer exact.
+    let plain_item = run(&mut host, "demo:plain_probe", true);
+    assert_eq!(
+        plain_item.unknown_host_call_count, 0,
+        "{:?}",
+        plain_item.unknown_host_calls
+    );
+    assert_eq!(
+        plain_item.result,
+        Some(InteractionResultValue::TryEmptyHandInteraction)
+    );
+    assert_eq!(
+        host.persistent_class_state()
+            .0
+            .get("demo/PlainProbe#providerNullI"),
+        Some(&Value::Int(3))
+    );
+    let plain_empty = run(&mut host, "demo:plain_probe", false);
+    assert_eq!(plain_empty.unknown_host_call_count, 0);
+    assert_eq!(plain_empty.result, Some(InteractionResultValue::Pass));
 }

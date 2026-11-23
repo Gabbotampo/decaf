@@ -12,6 +12,7 @@ use crate::{
     component_value, expect_ref, facade_text, game_object, host_ids, host_optional,
     host_ref::{ClassHierarchy, HostKind, HostRef, Methods, exact_class_rules_out},
     jar_object, jdk_call, menu_models, null_checks, server_values, uuid_value,
+    vanilla_block_use_methods,
 };
 
 pub(crate) const INTERACTION_RESULT: &str = "net/minecraft/world/InteractionResult";
@@ -92,14 +93,34 @@ impl BlockHitData {
     }
 }
 
+/// What the embedder knows of a server player's `containerMenu` when a block use starts.
+///
+/// `ServerPlayer.openMenu` (26.3, offsets 8-20) first closes the open container unless it is
+/// the player's `inventoryMenu`, so Decaf must know which one is open before Java builds the
+/// new menu.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PlayerContainer {
+    /// `containerMenu == inventoryMenu`: no container is open.
+    Inventory,
+    /// A container whose `containerId` is this is open.
+    Open(i32),
+    /// The embedder can't tell (a menu it has no handle for).
+    Unknown,
+}
+
 /// Player snapshot handed into a block-use invocation.
 #[derive(Clone, Debug)]
 pub struct BlockUsePlayerData {
     pub uuid: u128,
     pub name: String,
     pub entity_id: Option<i32>,
-    pub session: u32,
-    pub life: u32,
+    /// Which `ServerPlayer` object this is, as (session, life): a login and each
+    /// `PlayerList.respawn` build a new one. `None` when the embedder can't tell; Decaf then
+    /// keeps no per-object state for the player and counts what needs it
+    /// (`containerCounter`).
+    pub incarnation: Option<(u32, u32)>,
+    /// The player's open container as the block use starts (server side only).
+    pub container: PlayerContainer,
     pub sneaking: bool,
     pub spectator: bool,
     /// Optional held stacks (`ItemStack` host values). When `None`, `getMainHandItem` /
@@ -114,8 +135,8 @@ impl Default for BlockUsePlayerData {
             uuid: 1,
             name: "Player".to_owned(),
             entity_id: Some(1),
-            session: 1,
-            life: 0,
+            incarnation: Some((1, 0)),
+            container: PlayerContainer::Inventory,
             sneaking: false,
             spectator: false,
             main_hand: None,
@@ -235,12 +256,34 @@ pub struct OpenMenuEffect {
     pub title_json: Option<serde_json::Value>,
     /// Block position carried by `ContainerLevelAccess.create(level, pos)`, if any.
     pub access_pos: Option<[i32; 3]>,
-    /// Java `MenuConstructor` lambda captured by `SimpleMenuProvider`, kept for live-menu W11.
+    /// Java `MenuConstructor` lambda captured by `SimpleMenuProvider`, kept for the live-menu
+    /// bridge.
     pub constructor: Option<Value>,
     /// Java `MenuProvider` passed to `player.openMenu(...)`.
     pub provider: Value,
     /// Live `AbstractContainerMenu` returned by `provider.createMenu(...)`.
     pub menu: Value,
+}
+
+impl OpenMenuEffect {
+    /// Every Java value the effect holds: what keeping it alive across collections means.
+    fn values(&self) -> impl Iterator<Item = &Value> {
+        [&self.menu_type, &self.title, &self.provider, &self.menu]
+            .into_iter()
+            .chain(self.constructor.as_ref())
+    }
+}
+
+/// What a block use did to the player's open container, in bytecode order.
+#[derive(Clone, Debug)]
+pub enum MenuEffect {
+    /// `ServerPlayer.closeContainer()` closed the Java menu Decaf held as the player's
+    /// `containerMenu` (its `removed(player)` already ran): the embedder closes the window it
+    /// showed for it (`ClientboundContainerClosePacket`).
+    Closed { container_id: i32 },
+    /// `ServerPlayer.openMenu` opened a Java menu. The last one a use opens is the player's
+    /// `containerMenu` afterwards, and Decaf holds it ([`StdHost::player_open_menu`]).
+    Opened(OpenMenuEffect),
 }
 
 /// Result of running a block's `useItemOn` or `useWithoutItem` hook.
@@ -250,11 +293,31 @@ pub struct BlockUseOutcome {
     pub result: Option<InteractionResultValue>,
     /// Raw Java return value.
     pub raw_result: Value,
-    /// Typed open-menu effects recorded by `ServerPlayer.openMenu(MenuProvider)`.
-    pub open_menus: Vec<OpenMenuEffect>,
+    /// Menus closed and opened through `ServerPlayer.openMenu(MenuProvider)`, in order.
+    pub menu_effects: Vec<MenuEffect>,
     /// Unmodelled host calls recorded during this block-use invocation.
     pub unknown_host_calls: BTreeMap<String, usize>,
     /// Total count of unmodelled host calls during this block-use invocation.
+    pub unknown_host_call_count: usize,
+}
+
+impl BlockUseOutcome {
+    /// The menus this use opened, in order.
+    pub fn open_menus(&self) -> impl Iterator<Item = &OpenMenuEffect> {
+        self.menu_effects.iter().filter_map(|effect| match effect {
+            MenuEffect::Opened(open) => Some(open),
+            MenuEffect::Closed { .. } => None,
+        })
+    }
+}
+
+/// Result of [`NativeJar::close_player_menu`].
+#[derive(Clone, Debug)]
+pub struct MenuCloseOutcome {
+    /// The `containerId` of the Java menu that closed.
+    pub container_id: i32,
+    /// Unmodelled host calls its close made.
+    pub unknown_host_calls: BTreeMap<String, usize>,
     pub unknown_host_call_count: usize,
 }
 
@@ -270,17 +333,42 @@ pub(crate) struct ItemContextData {
     pub(crate) held_item_transformed_to: Value,
 }
 
+/// The server player a Java call is running for: a block use, or the close of the menu Decaf
+/// holds for them ([`NativeJar::close_player_menu`]).
 #[derive(Clone, Debug)]
 pub(crate) struct ActiveBlockUse {
     pub(crate) side: BlockUseSide,
     pub(crate) dimension: String,
     pub(crate) level: Value,
-    pub(crate) state: Value,
-    pub(crate) pos: [i32; 3],
+    /// The clicked block's state and position; `None` for a close, which has no block.
+    pub(crate) block: Option<(Value, [i32; 3])>,
     pub(crate) player: Value,
     pub(crate) player_data: BlockUsePlayerData,
     pub(crate) player_inventory: Value,
-    pub(crate) open_menus: Vec<OpenMenuEffect>,
+    /// The player's `containerMenu` as it stands at this point of the call: the embedder's
+    /// snapshot at the start, then what this call's closes and opens made it.
+    pub(crate) container: PlayerContainer,
+    pub(crate) menu_effects: Vec<MenuEffect>,
+}
+
+/// One `ServerPlayer` object's menu state, as Decaf models it (#629 review P1 1 and 2).
+///
+/// Vanilla keeps both on the `ServerPlayer`: `containerCounter` is a plain `int` field that only
+/// `nextContainerCounter` writes (`server-26.3.jar`: the constructor leaves it 0 and
+/// `restoreFrom` does not copy it), and `containerMenu` is the one open menu. A login and each
+/// `PlayerList.respawn` build a new object, so both start over there.
+#[derive(Clone, Debug)]
+pub(crate) struct PlayerMenus {
+    /// The object, as (session, life) ([`BlockUsePlayerData::incarnation`]).
+    pub(crate) incarnation: (u32, u32),
+    /// `containerCounter`, or `None` once Decaf can no longer know it: Decaf was not told the
+    /// object was created, a container opened that the embedder could not read the id of, or
+    /// the embedder refused a menu Java opened (Java advanced the counter, the embedder's
+    /// server did not).
+    pub(crate) counter: Option<i32>,
+    /// The Java menu Decaf opened that is still the object's `containerMenu`. Its Java values
+    /// are retained on the host while it is held, and released when it is dropped.
+    pub(crate) open: Option<OpenMenuEffect>,
 }
 
 /// Host state for block-use, `InteractionResult`, `BlockHitResult`, and `openMenu`.
@@ -290,7 +378,9 @@ pub(crate) struct BlockUseHostState {
     pub(crate) interaction_item_contexts: BTreeMap<String, ItemContextData>,
     pub(crate) block_hits: BTreeMap<String, BlockHitData>,
     pub(crate) active_use: Option<ActiveBlockUse>,
-    pub(crate) player_container_counters: BTreeMap<u128, i32>,
+    /// Each player's current `ServerPlayer` object's menu state, by UUID. At most one entry
+    /// (and so at most one held menu) per player: a newer object's entry replaces an older's.
+    pub(crate) players: BTreeMap<u128, PlayerMenus>,
     pub(crate) next_id: u64,
 }
 
@@ -301,13 +391,23 @@ impl BlockUseHostState {
         id
     }
 
-    pub(crate) fn next_container_counter(&mut self, player_uuid: u128) -> i32 {
-        let counter = self
-            .player_container_counters
-            .entry(player_uuid)
-            .or_insert(0);
-        *counter = (*counter % 100) + 1;
-        *counter
+    /// The entry of the `ServerPlayer` object `incarnation` of `uuid`, if Decaf has one.
+    fn player(&self, uuid: u128, incarnation: Option<(u32, u32)>) -> Option<&PlayerMenus> {
+        let incarnation = incarnation?;
+        self.players
+            .get(&uuid)
+            .filter(|entry| entry.incarnation == incarnation)
+    }
+
+    fn player_mut(
+        &mut self,
+        uuid: u128,
+        incarnation: Option<(u32, u32)>,
+    ) -> Option<&mut PlayerMenus> {
+        let incarnation = incarnation?;
+        self.players
+            .get_mut(&uuid)
+            .filter(|entry| entry.incarnation == incarnation)
     }
 
     pub(crate) fn alloc_success(&mut self, swing_source: Value, item_context: Value) -> Value {
@@ -357,9 +457,13 @@ impl BlockUseHostState {
         fn push_val<'a>(v: &'a Value, out: &mut Vec<&'a str>) {
             out.extend(crate::heap::value_texts(v));
         }
+        // A held menu (`PlayerMenus::open`) is kept through `StdHost::retain`, so only the
+        // running call's own values are roots here.
         if let Some(active) = &self.active_use {
             push_val(&active.level, out);
-            push_val(&active.state, out);
+            if let Some((state, _)) = &active.block {
+                push_val(state, out);
+            }
             push_val(&active.player, out);
             push_val(&active.player_inventory, out);
             if let Some(stack) = &active.player_data.main_hand {
@@ -368,14 +472,12 @@ impl BlockUseHostState {
             if let Some(stack) = &active.player_data.off_hand {
                 push_val(stack, out);
             }
-            for effect in &active.open_menus {
-                push_val(&effect.menu_type, out);
-                push_val(&effect.title, out);
-                if let Some(ctor) = &effect.constructor {
-                    push_val(ctor, out);
+            for effect in &active.menu_effects {
+                if let MenuEffect::Opened(effect) = effect {
+                    for value in effect.values() {
+                        push_val(value, out);
+                    }
                 }
-                push_val(&effect.provider, out);
-                push_val(&effect.menu, out);
             }
         }
     }
@@ -881,80 +983,56 @@ pub(crate) fn resolve_menu_type_id(host: &StdHost, menu_type: &Value) -> Option<
 }
 
 // ---------------------------------------------------------------------------
-// Vanilla MC 26.3 BlockBehaviour allow-lists (verified via javap on server-26.3.jar)
+// Inherited vanilla bodies of the block-use methods (#629 review P1 3)
 // ---------------------------------------------------------------------------
 
-/// Vanilla block superclasses whose `useItemOn` inherits `BlockBehaviour.useItemOn`
-/// verbatim (`return InteractionResult.TRY_WITH_EMPTY_HAND;`).
-pub(crate) fn inherits_block_behaviour_use_item_on(owner: &str) -> bool {
-    matches!(
-        owner,
-        "net/minecraft/world/level/block/state/BlockBehaviour"
-            | "net/minecraft/world/level/block/Block"
-            | "net/minecraft/world/level/block/HorizontalDirectionalBlock"
-            | "net/minecraft/world/level/block/DirectionalBlock"
-            | "net/minecraft/world/level/block/RotatedPillarBlock"
-            | "net/minecraft/world/level/block/TransparentBlock"
-            | "net/minecraft/world/level/block/HalfTransparentBlock"
-            | "net/minecraft/world/level/block/FallingBlock"
-            | "net/minecraft/world/level/block/ColoredFallingBlock"
-            | "net/minecraft/world/level/block/BaseEntityBlock"
-            | "net/minecraft/world/level/block/CraftingTableBlock"
-            | "net/minecraft/world/level/block/SlabBlock"
-            | "net/minecraft/world/level/block/StairBlock"
-            | "net/minecraft/world/level/block/WallBlock"
-            | "net/minecraft/world/level/block/FenceBlock"
-            | "net/minecraft/world/level/block/CrossCollisionBlock"
-            | "net/minecraft/world/level/block/IronBarsBlock"
-    )
+/// `BlockBehaviour`'s own body of a block-use method, with its bit in
+/// [`vanilla_block_use_methods`]. 26.3 `javap -c BlockBehaviour`: `useItemOn` is
+/// `getstatic InteractionResult.TRY_WITH_EMPTY_HAND; areturn`, `useWithoutItem`
+/// `getstatic InteractionResult.PASS; areturn`, `getMenuProvider` `aconst_null; areturn`.
+fn block_behaviour_body(name: &str, descriptor: &str) -> Option<(u8, Value)> {
+    match (name, descriptor) {
+        ("useItemOn", USE_ITEM_ON_DESC) => Some((
+            vanilla_block_use_methods::USE_ITEM_ON,
+            ir_try_with_empty_hand(),
+        )),
+        ("useWithoutItem", USE_WITHOUT_ITEM_DESC) => {
+            Some((vanilla_block_use_methods::USE_WITHOUT_ITEM, ir_pass()))
+        }
+        ("getMenuProvider", GET_MENU_PROVIDER_DESC) => Some((
+            vanilla_block_use_methods::GET_MENU_PROVIDER,
+            Value::Ref(None),
+        )),
+        _ => None,
+    }
 }
 
-/// Vanilla block superclasses whose `useWithoutItem` inherits `BlockBehaviour.useWithoutItem`
-/// verbatim (`return InteractionResult.PASS;`).
-/// Note: `CraftingTableBlock` and `FenceBlock` override `useWithoutItem`, so they are excluded.
-pub(crate) fn inherits_block_behaviour_use_without_item(owner: &str) -> bool {
-    matches!(
-        owner,
-        "net/minecraft/world/level/block/state/BlockBehaviour"
-            | "net/minecraft/world/level/block/Block"
-            | "net/minecraft/world/level/block/HorizontalDirectionalBlock"
-            | "net/minecraft/world/level/block/DirectionalBlock"
-            | "net/minecraft/world/level/block/RotatedPillarBlock"
-            | "net/minecraft/world/level/block/TransparentBlock"
-            | "net/minecraft/world/level/block/HalfTransparentBlock"
-            | "net/minecraft/world/level/block/FallingBlock"
-            | "net/minecraft/world/level/block/ColoredFallingBlock"
-            | "net/minecraft/world/level/block/BaseEntityBlock"
-            | "net/minecraft/world/level/block/SlabBlock"
-            | "net/minecraft/world/level/block/StairBlock"
-            | "net/minecraft/world/level/block/WallBlock"
-            | "net/minecraft/world/level/block/CrossCollisionBlock"
-            | "net/minecraft/world/level/block/IronBarsBlock"
-    )
-}
-
-/// Vanilla block superclasses whose `getMenuProvider` inherits `BlockBehaviour.getMenuProvider`
-/// verbatim (`return null;`).
-/// Note: `CraftingTableBlock` and `BaseEntityBlock` override `getMenuProvider`, so they are excluded.
-pub(crate) fn inherits_block_behaviour_get_menu_provider(owner: &str) -> bool {
-    matches!(
-        owner,
-        "net/minecraft/world/level/block/state/BlockBehaviour"
-            | "net/minecraft/world/level/block/Block"
-            | "net/minecraft/world/level/block/HorizontalDirectionalBlock"
-            | "net/minecraft/world/level/block/DirectionalBlock"
-            | "net/minecraft/world/level/block/RotatedPillarBlock"
-            | "net/minecraft/world/level/block/TransparentBlock"
-            | "net/minecraft/world/level/block/HalfTransparentBlock"
-            | "net/minecraft/world/level/block/FallingBlock"
-            | "net/minecraft/world/level/block/ColoredFallingBlock"
-            | "net/minecraft/world/level/block/SlabBlock"
-            | "net/minecraft/world/level/block/StairBlock"
-            | "net/minecraft/world/level/block/WallBlock"
-            | "net/minecraft/world/level/block/FenceBlock"
-            | "net/minecraft/world/level/block/CrossCollisionBlock"
-            | "net/minecraft/world/level/block/IronBarsBlock"
-    )
+/// Run the vanilla body an object of vanilla block class `vanilla_class` (the first class of
+/// its superclass chain outside the jar) has for block-use method `name`: the body of the
+/// nearest class on that chain that declares it. Decaf answers it when that class is
+/// `BlockBehaviour`; any other declaring class (`AbstractFurnaceBlock.useWithoutItem` opens a
+/// furnace menu, `CraftingTableBlock.getMenuProvider` builds a crafting one) is counted as
+/// that class's method, and so is a class 26.3 has no block of.
+fn run_inherited_block_method<H: Host>(
+    host: &mut H,
+    vanilla_class: &str,
+    name: &str,
+    descriptor: &str,
+) -> Result<Value, NativeError> {
+    let declaring = block_behaviour_body(name, descriptor).and_then(|(bit, body)| {
+        let class = vanilla_block_use_methods::declaring_class(vanilla_class, bit)?;
+        Some((class, body))
+    });
+    match declaring {
+        Some((BLOCK_BEHAVIOUR, body)) => Ok(body),
+        _ => host.unknown_operand_call(&MethodRef {
+            owner: declaring
+                .map_or(vanilla_class, |(class, _)| class)
+                .to_owned(),
+            name: name.to_owned(),
+            descriptor: descriptor.to_owned(),
+        }),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1129,33 +1207,10 @@ pub(crate) fn instance_call(
         return block_hit_call(host, r, key.to_owned(), args);
     }
 
-    // 4. Allow-listed vanilla BlockBehaviour defaults (inherited or `super.use*` / `super.getMenuProvider`)
-    if matches!(
-        r.name.as_str(),
-        "useItemOn" | "useWithoutItem" | "getMenuProvider"
-    ) && jar_object::object_class(receiver).is_some()
-    {
-        if r.name == "useItemOn"
-            && r.descriptor == USE_ITEM_ON_DESC
-            && inherits_block_behaviour_use_item_on(&r.owner)
-        {
-            return Some(Ok(ir_try_with_empty_hand()));
-        }
-        if r.name == "useWithoutItem"
-            && r.descriptor == USE_WITHOUT_ITEM_DESC
-            && inherits_block_behaviour_use_without_item(&r.owner)
-        {
-            return Some(Ok(ir_pass()));
-        }
-        if r.name == "getMenuProvider"
-            && r.descriptor == GET_MENU_PROVIDER_DESC
-            && inherits_block_behaviour_get_menu_provider(&r.owner)
-        {
-            return Some(Ok(Value::Ref(None)));
-        }
-    }
+    // An inherited `useItemOn`/`useWithoutItem`/`getMenuProvider` on a jar block is answered
+    // in `invoke_runtime_helper`, which knows the receiver's superclass chain.
 
-    // 5. Active block-use Level & Player objects
+    // 4. Active block-use Level & Player objects
     if let Some(active) = host.block_use.active_use.as_ref() {
         let is_level = receiver == &active.level;
         let is_player = !is_level && receiver == &active.player;
@@ -1436,9 +1491,10 @@ fn active_level_call(
             "(Lnet/minecraft/core/BlockPos;)Lnet/minecraft/world/level/block/state/BlockState;",
         ) => {
             if let Some(pos) = args.first().and_then(parse_block_pos)
-                && pos == active.pos
+                && let Some((state, clicked)) = &active.block
+                && pos == *clicked
             {
-                return Ok(active.state.clone());
+                return Ok(state.clone());
             }
             host.unknown_host_call(r)
         }
@@ -1562,27 +1618,47 @@ pub(crate) fn invoke_runtime_helper<H: Host>(
         return invoke_player_open_menu(runtime, receiver, args);
     }
 
+    // A block-use method on a jar block that reaches the model chain with no jar class
+    // declaring it on the symbolic owner's chain (`member_owner` stops at the first class the
+    // runtime doesn't hold): `super.useWithoutItem(..)` (`invokespecial` of a superclass), or
+    // an `invokevirtual` the receiver's jar classes don't override (`jvm_selected_jar_body`
+    // ran first). The body is then the one the receiver's first vanilla class inherits, which
+    // the symbolic owner's first vanilla class is or extends. A jar declaration keeps the
+    // interpreter's own resolution.
+    if block_behaviour_body(&r.name, &r.descriptor).is_some()
+        && jar_object::object_class(receiver).is_some()
+        && let Some((resolved, false)) = runtime.member_owner(&r.owner, &r.name, &r.descriptor)
+        && let Some(vanilla_class) = block_vanilla_superclass(runtime, receiver)
+        && vanilla_block_use_methods::extends(&vanilla_class, &resolved)
+    {
+        return run_inherited_block_method(runtime.host, &vanilla_class, &r.name, &r.descriptor)
+            .map(Some);
+    }
+
     Ok(None)
 }
 
+/// The first class of `block`'s superclass chain that the runtime doesn't hold: the vanilla
+/// (or library) class it leaves the jar at. `None` for a value that is no jar object, or a
+/// chain that ends inside the jar.
 #[inline(never)]
-fn block_vanilla_superclass<H: Host>(runtime: &Runtime<'_, H>, block: &Value) -> String {
-    let Some(class) = jar_object::object_class(block) else {
-        return BLOCK_BEHAVIOUR.to_owned();
-    };
-    let mut cur = class.to_owned();
+fn block_vanilla_superclass<H: Host>(runtime: &Runtime<'_, H>, block: &Value) -> Option<String> {
+    let mut current = jar_object::object_class(block)?.to_owned();
     for _ in 0..64 {
-        let Some(file) = runtime.class(&cur) else {
-            return cur;
+        let Some(file) = runtime.class(&current) else {
+            return Some(current);
         };
         if file.super_name.is_empty() {
-            return BLOCK_BEHAVIOUR.to_owned();
+            return None;
         }
-        cur = file.super_name.clone();
+        current = file.super_name.clone();
     }
-    BLOCK_BEHAVIOUR.to_owned()
+    None
 }
 
+/// `block.<name>(args)` as `invokevirtual BlockBehaviour.<name>` selects it: the jar's
+/// override when it has one, else the vanilla body its chain inherits
+/// ([`run_inherited_block_method`]); a block whose class Decaf can't place is counted.
 #[inline(never)]
 fn dispatch_block_virtual<H: Host>(
     runtime: &mut Runtime<'_, H>,
@@ -1599,26 +1675,11 @@ fn dispatch_block_virtual<H: Host>(
     if let Some(jar_owner) = runtime.jvm_selected_jar_body(&virtual_ref, 0xb6, Some(block))? {
         return runtime.invoke(&jar_owner, name, descriptor, Some(block.clone()), args);
     }
-    let vanilla_super = block_vanilla_superclass(runtime, block);
-    match (name, descriptor) {
-        ("useItemOn", USE_ITEM_ON_DESC) if inherits_block_behaviour_use_item_on(&vanilla_super) => {
-            Ok(ir_try_with_empty_hand())
+    match block_vanilla_superclass(runtime, block) {
+        Some(vanilla_class) => {
+            run_inherited_block_method(runtime.host, &vanilla_class, name, descriptor)
         }
-        ("useWithoutItem", USE_WITHOUT_ITEM_DESC)
-            if inherits_block_behaviour_use_without_item(&vanilla_super) =>
-        {
-            Ok(ir_pass())
-        }
-        ("getMenuProvider", GET_MENU_PROVIDER_DESC)
-            if inherits_block_behaviour_get_menu_provider(&vanilla_super) =>
-        {
-            Ok(Value::Ref(None))
-        }
-        _ => runtime.host.unknown_operand_call(&MethodRef {
-            owner: vanilla_super,
-            name: name.to_owned(),
-            descriptor: descriptor.to_owned(),
-        }),
+        None => runtime.host.unknown_operand_call(&virtual_ref),
     }
 }
 
@@ -1718,16 +1779,33 @@ fn invoke_block_state_use_item_on<H: Host>(
     .map(Some)
 }
 
-/// Exact MC 26.3 `Player.openMenu(MenuProvider)` vs `ServerPlayer.openMenu(MenuProvider)`:
-/// - Client (`LocalPlayer` / `Player`): returns `OptionalInt.empty()`, records nothing.
-/// - Server (`ServerPlayer`):
-///   - `provider == null` -> `OptionalInt.empty()`
-///   - increments `containerCounter = containerCounter % 100 + 1`
-///   - calls `provider.createMenu(containerCounter, getInventory(), this)`
-///   - if `menu == null` -> `OptionalInt.empty()`
-///   - calls `menu.getType()` (throws `UnsupportedOperationException` if `menuType == null`)
-///   - calls `provider.getDisplayName()`
-///   - records typed [`OpenMenuEffect`] and returns `OptionalInt.of(containerCounter)`
+const SERVER_PLAYER: &str = "net/minecraft/server/level/ServerPlayer";
+const PLAYER_DESC_ARG: &str = "(Lnet/minecraft/world/entity/player/Player;)V";
+
+fn server_player_method(name: &str, descriptor: &str) -> MethodRef {
+    MethodRef {
+        owner: SERVER_PLAYER.to_owned(),
+        name: name.to_owned(),
+        descriptor: descriptor.to_owned(),
+    }
+}
+
+/// Exact MC 26.3 `Player.openMenu(MenuProvider)` vs `ServerPlayer.openMenu(MenuProvider)`.
+///
+/// `Player.openMenu` (the client's `LocalPlayer` inherits it) returns `OptionalInt.empty()` and
+/// records nothing. `ServerPlayer.openMenu` runs, by its `server-26.3.jar` offsets:
+/// - 0-7: `provider == null` -> `OptionalInt.empty()`;
+/// - 8-20: `if (containerMenu != inventoryMenu) closeContainer()` ([`open_menu_close_current`]),
+///   so the old menu's `removed` runs before the new menu exists (#629 review P1 4);
+/// - 23-24: `nextContainerCounter()` ([`open_menu_next_container_counter`]);
+/// - 27-42: `menu = provider.createMenu(containerCounter, getInventory(), this)`;
+/// - 43-73: `menu == null` -> a spectator is sent `container.spectatorCantOpen` (counted), and
+///   `OptionalInt.empty()`;
+/// - 74-99: `ClientboundOpenScreenPacket(menu.containerId, menu.getType(),
+///   provider.getDisplayName())`, recorded as [`MenuEffect::Opened`];
+/// - 102-104: `initMenu(menu)` (counted, see below);
+/// - 107-109: `containerMenu = menu`: Decaf holds the menu for the player ([`PlayerMenus::open`]);
+/// - 112-119: `OptionalInt.of(containerCounter)`.
 #[inline(never)]
 fn invoke_player_open_menu<H: Host>(
     runtime: &mut Runtime<'_, H>,
@@ -1744,19 +1822,22 @@ fn invoke_player_open_menu<H: Host>(
     let Some(std_host) = runtime.host.as_std_host_mut() else {
         return Ok(None);
     };
-    let Some((player_uuid, inventory)) =
-        std_host.block_use.active_use.as_ref().and_then(|active| {
-            (active.side == BlockUseSide::Server && receiver == &active.player)
-                .then(|| (active.player_data.uuid, active.player_inventory.clone()))
+    let Some((inventory, spectator)) = std_host.block_use.active_use.as_ref().and_then(|active| {
+        (active.side == BlockUseSide::Server && receiver == &active.player).then(|| {
+            (
+                active.player_inventory.clone(),
+                active.player_data.spectator,
+            )
         })
-    else {
+    }) else {
         return Ok(None);
     };
     if *provider == Value::Ref(None) {
         return Ok(Some(host_optional::empty_of(HostKind::OptionalInt)));
     }
 
-    let container_id = std_host.block_use.next_container_counter(player_uuid);
+    open_menu_close_current(runtime, receiver)?;
+    let container_id = open_menu_next_container_counter(runtime)?;
 
     let menu = runtime.call_virtual(
         jdk_call::Site::Interface,
@@ -1767,6 +1848,14 @@ fn invoke_player_open_menu<H: Host>(
         &[Value::Int(container_id), inventory, receiver.clone()],
     )?;
     if menu == Value::Ref(None) {
+        if spectator {
+            // Offsets 54-67: `sendOverlayMessage(Component.translatable(
+            // "container.spectatorCantOpen").withStyle(RED))`, a message Decaf can't send.
+            runtime.host.unknown_operand_call(&server_player_method(
+                "sendOverlayMessage",
+                "(Lnet/minecraft/network/chat/Component;)V",
+            ))?;
+        }
         return Ok(Some(host_optional::empty_of(HostKind::OptionalInt)));
     }
 
@@ -1786,6 +1875,16 @@ fn invoke_player_open_menu<H: Host>(
         provider,
         &[],
     )?;
+
+    // Offsets 102-104: `initMenu(menu)` adds the player's slot listener (`addSlotListener`,
+    // which runs `broadcastChanges`) and synchronizer (`setSynchronizer`, which runs
+    // `sendAllDataToRemote`). Both read the menu's slots, containers and data slots through
+    // methods a mod's menu can override, and send what they read to the client. Nothing runs
+    // them for a Java menu yet (the live-menu bridge will), so the call is counted.
+    runtime.host.unknown_operand_call(&server_player_method(
+        "initMenu",
+        "(Lnet/minecraft/world/inventory/AbstractContainerMenu;)V",
+    ))?;
 
     // Resolve access_pos: first from ItemCombinerMenu.access (exact, honoring NULL),
     // otherwise from any ContainerLevelAccess instance field stored on a custom menu subclass.
@@ -1818,22 +1917,174 @@ fn invoke_player_open_menu<H: Host>(
         let title_json = facade_text::json_now(&title, Some(&std_host.component_states));
         let constructor =
             menu_models::simple_menu_provider_constructor(&std_host.menu_states, provider);
+        let effect = OpenMenuEffect {
+            container_id,
+            menu_type,
+            menu_type_id,
+            title,
+            title_json,
+            access_pos,
+            constructor,
+            provider: provider.clone(),
+            menu,
+        };
+        // Offsets 107-109: `containerMenu = menu`.
+        std_host.hold_opened_menu(&effect);
         if let Some(active) = std_host.block_use.active_use.as_mut() {
-            active.open_menus.push(OpenMenuEffect {
-                container_id,
-                menu_type,
-                menu_type_id,
-                title,
-                title_json,
-                access_pos,
-                constructor,
-                provider: provider.clone(),
-                menu,
-            });
+            active.container = PlayerContainer::Open(container_id);
+            active.menu_effects.push(MenuEffect::Opened(effect));
         }
     }
 
     Ok(Some(host_optional::optional_int(container_id)))
+}
+
+/// `ServerPlayer.openMenu` offsets 8-20: `if (containerMenu != inventoryMenu) closeContainer()`.
+///
+/// Decaf knows the player's `containerMenu` from the embedder's snapshot
+/// ([`BlockUsePlayerData::container`], updated by this call's own opens) and the Java menu it
+/// holds for them:
+/// - the inventory menu, and no held menu: nothing to close;
+/// - the held menu's window: `closeContainer()` runs here, before the new menu is built
+///   ([`run_do_close_container`]), and the embedder is told to close the window
+///   ([`MenuEffect::Closed`]);
+/// - the inventory menu while Decaf still holds a menu: the embedder closed it without Decaf
+///   running its `doCloseContainer`, so that missed close is counted;
+/// - any other menu (one the embedder or another jar owns), or a menu the embedder can't
+///   name: Decaf can't run its close, so `closeContainer` is counted.
+#[inline(never)]
+fn open_menu_close_current<H: Host>(
+    runtime: &mut Runtime<'_, H>,
+    player: &Value,
+) -> Result<(), NativeError> {
+    let Some(std_host) = runtime.host.as_std_host_mut() else {
+        return Ok(());
+    };
+    let Some(active) = std_host.block_use.active_use.as_ref() else {
+        return Ok(());
+    };
+    let (uuid, incarnation, container) = (
+        active.player_data.uuid,
+        active.player_data.incarnation,
+        active.container,
+    );
+    let held = std_host
+        .block_use
+        .player(uuid, incarnation)
+        .and_then(|entry| entry.open.as_ref())
+        .map(|open| open.container_id);
+    let counted = match (held, container) {
+        (None, PlayerContainer::Inventory) => return Ok(()),
+        (Some(held_id), PlayerContainer::Open(open_id)) if held_id == open_id => {
+            let Some(record) = std_host.take_held_menu(uuid, incarnation) else {
+                return Ok(());
+            };
+            if let Some(active) = std_host.block_use.active_use.as_mut() {
+                active.container = PlayerContainer::Inventory;
+                active.menu_effects.push(MenuEffect::Closed {
+                    container_id: record.container_id,
+                });
+            }
+            let result = run_do_close_container(runtime, &record.menu, player);
+            if let Some(std_host) = runtime.host.as_std_host_mut() {
+                std_host.release_menu_values(&record);
+            }
+            return result;
+        }
+        (Some(_), PlayerContainer::Inventory) => server_player_method("doCloseContainer", "()V"),
+        (_, PlayerContainer::Open(_) | PlayerContainer::Unknown) => {
+            server_player_method("closeContainer", "()V")
+        }
+    };
+    // What Decaf held is no longer the player's `containerMenu` either way.
+    if let Some(record) = std_host.take_held_menu(uuid, incarnation) {
+        std_host.release_menu_values(&record);
+    }
+    if let Some(active) = std_host.block_use.active_use.as_mut() {
+        active.container = PlayerContainer::Inventory;
+    }
+    runtime.host.unknown_operand_call(&counted).map(|_| ())
+}
+
+/// `ServerPlayer.doCloseContainer()` (26.3, offsets 0-27) on the Java menu Decaf held as the
+/// player's `containerMenu`:
+/// - 0-5: `containerMenu.removed(this)`, dispatched to the menu's own override;
+/// - 8-16: `inventoryMenu.transferState(containerMenu)`, which copies the old menu's remote
+///   slot state by `Slot.getContainerSlot()`. That is unobservable unless a jar slot overrides
+///   `getContainerSlot`, so it is counted only then (or when Decaf doesn't know the slots);
+/// - 19-24: `containerMenu = inventoryMenu` (the caller dropped the held menu).
+#[inline(never)]
+fn run_do_close_container<H: Host>(
+    runtime: &mut Runtime<'_, H>,
+    menu: &Value,
+    player: &Value,
+) -> Result<(), NativeError> {
+    runtime.call_virtual(
+        jdk_call::Site::Virtual,
+        menu_models::ABSTRACT_CONTAINER_MENU,
+        "removed",
+        PLAYER_DESC_ARG,
+        menu,
+        std::slice::from_ref(player),
+    )?;
+    let slots = runtime
+        .host
+        .as_std_host_mut()
+        .and_then(|std_host| menu_models::menu_broadcast_slots(&std_host.menu_states, menu));
+    let get_container_slot = MethodRef {
+        owner: "net/minecraft/world/inventory/Slot".to_owned(),
+        name: "getContainerSlot".to_owned(),
+        descriptor: "()I".to_owned(),
+    };
+    let mut observable = slots.is_none();
+    for slot in slots.unwrap_or_default() {
+        if runtime
+            .jvm_selected_jar_body(&get_container_slot, 0xb6, Some(&slot.slot))?
+            .is_some()
+        {
+            observable = true;
+            break;
+        }
+    }
+    if observable {
+        runtime.host.unknown_operand_call(&MethodRef {
+            owner: "net/minecraft/world/inventory/InventoryMenu".to_owned(),
+            name: "transferState".to_owned(),
+            descriptor: "(Lnet/minecraft/world/inventory/AbstractContainerMenu;)V".to_owned(),
+        })?;
+    }
+    Ok(())
+}
+
+/// `ServerPlayer.nextContainerCounter()` (26.3, offsets 0-13:
+/// `containerCounter = containerCounter % 100 + 1`) on the object Decaf keeps state for
+/// ([`PlayerMenus::counter`]). When Decaf doesn't know the counter (no object it was told was
+/// created, or the counter's value since lost), the call is counted and the menu is built
+/// with id 1 as a placeholder.
+#[inline(never)]
+fn open_menu_next_container_counter<H: Host>(
+    runtime: &mut Runtime<'_, H>,
+) -> Result<i32, NativeError> {
+    let next = runtime.host.as_std_host_mut().and_then(|std_host| {
+        let active = std_host.block_use.active_use.as_ref()?;
+        let (uuid, incarnation) = (active.player_data.uuid, active.player_data.incarnation);
+        let counter = std_host
+            .block_use
+            .player_mut(uuid, incarnation)?
+            .counter
+            .as_mut()?;
+        *counter = *counter % 100 + 1;
+        Some(*counter)
+    });
+    match next {
+        Some(id) => Ok(id),
+        None => {
+            runtime
+                .host
+                .unknown_operand_call(&server_player_method("nextContainerCounter", "()V"))?;
+            Ok(1)
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1849,27 +2100,134 @@ impl StdHost {
             .map(|entry| entry.value.clone())
     }
 
-    /// Retain every Java value held by an [`OpenMenuEffect`] across subsequent GC cycles
-    /// (for W11 live menu execution). Pair with [`StdHost::release_open_menu_effect`].
-    pub fn retain_open_menu_effect(&mut self, effect: &OpenMenuEffect) {
-        self.retain(&effect.menu_type);
-        self.retain(&effect.title);
-        if let Some(ctor) = &effect.constructor {
-            self.retain(ctor);
-        }
-        self.retain(&effect.provider);
-        self.retain(&effect.menu);
+    /// A new `ServerPlayer` object for `uuid`: a login (`session`) or `PlayerList.respawn`'s
+    /// copy (`life`). Its `containerCounter` starts at 0 (the field's default: `restoreFrom`
+    /// does not copy it, `server-26.3.jar`) and its `containerMenu` is its `inventoryMenu`, so
+    /// whatever Decaf held for the player's previous object is dropped.
+    pub fn server_player_created(&mut self, uuid: u128, session: u32, life: u32) {
+        self.forget_player_menus(uuid);
+        self.block_use.players.insert(
+            uuid,
+            PlayerMenus {
+                incarnation: (session, life),
+                counter: Some(0),
+                open: None,
+            },
+        );
     }
 
-    /// Release one retain hold acquired by [`StdHost::retain_open_menu_effect`].
-    pub fn release_open_menu_effect(&mut self, effect: &OpenMenuEffect) {
-        self.release(&effect.menu_type);
-        self.release(&effect.title);
-        if let Some(ctor) = &effect.constructor {
-            self.release(ctor);
+    /// The player left the server: their object is gone, and so is what Decaf held for it.
+    pub fn server_player_removed(&mut self, uuid: u128) {
+        self.forget_player_menus(uuid);
+    }
+
+    /// A container opened for the player's current object other than through this jar's
+    /// `ServerPlayer.openMenu` (vanilla, the embedder, another jar), or the embedder showed
+    /// one Decaf opened under its own id. `container_id` is its `containerId`, which every
+    /// opener takes from `containerCounter` (`openMenu` offsets 23-37, `openHorseInventory`),
+    /// so that is the counter now. `None` when the embedder can't read the id: Decaf then no
+    /// longer knows the counter, and counts `nextContainerCounter` until the next known open
+    /// or the player's next object.
+    pub fn server_player_container_opened(&mut self, uuid: u128, container_id: Option<i32>) {
+        if let Some(entry) = self.block_use.players.get_mut(&uuid) {
+            entry.counter = container_id;
         }
-        self.release(&effect.provider);
-        self.release(&effect.menu);
+    }
+
+    /// The Java menu Decaf holds as the player's `containerMenu`: the last one their current
+    /// object opened that nothing closed since, with the `MenuConstructor` and live menu the
+    /// live-menu bridge drives. At most one per player.
+    pub fn player_open_menu(&self, uuid: u128) -> Option<&OpenMenuEffect> {
+        self.block_use.players.get(&uuid)?.open.as_ref()
+    }
+
+    /// The embedder could not show the menu `container_id` Decaf opened for the player (a
+    /// menu type it doesn't know, a refusal, a different window id): Decaf drops it, since
+    /// nothing shows it, and stops trusting the player's `containerCounter`, which Java
+    /// advanced and the embedder's server did not. Answers whether that menu was held.
+    pub fn refuse_open_menu(&mut self, uuid: u128, container_id: i32) -> bool {
+        let Some(entry) = self.block_use.players.get_mut(&uuid) else {
+            return false;
+        };
+        entry.counter = None;
+        let held = entry.open.take_if(|open| open.container_id == container_id);
+        let dropped = held.is_some();
+        if let Some(record) = held {
+            self.release_menu_values(&record);
+        }
+        dropped
+    }
+
+    /// Drop every player's menu state: a new server, whose players are new objects.
+    pub fn reset_player_menus(&mut self) {
+        let players = std::mem::take(&mut self.block_use.players);
+        for record in players.into_values().filter_map(|entry| entry.open) {
+            self.release_menu_values(&record);
+        }
+    }
+
+    fn forget_player_menus(&mut self, uuid: u128) {
+        if let Some(record) = self
+            .block_use
+            .players
+            .remove(&uuid)
+            .and_then(|entry| entry.open)
+        {
+            self.release_menu_values(&record);
+        }
+    }
+
+    /// `containerMenu = menu` (`ServerPlayer.openMenu` offsets 107-109) for the player the
+    /// running call is for: Decaf holds the menu on their object's entry and retains its Java
+    /// values, so a later block use can close it and the live-menu bridge can drive it. A
+    /// player whose object Decaf can't name keeps nothing (a later close is then counted).
+    pub(crate) fn hold_opened_menu(&mut self, effect: &OpenMenuEffect) {
+        let Some(active) = self.block_use.active_use.as_ref() else {
+            return;
+        };
+        let uuid = active.player_data.uuid;
+        let Some(incarnation) = active.player_data.incarnation else {
+            return;
+        };
+        let stale = self
+            .block_use
+            .players
+            .get(&uuid)
+            .is_some_and(|entry| entry.incarnation != incarnation);
+        if stale {
+            // An older object's entry: that object is gone.
+            self.forget_player_menus(uuid);
+        }
+        let entry = self.block_use.players.entry(uuid).or_insert(PlayerMenus {
+            incarnation,
+            // Decaf was not told this object was created, so it can't know the counter.
+            counter: None,
+            open: None,
+        });
+        let replaced = entry.open.replace(effect.clone());
+        for value in effect.values() {
+            self.retain(value);
+        }
+        if let Some(record) = replaced {
+            self.release_menu_values(&record);
+        }
+    }
+
+    /// Take the menu Decaf holds for object `incarnation` of `uuid` off its entry; the caller
+    /// releases its values ([`Self::release_menu_values`]) once it is done with it.
+    pub(crate) fn take_held_menu(
+        &mut self,
+        uuid: u128,
+        incarnation: Option<(u32, u32)>,
+    ) -> Option<OpenMenuEffect> {
+        self.block_use.player_mut(uuid, incarnation)?.open.take()
+    }
+
+    /// Drop the retain holds [`Self::hold_opened_menu`] took on a menu's Java values.
+    pub(crate) fn release_menu_values(&mut self, effect: &OpenMenuEffect) {
+        for value in effect.values() {
+            self.release(value);
+        }
     }
 
     /// Build the canonical `BlockState` value for a registered mod block and property overrides.
@@ -1905,6 +2263,38 @@ impl StdHost {
 enum BlockUseKind {
     WithoutItem,
     ItemOn,
+}
+
+/// The `ServerPlayer` handle a player's data names, keyed as the server's game objects key a
+/// player (`GameObject::marker`): by UUID, object (session and life) and entity id.
+fn server_player_value(player: &BlockUsePlayerData) -> Value {
+    let uuid = player.uuid;
+    let key = match (player.incarnation, player.entity_id) {
+        (Some((session, life)), Some(id)) => {
+            format!("game/player/{uuid:032x}/{session}.{life}/{id}")
+        }
+        (Some((session, life)), None) => format!("game/player/{uuid:032x}/{session}.{life}"),
+        (None, _) => format!("game/player/{uuid:032x}"),
+    };
+    game_object::server_value(key)
+}
+
+/// How many unmodelled host calls `host` made since `before`, by method.
+fn unknown_calls_since(
+    host: &StdHost,
+    before: &BTreeMap<String, usize>,
+) -> (BTreeMap<String, usize>, usize) {
+    let mut calls = BTreeMap::new();
+    let mut total = 0usize;
+    for (name, count) in host.unknown_host_calls() {
+        let prev = before.get(&name).copied().unwrap_or(0);
+        if count > prev {
+            let delta = count - prev;
+            calls.insert(name, delta);
+            total += delta;
+        }
+    }
+    (calls, total)
 }
 
 impl NativeJar {
@@ -1956,6 +2346,78 @@ impl NativeJar {
         self.block_use_inner(host, context, BlockUseKind::ItemOn, budget)
     }
 
+    /// The embedder closed the window of the Java menu `container_id` that Decaf holds as the
+    /// player's `containerMenu` (the player closed it, walked away, left, or something else
+    /// replaced it): vanilla's `ServerGamePacketListenerImpl.handleContainerClose` and
+    /// `closeContainer` both end in `ServerPlayer.doCloseContainer`, so the menu's
+    /// `removed(player)` runs here and Decaf drops it. `Ok(None)` when Decaf holds no such
+    /// menu for the player's current object (one it already closed itself, say).
+    pub fn close_player_menu(
+        &self,
+        host: &mut StdHost,
+        player: &BlockUsePlayerData,
+        dimension: &str,
+        container_id: i32,
+        budget: &ExecutionBudget,
+    ) -> Result<Option<MenuCloseOutcome>, NativeError> {
+        let held = host
+            .block_use
+            .player(player.uuid, player.incarnation)
+            .and_then(|entry| entry.open.as_ref())
+            .is_some_and(|open| open.container_id == container_id);
+        if !held {
+            return Ok(None);
+        }
+        let Some(record) = host.take_held_menu(player.uuid, player.incarnation) else {
+            return Ok(None);
+        };
+        let level = game_object::server_value(format!("game/level/{dimension}"));
+        let player_value = server_player_value(player);
+        let player_inventory = menu_models::allocate_inventory(
+            &mut host.menu_states,
+            &mut host.next_menu_object,
+            player_value.clone(),
+        );
+        let unknowns_before: BTreeMap<String, usize> =
+            host.unknown_host_calls().into_iter().collect();
+        let mark = host.call_log_mark();
+        let previous_active = host.block_use.active_use.replace(ActiveBlockUse {
+            side: BlockUseSide::Server,
+            dimension: dimension.to_owned(),
+            level: level.clone(),
+            block: None,
+            player: player_value.clone(),
+            player_data: player.clone(),
+            player_inventory: player_inventory.clone(),
+            container: PlayerContainer::Open(container_id),
+            menu_effects: Vec::new(),
+        });
+        let roots = vec![
+            level,
+            player_value.clone(),
+            player_inventory,
+            record.menu.clone(),
+        ];
+        let menu = record.menu.clone();
+        let call_result =
+            self.with_persistent_runtime_with_budget(host, &roots, budget, |runtime| {
+                run_do_close_container(runtime, &menu, &player_value).map(|()| Value::Void)
+            });
+        host.block_use.active_use = previous_active;
+        host.rewind_call_log(mark);
+        // `containerMenu = inventoryMenu` (offsets 19-24): the menu is no longer held, even
+        // when its `removed` threw.
+        host.release_menu_values(&record);
+        call_result?;
+        let (unknown_host_calls, unknown_host_call_count) =
+            unknown_calls_since(host, &unknowns_before);
+        Ok(Some(MenuCloseOutcome {
+            container_id,
+            unknown_host_calls,
+            unknown_host_call_count,
+        }))
+    }
+
     fn block_use_inner(
         &self,
         host: &mut StdHost,
@@ -1979,16 +2441,7 @@ impl NativeJar {
             BlockUseSide::Client => game_object::client_value("client/level".into()),
         };
         let player = match context.side {
-            BlockUseSide::Server => {
-                let p = &context.player;
-                let key = match p.entity_id {
-                    Some(id) => {
-                        format!("game/player/{:032x}/{}.{}/{id}", p.uuid, p.session, p.life)
-                    }
-                    None => format!("game/player/{:032x}/{}.{}", p.uuid, p.session, p.life),
-                };
-                game_object::server_value(key)
-            }
+            BlockUseSide::Server => server_player_value(&context.player),
             BlockUseSide::Client => game_object::client_value("client/player".into()),
         };
         let player_inventory = menu_models::allocate_inventory(
@@ -2011,12 +2464,12 @@ impl NativeJar {
             side: context.side,
             dimension: context.dimension.clone(),
             level: level.clone(),
-            state: state.clone(),
-            pos: context.pos,
+            block: Some((state.clone(), context.pos)),
             player: player.clone(),
             player_data: context.player.clone(),
             player_inventory: player_inventory.clone(),
-            open_menus: Vec::new(),
+            container: context.player.container,
+            menu_effects: Vec::new(),
         });
 
         let roots = vec![
@@ -2067,24 +2520,17 @@ impl NativeJar {
         host.rewind_call_log(mark);
 
         let raw_result = call_result?;
-        let open_menus = finished_active.map(|a| a.open_menus).unwrap_or_default();
+        let menu_effects = finished_active
+            .map(|active| active.menu_effects)
+            .unwrap_or_default();
         let result = decode_interaction_result(host, &raw_result);
-
-        let mut unknown_host_calls = BTreeMap::new();
-        let mut unknown_host_call_count = 0usize;
-        for (name, count) in host.unknown_host_calls() {
-            let prev = unknowns_before.get(&name).copied().unwrap_or(0);
-            if count > prev {
-                let delta = count - prev;
-                unknown_host_calls.insert(name, delta);
-                unknown_host_call_count += delta;
-            }
-        }
+        let (unknown_host_calls, unknown_host_call_count) =
+            unknown_calls_since(host, &unknowns_before);
 
         Ok(BlockUseOutcome {
             result,
             raw_result,
-            open_menus,
+            menu_effects,
             unknown_host_calls,
             unknown_host_call_count,
         })

@@ -374,9 +374,6 @@ struct LoadedJar {
     /// on game objects between firings (`game_hooks.rs`).
     hooks: runtime::GameHookRegistrations,
     hook_state: runtime::GameHookState,
-    /// Menus opened through `Block.use*` -> `player.openMenu(MenuProvider)` (`block_use.rs`),
-    /// with their Java values retained on `host` for W11 live menu execution.
-    open_menus: Vec<block_use::RecordedOpenMenu>,
 }
 
 /// One Java command this bridge can run: its usage, the literal path that selects it, the
@@ -1161,12 +1158,16 @@ impl Hooks for HorizonJava {
         let leaving = {
             let mut state = self.lock();
             let leaving = state.take_leaver(event.player);
-            // The leaver's `ServerPlayer` is gone: what callbacks kept on it is dropped.
+            // The leaver's `ServerPlayer` is gone: what callbacks kept on it is dropped, and so
+            // is any Java menu a jar held as its `containerMenu`.
             for object in leaving
                 .iter()
                 .filter_map(|entry| game_hooks::player_of(entry, 0))
             {
                 game_hooks::forget(&mut state, &object);
+            }
+            for jar in &mut state.jars {
+                jar.host.server_player_removed(event.player);
             }
             leaving
         };
@@ -1207,6 +1208,25 @@ impl Hooks for HorizonJava {
             context,
             |_| true,
         );
+    }
+
+    /// A window a mod opened closed (the player closed it, something replaced it, or the
+    /// player left). A jar holding the Java menu behind it runs its close (`block_use.rs`).
+    fn menu_closed(&self, host: &mut dyn ServerHost, event: &mut mod_api::MenuClosedEvent) {
+        let mut state = self.lock();
+        block_use::menu_closed(&mut state, host, event.uuid, event.window);
+    }
+
+    /// A menu opened for a player, by anything. Its container id is the `ServerPlayer`'s
+    /// `containerCounter` now, which every jar's block-use model follows (`block_use.rs`).
+    fn player_container_open(
+        &self,
+        host: &mut dyn ServerHost,
+        event: &mut mod_api::PlayerContainerOpenEvent<'_>,
+    ) {
+        let container_id = event.menu.and_then(|menu| menu.container_id(&*host));
+        let mut state = self.lock();
+        block_use::container_opened(&mut state, event.player, container_id);
     }
 
     /// A player's data was copied to their new player (Fabric's `COPY_FROM`, NeoForge's
@@ -2029,6 +2049,11 @@ impl HorizonJava {
             player.session = session;
             player.life = life;
         }
+        // A new `ServerPlayer`: its `containerCounter` starts at 0 and its `containerMenu` is
+        // its inventory menu, in every jar (`block_use.rs`).
+        for jar in &mut state.jars {
+            jar.host.server_player_created(uuid, session, life);
+        }
     }
 
     /// The player whose action a hook hears, as the mod API's own helpers name them.
@@ -2753,9 +2778,9 @@ impl State {
             jar.row.commands_translated = 0;
             jar.row.commands_refused_at_registration = 0;
             jar.row.block_use = block_use::Tally::default();
-            for recorded in jar.open_menus.drain(..) {
-                jar.host.release_open_menu_effect(&recorded.effect);
-            }
+            // Every player of a new server is a new `ServerPlayer`: no Java menu or
+            // `containerCounter` carries over (`block_use.rs`).
+            jar.host.reset_player_menus();
             // No player value carries into another server's world.
             jar.host.reset_attachment_values();
         }
@@ -3089,7 +3114,6 @@ fn load_jar(
         failures,
         hooks,
         hook_state: runtime::GameHookState::default(),
-        open_menus: Vec::new(),
     })
     .map(|mut loaded| {
         loaded.row.game_hooks = tally;
@@ -3767,7 +3791,6 @@ mod tests {
                     failures: Vec::new(),
                     hooks: runtime::GameHookRegistrations::default(),
                     hook_state: runtime::GameHookState::default(),
-                    open_menus: Vec::new(),
                 }
             })
             .collect();
@@ -4290,7 +4313,6 @@ mod tests {
             failures: Vec::new(),
             hooks: runtime::GameHookRegistrations::default(),
             hook_state: runtime::GameHookState::default(),
-            open_menus: Vec::new(),
         };
         State {
             jars: vec![loaded],
