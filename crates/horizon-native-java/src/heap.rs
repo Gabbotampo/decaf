@@ -393,6 +393,10 @@ impl StdHost {
         self.recipes.root_texts(out);
         // Active block-use state and open-menu effects.
         self.block_use.root_texts(out);
+        // Seeded `Level.random` handles kept per dimension (`level_sound.rs`).
+        for held in self.level_sound.level_random_handles.values() {
+            value(held, out);
+        }
     }
 
     /// The host's own state that may name a jar object without a table this
@@ -2122,6 +2126,7 @@ mod tests {
             "recipe_sync_serializers",
             "vec2",
             "block_use",
+            "level_sound",
         ];
         const HOLDS_NO_OBJECT: &[&str] = &[
             "next_unmodifiable_collection",

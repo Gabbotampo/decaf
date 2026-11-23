@@ -199,6 +199,7 @@ mod jdk_text_oracle;
 mod jvm_dispatch;
 mod kotlin_stdlib;
 mod lambda_boxing;
+pub mod level_sound;
 mod library_dispatch;
 mod linked_resources;
 mod list_equality;
@@ -337,6 +338,10 @@ pub(crate) use host_optional::{
 pub(crate) use host_path::{path_text, path_value, unix_normal};
 pub use host_ref::{HostKind, HostRef};
 pub use java_nbt::{MAX_DEPTH as NBT_MAX_DEPTH, Nbt, NbtCompound};
+pub use level_sound::{
+    EntitySoundFacts, LevelSoundEffect, SoundHolderKind, SoundSeed, SoundSide, SoundSource,
+    SoundTarget,
+};
 pub use mixin_extras::{GameHookShape, MixinExtrasKind, MixinExtrasPlan};
 pub use mixin_plugins::ConfigPluginReport;
 use mixin_plugins::ConfigPlugins;
@@ -3375,6 +3380,47 @@ pub trait Host {
         None
     }
 
+    /// Registry id of a registered `SoundEvent` value (`MappedRegistry.wrapAsHolder`),
+    /// or `None` when unregistered (`Holder.direct`).
+    fn registered_sound_id(&self, _sound: &Value) -> Option<String> {
+        None
+    }
+
+    /// Unwrap a `Holder<SoundEvent>` handle into `(sound_event_value, bound_registry_id)`
+    /// or an `IllegalStateException` if it is an unbound `Holder$Reference`.
+    fn unwrap_sound_holder(
+        &mut self,
+        _value: &Value,
+    ) -> Option<Result<(Value, Option<String>), NativeError>> {
+        None
+    }
+
+    /// Handle for `Level.random` (`Level.getRandom()`) of `level_marker`.
+    fn level_random_handle(&mut self, _level_marker: &str) -> Option<Value> {
+        None
+    }
+
+    /// Draw `Level.soundSeedGenerator.nextLong()` for `level_marker` (or return
+    /// [`level_sound::SoundSeed::HostDeferred`] when a live host owns the seed stream).
+    fn draw_level_sound_seed(
+        &mut self,
+        _level_marker: &str,
+        _server_side: bool,
+    ) -> Option<level_sound::SoundSeed> {
+        None
+    }
+
+    /// Mark a level sound stream unknown (see `level_sound.rs`): Java drew, or
+    /// may have drawn, from it where Decaf did not, so every later draw from
+    /// it counts. A host that models no sound streams keeps the default: its
+    /// draws already count.
+    fn mark_sound_stream_unknown(&mut self, _stream: &str) {}
+
+    /// Construct a `SoundEvent` record handle from `new SoundEvent(Identifier, Optional<Float>)`.
+    fn construct_sound_event(&mut self, _r: &MethodRef, _args: &[Value]) -> Option<Value> {
+        None
+    }
+
     /// Record the message of a throwable the interpreter caught and is about
     /// to deliver to a Java handler.
     ///
@@ -4182,6 +4228,7 @@ pub struct StdHost {
     next_menu_object: u64,
     freed_menu_objects: heap::FreedObjects,
     block_use: block_use::BlockUseHostState,
+    pub(crate) level_sound: level_sound::LevelSoundState,
 }
 
 /// Who placed the block for a [`BlockPlaceContextData`] snapshot.
@@ -4501,6 +4548,7 @@ impl StdHost {
             next_menu_object: 0,
             freed_menu_objects: heap::FreedObjects::default(),
             block_use: block_use::BlockUseHostState::default(),
+            level_sound: level_sound::LevelSoundState::default(),
         }
     }
 
@@ -9439,6 +9487,37 @@ impl Host for StdHost {
         self.throwable_messages.get(marker).cloned()
     }
 
+    fn registered_sound_id(&self, sound: &Value) -> Option<String> {
+        self.registered_sound_id_impl(sound)
+    }
+
+    fn unwrap_sound_holder(
+        &mut self,
+        value: &Value,
+    ) -> Option<Result<(Value, Option<String>), NativeError>> {
+        host_registry_holder::unwrap_sound_holder(self, value)
+    }
+
+    fn level_random_handle(&mut self, level_marker: &str) -> Option<Value> {
+        self.level_random_handle_impl(level_marker)
+    }
+
+    fn draw_level_sound_seed(
+        &mut self,
+        level_marker: &str,
+        server_side: bool,
+    ) -> Option<level_sound::SoundSeed> {
+        self.draw_level_sound_seed_impl(level_marker, server_side)
+    }
+
+    fn mark_sound_stream_unknown(&mut self, stream: &str) {
+        StdHost::mark_sound_stream_unknown(self, stream);
+    }
+
+    fn construct_sound_event(&mut self, r: &MethodRef, args: &[Value]) -> Option<Value> {
+        sound_event::construct_record(self, r, args)
+    }
+
     fn record_throwable(&mut self, marker: &str, message: Option<String>) {
         // A throw the runtime raised carries no cause (its `getCause()` is
         // `null`), except the initializer error that wraps the `<clinit>`
@@ -11847,6 +11926,9 @@ impl Host for StdHost {
         // A client stand-in (`client/...`), a mod's `KeyMapping`, or a client
         // registration event answers the client surface first.
         if let Some(answer) = self.client_call(r, receiver, args) {
+            return answer;
+        }
+        if let Some(answer) = level_sound::standalone_client_sound_call(self, receiver, r, args) {
             return answer;
         }
         // A game-event façade marker (server, level, player, event object)
@@ -34563,7 +34645,13 @@ impl<H: Host> Runtime<'_, H> {
         receiver: &Value,
         args: &[Value],
     ) -> Result<Value, NativeError> {
-        let value = self.host.invoke_instance(r, receiver, args)?;
+        let value = if level_sound::needs_block_pos_resolution(r, args) {
+            let mut resolved_args = args.to_vec();
+            level_sound::resolve_block_pos_arg(self, r, &mut resolved_args);
+            self.host.invoke_instance(r, receiver, &resolved_args)?
+        } else {
+            self.host.invoke_instance(r, receiver, args)?
+        };
         Ok(self.materialize_host_array(value))
     }
 
@@ -36975,6 +37063,29 @@ impl<H: Host> Runtime<'_, H> {
         Ok((return_desc(descriptor) != "V").then_some(Value::Ref(Some(joined))))
     }
 
+    #[inline(never)]
+    fn invoke_sound_event_init(
+        &mut self,
+        r: &MethodRef,
+        receiver: Option<&Value>,
+        args: &[Value],
+        stack: &mut [Value],
+        locals: &mut [Value],
+    ) -> Option<Value> {
+        if r.owner != "net/minecraft/sounds/SoundEvent" || r.name != "<init>" {
+            return None;
+        }
+        let built = self.host.construct_sound_event(r, args)?;
+        if let Some(marker) = receiver.filter(|value| jar_object::is_object(value)) {
+            for slot in stack.iter_mut().chain(locals.iter_mut()) {
+                if slot == marker {
+                    *slot = built.clone();
+                }
+            }
+        }
+        Some(Value::Void)
+    }
+
     fn invoke_frame(
         &mut self,
         class: &str,
@@ -39043,6 +39154,17 @@ impl<H: Host> Runtime<'_, H> {
                             }
                             Value::Void
                         });
+                    }
+                    if dispatched.is_none()
+                        && let Some(value) = self.invoke_sound_event_init(
+                            &r,
+                            receiver.as_ref(),
+                            &args,
+                            &mut stack,
+                            &mut locals,
+                        )
+                    {
+                        dispatched = Some(value);
                     }
                     if dispatched.is_none()
                         && let Some(value) = invoke_or_catch!(
