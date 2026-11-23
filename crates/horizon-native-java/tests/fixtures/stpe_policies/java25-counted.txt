@@ -1,0 +1,14 @@
+factory-count factoryCalls=1
+factory-name got W-custom
+factory-throws EX java.lang.IllegalStateException: boom
+throwing-task scheduled get-EE java.lang.IllegalStateException: task
+throwing-callable scheduled get-EE java.io.IOException: io
+null-unit EX java.lang.NullPointerException: null
+getter-only-name false got W-getter
+execute-name W-custom
+submit-name got W-custom
+handler-discard no-exception handlerCalls=1
+handler-caller-runs no-exception ran=0
+handler-abort REE java.util.concurrent.RejectedExecutionException
+delayed-drop-on-shutdown terminated=true
+delayed-run-on-shutdown terminated=false

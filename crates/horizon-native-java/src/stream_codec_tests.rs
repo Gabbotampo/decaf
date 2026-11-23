@@ -111,7 +111,11 @@ fn codec_members_remain_counted() {
         matches!(answer, Ok(Value::Ref(Some(ref text))) if text == "done"),
         "{answer:?}"
     );
-    for name in ["toString", "hashCode", "apply", "dispatch"] {
+    // `toString`, `hashCode` and `dispatch` on a modelled codec remain counted
+    // (no host model answers them). `apply` is no longer counted here:
+    // `apply(null)` now throws the modelled NPE (see `runtime_instance_call`),
+    // and `apply` with a modelled `CodecOperation` is answered exactly.
+    for name in ["toString", "hashCode", "dispatch"] {
         assert!(
             host.unknown_host_calls()
                 .iter()
