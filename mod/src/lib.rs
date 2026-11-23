@@ -1211,10 +1211,10 @@ impl Hooks for HorizonJava {
     }
 
     /// A window a mod opened closed (the player closed it, something replaced it, or the
-    /// player left). A jar holding the Java menu behind it runs its close (`block_use.rs`).
+    /// player left). A jar holding the Java menu behind it runs its close, and what that close
+    /// opens goes out on Sunrise (`block_use.rs`).
     fn menu_closed(&self, host: &mut dyn ServerHost, event: &mut mod_api::MenuClosedEvent) {
-        let mut state = self.lock();
-        block_use::menu_closed(&mut state, host, event.uuid, event.window);
+        block_use::menu_closed(self, host, event.uuid, event.window);
     }
 
     /// A menu opened for a player, by anything. Its container id is the `ServerPlayer`'s

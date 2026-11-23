@@ -1571,3 +1571,352 @@ fn inherited_block_methods_follow_the_vanilla_declaring_class() {
     assert_eq!(plain_empty.unknown_host_call_count, 0);
     assert_eq!(plain_empty.result, Some(InteractionResultValue::Pass));
 }
+
+/// Menus whose `removed` re-enters `openMenu` or throws, for the vanilla `closeContainer` /
+/// `doCloseContainer` order (#629 review round 2). Every construction and `removed` appends
+/// three digits to `Log.log`, which keeps the last five: `1xx`/`2xx` a plain menu's,
+/// `4xx`/`3xx` a re-entrant one's, `5xx`/`6xx` a throwing one's, `xx` the container id.
+const NESTED_SOURCES: &[(&str, &str)] = &[
+    (
+        "demo/Log.java",
+        "package demo;\n\
+         public final class Log {\n\
+           public static long log = 0;\n\
+           public static int nestedId = -1;\n\
+           public static int caught = 0;\n\
+           public static void add(int code) { log = (log % 1000000000000L) * 1000 + code; }\n\
+         }",
+    ),
+    (
+        "demo/PlainMenu.java",
+        "package demo;\n\
+         import net.minecraft.world.entity.player.Inventory;\n\
+         import net.minecraft.world.entity.player.Player;\n\
+         import net.minecraft.world.flag.FeatureFlags;\n\
+         import net.minecraft.world.inventory.AbstractContainerMenu;\n\
+         import net.minecraft.world.inventory.MenuType;\n\
+         public class PlainMenu extends AbstractContainerMenu {\n\
+           public static final MenuType<PlainMenu> TYPE = new MenuType<>(PlainMenu::new, FeatureFlags.VANILLA_SET);\n\
+           private final int id;\n\
+           public PlainMenu(int id, Inventory inv) { super(TYPE, id); this.id = id; Log.add(100 + id); }\n\
+           @Override public void removed(Player player) { Log.add(200 + id); }\n\
+           @Override public boolean stillValid(Player player) { return true; }\n\
+         }",
+    ),
+    (
+        "demo/ReentrantMenu.java",
+        "package demo;\n\
+         import net.minecraft.world.entity.player.Inventory;\n\
+         import net.minecraft.world.entity.player.Player;\n\
+         import net.minecraft.world.flag.FeatureFlags;\n\
+         import net.minecraft.world.inventory.AbstractContainerMenu;\n\
+         import net.minecraft.world.inventory.MenuType;\n\
+         public class ReentrantMenu extends AbstractContainerMenu {\n\
+           public static final MenuType<ReentrantMenu> TYPE = new MenuType<>(ReentrantMenu::new, FeatureFlags.VANILLA_SET);\n\
+           private final int id;\n\
+           private boolean opened;\n\
+           public ReentrantMenu(int id, Inventory inv) { super(TYPE, id); this.id = id; Log.add(400 + id); }\n\
+           @Override public void removed(Player player) {\n\
+             Log.add(300 + id);\n\
+             if (!opened) {\n\
+               opened = true;\n\
+               Log.nestedId = player.openMenu(Providers.plain()).orElse(-1);\n\
+             }\n\
+           }\n\
+           @Override public boolean stillValid(Player player) { return true; }\n\
+         }",
+    ),
+    (
+        "demo/ThrowingMenu.java",
+        "package demo;\n\
+         import net.minecraft.world.entity.player.Inventory;\n\
+         import net.minecraft.world.entity.player.Player;\n\
+         import net.minecraft.world.flag.FeatureFlags;\n\
+         import net.minecraft.world.inventory.AbstractContainerMenu;\n\
+         import net.minecraft.world.inventory.MenuType;\n\
+         public class ThrowingMenu extends AbstractContainerMenu {\n\
+           public static final MenuType<ThrowingMenu> TYPE = new MenuType<>(ThrowingMenu::new, FeatureFlags.VANILLA_SET);\n\
+           private final int id;\n\
+           private int removedCalls;\n\
+           public ThrowingMenu(int id, Inventory inv) { super(TYPE, id); this.id = id; Log.add(500 + id); }\n\
+           @Override public void removed(Player player) {\n\
+             Log.add(600 + id);\n\
+             if (++removedCalls <= 2) throw new IllegalStateException(\"removed\");\n\
+           }\n\
+           @Override public boolean stillValid(Player player) { return true; }\n\
+         }",
+    ),
+    (
+        "demo/Providers.java",
+        "package demo;\n\
+         import net.minecraft.network.chat.Component;\n\
+         import net.minecraft.world.MenuProvider;\n\
+         import net.minecraft.world.SimpleMenuProvider;\n\
+         public final class Providers {\n\
+           public static MenuProvider plain() { return new SimpleMenuProvider((id, inv, p) -> new PlainMenu(id, inv), Component.literal(\"Plain\")); }\n\
+           public static MenuProvider reentrant() { return new SimpleMenuProvider((id, inv, p) -> new ReentrantMenu(id, inv), Component.literal(\"Reentrant\")); }\n\
+           public static MenuProvider throwing() { return new SimpleMenuProvider((id, inv, p) -> new ThrowingMenu(id, inv), Component.literal(\"Throwing\")); }\n\
+         }",
+    ),
+    (
+        "demo/MenuBlock.java",
+        "package demo;\n\
+         import net.minecraft.core.BlockPos;\n\
+         import net.minecraft.world.InteractionResult;\n\
+         import net.minecraft.world.entity.player.Player;\n\
+         import net.minecraft.world.level.Level;\n\
+         import net.minecraft.world.level.block.Block;\n\
+         import net.minecraft.world.level.block.state.BlockState;\n\
+         import net.minecraft.world.phys.BlockHitResult;\n\
+         public class MenuBlock extends Block {\n\
+           private final int kind;\n\
+           public MenuBlock(Properties props, int kind) { super(props); this.kind = kind; }\n\
+           @Override\n\
+           protected InteractionResult useWithoutItem(BlockState state, Level level, BlockPos pos, Player player, BlockHitResult hit) {\n\
+             switch (kind) {\n\
+               case 0 -> player.openMenu(Providers.plain());\n\
+               case 1 -> player.openMenu(Providers.reentrant());\n\
+               case 2 -> player.openMenu(Providers.throwing());\n\
+               default -> {\n\
+                 try { player.openMenu(Providers.plain()); }\n\
+                 catch (IllegalStateException e) { Log.caught++; }\n\
+               }\n\
+             }\n\
+             return InteractionResult.SUCCESS;\n\
+           }\n\
+         }",
+    ),
+    (
+        "demo/Probe.java",
+        "package demo;\n\
+         import net.fabricmc.api.ModInitializer;\n\
+         import net.minecraft.core.Registry;\n\
+         import net.minecraft.core.registries.BuiltInRegistries;\n\
+         import net.minecraft.resources.Identifier;\n\
+         import net.minecraft.world.level.block.state.BlockBehaviour;\n\
+         public class Probe implements ModInitializer {\n\
+           @Override public void onInitialize() {\n\
+             Registry.register(BuiltInRegistries.MENU, Identifier.fromNamespaceAndPath(\"demo\", \"plain\"), PlainMenu.TYPE);\n\
+             Registry.register(BuiltInRegistries.MENU, Identifier.fromNamespaceAndPath(\"demo\", \"reentrant\"), ReentrantMenu.TYPE);\n\
+             Registry.register(BuiltInRegistries.MENU, Identifier.fromNamespaceAndPath(\"demo\", \"throwing\"), ThrowingMenu.TYPE);\n\
+             String[] ids = { \"plain_block\", \"reentrant_block\", \"throwing_block\", \"catching_block\" };\n\
+             for (int kind = 0; kind < ids.length; kind++) {\n\
+               Registry.register(BuiltInRegistries.BLOCK, Identifier.fromNamespaceAndPath(\"demo\", ids[kind]), new MenuBlock(BlockBehaviour.Properties.of(), kind));\n\
+             }\n\
+           }\n\
+         }",
+    ),
+];
+
+fn nested_fixture(test: &str) -> (javac_fixture::Fixture, StdHost) {
+    let mut sources = MC_STUBS.to_vec();
+    sources.extend_from_slice(NESTED_SOURCES);
+    let fixture = javac_fixture::Fixture::build(test, &sources);
+    let mut host = StdHost::new();
+    fixture
+        .jar
+        .execute("demo.Probe", None, "main", &mut host)
+        .unwrap();
+    assert_eq!(
+        host.unknown_host_call_count(),
+        0,
+        "{:?}",
+        host.unknown_host_calls()
+    );
+    (fixture, host)
+}
+
+fn nested_static(host: &StdHost, field: &str) -> i64 {
+    match host
+        .persistent_class_state()
+        .0
+        .get(&format!("demo/Log#{field}"))
+    {
+        Some(Value::Long(value)) => *value,
+        Some(Value::Int(value)) => i64::from(*value),
+        other => panic!("Log.{field} is {other:?}"),
+    }
+}
+
+fn use_block(
+    fixture: &javac_fixture::Fixture,
+    host: &mut StdHost,
+    block: &str,
+    player: &BlockUsePlayerData,
+) -> BlockUseOutcome {
+    let mut ctx = default_context(block, BlockUseSide::Server, [2, 70, 2]);
+    ctx.player = player.clone();
+    fixture.jar.block_use_without_item(host, &ctx).unwrap()
+}
+
+/// A short description of a use's menu effects: `C1` closed 1, `O2` opened 2, `X2` discarded 2.
+fn effect_trace(effects: &[MenuEffect]) -> Vec<String> {
+    effects
+        .iter()
+        .map(|effect| match effect {
+            MenuEffect::Closed { container_id } => format!("C{container_id}"),
+            MenuEffect::Opened(open) => format!("O{}", open.container_id),
+            MenuEffect::Orphaned { container_id } => format!("X{container_id}"),
+        })
+        .collect()
+}
+
+/// A `removed` that opens a menu runs while its own menu is still installed (vanilla reaches
+/// `containerMenu = inventoryMenu` only at `doCloseContainer` offset 19): the nested
+/// `openMenu` closes that menu again first (`removed` re-entered), opens its menu, and the
+/// outer close's offset-19 assignment then discards that nested menu without closing it.
+#[test]
+fn a_removed_that_opens_a_menu_follows_vanillas_nested_close() {
+    let (fixture, mut host) = nested_fixture("block_use_nested_removed");
+    let baseline = host.retained_count();
+    host.server_player_created(1, 1, 0);
+    let mut player = BlockUsePlayerData::default();
+
+    let first = use_block(&fixture, &mut host, "demo:reentrant_block", &player);
+    assert_eq!(effect_trace(&first.menu_effects), ["O1"]);
+    assert_eq!(nested_static(&host, "logJ"), 401);
+
+    // Open a plain menu while the window shows the re-entrant one. Vanilla: close packet for
+    // 1, removed(1) -> nested openMenu: close packet for 1 again, removed(1) re-entered (no
+    // second open), container 2 built and installed; back in the outer doCloseContainer,
+    // `containerMenu = inventoryMenu` discards 2; then 3 is built and installed.
+    player.container = PlayerContainer::Open(1);
+    let second = use_block(&fixture, &mut host, "demo:plain_block", &player);
+    assert_eq!(
+        effect_trace(&second.menu_effects),
+        ["C1", "C1", "O2", "X2", "O3"]
+    );
+    assert_eq!(nested_static(&host, "logJ"), 401_301_301_102_103);
+    assert_eq!(nested_static(&host, "nestedIdI"), 2);
+    // `initMenu` for the nested menu and the outer one.
+    assert_eq!(
+        second.unknown_host_calls,
+        BTreeMap::from([(INIT_MENU.to_owned(), 2)])
+    );
+    assert_eq!(host.player_open_menu(1).map(|m| m.container_id), Some(3));
+
+    // The same through a close the embedder reports (`handleContainerClose`): no outer close
+    // packet, the nested open's own close and open, and its menu discarded at offset 19.
+    player.container = PlayerContainer::Open(3);
+    let third = use_block(&fixture, &mut host, "demo:reentrant_block", &player);
+    assert_eq!(effect_trace(&third.menu_effects), ["C3", "O4"]);
+    assert_eq!(nested_static(&host, "logJ"), 301_102_103_203_404);
+    let closed = fixture
+        .jar
+        .close_player_menu(
+            &mut host,
+            &player,
+            "minecraft:overworld",
+            4,
+            &ExecutionBudget::UNBOUNDED,
+        )
+        .unwrap()
+        .expect("menu 4 is held");
+    assert!(closed.failure.is_none(), "{:?}", closed.failure);
+    assert_eq!(effect_trace(&closed.menu_effects), ["C4", "O5", "X5"]);
+    assert_eq!(nested_static(&host, "logJ"), 203_404_304_304_105);
+    assert!(host.player_open_menu(1).is_none());
+    // Every menu discarded or closed along the way released its holds.
+    assert_eq!(host.retained_count(), baseline);
+}
+
+/// A `removed` that throws stops `doCloseContainer` before offset 19: the menu stays installed
+/// (its close packet already went out), the exception reaches the Java caller of `openMenu`,
+/// and the next `openMenu` closes it again.
+#[test]
+fn a_removed_that_throws_leaves_its_menu_installed() {
+    let (fixture, mut host) = nested_fixture("block_use_throwing_removed");
+    let baseline = host.retained_count();
+    host.server_player_created(1, 1, 0);
+    let mut player = BlockUsePlayerData::default();
+
+    let first = use_block(&fixture, &mut host, "demo:throwing_block", &player);
+    assert_eq!(effect_trace(&first.menu_effects), ["O1"]);
+
+    // The throw escapes `openMenu` and the use: the close packet went out, nothing else ran.
+    player.container = PlayerContainer::Open(1);
+    let failed = use_block(&fixture, &mut host, "demo:plain_block", &player);
+    assert!(
+        failed
+            .failure
+            .as_deref()
+            .is_some_and(|f| f.contains("IllegalStateException")),
+        "{:?}",
+        failed.failure
+    );
+    assert_eq!(failed.result, None);
+    assert_eq!(effect_trace(&failed.menu_effects), ["C1"]);
+    assert_eq!(nested_static(&host, "logJ"), 501_601);
+    assert_eq!(host.player_open_menu(1).map(|m| m.container_id), Some(1));
+    // Sunrise closing the window that close packet closed is no close of vanilla's server.
+    player.container = PlayerContainer::Inventory;
+    assert!(
+        fixture
+            .jar
+            .close_player_menu(
+                &mut host,
+                &player,
+                "minecraft:overworld",
+                1,
+                &ExecutionBudget::UNBOUNDED,
+            )
+            .unwrap()
+            .is_none()
+    );
+
+    // The next openMenu, with no window shown, still closes the installed menu: it throws
+    // again, and this block catches it at its `openMenu` call.
+    let caught = use_block(&fixture, &mut host, "demo:catching_block", &player);
+    assert!(caught.failure.is_none(), "{:?}", caught.failure);
+    assert_eq!(
+        caught.unknown_host_call_count, 0,
+        "{:?}",
+        caught.unknown_host_calls
+    );
+    assert_eq!(effect_trace(&caught.menu_effects), ["C1"]);
+    assert_eq!(nested_static(&host, "caughtI"), 1);
+    assert_eq!(nested_static(&host, "logJ"), 501_601_601);
+    assert_eq!(host.player_open_menu(1).map(|m| m.container_id), Some(1));
+
+    // Third time its removed returns: closed, and the counter (never advanced by the throws)
+    // gives 2.
+    let opened = use_block(&fixture, &mut host, "demo:plain_block", &player);
+    assert!(opened.failure.is_none());
+    assert_eq!(effect_trace(&opened.menu_effects), ["C1", "O2"]);
+    assert_eq!(nested_static(&host, "logJ"), 501_601_601_601_102);
+    assert_eq!(host.player_open_menu(1).map(|m| m.container_id), Some(2));
+
+    // A throwing removed on the embedder's close: the menu stays installed with no window,
+    // and the next openMenu closes it again.
+    player.container = PlayerContainer::Open(2);
+    let throwing = use_block(&fixture, &mut host, "demo:throwing_block", &player);
+    assert_eq!(effect_trace(&throwing.menu_effects), ["C2", "O3"]);
+    let closed = fixture
+        .jar
+        .close_player_menu(
+            &mut host,
+            &player,
+            "minecraft:overworld",
+            3,
+            &ExecutionBudget::UNBOUNDED,
+        )
+        .unwrap()
+        .expect("menu 3 is held");
+    assert!(
+        closed
+            .failure
+            .as_deref()
+            .is_some_and(|f| f.contains("IllegalStateException")),
+        "{:?}",
+        closed.failure
+    );
+    assert!(closed.menu_effects.is_empty());
+    assert_eq!(host.player_open_menu(1).map(|m| m.container_id), Some(3));
+    player.container = PlayerContainer::Inventory;
+    let again = use_block(&fixture, &mut host, "demo:catching_block", &player);
+    assert_eq!(effect_trace(&again.menu_effects), ["C3"]);
+    assert_eq!(nested_static(&host, "caughtI"), 2);
+
+    host.server_player_removed(1);
+    assert_eq!(host.retained_count(), baseline);
+}

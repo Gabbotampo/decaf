@@ -119,6 +119,18 @@ impl JavaBlockUsePart {
                 for applied in applied {
                     record_menu_outcome(jar, click.player, applied);
                 }
+                if let Some(failure) = &outcome.failure {
+                    // The hook threw (vanilla's use would fail too); what it did to menus before
+                    // that went out above.
+                    jar.row.block_use.uses_failed += 1;
+                    log::warn!(
+                        "{LOG}: {}: {} {} failed: {failure}",
+                        jar.row.id,
+                        self.block_id,
+                        hook_name
+                    );
+                    return None;
+                }
                 match outcome.result {
                     Some(ref result) => {
                         if let InteractionResultValue::Success { item_context, .. } = result {
@@ -402,6 +414,11 @@ pub(crate) enum MenuApplied {
     /// Java closed menu `container_id` and opened nothing after it: whether Sunrise closed the
     /// window too.
     Closed { container_id: i32, closed: bool },
+    /// Java's server discarded menu `container_id` without closing it, while its window stays:
+    /// Sunrise has no way to forget a menu it shows.
+    Orphaned { container_id: i32 },
+    /// After all of a call's effects: the window Sunrise shows the player.
+    Shown(PlayerContainer),
 }
 
 /// Carry a use's menu effects out on Sunrise, in order, without the state lock. A close
@@ -420,6 +437,9 @@ pub(crate) fn apply_menu_effects(
                 container_id: open.container_id,
                 attempt: try_open_sunrise_menu(host, player_uuid, open),
             }),
+            MenuEffect::Orphaned { container_id } => applied.push(MenuApplied::Orphaned {
+                container_id: *container_id,
+            }),
             MenuEffect::Closed { container_id } => {
                 if matches!(effects.get(index + 1), Some(MenuEffect::Opened(_))) {
                     continue;
@@ -435,6 +455,10 @@ pub(crate) fn apply_menu_effects(
                 });
             }
         }
+    }
+    if !effects.is_empty() {
+        let player = host.player(player_uuid);
+        applied.push(MenuApplied::Shown(player_container(&*host, player)));
     }
     applied
 }
@@ -490,18 +514,78 @@ pub(crate) fn record_menu_outcome(jar: &mut LoadedJar, player_uuid: u128, applie
                 );
             }
         }
+        MenuApplied::Orphaned { container_id } => {
+            jar.host
+                .note_unknown_game_hook("sunrise#containerMenu:orphaned");
+            log::warn!(
+                "{LOG}: {}: Java discarded container {container_id} without closing it; Sunrise keeps its window",
+                jar.row.id
+            );
+        }
+        MenuApplied::Shown(shown) => {
+            // The jar holds a menu vanilla still has installed (its `removed` threw after the
+            // close packet went out) while Sunrise shows no window for it.
+            if let Some(held) = jar
+                .host
+                .player_open_menu(player_uuid)
+                .map(|open| open.container_id)
+                && shown != PlayerContainer::Open(held)
+            {
+                jar.host
+                    .note_unknown_game_hook("sunrise#containerMenu:installed_without_window");
+                log::warn!(
+                    "{LOG}: {}: Java still has container {held} installed, but Sunrise shows {shown:?}",
+                    jar.row.id
+                );
+            }
+        }
     }
 }
 
 /// `menu_closed`: a window a mod opened closed (the player closed it, something replaced it, or
 /// the player left). A jar that holds its Java menu runs the menu's close
-/// (`ServerPlayer.doCloseContainer`: its `removed(player)`) and stops holding it.
+/// (`ServerPlayer.doCloseContainer`: its `removed(player)`) under the state lock; whatever that
+/// `removed` opened or closed then goes out on Sunrise without the lock (which those calls'
+/// own hooks take), and is recorded under it again.
 pub(crate) fn menu_closed(
-    state: &mut crate::State,
+    java: &crate::HorizonJava,
     host: &mut dyn ServerHost,
     player_uuid: u128,
     window: i32,
 ) {
+    let closes = {
+        let mut state = java.lock();
+        run_menu_closes(&mut state, &*host, player_uuid, window)
+    };
+    let delivered: Vec<(usize, String, Vec<MenuApplied>)> = closes
+        .into_iter()
+        .map(|(index, id, effects)| {
+            let applied = apply_menu_effects(host, player_uuid, &effects);
+            (index, id, applied)
+        })
+        .collect();
+    if delivered.iter().all(|(_, _, applied)| applied.is_empty()) {
+        return;
+    }
+    let mut state = java.lock();
+    for (index, id, applied) in delivered {
+        let Some(jar) = state.jars.get_mut(index).filter(|jar| jar.row.id == id) else {
+            continue;
+        };
+        for applied in applied {
+            record_menu_outcome(jar, player_uuid, applied);
+        }
+    }
+}
+
+/// Run the close of menu `window` in every jar that holds it for the player: each jar's index,
+/// id and the menu effects its `removed` made.
+fn run_menu_closes(
+    state: &mut crate::State,
+    host: &dyn ServerHost,
+    player_uuid: u128,
+    window: i32,
+) -> Vec<(usize, String, Vec<MenuEffect>)> {
     let holders: Vec<usize> = state
         .jars
         .iter()
@@ -514,34 +598,35 @@ pub(crate) fn menu_closed(
         .map(|(index, _)| index)
         .collect();
     if holders.is_empty() {
-        return;
+        return Vec::new();
     }
     let player_ref = host.player(player_uuid);
     let facade = state.players.iter().find(|p| p.uuid == player_uuid);
     let dimension = player_ref
-        .and_then(|player| player.entity().level(&*host))
+        .and_then(|player| player.entity().level(host))
         .map(|level| level.dimension_id().to_owned())
         .or_else(|| facade.and_then(|p| p.level.clone()));
     let player = BlockUsePlayerData {
         uuid: player_uuid,
         name: player_ref
-            .and_then(|p| p.name(&*host))
+            .and_then(|p| p.name(host))
             .or_else(|| facade.map(|p| p.name.clone()))
             .unwrap_or_else(|| "Player".to_owned()),
         entity_id: player_ref
             .map(|p| p.entity().id() as i32)
             .or_else(|| facade.and_then(|p| p.entity_id)),
         incarnation: state.lives.get(&player_uuid).copied(),
-        container: PlayerContainer::Open(window),
+        container: PlayerContainer::Inventory,
         sneaking: player_ref
-            .and_then(|p| p.entity().is_shift_key_down(&*host))
+            .and_then(|p| p.entity().is_shift_key_down(host))
             .unwrap_or(false),
         spectator: player_ref
-            .and_then(|p| p.is_spectator(&*host))
+            .and_then(|p| p.is_spectator(host))
             .unwrap_or(false),
         main_hand: None,
         off_hand: None,
     };
+    let mut effects = Vec::new();
     for index in holders {
         let jar = &mut state.jars[index];
         let Some(dimension) = dimension.as_deref() else {
@@ -569,6 +654,16 @@ pub(crate) fn menu_closed(
                         outcome.unknown_host_calls
                     );
                 }
+                if let Some(failure) = &outcome.failure {
+                    // Vanilla's `handleContainerClose` would throw too; the menu stays
+                    // installed, and the player's next `openMenu` closes it again.
+                    jar.row.block_use.uses_failed += 1;
+                    log::warn!(
+                        "{LOG}: {}: closing menu {window} threw: {failure}",
+                        jar.row.id
+                    );
+                }
+                effects.push((index, jar.row.id.clone(), outcome.menu_effects));
             }
             Ok(Ok(None)) => {}
             Ok(Err(error)) => {
@@ -587,6 +682,7 @@ pub(crate) fn menu_closed(
             }
         }
     }
+    effects
 }
 
 /// `player_container_open`: a menu opened for the player (any opener). Its container id is the
@@ -947,6 +1043,42 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// Effects go out in order: a close followed by another close is carried out (nothing of
+    /// Sunrise's shows container 1 here, so it is reported unclosed), a discarded menu is
+    /// passed on to be counted, and the window shown at the end is read for the jar's check.
+    #[test]
+    fn menu_effects_go_out_in_bytecode_order() {
+        let _ = mod_api::__private::initialize();
+        let _phase = mod_api::__private::PhaseOwner::scope(mod_api::__private::ModPhase::World);
+        let mut host = BlockUseTestHost::new(None);
+        let uuid = host.player_uuid;
+        let applied = apply_menu_effects(
+            &mut host,
+            uuid,
+            &[
+                MenuEffect::Closed { container_id: 1 },
+                MenuEffect::Closed { container_id: 1 },
+                MenuEffect::Orphaned { container_id: 2 },
+            ],
+        );
+        assert_eq!(
+            applied,
+            vec![
+                MenuApplied::Closed {
+                    container_id: 1,
+                    closed: false
+                },
+                MenuApplied::Closed {
+                    container_id: 1,
+                    closed: false
+                },
+                MenuApplied::Orphaned { container_id: 2 },
+                MenuApplied::Shown(PlayerContainer::Inventory),
+            ]
+        );
+        assert!(apply_menu_effects(&mut host, uuid, &[]).is_empty());
     }
 
     #[test]

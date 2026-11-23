@@ -277,13 +277,19 @@ impl OpenMenuEffect {
 /// What a block use did to the player's open container, in bytecode order.
 #[derive(Clone, Debug)]
 pub enum MenuEffect {
-    /// `ServerPlayer.closeContainer()` closed the Java menu Decaf held as the player's
-    /// `containerMenu` (its `removed(player)` already ran): the embedder closes the window it
-    /// showed for it (`ClientboundContainerClosePacket`).
+    /// `ServerPlayer.closeContainer()` sent the client `ClientboundContainerClosePacket` for
+    /// the Java menu Decaf held as the player's `containerMenu`, before its `doCloseContainer`
+    /// ran: the embedder closes the window it showed for it. When that menu's `removed` threw,
+    /// the menu stays installed with no window ([`StdHost::player_open_menu`] still has it).
     Closed { container_id: i32 },
     /// `ServerPlayer.openMenu` opened a Java menu. The last one a use opens is the player's
     /// `containerMenu` afterwards, and Decaf holds it ([`StdHost::player_open_menu`]).
     Opened(OpenMenuEffect),
+    /// A menu a nested `openMenu` installed (one a closing menu's `removed`, or a menu's
+    /// constructor, opened) was overwritten by the outer call's `containerMenu = ...`
+    /// assignment: vanilla's server forgets it with no `removed` and no close packet, while the
+    /// client still shows its window.
+    Orphaned { container_id: i32 },
 }
 
 /// Result of running a block's `useItemOn` or `useWithoutItem` hook.
@@ -299,6 +305,10 @@ pub struct BlockUseOutcome {
     pub unknown_host_calls: BTreeMap<String, usize>,
     /// Total count of unmodelled host calls during this block-use invocation.
     pub unknown_host_call_count: usize,
+    /// Why the hook didn't return (an exception it didn't catch, a budget it ran out of).
+    /// `menu_effects` still lists what it did before that: a close packet vanilla sent stays
+    /// sent.
+    pub failure: Option<String>,
 }
 
 impl BlockUseOutcome {
@@ -306,7 +316,7 @@ impl BlockUseOutcome {
     pub fn open_menus(&self) -> impl Iterator<Item = &OpenMenuEffect> {
         self.menu_effects.iter().filter_map(|effect| match effect {
             MenuEffect::Opened(open) => Some(open),
-            MenuEffect::Closed { .. } => None,
+            MenuEffect::Closed { .. } | MenuEffect::Orphaned { .. } => None,
         })
     }
 }
@@ -316,9 +326,13 @@ impl BlockUseOutcome {
 pub struct MenuCloseOutcome {
     /// The `containerId` of the Java menu that closed.
     pub container_id: i32,
+    /// What its `removed` did to the player's menus, in order: a `removed` may open another.
+    pub menu_effects: Vec<MenuEffect>,
     /// Unmodelled host calls its close made.
     pub unknown_host_calls: BTreeMap<String, usize>,
     pub unknown_host_call_count: usize,
+    /// Why the close didn't finish (its `removed` threw): the menu is then still installed.
+    pub failure: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -369,6 +383,11 @@ pub(crate) struct PlayerMenus {
     /// The Java menu Decaf opened that is still the object's `containerMenu`. Its Java values
     /// are retained on the host while it is held, and released when it is dropped.
     pub(crate) open: Option<OpenMenuEffect>,
+    /// `closeContainer` sent the client `open`'s close packet, so no window shows it, but its
+    /// `doCloseContainer` hasn't reached `containerMenu = inventoryMenu` (it is running, or its
+    /// `removed` threw): vanilla still has it installed, and its next `openMenu` closes it
+    /// again.
+    pub(crate) close_sent: bool,
 }
 
 /// Host state for block-use, `InteractionResult`, `BlockHitResult`, and `openMenu`.
@@ -1939,94 +1958,178 @@ fn invoke_player_open_menu<H: Host>(
     Ok(Some(host_optional::optional_int(container_id)))
 }
 
+/// The player's `containerMenu` at this point of the running call, as Decaf models it.
+#[derive(Clone, Debug, PartialEq)]
+enum InstalledMenu {
+    /// `inventoryMenu`: nothing open.
+    Inventory,
+    /// The Java menu Decaf holds: the window the embedder shows, or one whose close packet went
+    /// out while its `doCloseContainer` never finished ([`PlayerMenus::close_sent`]).
+    Held { container_id: i32, menu: Value },
+    /// A Java menu Decaf held whose window the embedder closed without Decaf running its close.
+    Stale,
+    /// A container Decaf doesn't hold (the embedder's own, another jar's), or one the embedder
+    /// can't name.
+    Foreign,
+}
+
+fn installed_menu(std_host: &StdHost) -> InstalledMenu {
+    let Some(active) = std_host.block_use.active_use.as_ref() else {
+        return InstalledMenu::Foreign;
+    };
+    let entry = std_host
+        .block_use
+        .player(active.player_data.uuid, active.player_data.incarnation);
+    let held = entry.and_then(|entry| {
+        let open = entry.open.as_ref()?;
+        Some((open.container_id, open.menu.clone(), entry.close_sent))
+    });
+    match (held, active.container) {
+        (Some((container_id, menu, _)), PlayerContainer::Open(open)) if open == container_id => {
+            InstalledMenu::Held { container_id, menu }
+        }
+        (Some((container_id, menu, true)), PlayerContainer::Inventory) => {
+            InstalledMenu::Held { container_id, menu }
+        }
+        (Some(_), PlayerContainer::Inventory) => InstalledMenu::Stale,
+        (None, PlayerContainer::Inventory) => InstalledMenu::Inventory,
+        (_, PlayerContainer::Open(_) | PlayerContainer::Unknown) => InstalledMenu::Foreign,
+    }
+}
+
+fn installed_menu_of<H: Host>(runtime: &mut Runtime<'_, H>) -> InstalledMenu {
+    runtime
+        .host
+        .as_std_host_mut()
+        .map_or(InstalledMenu::Foreign, |std_host| installed_menu(std_host))
+}
+
 /// `ServerPlayer.openMenu` offsets 8-20: `if (containerMenu != inventoryMenu) closeContainer()`.
 ///
 /// Decaf knows the player's `containerMenu` from the embedder's snapshot
-/// ([`BlockUsePlayerData::container`], updated by this call's own opens) and the Java menu it
-/// holds for them:
-/// - the inventory menu, and no held menu: nothing to close;
-/// - the held menu's window: `closeContainer()` runs here, before the new menu is built
-///   ([`run_do_close_container`]), and the embedder is told to close the window
-///   ([`MenuEffect::Closed`]);
-/// - the inventory menu while Decaf still holds a menu: the embedder closed it without Decaf
-///   running its `doCloseContainer`, so that missed close is counted;
-/// - any other menu (one the embedder or another jar owns), or a menu the embedder can't
-///   name: Decaf can't run its close, so `closeContainer` is counted.
+/// ([`BlockUsePlayerData::container`], updated by this call's own closes and opens) and the
+/// Java menu it holds for them ([`installed_menu`]):
+/// - the inventory menu: nothing to close;
+/// - the held menu: `closeContainer()` runs here, before the new menu is built
+///   ([`run_close_container`]);
+/// - a held menu whose window the embedder closed without Decaf running its
+///   `doCloseContainer`: that missed close is counted;
+/// - any other menu (one the embedder or another jar owns), or a menu the embedder can't name:
+///   Decaf can't run its close, so `closeContainer` is counted.
 #[inline(never)]
 fn open_menu_close_current<H: Host>(
+    runtime: &mut Runtime<'_, H>,
+    player: &Value,
+) -> Result<(), NativeError> {
+    let counted = match installed_menu_of(runtime) {
+        InstalledMenu::Inventory => return Ok(()),
+        InstalledMenu::Held { .. } => return run_close_container(runtime, player),
+        InstalledMenu::Stale => server_player_method("doCloseContainer", "()V"),
+        InstalledMenu::Foreign => server_player_method("closeContainer", "()V"),
+    };
+    // What Decaf held is no longer the player's `containerMenu` either way.
+    if let Some(std_host) = runtime.host.as_std_host_mut() {
+        std_host.drop_installed_menu();
+        if let Some(active) = std_host.block_use.active_use.as_mut() {
+            active.container = PlayerContainer::Inventory;
+        }
+    }
+    runtime.host.unknown_operand_call(&counted).map(|_| ())
+}
+
+/// `ServerPlayer.closeContainer()` (26.3, offsets 0-25) on the held menu: offsets 0-18 send
+/// the client `ClientboundContainerClosePacket(containerMenu.containerId)`
+/// ([`MenuEffect::Closed`]), so its window is gone from here on, then offset 22 runs
+/// `doCloseContainer` ([`run_do_close_container`]) with the menu still installed.
+#[inline(never)]
+fn run_close_container<H: Host>(
     runtime: &mut Runtime<'_, H>,
     player: &Value,
 ) -> Result<(), NativeError> {
     let Some(std_host) = runtime.host.as_std_host_mut() else {
         return Ok(());
     };
-    let Some(active) = std_host.block_use.active_use.as_ref() else {
+    let InstalledMenu::Held { container_id, .. } = installed_menu(std_host) else {
         return Ok(());
     };
-    let (uuid, incarnation, container) = (
-        active.player_data.uuid,
-        active.player_data.incarnation,
-        active.container,
-    );
-    let held = std_host
-        .block_use
-        .player(uuid, incarnation)
-        .and_then(|entry| entry.open.as_ref())
-        .map(|open| open.container_id);
-    let counted = match (held, container) {
-        (None, PlayerContainer::Inventory) => return Ok(()),
-        (Some(held_id), PlayerContainer::Open(open_id)) if held_id == open_id => {
-            let Some(record) = std_host.take_held_menu(uuid, incarnation) else {
-                return Ok(());
-            };
-            if let Some(active) = std_host.block_use.active_use.as_mut() {
-                active.container = PlayerContainer::Inventory;
-                active.menu_effects.push(MenuEffect::Closed {
-                    container_id: record.container_id,
-                });
-            }
-            let result = run_do_close_container(runtime, &record.menu, player);
-            if let Some(std_host) = runtime.host.as_std_host_mut() {
-                std_host.release_menu_values(&record);
-            }
-            return result;
-        }
-        (Some(_), PlayerContainer::Inventory) => server_player_method("doCloseContainer", "()V"),
-        (_, PlayerContainer::Open(_) | PlayerContainer::Unknown) => {
-            server_player_method("closeContainer", "()V")
-        }
-    };
-    // What Decaf held is no longer the player's `containerMenu` either way.
-    if let Some(record) = std_host.take_held_menu(uuid, incarnation) {
-        std_host.release_menu_values(&record);
-    }
+    std_host.mark_close_sent();
     if let Some(active) = std_host.block_use.active_use.as_mut() {
         active.container = PlayerContainer::Inventory;
+        active
+            .menu_effects
+            .push(MenuEffect::Closed { container_id });
     }
-    runtime.host.unknown_operand_call(&counted).map(|_| ())
+    run_do_close_container(runtime, player)
 }
 
-/// `ServerPlayer.doCloseContainer()` (26.3, offsets 0-27) on the Java menu Decaf held as the
-/// player's `containerMenu`:
-/// - 0-5: `containerMenu.removed(this)`, dispatched to the menu's own override;
-/// - 8-16: `inventoryMenu.transferState(containerMenu)`, which copies the old menu's remote
-///   slot state by `Slot.getContainerSlot()`. That is unobservable unless a jar slot overrides
+/// `ServerPlayer.doCloseContainer()` (26.3, offsets 0-27), each step on the `containerMenu`
+/// installed when it runs, as the bytecode reads the field afresh each time:
+/// - 0-5: `containerMenu.removed(this)`, dispatched to the menu's own override. The menu stays
+///   installed while it runs, so a `removed` that opens a menu closes this one again first
+///   (re-entrantly) and installs its own. If it throws, nothing below runs: the menu stays
+///   installed (the client's window is already gone, [`PlayerMenus::close_sent`]) and the
+///   exception propagates to the caller, as in vanilla;
+/// - 8-16: `inventoryMenu.transferState(containerMenu)`, which copies that menu's remote slot
+///   state by `Slot.getContainerSlot()`. That is unobservable unless a jar slot overrides
 ///   `getContainerSlot`, so it is counted only then (or when Decaf doesn't know the slots);
-/// - 19-24: `containerMenu = inventoryMenu` (the caller dropped the held menu).
+/// - 19-24: `containerMenu = inventoryMenu`. Decaf drops whatever is installed then; a menu
+///   other than the one closing (a nested open's) is discarded without any close
+///   ([`MenuEffect::Orphaned`]).
 #[inline(never)]
 fn run_do_close_container<H: Host>(
     runtime: &mut Runtime<'_, H>,
-    menu: &Value,
     player: &Value,
 ) -> Result<(), NativeError> {
+    let InstalledMenu::Held { menu: closing, .. } = installed_menu_of(runtime) else {
+        return Ok(());
+    };
     runtime.call_virtual(
         jdk_call::Site::Virtual,
         menu_models::ABSTRACT_CONTAINER_MENU,
         "removed",
         PLAYER_DESC_ARG,
-        menu,
+        &closing,
         std::slice::from_ref(player),
     )?;
+    match installed_menu_of(runtime) {
+        InstalledMenu::Held { menu, .. } => transfer_state(runtime, &menu)?,
+        // `inventoryMenu.transferState(inventoryMenu)`: its own state, nothing a mod reads.
+        InstalledMenu::Inventory => {}
+        InstalledMenu::Stale | InstalledMenu::Foreign => {
+            runtime
+                .host
+                .unknown_operand_call(&transfer_state_method())?;
+        }
+    }
+    if let Some(std_host) = runtime.host.as_std_host_mut() {
+        if let InstalledMenu::Held { container_id, menu } = installed_menu(std_host)
+            && menu != closing
+            && let Some(active) = std_host.block_use.active_use.as_mut()
+        {
+            active
+                .menu_effects
+                .push(MenuEffect::Orphaned { container_id });
+        }
+        std_host.drop_installed_menu();
+        if let Some(active) = std_host.block_use.active_use.as_mut() {
+            active.container = PlayerContainer::Inventory;
+        }
+    }
+    Ok(())
+}
+
+fn transfer_state_method() -> MethodRef {
+    MethodRef {
+        owner: "net/minecraft/world/inventory/InventoryMenu".to_owned(),
+        name: "transferState".to_owned(),
+        descriptor: "(Lnet/minecraft/world/inventory/AbstractContainerMenu;)V".to_owned(),
+    }
+}
+
+/// `inventoryMenu.transferState(menu)` (`AbstractContainerMenu.transferState`): reads each of
+/// `menu`'s slots' `getContainerSlot()`, which only a jar slot's override makes observable.
+#[inline(never)]
+fn transfer_state<H: Host>(runtime: &mut Runtime<'_, H>, menu: &Value) -> Result<(), NativeError> {
     let slots = runtime
         .host
         .as_std_host_mut()
@@ -2047,11 +2150,9 @@ fn run_do_close_container<H: Host>(
         }
     }
     if observable {
-        runtime.host.unknown_operand_call(&MethodRef {
-            owner: "net/minecraft/world/inventory/InventoryMenu".to_owned(),
-            name: "transferState".to_owned(),
-            descriptor: "(Lnet/minecraft/world/inventory/AbstractContainerMenu;)V".to_owned(),
-        })?;
+        runtime
+            .host
+            .unknown_operand_call(&transfer_state_method())?;
     }
     Ok(())
 }
@@ -2112,6 +2213,7 @@ impl StdHost {
                 incarnation: (session, life),
                 counter: Some(0),
                 open: None,
+                close_sent: false,
             },
         );
     }
@@ -2152,6 +2254,9 @@ impl StdHost {
         entry.counter = None;
         let held = entry.open.take_if(|open| open.container_id == container_id);
         let dropped = held.is_some();
+        if dropped {
+            entry.close_sent = false;
+        }
         if let Some(record) = held {
             self.release_menu_values(&record);
         }
@@ -2182,6 +2287,15 @@ impl StdHost {
     /// values, so a later block use can close it and the live-menu bridge can drive it. A
     /// player whose object Decaf can't name keeps nothing (a later close is then counted).
     pub(crate) fn hold_opened_menu(&mut self, effect: &OpenMenuEffect) {
+        // A menu still installed here was installed by an open nested in this one (its
+        // constructor's): the assignment discards it without any close.
+        if let InstalledMenu::Held { container_id, .. } = installed_menu(self)
+            && let Some(active) = self.block_use.active_use.as_mut()
+        {
+            active
+                .menu_effects
+                .push(MenuEffect::Orphaned { container_id });
+        }
         let Some(active) = self.block_use.active_use.as_ref() else {
             return;
         };
@@ -2203,8 +2317,10 @@ impl StdHost {
             // Decaf was not told this object was created, so it can't know the counter.
             counter: None,
             open: None,
+            close_sent: false,
         });
         let replaced = entry.open.replace(effect.clone());
+        entry.close_sent = false;
         for value in effect.values() {
             self.retain(value);
         }
@@ -2213,14 +2329,32 @@ impl StdHost {
         }
     }
 
-    /// Take the menu Decaf holds for object `incarnation` of `uuid` off its entry; the caller
-    /// releases its values ([`Self::release_menu_values`]) once it is done with it.
-    pub(crate) fn take_held_menu(
-        &mut self,
-        uuid: u128,
-        incarnation: Option<(u32, u32)>,
-    ) -> Option<OpenMenuEffect> {
-        self.block_use.player_mut(uuid, incarnation)?.open.take()
+    /// The running call's player's `containerMenu` stops being the menu Decaf holds
+    /// (`containerMenu = inventoryMenu`): drop it and release its values.
+    pub(crate) fn drop_installed_menu(&mut self) {
+        let Some(active) = self.block_use.active_use.as_ref() else {
+            return;
+        };
+        let (uuid, incarnation) = (active.player_data.uuid, active.player_data.incarnation);
+        let Some(entry) = self.block_use.player_mut(uuid, incarnation) else {
+            return;
+        };
+        entry.close_sent = false;
+        if let Some(record) = entry.open.take() {
+            self.release_menu_values(&record);
+        }
+    }
+
+    /// `closeContainer` sent the client the held menu's close packet: its window is gone,
+    /// while the menu stays installed until `doCloseContainer` reaches offset 19.
+    pub(crate) fn mark_close_sent(&mut self) {
+        let Some(active) = self.block_use.active_use.as_ref() else {
+            return;
+        };
+        let (uuid, incarnation) = (active.player_data.uuid, active.player_data.incarnation);
+        if let Some(entry) = self.block_use.player_mut(uuid, incarnation) {
+            entry.close_sent = true;
+        }
     }
 
     /// Drop the retain holds [`Self::hold_opened_menu`] took on a menu's Java values.
@@ -2347,11 +2481,17 @@ impl NativeJar {
     }
 
     /// The embedder closed the window of the Java menu `container_id` that Decaf holds as the
-    /// player's `containerMenu` (the player closed it, walked away, left, or something else
-    /// replaced it): vanilla's `ServerGamePacketListenerImpl.handleContainerClose` and
-    /// `closeContainer` both end in `ServerPlayer.doCloseContainer`, so the menu's
-    /// `removed(player)` runs here and Decaf drops it. `Ok(None)` when Decaf holds no such
-    /// menu for the player's current object (one it already closed itself, say).
+    /// player's `containerMenu` (the player closed it, walked away or left, or something else
+    /// replaced it): vanilla's `ServerGamePacketListenerImpl.handleContainerClose` runs
+    /// `ServerPlayer.doCloseContainer`, so the menu's `removed(player)` runs here with the menu
+    /// still installed, and Decaf drops it at `containerMenu = inventoryMenu` (offset 19). What
+    /// a `removed` opens meanwhile is in the outcome's effects; a `removed` that throws leaves
+    /// the menu installed with no window (the outcome's `failure`), and the player's next
+    /// `openMenu` closes it again.
+    ///
+    /// `Ok(None)` when Decaf holds no such menu for the player's current object, or when the
+    /// window closed because Java's own `closeContainer` sent its close packet: vanilla's
+    /// client doesn't answer that with a close of its own.
     pub fn close_player_menu(
         &self,
         host: &mut StdHost,
@@ -2360,15 +2500,14 @@ impl NativeJar {
         container_id: i32,
         budget: &ExecutionBudget,
     ) -> Result<Option<MenuCloseOutcome>, NativeError> {
-        let held = host
+        let Some(menu) = host
             .block_use
             .player(player.uuid, player.incarnation)
+            .filter(|entry| !entry.close_sent)
             .and_then(|entry| entry.open.as_ref())
-            .is_some_and(|open| open.container_id == container_id);
-        if !held {
-            return Ok(None);
-        }
-        let Some(record) = host.take_held_menu(player.uuid, player.incarnation) else {
+            .filter(|open| open.container_id == container_id)
+            .map(|open| open.menu.clone())
+        else {
             return Ok(None);
         };
         let level = game_object::server_value(format!("game/level/{dimension}"));
@@ -2381,6 +2520,7 @@ impl NativeJar {
         let unknowns_before: BTreeMap<String, usize> =
             host.unknown_host_calls().into_iter().collect();
         let mark = host.call_log_mark();
+        // The window is gone; the menu stays installed until offset 19.
         let previous_active = host.block_use.active_use.replace(ActiveBlockUse {
             side: BlockUseSide::Server,
             dimension: dimension.to_owned(),
@@ -2389,32 +2529,28 @@ impl NativeJar {
             player: player_value.clone(),
             player_data: player.clone(),
             player_inventory: player_inventory.clone(),
-            container: PlayerContainer::Open(container_id),
+            container: PlayerContainer::Inventory,
             menu_effects: Vec::new(),
         });
-        let roots = vec![
-            level,
-            player_value.clone(),
-            player_inventory,
-            record.menu.clone(),
-        ];
-        let menu = record.menu.clone();
+        host.mark_close_sent();
+        let roots = vec![level, player_value.clone(), player_inventory, menu];
         let call_result =
             self.with_persistent_runtime_with_budget(host, &roots, budget, |runtime| {
-                run_do_close_container(runtime, &menu, &player_value).map(|()| Value::Void)
+                run_do_close_container(runtime, &player_value).map(|()| Value::Void)
             });
+        let finished_active = host.block_use.active_use.take();
         host.block_use.active_use = previous_active;
         host.rewind_call_log(mark);
-        // `containerMenu = inventoryMenu` (offsets 19-24): the menu is no longer held, even
-        // when its `removed` threw.
-        host.release_menu_values(&record);
-        call_result?;
         let (unknown_host_calls, unknown_host_call_count) =
             unknown_calls_since(host, &unknowns_before);
         Ok(Some(MenuCloseOutcome {
             container_id,
+            menu_effects: finished_active
+                .map(|active| active.menu_effects)
+                .unwrap_or_default(),
             unknown_host_calls,
             unknown_host_call_count,
+            failure: call_result.err().map(|error| error.to_string()),
         }))
     }
 
@@ -2519,11 +2655,20 @@ impl NativeJar {
         host.block_use.active_use = previous_active;
         host.rewind_call_log(mark);
 
-        let raw_result = call_result?;
+        // A hook that threw (or ran out of budget) still did what it did before that: a close
+        // packet vanilla sent stays sent, so its effects are kept with the failure.
         let menu_effects = finished_active
             .map(|active| active.menu_effects)
             .unwrap_or_default();
-        let result = decode_interaction_result(host, &raw_result);
+        let (raw_result, failure) = match call_result {
+            Ok(value) => (value, None),
+            Err(error) => (Value::Void, Some(error.to_string())),
+        };
+        let result = if failure.is_none() {
+            decode_interaction_result(host, &raw_result)
+        } else {
+            None
+        };
         let (unknown_host_calls, unknown_host_call_count) =
             unknown_calls_since(host, &unknowns_before);
 
@@ -2533,6 +2678,7 @@ impl NativeJar {
             menu_effects,
             unknown_host_calls,
             unknown_host_call_count,
+            failure,
         })
     }
 }
