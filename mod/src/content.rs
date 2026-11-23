@@ -21,10 +21,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
-use mod_api::{BlocksEvent, ItemsEvent, PackageKind, RegistrationContext};
+use mod_api::{BlocksEvent, ItemsEvent, PackageKind, Registrar, RegistrationContext};
 
 use crate::runtime;
 use crate::{JARS, JarRow, LOG, LoadedJar, State, jar_id, load_jar};
@@ -490,6 +489,50 @@ pub(crate) fn declare_items(
         "{LOG}: content: {count} item declaration(s) from {} jar(s)",
         state.jars.len()
     );
+}
+
+/// Attaches a generic [`crate::block_use::JavaBlockUsePart`] to every registered Java mod block
+/// whose namespace is owned by this mod or by an installed content package (so Sunrise's block
+/// key validation always succeeds).
+pub(crate) fn register_block_parts(
+    state: &Arc<Mutex<State>>,
+    registrar: &mut dyn Registrar,
+    context: &RegistrationContext,
+) {
+    let owned = owned_namespaces(context);
+    let mut attached = BTreeSet::new();
+    let mut guard = state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard.ensure_loaded(context, registration_game_version(context));
+    for jar in &guard.jars {
+        for entry in jar.host.registrations() {
+            if entry.registry != "minecraft:block" {
+                continue;
+            }
+            let id = entry.id.as_str();
+            if !usable_id(id) {
+                continue;
+            }
+            if !owns(&owned, id) && !owns_assets(context, id) {
+                continue;
+            }
+            if !attached.insert(id.to_owned()) {
+                continue;
+            }
+            let key = registrar.block_key(id);
+            registrar.block_part(
+                key,
+                crate::block_use::JavaBlockUsePart::new(Arc::clone(state), id.to_owned()),
+            );
+        }
+    }
+    if !attached.is_empty() {
+        log::info!(
+            "{LOG}: attached Java block-use part(s) to {} block(s)",
+            attached.len()
+        );
+    }
 }
 
 /// Whether an installed content package owns the id's namespace, and so supplies that content's
