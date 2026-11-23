@@ -2260,6 +2260,7 @@ mod tests {
                         player: Value::Ref(None),
                     }),
                     seq: i as u64,
+                    live: crate::runtime::menu_models::LiveState::default(),
                 }),
             );
         }

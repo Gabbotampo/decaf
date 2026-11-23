@@ -1,0 +1,524 @@
+ws000009=1
+ws00000A=1
+ws00000B=1
+ws00000C=1
+ws00000D=1
+ws00001C=1
+ws00001D=1
+ws00001E=1
+ws00001F=1
+ws000020=1
+ws001680=1
+ws002000=1
+ws002001=1
+ws002002=1
+ws002003=1
+ws002004=1
+ws002005=1
+ws002006=1
+ws002008=1
+ws002009=1
+ws00200A=1
+ws002028=1
+ws002029=1
+ws00205F=1
+ws003000=1
+sp000020=1
+sp0000A0=1
+sp001680=1
+sp002000=1
+sp002001=1
+sp002002=1
+sp002003=1
+sp002004=1
+sp002005=1
+sp002006=1
+sp002007=1
+sp002008=1
+sp002009=1
+sp00200A=1
+sp002028=1
+sp002029=1
+sp00202F=1
+sp00205F=1
+sp003000=1
+a000009.strip=len=3 units=000061000009000062
+a000009.stripLeading=len=3 units=000061000009000062
+a000009.stripTrailing=len=3 units=000061000009000062
+a000009.trim=len=3 units=000061000009000062
+a000009.isBlank=false
+b000009.strip=len=1 units=000061
+b000009.stripLeading=len=2 units=000061000009
+b000009.stripTrailing=len=2 units=000009000061
+b000009.trim=len=1 units=000061
+b000009.isBlank=false
+z000009.strip=len=0 units=
+z000009.stripLeading=len=0 units=
+z000009.stripTrailing=len=0 units=
+z000009.trim=len=0 units=
+z000009.isBlank=true
+a00000A.strip=len=3 units=00006100000A000062
+a00000A.stripLeading=len=3 units=00006100000A000062
+a00000A.stripTrailing=len=3 units=00006100000A000062
+a00000A.trim=len=3 units=00006100000A000062
+a00000A.isBlank=false
+b00000A.strip=len=1 units=000061
+b00000A.stripLeading=len=2 units=00006100000A
+b00000A.stripTrailing=len=2 units=00000A000061
+b00000A.trim=len=1 units=000061
+b00000A.isBlank=false
+z00000A.strip=len=0 units=
+z00000A.stripLeading=len=0 units=
+z00000A.stripTrailing=len=0 units=
+z00000A.trim=len=0 units=
+z00000A.isBlank=true
+a00000B.strip=len=3 units=00006100000B000062
+a00000B.stripLeading=len=3 units=00006100000B000062
+a00000B.stripTrailing=len=3 units=00006100000B000062
+a00000B.trim=len=3 units=00006100000B000062
+a00000B.isBlank=false
+b00000B.strip=len=1 units=000061
+b00000B.stripLeading=len=2 units=00006100000B
+b00000B.stripTrailing=len=2 units=00000B000061
+b00000B.trim=len=1 units=000061
+b00000B.isBlank=false
+z00000B.strip=len=0 units=
+z00000B.stripLeading=len=0 units=
+z00000B.stripTrailing=len=0 units=
+z00000B.trim=len=0 units=
+z00000B.isBlank=true
+a00000C.strip=len=3 units=00006100000C000062
+a00000C.stripLeading=len=3 units=00006100000C000062
+a00000C.stripTrailing=len=3 units=00006100000C000062
+a00000C.trim=len=3 units=00006100000C000062
+a00000C.isBlank=false
+b00000C.strip=len=1 units=000061
+b00000C.stripLeading=len=2 units=00006100000C
+b00000C.stripTrailing=len=2 units=00000C000061
+b00000C.trim=len=1 units=000061
+b00000C.isBlank=false
+z00000C.strip=len=0 units=
+z00000C.stripLeading=len=0 units=
+z00000C.stripTrailing=len=0 units=
+z00000C.trim=len=0 units=
+z00000C.isBlank=true
+a00000D.strip=len=3 units=00006100000D000062
+a00000D.stripLeading=len=3 units=00006100000D000062
+a00000D.stripTrailing=len=3 units=00006100000D000062
+a00000D.trim=len=3 units=00006100000D000062
+a00000D.isBlank=false
+b00000D.strip=len=1 units=000061
+b00000D.stripLeading=len=2 units=00006100000D
+b00000D.stripTrailing=len=2 units=00000D000061
+b00000D.trim=len=1 units=000061
+b00000D.isBlank=false
+z00000D.strip=len=0 units=
+z00000D.stripLeading=len=0 units=
+z00000D.stripTrailing=len=0 units=
+z00000D.trim=len=0 units=
+z00000D.isBlank=true
+a00001C.strip=len=3 units=00006100001C000062
+a00001C.stripLeading=len=3 units=00006100001C000062
+a00001C.stripTrailing=len=3 units=00006100001C000062
+a00001C.trim=len=3 units=00006100001C000062
+a00001C.isBlank=false
+b00001C.strip=len=1 units=000061
+b00001C.stripLeading=len=2 units=00006100001C
+b00001C.stripTrailing=len=2 units=00001C000061
+b00001C.trim=len=1 units=000061
+b00001C.isBlank=false
+z00001C.strip=len=0 units=
+z00001C.stripLeading=len=0 units=
+z00001C.stripTrailing=len=0 units=
+z00001C.trim=len=0 units=
+z00001C.isBlank=true
+a00001D.strip=len=3 units=00006100001D000062
+a00001D.stripLeading=len=3 units=00006100001D000062
+a00001D.stripTrailing=len=3 units=00006100001D000062
+a00001D.trim=len=3 units=00006100001D000062
+a00001D.isBlank=false
+b00001D.strip=len=1 units=000061
+b00001D.stripLeading=len=2 units=00006100001D
+b00001D.stripTrailing=len=2 units=00001D000061
+b00001D.trim=len=1 units=000061
+b00001D.isBlank=false
+z00001D.strip=len=0 units=
+z00001D.stripLeading=len=0 units=
+z00001D.stripTrailing=len=0 units=
+z00001D.trim=len=0 units=
+z00001D.isBlank=true
+a00001E.strip=len=3 units=00006100001E000062
+a00001E.stripLeading=len=3 units=00006100001E000062
+a00001E.stripTrailing=len=3 units=00006100001E000062
+a00001E.trim=len=3 units=00006100001E000062
+a00001E.isBlank=false
+b00001E.strip=len=1 units=000061
+b00001E.stripLeading=len=2 units=00006100001E
+b00001E.stripTrailing=len=2 units=00001E000061
+b00001E.trim=len=1 units=000061
+b00001E.isBlank=false
+z00001E.strip=len=0 units=
+z00001E.stripLeading=len=0 units=
+z00001E.stripTrailing=len=0 units=
+z00001E.trim=len=0 units=
+z00001E.isBlank=true
+a00001F.strip=len=3 units=00006100001F000062
+a00001F.stripLeading=len=3 units=00006100001F000062
+a00001F.stripTrailing=len=3 units=00006100001F000062
+a00001F.trim=len=3 units=00006100001F000062
+a00001F.isBlank=false
+b00001F.strip=len=1 units=000061
+b00001F.stripLeading=len=2 units=00006100001F
+b00001F.stripTrailing=len=2 units=00001F000061
+b00001F.trim=len=1 units=000061
+b00001F.isBlank=false
+z00001F.strip=len=0 units=
+z00001F.stripLeading=len=0 units=
+z00001F.stripTrailing=len=0 units=
+z00001F.trim=len=0 units=
+z00001F.isBlank=true
+a000020.strip=len=3 units=000061000020000062
+a000020.stripLeading=len=3 units=000061000020000062
+a000020.stripTrailing=len=3 units=000061000020000062
+a000020.trim=len=3 units=000061000020000062
+a000020.isBlank=false
+b000020.strip=len=1 units=000061
+b000020.stripLeading=len=2 units=000061000020
+b000020.stripTrailing=len=2 units=000020000061
+b000020.trim=len=1 units=000061
+b000020.isBlank=false
+z000020.strip=len=0 units=
+z000020.stripLeading=len=0 units=
+z000020.stripTrailing=len=0 units=
+z000020.trim=len=0 units=
+z000020.isBlank=true
+a000085.strip=len=3 units=000061000085000062
+a000085.stripLeading=len=3 units=000061000085000062
+a000085.stripTrailing=len=3 units=000061000085000062
+a000085.trim=len=3 units=000061000085000062
+a000085.isBlank=false
+b000085.strip=len=3 units=000085000061000085
+b000085.stripLeading=len=3 units=000085000061000085
+b000085.stripTrailing=len=3 units=000085000061000085
+b000085.trim=len=3 units=000085000061000085
+b000085.isBlank=false
+z000085.strip=len=1 units=000085
+z000085.stripLeading=len=1 units=000085
+z000085.stripTrailing=len=1 units=000085
+z000085.trim=len=1 units=000085
+z000085.isBlank=false
+a0000A0.strip=len=3 units=0000610000A0000062
+a0000A0.stripLeading=len=3 units=0000610000A0000062
+a0000A0.stripTrailing=len=3 units=0000610000A0000062
+a0000A0.trim=len=3 units=0000610000A0000062
+a0000A0.isBlank=false
+b0000A0.strip=len=3 units=0000A00000610000A0
+b0000A0.stripLeading=len=3 units=0000A00000610000A0
+b0000A0.stripTrailing=len=3 units=0000A00000610000A0
+b0000A0.trim=len=3 units=0000A00000610000A0
+b0000A0.isBlank=false
+z0000A0.strip=len=1 units=0000A0
+z0000A0.stripLeading=len=1 units=0000A0
+z0000A0.stripTrailing=len=1 units=0000A0
+z0000A0.trim=len=1 units=0000A0
+z0000A0.isBlank=false
+a001680.strip=len=3 units=000061001680000062
+a001680.stripLeading=len=3 units=000061001680000062
+a001680.stripTrailing=len=3 units=000061001680000062
+a001680.trim=len=3 units=000061001680000062
+a001680.isBlank=false
+b001680.strip=len=1 units=000061
+b001680.stripLeading=len=2 units=000061001680
+b001680.stripTrailing=len=2 units=001680000061
+b001680.trim=len=3 units=001680000061001680
+b001680.isBlank=false
+z001680.strip=len=0 units=
+z001680.stripLeading=len=0 units=
+z001680.stripTrailing=len=0 units=
+z001680.trim=len=1 units=001680
+z001680.isBlank=true
+a00180E.strip=len=3 units=00006100180E000062
+a00180E.stripLeading=len=3 units=00006100180E000062
+a00180E.stripTrailing=len=3 units=00006100180E000062
+a00180E.trim=len=3 units=00006100180E000062
+a00180E.isBlank=false
+b00180E.strip=len=3 units=00180E00006100180E
+b00180E.stripLeading=len=3 units=00180E00006100180E
+b00180E.stripTrailing=len=3 units=00180E00006100180E
+b00180E.trim=len=3 units=00180E00006100180E
+b00180E.isBlank=false
+z00180E.strip=len=1 units=00180E
+z00180E.stripLeading=len=1 units=00180E
+z00180E.stripTrailing=len=1 units=00180E
+z00180E.trim=len=1 units=00180E
+z00180E.isBlank=false
+a002000.strip=len=3 units=000061002000000062
+a002000.stripLeading=len=3 units=000061002000000062
+a002000.stripTrailing=len=3 units=000061002000000062
+a002000.trim=len=3 units=000061002000000062
+a002000.isBlank=false
+b002000.strip=len=1 units=000061
+b002000.stripLeading=len=2 units=000061002000
+b002000.stripTrailing=len=2 units=002000000061
+b002000.trim=len=3 units=002000000061002000
+b002000.isBlank=false
+z002000.strip=len=0 units=
+z002000.stripLeading=len=0 units=
+z002000.stripTrailing=len=0 units=
+z002000.trim=len=1 units=002000
+z002000.isBlank=true
+a002001.strip=len=3 units=000061002001000062
+a002001.stripLeading=len=3 units=000061002001000062
+a002001.stripTrailing=len=3 units=000061002001000062
+a002001.trim=len=3 units=000061002001000062
+a002001.isBlank=false
+b002001.strip=len=1 units=000061
+b002001.stripLeading=len=2 units=000061002001
+b002001.stripTrailing=len=2 units=002001000061
+b002001.trim=len=3 units=002001000061002001
+b002001.isBlank=false
+z002001.strip=len=0 units=
+z002001.stripLeading=len=0 units=
+z002001.stripTrailing=len=0 units=
+z002001.trim=len=1 units=002001
+z002001.isBlank=true
+a002002.strip=len=3 units=000061002002000062
+a002002.stripLeading=len=3 units=000061002002000062
+a002002.stripTrailing=len=3 units=000061002002000062
+a002002.trim=len=3 units=000061002002000062
+a002002.isBlank=false
+b002002.strip=len=1 units=000061
+b002002.stripLeading=len=2 units=000061002002
+b002002.stripTrailing=len=2 units=002002000061
+b002002.trim=len=3 units=002002000061002002
+b002002.isBlank=false
+z002002.strip=len=0 units=
+z002002.stripLeading=len=0 units=
+z002002.stripTrailing=len=0 units=
+z002002.trim=len=1 units=002002
+z002002.isBlank=true
+a002003.strip=len=3 units=000061002003000062
+a002003.stripLeading=len=3 units=000061002003000062
+a002003.stripTrailing=len=3 units=000061002003000062
+a002003.trim=len=3 units=000061002003000062
+a002003.isBlank=false
+b002003.strip=len=1 units=000061
+b002003.stripLeading=len=2 units=000061002003
+b002003.stripTrailing=len=2 units=002003000061
+b002003.trim=len=3 units=002003000061002003
+b002003.isBlank=false
+z002003.strip=len=0 units=
+z002003.stripLeading=len=0 units=
+z002003.stripTrailing=len=0 units=
+z002003.trim=len=1 units=002003
+z002003.isBlank=true
+a002004.strip=len=3 units=000061002004000062
+a002004.stripLeading=len=3 units=000061002004000062
+a002004.stripTrailing=len=3 units=000061002004000062
+a002004.trim=len=3 units=000061002004000062
+a002004.isBlank=false
+b002004.strip=len=1 units=000061
+b002004.stripLeading=len=2 units=000061002004
+b002004.stripTrailing=len=2 units=002004000061
+b002004.trim=len=3 units=002004000061002004
+b002004.isBlank=false
+z002004.strip=len=0 units=
+z002004.stripLeading=len=0 units=
+z002004.stripTrailing=len=0 units=
+z002004.trim=len=1 units=002004
+z002004.isBlank=true
+a002005.strip=len=3 units=000061002005000062
+a002005.stripLeading=len=3 units=000061002005000062
+a002005.stripTrailing=len=3 units=000061002005000062
+a002005.trim=len=3 units=000061002005000062
+a002005.isBlank=false
+b002005.strip=len=1 units=000061
+b002005.stripLeading=len=2 units=000061002005
+b002005.stripTrailing=len=2 units=002005000061
+b002005.trim=len=3 units=002005000061002005
+b002005.isBlank=false
+z002005.strip=len=0 units=
+z002005.stripLeading=len=0 units=
+z002005.stripTrailing=len=0 units=
+z002005.trim=len=1 units=002005
+z002005.isBlank=true
+a002006.strip=len=3 units=000061002006000062
+a002006.stripLeading=len=3 units=000061002006000062
+a002006.stripTrailing=len=3 units=000061002006000062
+a002006.trim=len=3 units=000061002006000062
+a002006.isBlank=false
+b002006.strip=len=1 units=000061
+b002006.stripLeading=len=2 units=000061002006
+b002006.stripTrailing=len=2 units=002006000061
+b002006.trim=len=3 units=002006000061002006
+b002006.isBlank=false
+z002006.strip=len=0 units=
+z002006.stripLeading=len=0 units=
+z002006.stripTrailing=len=0 units=
+z002006.trim=len=1 units=002006
+z002006.isBlank=true
+a002007.strip=len=3 units=000061002007000062
+a002007.stripLeading=len=3 units=000061002007000062
+a002007.stripTrailing=len=3 units=000061002007000062
+a002007.trim=len=3 units=000061002007000062
+a002007.isBlank=false
+b002007.strip=len=3 units=002007000061002007
+b002007.stripLeading=len=3 units=002007000061002007
+b002007.stripTrailing=len=3 units=002007000061002007
+b002007.trim=len=3 units=002007000061002007
+b002007.isBlank=false
+z002007.strip=len=1 units=002007
+z002007.stripLeading=len=1 units=002007
+z002007.stripTrailing=len=1 units=002007
+z002007.trim=len=1 units=002007
+z002007.isBlank=false
+a002008.strip=len=3 units=000061002008000062
+a002008.stripLeading=len=3 units=000061002008000062
+a002008.stripTrailing=len=3 units=000061002008000062
+a002008.trim=len=3 units=000061002008000062
+a002008.isBlank=false
+b002008.strip=len=1 units=000061
+b002008.stripLeading=len=2 units=000061002008
+b002008.stripTrailing=len=2 units=002008000061
+b002008.trim=len=3 units=002008000061002008
+b002008.isBlank=false
+z002008.strip=len=0 units=
+z002008.stripLeading=len=0 units=
+z002008.stripTrailing=len=0 units=
+z002008.trim=len=1 units=002008
+z002008.isBlank=true
+a002009.strip=len=3 units=000061002009000062
+a002009.stripLeading=len=3 units=000061002009000062
+a002009.stripTrailing=len=3 units=000061002009000062
+a002009.trim=len=3 units=000061002009000062
+a002009.isBlank=false
+b002009.strip=len=1 units=000061
+b002009.stripLeading=len=2 units=000061002009
+b002009.stripTrailing=len=2 units=002009000061
+b002009.trim=len=3 units=002009000061002009
+b002009.isBlank=false
+z002009.strip=len=0 units=
+z002009.stripLeading=len=0 units=
+z002009.stripTrailing=len=0 units=
+z002009.trim=len=1 units=002009
+z002009.isBlank=true
+a00200A.strip=len=3 units=00006100200A000062
+a00200A.stripLeading=len=3 units=00006100200A000062
+a00200A.stripTrailing=len=3 units=00006100200A000062
+a00200A.trim=len=3 units=00006100200A000062
+a00200A.isBlank=false
+b00200A.strip=len=1 units=000061
+b00200A.stripLeading=len=2 units=00006100200A
+b00200A.stripTrailing=len=2 units=00200A000061
+b00200A.trim=len=3 units=00200A00006100200A
+b00200A.isBlank=false
+z00200A.strip=len=0 units=
+z00200A.stripLeading=len=0 units=
+z00200A.stripTrailing=len=0 units=
+z00200A.trim=len=1 units=00200A
+z00200A.isBlank=true
+a00200B.strip=len=3 units=00006100200B000062
+a00200B.stripLeading=len=3 units=00006100200B000062
+a00200B.stripTrailing=len=3 units=00006100200B000062
+a00200B.trim=len=3 units=00006100200B000062
+a00200B.isBlank=false
+b00200B.strip=len=3 units=00200B00006100200B
+b00200B.stripLeading=len=3 units=00200B00006100200B
+b00200B.stripTrailing=len=3 units=00200B00006100200B
+b00200B.trim=len=3 units=00200B00006100200B
+b00200B.isBlank=false
+z00200B.strip=len=1 units=00200B
+z00200B.stripLeading=len=1 units=00200B
+z00200B.stripTrailing=len=1 units=00200B
+z00200B.trim=len=1 units=00200B
+z00200B.isBlank=false
+a002028.strip=len=3 units=000061002028000062
+a002028.stripLeading=len=3 units=000061002028000062
+a002028.stripTrailing=len=3 units=000061002028000062
+a002028.trim=len=3 units=000061002028000062
+a002028.isBlank=false
+b002028.strip=len=1 units=000061
+b002028.stripLeading=len=2 units=000061002028
+b002028.stripTrailing=len=2 units=002028000061
+b002028.trim=len=3 units=002028000061002028
+b002028.isBlank=false
+z002028.strip=len=0 units=
+z002028.stripLeading=len=0 units=
+z002028.stripTrailing=len=0 units=
+z002028.trim=len=1 units=002028
+z002028.isBlank=true
+a002029.strip=len=3 units=000061002029000062
+a002029.stripLeading=len=3 units=000061002029000062
+a002029.stripTrailing=len=3 units=000061002029000062
+a002029.trim=len=3 units=000061002029000062
+a002029.isBlank=false
+b002029.strip=len=1 units=000061
+b002029.stripLeading=len=2 units=000061002029
+b002029.stripTrailing=len=2 units=002029000061
+b002029.trim=len=3 units=002029000061002029
+b002029.isBlank=false
+z002029.strip=len=0 units=
+z002029.stripLeading=len=0 units=
+z002029.stripTrailing=len=0 units=
+z002029.trim=len=1 units=002029
+z002029.isBlank=true
+a00202F.strip=len=3 units=00006100202F000062
+a00202F.stripLeading=len=3 units=00006100202F000062
+a00202F.stripTrailing=len=3 units=00006100202F000062
+a00202F.trim=len=3 units=00006100202F000062
+a00202F.isBlank=false
+b00202F.strip=len=3 units=00202F00006100202F
+b00202F.stripLeading=len=3 units=00202F00006100202F
+b00202F.stripTrailing=len=3 units=00202F00006100202F
+b00202F.trim=len=3 units=00202F00006100202F
+b00202F.isBlank=false
+z00202F.strip=len=1 units=00202F
+z00202F.stripLeading=len=1 units=00202F
+z00202F.stripTrailing=len=1 units=00202F
+z00202F.trim=len=1 units=00202F
+z00202F.isBlank=false
+a00205F.strip=len=3 units=00006100205F000062
+a00205F.stripLeading=len=3 units=00006100205F000062
+a00205F.stripTrailing=len=3 units=00006100205F000062
+a00205F.trim=len=3 units=00006100205F000062
+a00205F.isBlank=false
+b00205F.strip=len=1 units=000061
+b00205F.stripLeading=len=2 units=00006100205F
+b00205F.stripTrailing=len=2 units=00205F000061
+b00205F.trim=len=3 units=00205F00006100205F
+b00205F.isBlank=false
+z00205F.strip=len=0 units=
+z00205F.stripLeading=len=0 units=
+z00205F.stripTrailing=len=0 units=
+z00205F.trim=len=1 units=00205F
+z00205F.isBlank=true
+a003000.strip=len=3 units=000061003000000062
+a003000.stripLeading=len=3 units=000061003000000062
+a003000.stripTrailing=len=3 units=000061003000000062
+a003000.trim=len=3 units=000061003000000062
+a003000.isBlank=false
+b003000.strip=len=1 units=000061
+b003000.stripLeading=len=2 units=000061003000
+b003000.stripTrailing=len=2 units=003000000061
+b003000.trim=len=3 units=003000000061003000
+b003000.isBlank=false
+z003000.strip=len=0 units=
+z003000.stripLeading=len=0 units=
+z003000.stripTrailing=len=0 units=
+z003000.trim=len=1 units=003000
+z003000.isBlank=true
+a00FEFF.strip=len=3 units=00006100FEFF000062
+a00FEFF.stripLeading=len=3 units=00006100FEFF000062
+a00FEFF.stripTrailing=len=3 units=00006100FEFF000062
+a00FEFF.trim=len=3 units=00006100FEFF000062
+a00FEFF.isBlank=false
+b00FEFF.strip=len=3 units=00FEFF00006100FEFF
+b00FEFF.stripLeading=len=3 units=00FEFF00006100FEFF
+b00FEFF.stripTrailing=len=3 units=00FEFF00006100FEFF
+b00FEFF.trim=len=3 units=00FEFF00006100FEFF
+b00FEFF.isBlank=false
+z00FEFF.strip=len=1 units=00FEFF
+z00FEFF.stripLeading=len=1 units=00FEFF
+z00FEFF.stripTrailing=len=1 units=00FEFF
+z00FEFF.trim=len=1 units=00FEFF
+z00FEFF.isBlank=false

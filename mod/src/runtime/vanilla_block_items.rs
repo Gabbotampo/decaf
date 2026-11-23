@@ -895,7 +895,7 @@ const TABLE: &[(&str, &str)] = &[
 mod tests {
     use super::item_id;
 
-    const JAVA25: &str = include_str!("vanilla_block_items_java25.tsv");
+    const JAVA25: &str = crate::runtime::vendored_vanilla_block_items_java25_tsv::VENDORED_DATA;
 
     #[test]
     fn every_26_3_block_as_item_matches_java25() {
