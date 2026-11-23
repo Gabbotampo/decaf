@@ -118,6 +118,11 @@ pub struct GameObject {
     /// object each. `None` for a player the host does not count, whose key
     /// names no session (comparisons counted).
     pub incarnation: Option<(u32, u32)>,
+    /// `Entity.isSilent()`, when known by the hook (`None` refuses).
+    pub silent: Option<bool>,
+    /// Explicit `Entity.getSoundSource()` override when not uniquely implied
+    /// by `type_id` (e.g. `minecraft:rabbit`).
+    pub sound_source: Option<crate::level_sound::SoundSource>,
 }
 
 impl GameObject {
@@ -141,6 +146,8 @@ impl GameObject {
             main_hand: None,
             off_hand: None,
             incarnation: None,
+            silent: None,
+            sound_source: None,
         }
     }
 
@@ -293,6 +300,14 @@ impl GameObject {
         self.game_mode = Some(mode);
         self
     }
+    pub fn with_silent(mut self, silent: bool) -> Self {
+        self.silent = Some(silent);
+        self
+    }
+    pub fn with_sound_source(mut self, source: crate::level_sound::SoundSource) -> Self {
+        self.sound_source = Some(source);
+        self
+    }
     pub fn with_address(mut self, address: &str) -> Self {
         self.address = Some(address.to_owned());
         self
@@ -384,6 +399,9 @@ pub enum GameHookEffect {
     /// `ServerPlayer#sendSystemMessage(Component)`: a system line in the
     /// player's chat.
     SystemMessage { player: u128, text: String },
+    /// `Level.playSound` / `playSeededSound` / `Entity.playSound`: a sound
+    /// effect requested during the hook firing.
+    PlaySound(crate::level_sound::LevelSoundEffect),
 }
 
 /// The game objects of one firing, and what the callbacks asked of them.
@@ -430,6 +448,10 @@ impl GameHookContext {
 
     pub fn take_effects(&mut self) -> Vec<GameHookEffect> {
         std::mem::take(&mut self.effects)
+    }
+
+    pub(crate) fn push_effect(&mut self, effect: GameHookEffect) {
+        self.effects.push(effect);
     }
 }
 
@@ -730,6 +752,12 @@ fn is_value_constructor(r: &MethodRef) -> bool {
             "net/minecraft/resources/Identifier",
             "fromNamespaceAndPath" | "withDefaultNamespace" | "parse" | "tryParse" | "tryBuild"
         ) | ("net/minecraft/resources/ResourceKey", "create")
+            | (
+                "net/minecraft/sounds/SoundEvent",
+                "createVariableRangeEvent" | "createFixedRangeEvent"
+            )
+            | ("net/minecraft/core/Holder", "direct")
+            | ("net/minecraft/sounds/SoundSource", "valueOf" | "values")
             // A logger: the bootstrap host's slf4j model answers it.
             | ("com/mojang/logging/LogUtils", "getLogger")
     )
@@ -743,6 +771,7 @@ fn is_host_value_class(owner: &str) -> bool {
         owner,
         "net/minecraft/network/protocol/common/custom/CustomPacketPayload$Type"
             | "net/minecraft/world/level/storage/LevelResource"
+            | "net/minecraft/sounds/SoundEvent"
     )
 }
 
@@ -801,6 +830,16 @@ impl<H: Host> GameHookHost<'_, H> {
             return Ok(Value::Void);
         }
         let object = self.object(marker)?;
+        if let Some(answer) = crate::level_sound::game_hook_sound_call(
+            self.inner,
+            self.context,
+            marker,
+            &object,
+            r,
+            args,
+        ) {
+            return answer;
+        }
         let fact = |value: Option<Value>| value.ok_or_else(|| unmodelled(marker, r));
         let entity = matches!(
             object.kind,
@@ -1175,6 +1214,30 @@ impl<H: Host> Host for GameHookHost<'_, H> {
         self.inner.collection_generation(marker)
     }
 
+    fn next_identity_run(&mut self) -> u64 {
+        self.inner.next_identity_run()
+    }
+
+    fn clear_identity_known_epochs(&mut self) {
+        self.inner.clear_identity_known_epochs()
+    }
+
+    fn identity_known_epoch(&self, marker: &str) -> Option<(u64, u64)> {
+        self.inner.identity_known_epoch(marker)
+    }
+
+    fn set_identity_known_epoch(&mut self, marker: &str, run_id: u64, epoch: u64) {
+        self.inner.set_identity_known_epoch(marker, run_id, epoch)
+    }
+
+    fn note_identity_token_table_len(&mut self, len: usize) {
+        self.inner.note_identity_token_table_len(len)
+    }
+
+    fn reversed_view_source(&self, marker: &str) -> Option<String> {
+        self.inner.reversed_view_source(marker)
+    }
+
     fn collection_slice(&self, marker: &str) -> Option<&[Value]> {
         self.inner.collection_slice(marker)
     }
@@ -1287,6 +1350,10 @@ impl<H: Host> Host for GameHookHost<'_, H> {
         self.inner.list_iterator(marker)
     }
 
+    fn list_iterator_source(&self, marker: &str) -> Option<Value> {
+        self.inner.list_iterator_source(marker)
+    }
+
     fn store_list_iterator(&mut self, marker: &str, state: host_list_iterator::ListIter) {
         self.inner.store_list_iterator(marker, state)
     }
@@ -1313,6 +1380,14 @@ impl<H: Host> Host for GameHookHost<'_, H> {
 
     fn set_host_iterator_cursor(&mut self, marker: &str, cursor: usize) {
         self.inner.set_host_iterator_cursor(marker, cursor)
+    }
+
+    fn host_iterator_origin(&self, marker: &str) -> Option<Value> {
+        self.inner.host_iterator_origin(marker)
+    }
+
+    fn set_host_iterator_origin(&mut self, marker: &str, origin: Value) {
+        self.inner.set_host_iterator_origin(marker, origin)
     }
 
     fn write_console(&mut self, text: &str) {
@@ -1396,6 +1471,10 @@ impl<H: Host> Host for GameHookHost<'_, H> {
         self.inner.enumeration_over(marker)
     }
 
+    fn enumeration_source(&self, marker: &str) -> Option<Value> {
+        self.inner.enumeration_source(marker)
+    }
+
     fn store_enumeration(&mut self, marker: &str, over: crate::host_iterator::EnumerationOver) {
         self.inner.store_enumeration(marker, over);
     }
@@ -1406,6 +1485,10 @@ impl<H: Host> Host for GameHookHost<'_, H> {
 
     fn map_entry_parts(&self, value: &Value) -> Option<(Value, Value)> {
         self.inner.map_entry_parts(value)
+    }
+
+    fn map_entry_source(&self, value: &Value) -> Option<String> {
+        self.inner.map_entry_source(value)
     }
 
     fn map_entry_is_instance_of(&self, value: &Value, wanted: &str) -> Option<bool> {
@@ -1667,6 +1750,37 @@ impl<H: Host> Host for GameHookHost<'_, H> {
         self.inner.throwable_message(marker)
     }
 
+    fn registered_sound_id(&self, sound: &Value) -> Option<String> {
+        self.inner.registered_sound_id(sound)
+    }
+
+    fn unwrap_sound_holder(
+        &mut self,
+        value: &Value,
+    ) -> Option<Result<(Value, Option<String>), NativeError>> {
+        self.inner.unwrap_sound_holder(value)
+    }
+
+    fn level_random_handle(&mut self, level_marker: &str) -> Option<Value> {
+        self.inner.level_random_handle(level_marker)
+    }
+
+    fn draw_level_sound_seed(
+        &mut self,
+        level_marker: &str,
+        server_side: bool,
+    ) -> Option<crate::level_sound::SoundSeed> {
+        self.inner.draw_level_sound_seed(level_marker, server_side)
+    }
+
+    fn mark_sound_stream_unknown(&mut self, stream: &str) {
+        self.inner.mark_sound_stream_unknown(stream);
+    }
+
+    fn construct_sound_event(&mut self, r: &MethodRef, args: &[Value]) -> Option<Value> {
+        self.inner.construct_sound_event(r, args)
+    }
+
     fn record_throwable(&mut self, marker: &str, message: Option<String>) {
         self.inner.record_throwable(marker, message);
     }
@@ -1756,6 +1870,14 @@ impl<H: Host> Host for GameHookHost<'_, H> {
 
     fn pause_collections(&mut self, paused: bool) {
         self.inner.pause_collections(paused);
+    }
+
+    fn has_retained_shape_probes(&self) -> bool {
+        self.inner.has_retained_shape_probes()
+    }
+
+    fn note_retained_shape_probe(&mut self) {
+        self.inner.note_retained_shape_probe();
     }
 
     fn empty_mutable_collection(&mut self, kind: &str) -> Option<Value> {
@@ -2053,6 +2175,10 @@ impl NativeJar {
             pipelines: Default::default(),
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
+            counted_strings: std::collections::BTreeSet::new(),
+            identity_collections: Default::default(),
+            string_pool: Default::default(),
+            counted_text_objects: std::collections::BTreeSet::new(),
             gson_writers: BTreeMap::new(),
             string_builder_capacities: BTreeMap::new(),
 
@@ -2067,6 +2193,7 @@ impl NativeJar {
             io_writer_bytes: BTreeMap::new(),
             io_stream_positions: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
+            io_writer_sinks: BTreeMap::new(),
             io_paths,
             io_files,
             io_file_bytes,
@@ -2082,6 +2209,9 @@ impl NativeJar {
             stream_plan: Default::default(),
             store_verdict: Default::default(),
             depth: 0,
+            next_frame_id: 0,
+            shape_extraction: None,
+            check_shape_probes: false,
             budget,
         };
         // `game_hook_callback_values` answers whether the callback is an

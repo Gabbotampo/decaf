@@ -13,6 +13,7 @@ pub(crate) const GAME_RULE: &str = "game-rule/";
 const ITEM: &str = "game/item/";
 const BLOCK: &str = "game/block/";
 const BLOCK_STATE: &str = "game/block-state/";
+const DEFAULT_BLOCK_STATE: &str = "game/default-block-state/";
 
 /// The coordinates of a `block-pos/x,y,z` key.
 pub(crate) fn block_pos(key: &str) -> Option<[i32; 3]> {
@@ -90,8 +91,21 @@ fn family_classes(key: &str) -> Option<&'static [&'static str]> {
 /// value; `Some(None)` when Java's answer needs fields the model lacks.
 pub(crate) fn equals(key: &str, other_key: Option<&str>, other: &Value) -> Option<Option<bool>> {
     let classes = family_classes(key)?;
+    if matches!(other, Value::Host(h) if h.kind() == crate::host_ref::HostKind::ShapeProbe) {
+        return Some(None);
+    }
+    // An opaque position probe (`block-pos/shape-probe`) has unknown coordinates, so any
+    // equality check against another `BlockPos` is counted as a position dependency.
+    if key.starts_with(BLOCK_POS) && block_pos(key).is_none() {
+        return Some(None);
+    }
     match other_key.filter(|other| family_classes(other) == Some(classes)) {
-        Some(other_key) => Some(Some(key == other_key)),
+        Some(other_key) => {
+            if other_key.starts_with(BLOCK_POS) && block_pos(other_key).is_none() {
+                return Some(None);
+            }
+            Some(Some(key == other_key))
+        }
         // A jar's own `BlockPos`/`LevelResource`: its fields are not ours.
         None => {
             let foreign = crate::jar_object::object_class(other)
@@ -128,6 +142,25 @@ pub(crate) fn canonical(key: &str) -> bool {
 pub(crate) fn registry_canonical(key: &str) -> bool {
     key.strip_prefix(BLOCK_STATE)
         .is_none_or(|state| state.contains('['))
+}
+
+/// Whether two `GameRegistryObject` keys might refer to the same `BlockState`
+/// despite different spellings: `game/default-block-state/<id>` against a
+/// `game/block-state/<id>` or `game/block-state/<id>[...]` of the same block
+/// (we do not store vanilla's default property map to prove equality or
+/// inequality).
+pub(crate) fn same_block_state_unknown(a: &str, b: &str) -> bool {
+    let check = |default_key: &str, state_key: &str| {
+        let Some(default_block) = default_key.strip_prefix(DEFAULT_BLOCK_STATE) else {
+            return false;
+        };
+        let Some(state_rest) = state_key.strip_prefix(BLOCK_STATE) else {
+            return false;
+        };
+        let state_block = state_rest.split_once('[').map_or(state_rest, |(id, _)| id);
+        default_block == state_block
+    };
+    check(a, b) || check(b, a)
 }
 
 #[cfg(test)]

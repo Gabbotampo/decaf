@@ -289,13 +289,35 @@ public final class FabricCreativeModeTab {
     (
         "net/fabricmc/fabric/api/creativetab/v1/FabricCreativeModeTabOutput.java",
         r#"package net.fabricmc.fabric.api.creativetab.v1;
+import java.util.Collection;
 import net.minecraft.world.flag.FeatureFlagSet;
 import net.minecraft.world.item.CreativeModeTab;
 import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.level.ItemLike;
 public class FabricCreativeModeTabOutput implements CreativeModeTab.Output {
     public FeatureFlagSet getEnabledFeatures() { throw new AssertionError(); }
     public boolean shouldShowOpRestrictedItems() { throw new AssertionError(); }
     @Override public void accept(ItemStack stack, CreativeModeTab.TabVisibility visibility) { throw new AssertionError(); }
+    public void prepend(ItemStack stack) { throw new AssertionError(); }
+    public void prepend(ItemStack stack, CreativeModeTab.TabVisibility visibility) { throw new AssertionError(); }
+    public void prepend(ItemLike item) { throw new AssertionError(); }
+    public void prepend(ItemLike item, CreativeModeTab.TabVisibility visibility) { throw new AssertionError(); }
+    public void insertBefore(ItemLike anchor, ItemStack... stacks) { throw new AssertionError(); }
+    public void insertBefore(ItemStack anchor, ItemStack... stacks) { throw new AssertionError(); }
+    public void insertBefore(ItemLike anchor, ItemLike... items) { throw new AssertionError(); }
+    public void insertBefore(ItemStack anchor, ItemLike... items) { throw new AssertionError(); }
+    public void insertBefore(ItemLike anchor, Collection<ItemStack> stacks) { throw new AssertionError(); }
+    public void insertBefore(ItemStack anchor, Collection<ItemStack> stacks) { throw new AssertionError(); }
+    public void insertBefore(ItemLike anchor, Collection<ItemStack> stacks, CreativeModeTab.TabVisibility visibility) { throw new AssertionError(); }
+    public void insertBefore(ItemStack anchor, Collection<ItemStack> stacks, CreativeModeTab.TabVisibility visibility) { throw new AssertionError(); }
+    public void insertAfter(ItemLike anchor, ItemStack... stacks) { throw new AssertionError(); }
+    public void insertAfter(ItemStack anchor, ItemStack... stacks) { throw new AssertionError(); }
+    public void insertAfter(ItemLike anchor, ItemLike... items) { throw new AssertionError(); }
+    public void insertAfter(ItemStack anchor, ItemLike... items) { throw new AssertionError(); }
+    public void insertAfter(ItemLike anchor, Collection<ItemStack> stacks) { throw new AssertionError(); }
+    public void insertAfter(ItemStack anchor, Collection<ItemStack> stacks) { throw new AssertionError(); }
+    public void insertAfter(ItemLike anchor, Collection<ItemStack> stacks, CreativeModeTab.TabVisibility visibility) { throw new AssertionError(); }
+    public void insertAfter(ItemStack anchor, Collection<ItemStack> stacks, CreativeModeTab.TabVisibility visibility) { throw new AssertionError(); }
 }"#,
     ),
     (
@@ -1095,4 +1117,727 @@ fn run_real_runes_test(jar_path: &Path) {
     let after_build = host.game_listeners(&jar, true);
     assert_eq!(after_build.unsupported.get(functional_source), None);
     assert_eq!(after_build.unsupported.get(combat_source), None);
+}
+
+const PLACEMENT_PROBE: &str = r##"
+package demo;
+
+import java.util.List;
+import net.fabricmc.fabric.api.creativetab.v1.CreativeModeTabEvents;
+import net.minecraft.core.Registry;
+import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.resources.Identifier;
+import net.minecraft.resources.ResourceKey;
+import net.minecraft.core.registries.Registries;
+import net.minecraft.world.flag.FeatureFlags;
+import net.minecraft.world.item.CreativeModeTab;
+import net.minecraft.world.item.Item;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.Items;
+import net.minecraft.world.level.ItemLike;
+
+public final class PlacementProbe {
+    public static String errLog = "";
+
+    private static String catchMsg(Runnable r) {
+        try {
+            r.run();
+            return "NONE";
+        } catch (Throwable t) {
+            return t.getClass().getSimpleName() + ":" + t.getMessage();
+        }
+    }
+
+    public static void setup() {
+        Item a = Registry.register(BuiltInRegistries.ITEM, Identifier.parse("demo:a"), new Item(new Item.Properties()));
+        Item b = Registry.register(BuiltInRegistries.ITEM, Identifier.parse("demo:b"), new Item(new Item.Properties()));
+        Item c = Registry.register(BuiltInRegistries.ITEM, Identifier.parse("demo:c"), new Item(new Item.Properties()));
+        Item d = Registry.register(BuiltInRegistries.ITEM, Identifier.parse("demo:d"), new Item(new Item.Properties()));
+        Item e = Registry.register(BuiltInRegistries.ITEM, Identifier.parse("demo:e"), new Item(new Item.Properties()));
+        Item disabled = Registry.register(
+            BuiltInRegistries.ITEM,
+            Identifier.parse("demo:disabled"),
+            new Item(new Item.Properties().requiredFeatures(FeatureFlags.TRADE_REBALANCE))
+        );
+
+        ResourceKey<CreativeModeTab> mainTab = ResourceKey.create(Registries.CREATIVE_MODE_TAB, Identifier.parse("demo:placement"));
+        CreativeModeTabEvents.modifyOutputEvent(mainTab).register(entries -> {
+            entries.insertBefore(Items.DIRT, List.of(new ItemStack(a)), CreativeModeTab.TabVisibility.PARENT_TAB_ONLY);
+            entries.insertAfter(Items.STONE, List.of(new ItemStack(b)), CreativeModeTab.TabVisibility.SEARCH_TAB_ONLY);
+            entries.insertAfter(a, c, disabled);
+            entries.insertBefore(Items.GOLD_INGOT, d);
+            entries.prepend(e, CreativeModeTab.TabVisibility.PARENT_AND_SEARCH_TABS);
+        });
+
+        ResourceKey<CreativeModeTab> dupTab = ResourceKey.create(Registries.CREATIVE_MODE_TAB, Identifier.parse("demo:dup"));
+        CreativeModeTabEvents.modifyOutputEvent(dupTab).register(entries -> {
+            entries.insertBefore(Items.STONE, a);
+            entries.insertAfter(Items.STONE, b);
+        });
+
+        ResourceKey<CreativeModeTab> errTab = ResourceKey.create(Registries.CREATIVE_MODE_TAB, Identifier.parse("demo:errors"));
+        CreativeModeTabEvents.modifyOutputEvent(errTab).register(entries -> {
+            StringBuilder sb = new StringBuilder();
+            sb.append("null_vis_disabled=").append(catchMsg(() ->
+                entries.insertBefore(Items.STONE, List.of(new ItemStack(disabled)), null)
+            )).append('\n');
+            sb.append("null_anchor_disabled=").append(catchMsg(() ->
+                entries.insertBefore((ItemLike) null, List.of(new ItemStack(disabled)))
+            )).append('\n');
+            sb.append("null_item_anchor=").append(catchMsg(() ->
+                entries.insertBefore((ItemLike) null, List.of(new ItemStack(a)))
+            )).append('\n');
+            sb.append("null_stack_anchor=").append(catchMsg(() ->
+                entries.insertBefore((ItemStack) null, List.of(new ItemStack(a)))
+            )).append('\n');
+            sb.append("null_collection=").append(catchMsg(() ->
+                entries.insertBefore(Items.STONE, (List<ItemStack>) null)
+            )).append('\n');
+            sb.append("null_vis=").append(catchMsg(() ->
+                entries.insertBefore(Items.STONE, List.of(new ItemStack(a)), null)
+            )).append('\n');
+            sb.append("empty_stack=").append(catchMsg(() ->
+                entries.insertBefore(Items.STONE, ItemStack.EMPTY)
+            )).append('\n');
+            sb.append("count2=").append(catchMsg(() ->
+                entries.insertBefore(Items.STONE, new ItemStack(a, 2))
+            ));
+            errLog = sb.toString();
+        });
+
+        ResourceKey<CreativeModeTab> stackAnchorTab = ResourceKey.create(Registries.CREATIVE_MODE_TAB, Identifier.parse("demo:stack_anchor"));
+        CreativeModeTabEvents.modifyOutputEvent(stackAnchorTab).register(entries -> {
+            entries.insertAfter(new ItemStack(Items.STONE), new ItemStack(a));
+        });
+    }
+
+    public static String errors() {
+        return errLog;
+    }
+}
+"##;
+
+#[test]
+fn anchor_placement_and_prepend_match_java25_fabric_api_oracle() {
+    let mut sources = vec![
+        ("demo/PlacementProbe.java", PLACEMENT_PROBE),
+        (
+            "net/minecraft/world/item/Items.java",
+            "package net.minecraft.world.item; public final class Items { public static final Item STONE = null; public static final Item DIRT = null; public static final Item GOLD_INGOT = null; }",
+        ),
+    ];
+    sources.extend_from_slice(STUBS);
+    let fixture = javac_fixture::Fixture::build("creative-tab-placement-oracle", &sources);
+    let mut host = fixture.jar.seed_host(StdHost::new());
+
+    fixture
+        .jar
+        .invoke_method("demo/PlacementProbe", "setup", "()V", None, &mut host)
+        .unwrap();
+
+    let ids = |host: &StdHost, stacks: &[Value]| -> Vec<String> {
+        stacks
+            .iter()
+            .map(|s| host.item_stack_item_id(s).expect("stack item id"))
+            .collect()
+    };
+
+    // Case 1: Initial `[stone, dirt]` — exact Java 25 + Fabric API 5.0.21 oracle output.
+    let s_stone = host.make_item_stack_for_id("minecraft:stone", 1, false);
+    let s_dirt = host.make_item_stack_for_id("minecraft:dirt", 1, false);
+    let placed = fixture
+        .jar
+        .creative_tab_contents_with(
+            &mut host,
+            "demo:placement",
+            CreativeTabBuildContext {
+                initial_display_stacks: vec![s_stone.clone(), s_dirt.clone()],
+                initial_search_tab_stacks: vec![s_stone.clone(), s_dirt.clone()],
+                ..CreativeTabBuildContext::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        ids(&host, &placed.display_stacks),
+        vec![
+            "demo:e",
+            "minecraft:stone",
+            "demo:a",
+            "demo:c",
+            "minecraft:dirt",
+            "demo:d",
+        ]
+    );
+    assert_eq!(
+        ids(&host, &placed.search_tab_stacks),
+        vec![
+            "demo:e",
+            "minecraft:stone",
+            "demo:b",
+            "minecraft:dirt",
+            "demo:c",
+            "demo:d",
+        ]
+    );
+
+    // Case 2: Duplicate anchor `[stone, dirt, stone]` — `insertBefore` uses FIRST match,
+    // `insertAfter` uses LAST match.
+    let s_stone2 = host.make_item_stack_for_id("minecraft:stone", 1, false);
+    let dup = fixture
+        .jar
+        .creative_tab_contents_with(
+            &mut host,
+            "demo:dup",
+            CreativeTabBuildContext {
+                initial_display_stacks: vec![s_stone.clone(), s_dirt.clone(), s_stone2.clone()],
+                initial_search_tab_stacks: vec![s_stone.clone(), s_dirt.clone(), s_stone2],
+                ..CreativeTabBuildContext::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        ids(&host, &dup.display_stacks),
+        vec![
+            "demo:a",
+            "minecraft:stone",
+            "minecraft:dirt",
+            "minecraft:stone",
+            "demo:b",
+        ]
+    );
+
+    // Case 3: Exact Java 25 / Fabric API 5.0.21 exception messages and evaluation order.
+    let _ = fixture
+        .jar
+        .creative_tab_contents_with(
+            &mut host,
+            "demo:errors",
+            CreativeTabBuildContext {
+                initial_display_stacks: vec![s_stone.clone(), s_dirt.clone()],
+                initial_search_tab_stacks: vec![s_stone.clone(), s_dirt],
+                ..CreativeTabBuildContext::default()
+            },
+        )
+        .unwrap();
+    let err_text = match fixture
+        .jar
+        .invoke_method(
+            "demo/PlacementProbe",
+            "errors",
+            "()Ljava/lang/String;",
+            None,
+            &mut host,
+        )
+        .unwrap()
+    {
+        Value::Ref(Some(text)) => text,
+        other => panic!("unexpected errors result: {other:?}"),
+    };
+    let rows: BTreeMap<&str, &str> = err_text
+        .lines()
+        .map(|l| l.split_once('=').unwrap())
+        .collect();
+    assert_eq!(rows["null_vis_disabled"], "NONE");
+    assert_eq!(rows["null_anchor_disabled"], "NONE");
+    assert_eq!(
+        rows["null_item_anchor"],
+        "NullPointerException:Cannot invoke \"net.minecraft.world.level.ItemLike.asItem()\" because \"anchor\" is null"
+    );
+    assert_eq!(
+        rows["null_stack_anchor"],
+        "NullPointerException:Cannot invoke \"net.minecraft.world.item.ItemStack.is(Object)\" because \"a\" is null"
+    );
+    assert_eq!(
+        rows["null_collection"],
+        "NullPointerException:Cannot invoke \"java.util.Collection.stream()\" because \"newStacks\" is null"
+    );
+    assert_eq!(
+        rows["null_vis"],
+        "NullPointerException:Cannot invoke \"net.minecraft.world.item.CreativeModeTab$TabVisibility.ordinal()\" because \"visibility\" is null"
+    );
+    assert_eq!(
+        rows["empty_stack"],
+        "IllegalArgumentException:Cannot add empty stack"
+    );
+    assert_eq!(
+        rows["count2"],
+        "IllegalArgumentException:Stack size must be exactly 1 for stack: 2 demo:a"
+    );
+    assert_eq!(
+        host.unknown_host_calls(),
+        Vec::<(String, usize)>::new(),
+        "placement oracle must have zero unknown host calls"
+    );
+
+    // Case 4: `ItemStack` anchor against a seeded stack with opaque custom components MUST be
+    // counted as unknown rather than falsely equating components.
+    let opaque_stone = host.make_item_stack_for_id("minecraft:stone", 1, true);
+    let before_unknown = host.unknown_host_call_count();
+    let _ = fixture
+        .jar
+        .creative_tab_contents_with(
+            &mut host,
+            "demo:stack_anchor",
+            CreativeTabBuildContext {
+                initial_display_stacks: vec![opaque_stone.clone()],
+                initial_search_tab_stacks: vec![opaque_stone],
+                ..CreativeTabBuildContext::default()
+            },
+        )
+        .unwrap();
+    assert!(
+        host.unknown_host_call_count() > before_unknown,
+        "ItemStack anchor matching an opaque-component stack must be counted"
+    );
+}
+
+const COMPONENT_ANCHOR_PROBE: &str = r##"
+package demo;
+
+import net.fabricmc.fabric.api.creativetab.v1.CreativeModeTabEvents;
+import net.minecraft.core.Registry;
+import net.minecraft.core.component.DataComponents;
+import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.core.registries.Registries;
+import net.minecraft.nbt.CompoundTag;
+import net.minecraft.resources.Identifier;
+import net.minecraft.resources.ResourceKey;
+import net.minecraft.util.Unit;
+import net.minecraft.world.item.CreativeModeTab;
+import net.minecraft.world.item.Item;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.Items;
+import net.minecraft.world.item.component.CustomData;
+
+public final class ComponentAnchorProbe {
+    public static void setup() {
+        Item marker = Registry.register(
+            BuiltInRegistries.ITEM,
+            Identifier.parse("demo:marker"),
+            new Item(new Item.Properties())
+        );
+
+        ResourceKey<CreativeModeTab> tab = ResourceKey.create(
+            Registries.CREATIVE_MODE_TAB,
+            Identifier.parse("demo:comp_anchor")
+        );
+        CreativeModeTabEvents.modifyOutputEvent(tab).register(entries -> {
+            ItemStack damagedAnchor = new ItemStack(Items.DIAMOND_SWORD);
+            damagedAnchor.set(DataComponents.DAMAGE, 12);
+            CompoundTag tag = new CompoundTag();
+            tag.putInt("tier", 3);
+            CustomData.set(DataComponents.CUSTOM_DATA, damagedAnchor, tag);
+            damagedAnchor.set(DataComponents.UNBREAKABLE, Unit.INSTANCE);
+            entries.insertAfter(damagedAnchor, new ItemStack(marker));
+        });
+    }
+}
+"##;
+
+#[test]
+fn component_stack_anchor_distinguishes_modelled_components_with_zero_unknown_calls() {
+    use horizon_native_java::{Nbt, NbtCompound, RuntimeComponentValue};
+
+    let mut sources = vec![
+        ("demo/ComponentAnchorProbe.java", COMPONENT_ANCHOR_PROBE),
+        (
+            "net/minecraft/world/item/Items.java",
+            "package net.minecraft.world.item; public final class Items { public static final Item DIAMOND_SWORD = null; }",
+        ),
+        (
+            "net/minecraft/core/component/DataComponentType.java",
+            "package net.minecraft.core.component; public interface DataComponentType<T> {}",
+        ),
+        (
+            "net/minecraft/core/component/DataComponents.java",
+            r#"package net.minecraft.core.component;
+import net.minecraft.util.Unit;
+import net.minecraft.world.item.component.CustomData;
+public final class DataComponents {
+    public static final DataComponentType<Integer> DAMAGE = null;
+    public static final DataComponentType<CustomData> CUSTOM_DATA = null;
+    public static final DataComponentType<Unit> UNBREAKABLE = null;
+}"#,
+        ),
+        (
+            "net/minecraft/util/Unit.java",
+            "package net.minecraft.util; public enum Unit { INSTANCE }",
+        ),
+        (
+            "net/minecraft/nbt/CompoundTag.java",
+            "package net.minecraft.nbt; public class CompoundTag { public CompoundTag() {} public void putInt(String k, int v) {} }",
+        ),
+        (
+            "net/minecraft/world/item/component/CustomData.java",
+            "package net.minecraft.world.item.component; import net.minecraft.core.component.DataComponentType; import net.minecraft.nbt.CompoundTag; import net.minecraft.world.item.ItemStack; public final class CustomData { public static void set(DataComponentType<CustomData> type, ItemStack stack, CompoundTag tag) {} }",
+        ),
+        (
+            "net/minecraft/world/item/ItemStack.java",
+            r#"package net.minecraft.world.item;
+import net.minecraft.core.component.DataComponentType;
+import net.minecraft.world.flag.FeatureFlagSet;
+import net.minecraft.world.level.ItemLike;
+public final class ItemStack {
+    public static final ItemStack EMPTY = null;
+    public ItemStack(ItemLike item) {}
+    public ItemStack(ItemLike item, int count) {}
+    public <T> T set(DataComponentType<? super T> type, T value) { throw new AssertionError(); }
+    public boolean isEmpty() { throw new AssertionError(); }
+    public int getCount() { throw new AssertionError(); }
+    public Item getItem() { throw new AssertionError(); }
+    public boolean is(Item item) { throw new AssertionError(); }
+    public boolean isItemEnabled(FeatureFlagSet enabledFeatures) { throw new AssertionError(); }
+}"#,
+        ),
+    ];
+    for &(path, src) in STUBS {
+        if path != "net/minecraft/world/item/ItemStack.java" {
+            sources.push((path, src));
+        }
+    }
+    let fixture = javac_fixture::Fixture::build("creative-tab-component-anchor", &sources);
+    let mut host = fixture.jar.seed_host(StdHost::new());
+    fixture
+        .jar
+        .invoke_method("demo/ComponentAnchorProbe", "setup", "()V", None, &mut host)
+        .unwrap();
+
+    let plain_sword = host.make_item_stack_for_id("minecraft:diamond_sword", 1, false);
+    let mut nbt = NbtCompound::new();
+    nbt.insert("tier".into(), Nbt::Int(3));
+    let matching_sword = host.make_host_item_stack_with_components(
+        None,
+        "minecraft:diamond_sword",
+        1,
+        vec![
+            (
+                "minecraft:damage".into(),
+                Some(RuntimeComponentValue::Int(12)),
+            ),
+            (
+                "minecraft:custom_data".into(),
+                Some(RuntimeComponentValue::CustomData(nbt)),
+            ),
+            (
+                "minecraft:unbreakable".into(),
+                Some(RuntimeComponentValue::Unit),
+            ),
+        ],
+        false,
+        Vec::new(),
+    );
+    let different_sword = host.make_host_item_stack_with_components(
+        None,
+        "minecraft:diamond_sword",
+        1,
+        vec![(
+            "minecraft:damage".into(),
+            Some(RuntimeComponentValue::Int(5)),
+        )],
+        false,
+        Vec::new(),
+    );
+
+    let out = fixture
+        .jar
+        .creative_tab_contents_with(
+            &mut host,
+            "demo:comp_anchor",
+            CreativeTabBuildContext {
+                initial_display_stacks: vec![
+                    plain_sword.clone(),
+                    matching_sword.clone(),
+                    different_sword.clone(),
+                ],
+                initial_search_tab_stacks: vec![plain_sword, matching_sword, different_sword],
+                ..CreativeTabBuildContext::default()
+            },
+        )
+        .unwrap();
+
+    let ids: Vec<String> = out
+        .display_stacks
+        .iter()
+        .map(|s| host.item_stack_item_id(s).unwrap())
+        .collect();
+    assert_eq!(
+        ids,
+        vec![
+            "minecraft:diamond_sword",
+            "minecraft:diamond_sword",
+            "demo:marker",
+            "minecraft:diamond_sword",
+        ]
+    );
+    assert_eq!(
+        host.unknown_host_calls(),
+        Vec::<(String, usize)>::new(),
+        "modelled component ItemStack anchor must have zero unknown host calls"
+    );
+}
+
+const TOOLTIP_DISPLAY_SET_PROBE: &str = r##"
+package demo;
+
+import net.fabricmc.fabric.api.creativetab.v1.CreativeModeTabEvents;
+import net.minecraft.core.Registry;
+import net.minecraft.core.component.DataComponents;
+import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.core.registries.Registries;
+import net.minecraft.resources.Identifier;
+import net.minecraft.resources.ResourceKey;
+import net.minecraft.world.item.CreativeModeTab;
+import net.minecraft.world.item.Item;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.Items;
+import net.minecraft.world.item.component.TooltipDisplay;
+
+public final class TooltipDisplaySetProbe {
+    public static String checkEquality() {
+        TooltipDisplay a = TooltipDisplay.DEFAULT
+            .withHidden(DataComponents.LORE, true)
+            .withHidden(DataComponents.DAMAGE, true);
+        TooltipDisplay b = TooltipDisplay.DEFAULT
+            .withHidden(DataComponents.DAMAGE, true)
+            .withHidden(DataComponents.LORE, true);
+        ItemStack stackA = new ItemStack(Items.DIAMOND_SWORD);
+        stackA.set(DataComponents.TOOLTIP_DISPLAY, a);
+        ItemStack stackB = new ItemStack(Items.DIAMOND_SWORD);
+        stackB.set(DataComponents.TOOLTIP_DISPLAY, b);
+        ItemStack stackPlain = new ItemStack(Items.DIAMOND_SWORD);
+        return a.equals(b) + "|"
+            + a.equals(TooltipDisplay.DEFAULT) + "|"
+            + ItemStack.isSameItemSameComponents(stackA, stackB) + "|"
+            + ItemStack.isSameItemSameComponents(stackA, stackPlain);
+    }
+
+    public static void setup() {
+        Item marker = Registry.register(
+            BuiltInRegistries.ITEM,
+            Identifier.parse("demo:td_marker"),
+            new Item(new Item.Properties())
+        );
+        ResourceKey<CreativeModeTab> tab = ResourceKey.create(
+            Registries.CREATIVE_MODE_TAB,
+            Identifier.parse("demo:td_set_anchor")
+        );
+        CreativeModeTabEvents.modifyOutputEvent(tab).register(entries -> {
+            TooltipDisplay b = TooltipDisplay.DEFAULT
+                .withHidden(DataComponents.DAMAGE, true)
+                .withHidden(DataComponents.LORE, true);
+            ItemStack anchorB = new ItemStack(Items.DIAMOND_SWORD);
+            anchorB.set(DataComponents.TOOLTIP_DISPLAY, b);
+            entries.insertAfter(anchorB, new ItemStack(marker));
+        });
+    }
+
+    public static int probeHashCode() {
+        return TooltipDisplay.DEFAULT.withHidden(DataComponents.LORE, true).hashCode();
+    }
+}
+"##;
+
+#[test]
+fn tooltip_display_hidden_components_use_set_equality_and_keep_first_occurrence_order() {
+    use horizon_native_java::RuntimeComponentValue;
+
+    let mut sources = vec![
+        (
+            "demo/TooltipDisplaySetProbe.java",
+            TOOLTIP_DISPLAY_SET_PROBE,
+        ),
+        (
+            "net/minecraft/world/item/Items.java",
+            "package net.minecraft.world.item; public final class Items { public static final Item DIAMOND_SWORD = null; }",
+        ),
+        (
+            "net/minecraft/core/component/DataComponentType.java",
+            "package net.minecraft.core.component; public interface DataComponentType<T> {}",
+        ),
+        (
+            "net/minecraft/core/component/DataComponents.java",
+            r#"package net.minecraft.core.component;
+import net.minecraft.world.item.component.TooltipDisplay;
+public final class DataComponents {
+    public static final DataComponentType<Integer> DAMAGE = null;
+    public static final DataComponentType<Object> LORE = null;
+    public static final DataComponentType<TooltipDisplay> TOOLTIP_DISPLAY = null;
+}"#,
+        ),
+        (
+            "net/minecraft/world/item/component/TooltipDisplay.java",
+            r#"package net.minecraft.world.item.component;
+import net.minecraft.core.component.DataComponentType;
+public final class TooltipDisplay {
+    public static final TooltipDisplay DEFAULT = null;
+    public boolean hideTooltip() { throw new AssertionError(); }
+    public boolean shows(DataComponentType<?> type) { throw new AssertionError(); }
+    public TooltipDisplay withHidden(DataComponentType<?> type, boolean hidden) { throw new AssertionError(); }
+}"#,
+        ),
+        (
+            "net/minecraft/world/item/ItemStack.java",
+            r#"package net.minecraft.world.item;
+import net.minecraft.core.component.DataComponentType;
+import net.minecraft.world.flag.FeatureFlagSet;
+import net.minecraft.world.level.ItemLike;
+public final class ItemStack {
+    public static final ItemStack EMPTY = null;
+    public ItemStack(ItemLike item) {}
+    public ItemStack(ItemLike item, int count) {}
+    public static boolean isSameItemSameComponents(ItemStack a, ItemStack b) { throw new AssertionError(); }
+    public <T> T set(DataComponentType<? super T> type, T value) { throw new AssertionError(); }
+    public boolean isEmpty() { throw new AssertionError(); }
+    public int getCount() { throw new AssertionError(); }
+    public Item getItem() { throw new AssertionError(); }
+    public boolean is(Item item) { throw new AssertionError(); }
+    public boolean isItemEnabled(FeatureFlagSet enabledFeatures) { throw new AssertionError(); }
+}"#,
+        ),
+    ];
+    for &(path, src) in STUBS {
+        if path != "net/minecraft/world/item/ItemStack.java" {
+            sources.push((path, src));
+        }
+    }
+    let fixture = javac_fixture::Fixture::build("creative-tab-tooltip-display-set", &sources);
+    let mut host = fixture.jar.seed_host(StdHost::new());
+
+    let eq_summary = match fixture
+        .jar
+        .invoke_method(
+            "demo/TooltipDisplaySetProbe",
+            "checkEquality",
+            "()Ljava/lang/String;",
+            None,
+            &mut host,
+        )
+        .unwrap()
+    {
+        Value::Ref(Some(text)) => text,
+        other => panic!("unexpected checkEquality result: {other:?}"),
+    };
+    assert_eq!(eq_summary, "true|false|true|false");
+
+    fixture
+        .jar
+        .invoke_method(
+            "demo/TooltipDisplaySetProbe",
+            "setup",
+            "()V",
+            None,
+            &mut host,
+        )
+        .unwrap();
+
+    // Seed with duplicate hidden_components: alloc_tooltip_display must dedupe preserving
+    // first-occurrence order (`["minecraft:lore", "minecraft:damage"]`), and anchor `[damage, lore]`
+    // must match it with zero unknown calls.
+    let seeded_dup = host.make_host_item_stack_with_components(
+        None,
+        "minecraft:diamond_sword",
+        1,
+        vec![(
+            "minecraft:tooltip_display".into(),
+            Some(RuntimeComponentValue::TooltipDisplay {
+                hide_tooltip: false,
+                hidden_components: vec![
+                    "minecraft:lore".into(),
+                    "minecraft:damage".into(),
+                    "minecraft:lore".into(),
+                ],
+                hidden_known: true,
+            }),
+        )],
+        false,
+        Vec::new(),
+    );
+    let extracted = host.item_stack_components(&seeded_dup).unwrap();
+    assert_eq!(
+        extracted.patch,
+        vec![(
+            "minecraft:tooltip_display".into(),
+            Some(RuntimeComponentValue::TooltipDisplay {
+                hide_tooltip: false,
+                hidden_components: vec!["minecraft:lore".into(), "minecraft:damage".into()],
+                hidden_known: true,
+            }),
+        )]
+    );
+
+    let plain_sword = host.make_item_stack_for_id("minecraft:diamond_sword", 1, false);
+    let hidden_sword = host.make_host_item_stack_with_components(
+        None,
+        "minecraft:diamond_sword",
+        1,
+        vec![(
+            "minecraft:tooltip_display".into(),
+            Some(RuntimeComponentValue::TooltipDisplay {
+                hide_tooltip: true,
+                hidden_components: vec!["minecraft:lore".into(), "minecraft:damage".into()],
+                hidden_known: true,
+            }),
+        )],
+        false,
+        Vec::new(),
+    );
+    // `hide_tooltip` mismatch must NOT compare equal (`stack_same_with_hide=false` on JDK 25).
+    assert_eq!(
+        host.stacks_same_item_same_components(&seeded_dup, &hidden_sword)
+            .unwrap(),
+        Some(false)
+    );
+
+    let out = fixture
+        .jar
+        .creative_tab_contents_with(
+            &mut host,
+            "demo:td_set_anchor",
+            CreativeTabBuildContext {
+                initial_display_stacks: vec![
+                    plain_sword.clone(),
+                    seeded_dup.clone(),
+                    hidden_sword.clone(),
+                ],
+                initial_search_tab_stacks: vec![plain_sword, seeded_dup, hidden_sword],
+                ..CreativeTabBuildContext::default()
+            },
+        )
+        .unwrap();
+    let ids: Vec<String> = out
+        .display_stacks
+        .iter()
+        .map(|s| host.item_stack_item_id(s).unwrap())
+        .collect();
+    assert_eq!(
+        ids,
+        vec![
+            "minecraft:diamond_sword",
+            "minecraft:diamond_sword",
+            "demo:td_marker",
+            "minecraft:diamond_sword",
+        ]
+    );
+    assert_eq!(
+        host.unknown_host_calls(),
+        Vec::<(String, usize)>::new(),
+        "TooltipDisplay set equality and anchor matching must have zero unknown calls"
+    );
+
+    // `TooltipDisplay.hashCode()` depends on JVM identity hash codes of `DataComponentType`
+    // singletons and must remain counted rather than fabricating an order-dependent value.
+    let _ = fixture
+        .jar
+        .invoke_method(
+            "demo/TooltipDisplaySetProbe",
+            "probeHashCode",
+            "()I",
+            None,
+            &mut host,
+        )
+        .unwrap();
+    assert!(
+        !host.unknown_host_calls().is_empty(),
+        "TooltipDisplay.hashCode must stay counted"
+    );
 }

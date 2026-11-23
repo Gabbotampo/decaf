@@ -355,7 +355,7 @@ fn exact_here(site: &str, entries: &[crate::runtime::RegisteredGameHook], dedica
 #[derive(Default)]
 pub(crate) struct Fired {
     pub cancelled: bool,
-    pub effects: Vec<GameHookEffect>,
+    pub effects: Vec<(usize, GameHookEffect)>,
 }
 
 /// Run every jar's callbacks at `site`, against `receiver` and `args` (the target method's).
@@ -363,8 +363,19 @@ pub(crate) struct Fired {
 /// at the site is skipped, so no `cancel()` is dropped or mistranslated.
 /// Once a jar's callback cancels, the target method returns: no later jar's callback at that
 /// point runs (jars run in load order; Mixin orders them by priority across jars, a departure).
+#[allow(dead_code)]
 pub(crate) fn fire(
     state: &mut State,
+    site: &str,
+    receiver: Option<GameObject>,
+    args: Vec<Arg>,
+) -> Fired {
+    fire_with_host(state, None, site, receiver, args)
+}
+
+pub(crate) fn fire_with_host(
+    state: &mut State,
+    server: Option<&dyn mod_api::ServerHost>,
     site: &str,
     receiver: Option<GameObject>,
     args: Vec<Arg>,
@@ -373,7 +384,26 @@ pub(crate) fn fire(
     let cancels = CANCELS.contains(&site);
     let facts = std::sync::Arc::clone(&state.server);
     let dedicated = state.dedicated;
-    for loaded in &mut state.jars {
+    let receiver = match (server, receiver) {
+        (Some(host), Some(obj)) => Some(crate::sound::enrich_game_object(host, obj)),
+        (_, receiver) => receiver,
+    };
+    let args: Vec<Arg> = args
+        .into_iter()
+        .map(|arg| match (server, arg) {
+            (Some(host), Arg::Object(obj)) => {
+                Arg::Object(crate::sound::enrich_game_object(host, obj))
+            }
+            (_, arg) => arg,
+        })
+        .collect();
+    let defer_seeds = server.is_some();
+    for jar_idx in 0..state.jars.len() {
+        // Each jar's callbacks run after the previous jar's: a level sound stream any jar left
+        // unknown is unknown for this one (`sound.rs`).
+        let sound_streams =
+            crate::sound::gather_unknown_sound_streams(state.jars.iter().map(|jar| &jar.host));
+        let loaded = &mut state.jars[jar_idx];
         let LoadedJar {
             jar,
             host,
@@ -404,6 +434,8 @@ pub(crate) fn fire(
             })
             .collect();
         let budget = ExecutionBudget::within(JAR_BUDGET);
+        crate::sound::share_unknown_sound_streams([&mut *host], &sound_streams);
+        host.set_host_deferred_server_sound_seeds(defer_seeds);
         let outcome = crate::caught(&format!("{} game hook {site}", row.id), || {
             jar.run_game_hook_in(
                 hooks,
@@ -416,6 +448,7 @@ pub(crate) fn fire(
                 &budget,
             )
         });
+        host.set_host_deferred_server_sound_seeds(false);
         match outcome {
             Ok(Ok(run)) => {
                 row.game_hooks.ran += run.ran;
@@ -427,7 +460,12 @@ pub(crate) fn fire(
             Ok(Err(error)) => note_failure(row, site, &error.to_string()),
             Err(panic) => note_failure(row, site, &format!("panicked: {panic}")),
         }
-        fired.effects.extend(context.take_effects());
+        fired.effects.extend(
+            context
+                .take_effects()
+                .into_iter()
+                .map(|effect| (jar_idx, effect)),
+        );
         if fired.cancelled {
             break;
         }

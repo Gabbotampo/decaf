@@ -86,6 +86,40 @@ pub(crate) fn hash_code(key: &str) -> Option<i32> {
     Some(location_hash.wrapping_mul(31).wrapping_add(fixed_hash))
 }
 
+pub(crate) fn from_value(value: &Value) -> Option<(String, Option<f32>)> {
+    let Value::Host(handle) = value else {
+        return None;
+    };
+    if handle.kind() != crate::host_ref::HostKind::GameValue {
+        return None;
+    }
+    let (location, fixed) = parse(handle.key())?;
+    Some((location.to_owned(), fixed))
+}
+
+pub(crate) fn construct_record(host: &mut StdHost, r: &MethodRef, args: &[Value]) -> Option<Value> {
+    if r.owner != "net/minecraft/sounds/SoundEvent"
+        || r.name != "<init>"
+        || r.descriptor != "(Lnet/minecraft/resources/Identifier;Ljava/util/Optional;)V"
+    {
+        return None;
+    }
+    let location = args
+        .first()
+        .and_then(|value| crate::java_identifier::id_text(host, value))?;
+    let optional = args.get(1)?;
+    if !crate::is_optional(optional) {
+        return None;
+    }
+    let fixed = match crate::optional_present(optional) {
+        None => None,
+        Some(Value::Boxed(crate::Boxed::Float(bits))) => Some(f32::from_bits(bits)),
+        Some(Value::Float(v)) => Some(v as f32),
+        Some(_) => return None,
+    };
+    Some(game_value(key(&location, fixed)))
+}
+
 fn game_value(key: String) -> Value {
     crate::game_object::value(&key).expect("sound-event key is a GameValue")
 }
@@ -142,12 +176,12 @@ pub(crate) fn instance_call(
         }
         ("getRange", "(F)F") => {
             let distance = match expect_float(r, args.first().unwrap_or(&Value::Float(0.0))) {
-                Ok(value) => value,
+                Ok(value) => value as f32,
                 Err(error) => return Some(Err(error)),
             };
             Ok(Value::Float(f64::from(fixed.unwrap_or(
                 if distance > 1.0 {
-                    16.0 * distance as f32
+                    16.0 * distance
                 } else {
                     16.0
                 },

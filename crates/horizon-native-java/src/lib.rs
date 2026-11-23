@@ -12,7 +12,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs::File,
     path::Path,
-    sync::Arc,
+    sync::{Arc, OnceLock},
     time::Instant,
 };
 
@@ -35,6 +35,12 @@ mod attachment_codec;
 mod bigdecimal_slice;
 mod block_entity_types;
 mod block_item_id;
+mod block_use;
+pub use block_use::{
+    BlockHitData, BlockUseContext, BlockUseOutcome, BlockUsePlayerData, BlockUseSide,
+    InteractionItemContext, InteractionResultValue, MenuCloseOutcome, MenuEffect, OpenMenuEffect,
+    PlayerContainer, SwingSource,
+};
 mod boxed;
 pub mod brigadier;
 mod callback_marker;
@@ -50,6 +56,7 @@ mod collection_base;
 mod collection_callback;
 mod collection_store;
 mod color_collection;
+mod commons_fraction;
 mod commons_io;
 mod commons_lang;
 mod commons_pair;
@@ -58,6 +65,7 @@ pub mod content;
 mod declarations_content;
 pub mod dependencies;
 mod dfu_codec;
+pub use dfu_codec::DfuCodecResult;
 mod dfu_either;
 mod dfu_pair;
 mod dfu_pair_ops;
@@ -191,6 +199,7 @@ mod jdk_text_oracle;
 mod jvm_dispatch;
 mod kotlin_stdlib;
 mod lambda_boxing;
+pub mod level_sound;
 mod library_dispatch;
 mod linked_resources;
 mod list_equality;
@@ -205,6 +214,7 @@ mod mod_count;
 mod mod_origin;
 mod model_layers;
 mod modified_utf8;
+mod mutable_container;
 mod native_library;
 mod neoforge_api;
 pub mod neoforge_attachments;
@@ -275,8 +285,10 @@ mod tree_map;
 mod type_switch;
 mod value_class;
 mod vanilla_block_items;
+mod vanilla_block_shapes;
 mod vanilla_block_state_definers;
 mod vanilla_block_state_properties;
+mod vanilla_block_use_methods;
 mod vanilla_blocks;
 mod vanilla_entity_types;
 mod vanilla_holders;
@@ -288,10 +300,15 @@ mod vanilla_registry_keys;
 mod vanilla_static;
 mod vanilla_values;
 pub mod verdict;
+mod voxel_shape;
 mod watch_service;
 pub mod weaver;
 
-pub use events::{CreativeTabBuildContext, CreativeTabContents, CreativeTabListener};
+pub use voxel_shape::{BlockShapes, BlockStateShape};
+
+pub use events::{
+    CreativeTabBuildContext, CreativeTabContents, CreativeTabListener, creative_feature_mask,
+};
 pub use facade_server::{GameRuleValue, ServerFacts};
 pub use game_hooks::{
     GAME_OBJECT_PREFIX, GameHookContext, GameHookEffect, GameHookState, GameObject, GameObjectKind,
@@ -321,9 +338,15 @@ pub(crate) use host_optional::{
 pub(crate) use host_path::{path_text, path_value, unix_normal};
 pub use host_ref::{HostKind, HostRef};
 pub use java_nbt::{MAX_DEPTH as NBT_MAX_DEPTH, Nbt, NbtCompound};
+pub use level_sound::{
+    EntitySoundFacts, LevelSoundEffect, SoundHolderKind, SoundSeed, SoundSide, SoundSource,
+    SoundTarget,
+};
 pub use mixin_extras::{GameHookShape, MixinExtrasKind, MixinExtrasPlan};
 pub use mixin_plugins::ConfigPluginReport;
 use mixin_plugins::ConfigPlugins;
+pub use recipe_models::{RuntimeComponentValue, StackComponents};
+pub use vanilla_item_data::all_vanilla_data_component_ids;
 pub use weaver::{
     ReturnMode, ShiftBy, WovenClasses, callback_info_class, callback_info_returnable_class,
     weave_class, weave_class_with_extras, weave_classes, weave_classes_with_extras, weave_head,
@@ -2391,6 +2414,12 @@ pub struct EventDispatch {
 /// keeps no such state", which the caller turns into a counted path of its own (#246's review:
 /// a silent `null` from `unknown_operand_call` printed a hook-tier player as `null`).
 pub trait Host {
+    /// Materialize a host-owned array returned by a modelled game object into
+    /// the active interpreter invocation as `(array_descriptor, elements)`.
+    /// `None` means the value is not one.
+    fn host_array_values(&self, _value: &Value) -> Option<(&'static str, Vec<Value>)> {
+        None
+    }
     /// Structural vanilla menu/container call. `None` leaves the call on the
     /// ordinary host path; a returned error is a counted refusal.
     fn menu_instance_call(
@@ -2531,6 +2560,23 @@ pub trait Host {
     fn finish_block_state_definition(&mut self, _block: &Value, _builder: &Value) {}
     fn block_state_definition_unknown(&mut self, _block: &Value, _method: &MethodRef) {}
     fn block_placement_unknown(&mut self) {}
+    fn voxel_shape_or_array(
+        &mut self,
+        r: &MethodRef,
+        _first: &Value,
+        _others: &[Value],
+    ) -> Result<Value, NativeError> {
+        Err(NativeError::UnknownHostCall(r.clone()))
+    }
+    fn block_state_block(&self, _state: &Value) -> Option<Value> {
+        None
+    }
+    fn block_has_collision(&self, _block: &Value) -> Option<bool> {
+        None
+    }
+    fn voxel_shape_to_string(&self, _key: &str) -> Option<String> {
+        None
+    }
     fn properties_put_all(&mut self, _marker: &str, _entries: Vec<(String, String)>) -> bool {
         false
     }
@@ -2649,6 +2695,36 @@ pub trait Host {
         _visibility_ordinal: u8,
     ) -> bool {
         false
+    }
+
+    /// Prepend an already-enabled, checked `ItemStack` to index 0 of an active
+    /// `FabricCreativeModeTabOutput`.
+    fn creative_tab_output_prepend_verified(
+        &mut self,
+        _output: &Value,
+        _stack: Value,
+        _visibility_ordinal: u8,
+    ) -> bool {
+        false
+    }
+
+    /// Insert already-enabled, checked `ItemStack`s before the first matching anchor (`before ==
+    /// true`) or after the last matching anchor (`before == false`) of an active
+    /// `FabricCreativeModeTabOutput`, appending to the end when the anchor is absent.
+    ///
+    /// When `anchor_is_stack` is `false`, `anchor` is the resolved `Item` value (`stack.is(item)`).
+    /// When `anchor_is_stack` is `true`, `anchor` is an `ItemStack` (`isSameItemSameComponents`).
+    /// Returns `Ok(None)` when anchor matching encounters an unknown component state.
+    fn creative_tab_output_insert_relative(
+        &mut self,
+        _output: &Value,
+        _anchor: &Value,
+        _anchor_is_stack: bool,
+        _stacks: Vec<Value>,
+        _visibility_ordinal: u8,
+        _before: bool,
+    ) -> Result<Option<bool>, NativeError> {
+        Ok(Some(false))
     }
 
     fn invoke(&mut self, r: &MethodRef, _: &[Value]) -> Result<Value, NativeError> {
@@ -2774,6 +2850,11 @@ pub trait Host {
         None
     }
 
+    /// The backing map marker of a live host `Map.Entry`, if any.
+    fn map_entry_source(&self, _value: &Value) -> Option<String> {
+        None
+    }
+
     /// Whether a host map entry implements a fastutil primitive entry interface.
     fn map_entry_is_instance_of(&self, _value: &Value, _wanted: &str) -> Option<bool> {
         None
@@ -2891,6 +2972,11 @@ pub trait Host {
         None
     }
 
+    /// The collection a `List.reversed()` view reads, by the view's marker.
+    fn reversed_view_source(&self, _marker: &str) -> Option<String> {
+        None
+    }
+
     fn is_unmodifiable_collection(&self, _marker: &str) -> bool {
         false
     }
@@ -2938,6 +3024,27 @@ pub trait Host {
     fn collection_generation(&self, _marker: &str) -> Option<u64> {
         None
     }
+
+    /// Allocate a fresh invocation run id for identity-epoch tracking.
+    fn next_identity_run(&mut self) -> u64 {
+        0
+    }
+
+    /// Clear per-collection identity-epoch entries after an epoch bump.
+    fn clear_identity_known_epochs(&mut self) {}
+
+    /// `(run_id, epoch)` at which `marker`'s identity-collection contents were
+    /// last known, if recorded.
+    fn identity_known_epoch(&self, _marker: &str) -> Option<(u64, u64)> {
+        None
+    }
+
+    /// Record the `(run_id, epoch)` at which `marker` was freshly constructed.
+    fn set_identity_known_epoch(&mut self, _marker: &str, _run_id: u64, _epoch: u64) {}
+
+    /// Record the current length of the runtime's identity-token table for
+    /// bounded-growth diagnostics.
+    fn note_identity_token_table_len(&mut self, _len: usize) {}
 
     /// The list the host keeps for `marker`, borrowed; `None` as for
     /// [`Self::collection_generation`].
@@ -3078,6 +3185,11 @@ pub trait Host {
         None
     }
 
+    /// The collection or iterator handle held by enumeration `marker`.
+    fn enumeration_source(&self, _marker: &str) -> Option<Value> {
+        None
+    }
+
     fn store_enumeration(&mut self, _marker: &str, _over: host_iterator::EnumerationOver) {}
 
     fn new_list_iterator(&mut self, _state: host_list_iterator::ListIter) -> Option<String> {
@@ -3086,6 +3198,11 @@ pub trait Host {
 
     /// A host list iterator's state, by marker.
     fn list_iterator(&self, _marker: &str) -> Option<host_list_iterator::ListIter> {
+        None
+    }
+
+    /// The list handle held by list iterator `marker`.
+    fn list_iterator_source(&self, _marker: &str) -> Option<Value> {
         None
     }
 
@@ -3130,6 +3247,14 @@ pub trait Host {
     }
 
     fn set_host_iterator_source(&mut self, _marker: &str, _source: String) {}
+
+    /// The originating collection or stream root handle for host iterator `marker`.
+    fn host_iterator_origin(&self, _marker: &str) -> Option<Value> {
+        None
+    }
+
+    /// Attach an originating collection or stream root handle to host iterator `marker`.
+    fn set_host_iterator_origin(&mut self, _marker: &str, _origin: Value) {}
 
     /// The provider classes explicitly seeded for one `ServiceLoader` key.
     /// An unseeded service answers an empty list, never a classpath scan.
@@ -3252,6 +3377,47 @@ pub trait Host {
     /// Hosts that do not model exceptions keep the default: an uncaught throw
     /// is still diagnosed, just without a message.
     fn throwable_message(&self, _marker: &str) -> Option<Option<String>> {
+        None
+    }
+
+    /// Registry id of a registered `SoundEvent` value (`MappedRegistry.wrapAsHolder`),
+    /// or `None` when unregistered (`Holder.direct`).
+    fn registered_sound_id(&self, _sound: &Value) -> Option<String> {
+        None
+    }
+
+    /// Unwrap a `Holder<SoundEvent>` handle into `(sound_event_value, bound_registry_id)`
+    /// or an `IllegalStateException` if it is an unbound `Holder$Reference`.
+    fn unwrap_sound_holder(
+        &mut self,
+        _value: &Value,
+    ) -> Option<Result<(Value, Option<String>), NativeError>> {
+        None
+    }
+
+    /// Handle for `Level.random` (`Level.getRandom()`) of `level_marker`.
+    fn level_random_handle(&mut self, _level_marker: &str) -> Option<Value> {
+        None
+    }
+
+    /// Draw `Level.soundSeedGenerator.nextLong()` for `level_marker` (or return
+    /// [`level_sound::SoundSeed::HostDeferred`] when a live host owns the seed stream).
+    fn draw_level_sound_seed(
+        &mut self,
+        _level_marker: &str,
+        _server_side: bool,
+    ) -> Option<level_sound::SoundSeed> {
+        None
+    }
+
+    /// Mark a level sound stream unknown (see `level_sound.rs`): Java drew, or
+    /// may have drawn, from it where Decaf did not, so every later draw from
+    /// it counts. A host that models no sound streams keeps the default: its
+    /// draws already count.
+    fn mark_sound_stream_unknown(&mut self, _stream: &str) {}
+
+    /// Construct a `SoundEvent` record handle from `new SoundEvent(Identifier, Optional<Float>)`.
+    fn construct_sound_event(&mut self, _r: &MethodRef, _args: &[Value]) -> Option<Value> {
         None
     }
 
@@ -3527,6 +3693,17 @@ pub trait Host {
     fn level_resource_id(&self, _marker: &str) -> Option<String> {
         None
     }
+
+    /// Whether an earlier leaky block-shape extraction may have left a live
+    /// `HostKind::ShapeProbe` in persistent state, keeping the structural probe
+    /// allow-list armed across later invocations until GC finds no probes left.
+    fn has_retained_shape_probes(&self) -> bool {
+        false
+    }
+
+    /// Record that a `HostKind::ShapeProbe` attempted an escaping operation
+    /// (stored, passed to a non-forwarding call, returned, thrown, or captured).
+    fn note_retained_shape_probe(&mut self) {}
 }
 
 #[derive(Debug, Default)]
@@ -3565,6 +3742,7 @@ const INFERRED_BLOCK_TEMPLATE: &str = "minecraft:stone";
 const MAX_PROPERTY_BUILDERS: usize = 512;
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct StatePropertyInfo {
+    field: String,
     kind: String,
     values: Vec<String>,
 }
@@ -3657,6 +3835,31 @@ pub struct StdHost {
     resource_generation: u64,
     /// Per-call container stack clamp resolved virtually for `SimpleContainer.setItem`.
     pending_container_clamp: Option<menu_models::ContainerClamp>,
+    /// Host-owned snapshots handed to a jar's `BlockPlaceContext` override,
+    /// by handle key (`placement-context/<serial>`).
+    /// The context is deliberately a value object: it has no guessed world
+    /// state and every accessor is answered from the placement snapshot.
+    ///
+    /// A row lives only while the placement it was made for runs:
+    /// [`NativeJar::block_state_for_placement`] registers it on entry and
+    /// releases it when the invocation returns, fails or unwinds
+    /// (`PlacementScope`), so a placement keeps nothing once it ends (#635:
+    /// every row used to stay, rooting its player, level and item for the
+    /// server's life). While a row is here it is a root of the heap's
+    /// collections (`heap.rs`); a handle the jar kept past its placement
+    /// finds no row and every accessor on it is counted, as a tooltip sink
+    /// is once its `appendHoverText` returns.
+    placement_contexts: BTreeMap<String, BlockPlaceContextData>,
+    /// The `Direction[]`s `getNearestLookingDirections` answered, by handle
+    /// key (`placement-array/<serial>`), each with the key of the context it
+    /// came from. The runtime copies one into a jar array as soon as the call
+    /// returns (`Runtime::materialize_host_array`), so the jar never holds
+    /// this row: it is a hand-off, released with its context.
+    placement_arrays: BTreeMap<String, (String, Vec<Value>)>,
+    /// The serial of the next placement context or array key. Never reused:
+    /// a key handed out again after a release would make a context the jar
+    /// kept answer for a different placement.
+    next_placement_handle: u64,
     resource_streams: BTreeMap<String, (Vec<u8>, usize)>,
     resource_marks: BTreeMap<String, usize>,
     /// Explicitly seeded class names exposed through `ClassLoader.loadClass`.
@@ -3762,13 +3965,15 @@ pub struct StdHost {
     item_property_builders: BTreeMap<String, BTreeMap<String, String>>,
     /// Bounded `BlockBehaviour.Properties` chains, keyed the same way.
     block_property_builders: BTreeMap<String, BTreeMap<String, String>>,
+    /// Property builders / blocks created from `ofFullCopy` / `ofLegacyCopy` / `copy` whose
+    /// source block's `hasCollision` is unknown (cleared if `.noCollision()` is called).
+    block_copied_properties: BTreeSet<String>,
     /// Properties captured from each mod block's virtual state-definition hook.
     block_state_properties: BTreeMap<String, BTreeMap<String, StatePropertyInfo>>,
     state_definition_builders: BTreeMap<String, String>,
     block_states: BTreeMap<String, (String, BTreeMap<String, String>)>,
     block_default_states: BTreeMap<String, BTreeMap<String, String>>,
     unknown_block_state_definitions: BTreeSet<String>,
-    next_block_state: usize,
     /// Marker counter for a property builder made by a static factory
     /// (`BlockBehaviour.Properties.of()`), which has no `new` site to name it.
     next_property_builder: usize,
@@ -3859,6 +4064,8 @@ pub struct StdHost {
     cached_collections: BTreeMap<(String, String), String>,
     /// Primitive state for vanilla RangedAttribute handles.
     ranged_attributes: BTreeMap<String, vanilla_values::RangedAttributeState>,
+    /// Modelled Minecraft 26.3 `VoxelShape` values, keyed by their host handle.
+    voxel_shapes: BTreeMap<String, voxel_shape::VoxelShapeData>,
     /// The `Arrays.asList` views and the arrays they mirror (`array_views.rs`).
     array_views: array_views::ArrayViews,
     /// The JDK's own `List.of`/`List.copyOf` lists among the unmodifiable
@@ -3901,7 +4108,9 @@ pub struct StdHost {
     /// The referent of every `java.lang.ref.Reference` a jar built, keyed by
     /// its object marker ([`references`]).
     references: BTreeMap<String, Value>,
-    iterators: BTreeMap<String, (Vec<Value>, usize)>,
+    iterators: BTreeMap<String, HostIterator>,
+    /// Peak length observed for `Runtime::identity_collections.tokens`.
+    peak_identity_tokens: usize,
     /// The last value returned by each generic iterator, for Iterator.remove.
     iterator_last: BTreeMap<String, Value>,
     /// The enumerations `Collections.enumeration`/`Vector.elements()` made, by key
@@ -3980,6 +4189,12 @@ pub struct StdHost {
     next_unmodifiable_collection: usize,
     next_reversed_view: usize,
     next_ranged_attribute: usize,
+    next_voxel_shape: u64,
+    next_shape_extraction: u64,
+    /// Set when a shape-extraction probe attempts an escaping operation (store,
+    /// non-forwarding call, return, throw, or capture); cleared by GC once no
+    /// live `HostKind::ShapeProbe` handles remain in heap or host roots.
+    retained_shape_probes: bool,
     /// The game event one listener is running for, so the façade markers a
     /// callback receives (server, level, player, NeoForge event object) can
     /// answer from it. `None` outside [`NativeJar::run_game_listener`].
@@ -4012,6 +4227,118 @@ pub struct StdHost {
     menu_states: menu_models::States,
     next_menu_object: u64,
     freed_menu_objects: heap::FreedObjects,
+    block_use: block_use::BlockUseHostState,
+    pub(crate) level_sound: level_sound::LevelSoundState,
+}
+
+/// Who placed the block for a [`BlockPlaceContextData`] snapshot.
+#[derive(Clone, Debug)]
+pub enum Placer {
+    /// A live player (`BlockPlaceContext` with non-null `getPlayer()`).
+    Player {
+        player: Value,
+        yaw: f32,
+        pitch: f32,
+        secondary_use: bool,
+    },
+    /// No player placed the block (`getPlayer() == null`).
+    ///
+    /// - `direction: Some(dir)` models vanilla `DirectionalPlaceContext`
+    ///   (e.g. a dispenser facing `dir`).
+    /// - `direction: None` models a plain `BlockPlaceContext` constructed with
+    ///   a `null` player.
+    None { direction: Option<Value> },
+    /// The host adapter did not tell the runtime whether a player placed the
+    /// block. Every player- or rotation-dependent accessor is counted as an
+    /// unknown host call rather than guessed.
+    Unknown,
+}
+
+/// The exact inputs exposed by vanilla's `BlockPlaceContext`/`UseOnContext`/
+/// `DirectionalPlaceContext`. Game adapters build this from their resolved
+/// placement snapshot; the runtime never derives a value from a mod or from a
+/// baked block state.
+#[derive(Clone, Debug)]
+pub struct BlockPlaceContextData {
+    pub clicked_pos: [i32; 3],
+    pub clicked_face: Value,
+    pub click_location: [f64; 3],
+    pub inside: bool,
+    pub replacing_clicked_on_block: bool,
+    pub can_place: bool,
+    pub placer: Placer,
+    pub item_in_hand: Value,
+    pub level: Value,
+}
+
+/// The key prefix of a `BlockPlaceContext` handle
+/// (`StdHost::new_block_place_context`).
+const PLACEMENT_CONTEXT_PREFIX: &str = "placement-context/";
+
+/// The `BlockPlaceContext` accessors `StdHost` answers from a placement
+/// snapshot. One list, so a registered context and a released one (#635)
+/// claim exactly the same calls: the first answers them, the second counts
+/// them, and every other call takes the ordinary host path either way.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PlacementAccessor {
+    ClickedPos,
+    ClickedFace,
+    ClickLocation,
+    Inside,
+    ItemInHand,
+    Level,
+    CanPlace,
+    ReplacingClickedOnBlock,
+    Player,
+    HorizontalDirection,
+    SecondaryUseActive,
+    Rotation,
+    NearestLookingDirection,
+    NearestLookingVerticalDirection,
+    NearestLookingDirections,
+}
+
+impl PlacementAccessor {
+    fn of(r: &MethodRef) -> Option<Self> {
+        Some(match (r.name.as_str(), r.descriptor.as_str()) {
+            ("getClickedPos", "()Lnet/minecraft/core/BlockPos;") => Self::ClickedPos,
+            ("getClickedFace", "()Lnet/minecraft/core/Direction;") => Self::ClickedFace,
+            ("getClickLocation", "()Lnet/minecraft/world/phys/Vec3;") => Self::ClickLocation,
+            ("isInside", "()Z") => Self::Inside,
+            ("getItemInHand", "()Lnet/minecraft/world/item/ItemStack;") => Self::ItemInHand,
+            ("getLevel", "()Lnet/minecraft/world/level/Level;") => Self::Level,
+            ("canPlace", "()Z") => Self::CanPlace,
+            ("replacingClickedOnBlock", "()Z") => Self::ReplacingClickedOnBlock,
+            ("getPlayer", "()Lnet/minecraft/world/entity/player/Player;") => Self::Player,
+            ("getHorizontalDirection", "()Lnet/minecraft/core/Direction;") => {
+                Self::HorizontalDirection
+            }
+            ("isSecondaryUseActive", "()Z") => Self::SecondaryUseActive,
+            ("getRotation", "()F") => Self::Rotation,
+            ("getNearestLookingDirection", "()Lnet/minecraft/core/Direction;") => {
+                Self::NearestLookingDirection
+            }
+            ("getNearestLookingVerticalDirection", "()Lnet/minecraft/core/Direction;") => {
+                Self::NearestLookingVerticalDirection
+            }
+            ("getNearestLookingDirections", "()[Lnet/minecraft/core/Direction;") => {
+                Self::NearestLookingDirections
+            }
+            _ => return None,
+        })
+    }
+}
+
+fn opposite(direction: &str) -> &'static str {
+    match direction {
+        "DOWN" => "UP",
+        "UP" => "DOWN",
+        "NORTH" => "SOUTH",
+        "SOUTH" => "NORTH",
+        "WEST" => "EAST",
+        "EAST" => "WEST",
+        _ => "NORTH",
+    }
 }
 
 impl Default for StdHost {
@@ -4058,6 +4385,9 @@ impl StdHost {
             data_pack_layers: Vec::new(),
             resource_generation: 0,
             pending_container_clamp: None,
+            placement_contexts: BTreeMap::new(),
+            placement_arrays: BTreeMap::new(),
+            next_placement_handle: 0,
             resource_streams: BTreeMap::new(),
             resource_marks: BTreeMap::new(),
             classes: BTreeMap::new(),
@@ -4099,12 +4429,12 @@ impl StdHost {
             declared_registrations: BTreeSet::new(),
             item_property_builders: BTreeMap::new(),
             block_property_builders: BTreeMap::new(),
+            block_copied_properties: BTreeSet::new(),
             block_state_properties: BTreeMap::new(),
             state_definition_builders: BTreeMap::new(),
             block_states: BTreeMap::new(),
             block_default_states: BTreeMap::new(),
             unknown_block_state_definitions: BTreeSet::new(),
-            next_block_state: 0,
             next_property_builder: 0,
             payload_registrations: Vec::new(),
             outgoing_payloads: Vec::new(),
@@ -4142,6 +4472,7 @@ impl StdHost {
             shared_empties: BTreeMap::new(),
             cached_collections: BTreeMap::new(),
             ranged_attributes: BTreeMap::new(),
+            voxel_shapes: BTreeMap::new(),
             array_views: Default::default(),
             jdk_list_of: std::collections::BTreeSet::new(),
             charset_decoders: BTreeMap::new(),
@@ -4159,6 +4490,7 @@ impl StdHost {
             levels: Vec::new(),
             references: BTreeMap::new(),
             iterators: BTreeMap::new(),
+            peak_identity_tokens: 0,
             iterator_last: BTreeMap::new(),
             enumerations: BTreeMap::new(),
             iterator_guards: BTreeMap::new(),
@@ -4195,6 +4527,9 @@ impl StdHost {
             next_unmodifiable_collection: 0,
             next_reversed_view: 0,
             next_ranged_attribute: 0,
+            next_voxel_shape: 0,
+            next_shape_extraction: 0,
+            retained_shape_probes: false,
             game_event: None,
             client: client_surface::ClientState::default(),
             render_objects: BTreeMap::new(),
@@ -4212,6 +4547,8 @@ impl StdHost {
             menu_states: BTreeMap::new(),
             next_menu_object: 0,
             freed_menu_objects: heap::FreedObjects::default(),
+            block_use: block_use::BlockUseHostState::default(),
+            level_sound: level_sound::LevelSoundState::default(),
         }
     }
 
@@ -4860,7 +5197,8 @@ impl StdHost {
             .resource(name)
             .map(|value| vec![Value::Ref(Some(value.to_owned()))])
             .unwrap_or_default();
-        self.iterators.insert(marker.clone(), (values, 0));
+        self.iterators
+            .insert(marker.clone(), HostIterator::new(values, None));
         host_iterator::enumeration(marker)
     }
 
@@ -5512,6 +5850,323 @@ impl StdHost {
         &self.calls
     }
 
+    /// Register a vanilla-shaped `BlockPlaceContext` snapshot for a virtual
+    /// block call, until [`Self::release_block_place_context`].
+    ///
+    /// [`NativeJar::block_state_for_placement`] does both around its
+    /// invocation; a caller that passes the handle to an invocation of its own
+    /// releases it once that invocation (and any nested call reusing the
+    /// handle) is done. While registered, the snapshot is a root of the
+    /// heap's collections; once released, every accessor on a handle the jar
+    /// kept is counted, never answered from the old snapshot.
+    pub fn new_block_place_context(&mut self, data: BlockPlaceContextData) -> Value {
+        let key = format!("{PLACEMENT_CONTEXT_PREFIX}{}", self.next_placement_serial());
+        self.placement_contexts.insert(key.clone(), data);
+        Value::Host(HostRef::new(HostKind::GameTransient, key))
+    }
+
+    /// Drop a snapshot [`Self::new_block_place_context`] registered, with
+    /// every `Direction[]` its `getNearestLookingDirections` answered (the jar
+    /// already holds its own copy of each). Releasing a value that is not a
+    /// registered context, or one already released, does nothing.
+    pub fn release_block_place_context(&mut self, context: &Value) {
+        let Value::Host(handle) = context else {
+            return;
+        };
+        if handle.kind() != HostKind::GameTransient
+            || self.placement_contexts.remove(handle.key()).is_none()
+        {
+            return;
+        }
+        self.placement_arrays
+            .retain(|_, (owner, _)| owner.as_str() != handle.key());
+    }
+
+    /// How many `BlockPlaceContext` snapshots are registered now: zero
+    /// between placements, however many ran.
+    pub fn block_place_context_count(&self) -> usize {
+        self.placement_contexts.len()
+    }
+
+    /// How many `getNearestLookingDirections` hand-off arrays the host holds
+    /// now: zero between placements, however many ran.
+    pub fn placement_array_count(&self) -> usize {
+        self.placement_arrays.len()
+    }
+
+    /// A placement handle serial that is never handed out twice by this host.
+    /// The space is `u64`, so exhaustion is unreachable in practice, but it is
+    /// a hard stop rather than a wrap: a wrapped serial would alias a context
+    /// a long-lived caller still holds.
+    fn next_placement_serial(&mut self) -> u64 {
+        let serial = self.next_placement_handle;
+        self.next_placement_handle = serial
+            .checked_add(1)
+            .expect("placement handle serials exhausted; refusing to reuse one");
+        serial
+    }
+
+    /// The canonical empty `ItemStack` used by vanilla contexts with no hand item.
+    pub fn empty_item_stack() -> Value {
+        menu_models::empty_stack()
+    }
+
+    fn placement_direction(name: &str) -> Value {
+        Value::Ref(Some(format!("enum/net/minecraft/core/Direction/{name}")))
+    }
+
+    fn direction_name(value: &Value) -> Option<&str> {
+        let name = crate::expect_ref(value)?.strip_prefix("enum/net/minecraft/core/Direction/")?;
+        matches!(name, "DOWN" | "UP" | "NORTH" | "SOUTH" | "WEST" | "EAST").then_some(name)
+    }
+
+    fn direction_data_2d(direction: &str) -> Option<i32> {
+        match direction {
+            "DOWN" | "UP" => Some(-1),
+            "SOUTH" => Some(0),
+            "WEST" => Some(1),
+            "NORTH" => Some(2),
+            "EAST" => Some(3),
+            _ => None,
+        }
+    }
+
+    fn directional_nearest_looking_directions(direction: &str) -> Option<[&'static str; 6]> {
+        match direction {
+            "DOWN" => Some(["DOWN", "NORTH", "EAST", "SOUTH", "WEST", "UP"]),
+            "UP" => Some(["DOWN", "UP", "NORTH", "EAST", "SOUTH", "WEST"]),
+            "NORTH" => Some(["DOWN", "NORTH", "EAST", "WEST", "UP", "SOUTH"]),
+            "SOUTH" => Some(["DOWN", "SOUTH", "EAST", "WEST", "UP", "NORTH"]),
+            "WEST" => Some(["DOWN", "WEST", "SOUTH", "UP", "NORTH", "EAST"]),
+            "EAST" => Some(["DOWN", "EAST", "SOUTH", "UP", "NORTH", "WEST"]),
+            _ => None,
+        }
+    }
+
+    fn null_entity_view_xrot_npe() -> NativeError {
+        NativeError::UncaughtException {
+            class: "java/lang/NullPointerException".into(),
+            message: Some(
+                "Cannot invoke \"net.minecraft.world.entity.Entity.getViewXRot(float)\" because \"entity\" is null"
+                    .into(),
+            ),
+            frame: None,
+        }
+    }
+
+    fn placement_yaw_direction(yaw: f32) -> &'static str {
+        const HORIZONTAL: [&str; 4] = ["SOUTH", "WEST", "NORTH", "EAST"];
+        let scaled = f64::from(yaw) / 90.0 + 0.5;
+        let i = scaled as i32;
+        let floored = if scaled < f64::from(i) {
+            i.wrapping_sub(1)
+        } else {
+            i
+        };
+        HORIZONTAL[(floored & 3) as usize]
+    }
+
+    fn mth_sin_table() -> &'static [f32] {
+        static SIN: OnceLock<Box<[f32]>> = OnceLock::new();
+        SIN.get_or_init(|| {
+            (0..65_536)
+                .map(|i| (f64::from(i) / 10_430.378_350_470_453).sin() as f32)
+                .collect::<Vec<_>>()
+                .into_boxed_slice()
+        })
+    }
+
+    fn mth_sin(angle: f64) -> f32 {
+        Self::mth_sin_table()[((angle * 10_430.378_350_470_453) as i64 & 65_535) as usize]
+    }
+
+    fn mth_cos(angle: f64) -> f32 {
+        Self::mth_sin_table()
+            [((angle * 10_430.378_350_470_453 + 16_384.0) as i64 & 65_535) as usize]
+    }
+
+    fn placement_ordered_directions(yaw: f32, pitch: f32) -> [&'static str; 6] {
+        let pitch = pitch * 0.017453292f32;
+        let yaw = -yaw * 0.017453292f32;
+        let pitch_sin = Self::mth_sin(f64::from(pitch));
+        let pitch_cos = Self::mth_cos(f64::from(pitch));
+        let yaw_sin = Self::mth_sin(f64::from(yaw));
+        let yaw_cos = Self::mth_cos(f64::from(yaw));
+        let x_pos = yaw_sin > 0.0;
+        let y_pos = pitch_sin < 0.0;
+        let z_pos = yaw_cos > 0.0;
+        let x_yaw = if x_pos { yaw_sin } else { -yaw_sin };
+        let y_mag = if y_pos { -pitch_sin } else { pitch_sin };
+        let z_yaw = if z_pos { yaw_cos } else { -yaw_cos };
+        let x_mag = x_yaw * pitch_cos;
+        let z_mag = z_yaw * pitch_cos;
+        let ax = if x_pos { "EAST" } else { "WEST" };
+        let ay = if y_pos { "UP" } else { "DOWN" };
+        let az = if z_pos { "SOUTH" } else { "NORTH" };
+        let make = |a, b, c| [a, b, c, opposite(c), opposite(b), opposite(a)];
+        if x_yaw > z_yaw {
+            if y_mag > x_mag {
+                make(ay, ax, az)
+            } else if z_mag > y_mag {
+                make(ax, az, ay)
+            } else {
+                make(ax, ay, az)
+            }
+        } else if y_mag > z_mag {
+            make(ay, az, ax)
+        } else if x_mag > y_mag {
+            make(az, ax, ay)
+        } else {
+            make(az, ay, ax)
+        }
+    }
+
+    /// Hand `names` to the runtime as a fresh `Direction[]`, owned by the
+    /// context `owner` (its key), which releases it.
+    fn store_placement_direction_array(&mut self, owner: &str, names: [&'static str; 6]) -> Value {
+        let values = names
+            .into_iter()
+            .map(Self::placement_direction)
+            .collect::<Vec<_>>();
+        let key = format!("placement-array/{}", self.next_placement_serial());
+        self.placement_arrays
+            .insert(key.clone(), (owner.to_owned(), values));
+        Value::Host(HostRef::new(HostKind::GameTransient, key))
+    }
+
+    /// A `BlockPlaceContext` accessor on a handle
+    /// [`Self::new_block_place_context`] made. `None` leaves every other call
+    /// (and every other receiver) on the ordinary host path, for a released
+    /// handle exactly as for a registered one.
+    fn placement_context_call(
+        &mut self,
+        r: &MethodRef,
+        receiver: &Value,
+    ) -> Option<Result<Value, NativeError>> {
+        let Value::Host(handle) = receiver else {
+            return None;
+        };
+        if handle.kind() != HostKind::GameTransient
+            || !handle.key().starts_with(PLACEMENT_CONTEXT_PREFIX)
+        {
+            return None;
+        }
+        let accessor = PlacementAccessor::of(r)?;
+        let Some(context) = self.placement_contexts.get(handle.key()).cloned() else {
+            // The jar kept the context past the placement it was made for
+            // (#635). Most accessors read the player or the world as they are
+            // now (`canPlace`, the rotation family, `isSecondaryUseActive`),
+            // which the old snapshot no longer is, so each is counted rather
+            // than answered stale.
+            return Some(self.unknown_host_call(r));
+        };
+        let owner = handle.key().to_owned();
+        let direction = |name| Ok(Self::placement_direction(name));
+        let pos = || {
+            Ok(crate::game_object::server_value(format!(
+                "block-pos/{},{},{}",
+                context.clicked_pos[0], context.clicked_pos[1], context.clicked_pos[2]
+            )))
+        };
+        let result = match accessor {
+            PlacementAccessor::ClickedPos => pos(),
+            PlacementAccessor::ClickedFace => Ok(context.clicked_face),
+            PlacementAccessor::ClickLocation => Ok(crate::game_object::client_value(format!(
+                "client/vec3/{},{},{}",
+                context.click_location[0], context.click_location[1], context.click_location[2]
+            ))),
+            PlacementAccessor::Inside => Ok(Value::Int(i32::from(context.inside))),
+            PlacementAccessor::ItemInHand => Ok(context.item_in_hand),
+            PlacementAccessor::Level => Ok(context.level),
+            PlacementAccessor::CanPlace => Ok(Value::Int(i32::from(context.can_place))),
+            PlacementAccessor::ReplacingClickedOnBlock => match context.placer {
+                Placer::None { direction: Some(_) } => Ok(Value::Int(i32::from(context.can_place))),
+                Placer::Player { .. } | Placer::None { direction: None } | Placer::Unknown => {
+                    Ok(Value::Int(i32::from(context.replacing_clicked_on_block)))
+                }
+            },
+            PlacementAccessor::Player => match context.placer {
+                Placer::Player { player, .. } => Ok(player),
+                Placer::None { .. } => Ok(Value::Ref(None)),
+                Placer::Unknown => self.unknown_host_call(r),
+            },
+            PlacementAccessor::HorizontalDirection => match context.placer {
+                Placer::Player { yaw, .. } => direction(Self::placement_yaw_direction(yaw)),
+                Placer::None { direction: None } => direction("NORTH"),
+                Placer::None {
+                    direction: Some(ref dir),
+                } => match Self::direction_name(dir) {
+                    Some("DOWN" | "UP") => direction("NORTH"),
+                    Some(name) => direction(name),
+                    None => self.unknown_host_call(r),
+                },
+                Placer::Unknown => self.unknown_host_call(r),
+            },
+            PlacementAccessor::SecondaryUseActive => match context.placer {
+                Placer::Player { secondary_use, .. } => Ok(Value::Int(i32::from(secondary_use))),
+                Placer::None { .. } => Ok(Value::Int(0)),
+                Placer::Unknown => self.unknown_host_call(r),
+            },
+            PlacementAccessor::Rotation => match context.placer {
+                Placer::Player { yaw, .. } => Ok(Value::Float(f64::from(yaw))),
+                Placer::None { direction: None } => Ok(Value::Float(0.0)),
+                Placer::None {
+                    direction: Some(ref dir),
+                } => match Self::direction_name(dir).and_then(Self::direction_data_2d) {
+                    Some(data_2d) => Ok(Value::Float(f64::from((data_2d * 90) as f32))),
+                    None => self.unknown_host_call(r),
+                },
+                Placer::Unknown => self.unknown_host_call(r),
+            },
+            PlacementAccessor::NearestLookingDirection => match context.placer {
+                Placer::Player { yaw, pitch, .. } => {
+                    direction(Self::placement_ordered_directions(yaw, pitch)[0])
+                }
+                Placer::None { direction: Some(_) } => direction("DOWN"),
+                Placer::None { direction: None } => Err(Self::null_entity_view_xrot_npe()),
+                Placer::Unknown => self.unknown_host_call(r),
+            },
+            PlacementAccessor::NearestLookingVerticalDirection => match context.placer {
+                Placer::Player { pitch, .. } => direction(if pitch < 0.0 { "UP" } else { "DOWN" }),
+                Placer::None { .. } => Err(Self::null_entity_view_xrot_npe()),
+                Placer::Unknown => self.unknown_host_call(r),
+            },
+            PlacementAccessor::NearestLookingDirections => match context.placer {
+                Placer::Player { yaw, pitch, .. } => {
+                    let mut names = Self::placement_ordered_directions(yaw, pitch);
+                    if !context.replacing_clicked_on_block {
+                        let Some(clicked) = Self::direction_name(&context.clicked_face) else {
+                            return Some(self.unknown_host_call(r));
+                        };
+                        let clicked_opp = opposite(clicked);
+                        if let Some(index) = names.iter().position(|name| *name == clicked_opp)
+                            && index > 0
+                        {
+                            for i in (0..index).rev() {
+                                names[i + 1] = names[i];
+                            }
+                            names[0] = clicked_opp;
+                        }
+                    }
+                    Ok(self.store_placement_direction_array(&owner, names))
+                }
+                Placer::None {
+                    direction: Some(ref dir),
+                } => {
+                    let Some(names) = Self::direction_name(dir)
+                        .and_then(Self::directional_nearest_looking_directions)
+                    else {
+                        return Some(self.unknown_host_call(r));
+                    };
+                    Ok(self.store_placement_direction_array(&owner, names))
+                }
+                Placer::None { direction: None } => Err(Self::null_entity_view_xrot_npe()),
+                Placer::Unknown => self.unknown_host_call(r),
+            },
+        };
+        Some(result)
+    }
+
     pub fn invocations(&self) -> &[HostInvocation] {
         &self.invocations
     }
@@ -5521,18 +6176,105 @@ impl StdHost {
         host_creative_tab::begin_output(&mut self.creative_tab, tab)
     }
 
-    pub(crate) fn begin_creative_tab_output_with(
+    pub(crate) fn begin_creative_tab_output_with_initial(
         &mut self,
         tab: &str,
         enabled_features: u64,
         has_permissions: bool,
+        initial_display: Vec<Value>,
+        initial_search: Vec<Value>,
     ) -> Value {
-        host_creative_tab::begin_output_with(
+        host_creative_tab::begin_output_with_initial(
             &mut self.creative_tab,
             tab,
             enabled_features,
             has_permissions,
+            initial_display,
+            initial_search,
         )
+    }
+
+    /// Allocate a host `ItemStack` representing an existing game stack for `item_id` (for
+    /// seeding a creative tab with vanilla/earlier-mod entries before Fabric listeners run).
+    ///
+    /// If `has_custom_components` is true, the stack's components are marked opaque so
+    /// `ItemStack.isSameItemSameComponents` counts comparisons against same-item stacks rather
+    /// than guessing component equality.
+    pub fn make_item_stack_for_id(
+        &mut self,
+        item_id: &str,
+        count: i32,
+        has_custom_components: bool,
+    ) -> Value {
+        let live = recipe_models::LiveStack::from_host_item_id(
+            self,
+            item_id,
+            count,
+            has_custom_components,
+        );
+        self.recipes.alloc_stack(live)
+    }
+
+    /// Allocate a modelled host `ItemStack` carrying converted component overrides/removals and
+    /// tracking any unrepresentable component keys as opaque so Java reads count rather than
+    /// seeing defaults.
+    pub fn make_host_item_stack_with_components(
+        &mut self,
+        item_override: Option<Value>,
+        item_id: &str,
+        count: i32,
+        patch: Vec<(String, Option<RuntimeComponentValue>)>,
+        opaque_components: bool,
+        opaque_keys: Vec<String>,
+    ) -> Value {
+        recipe_models::build_host_stack(
+            self,
+            item_override,
+            item_id,
+            count,
+            patch,
+            opaque_components,
+            opaque_keys,
+        )
+    }
+
+    /// Extract item id, count, and modelled component patch entries from a runtime `ItemStack`.
+    pub fn item_stack_components(&self, stack: &Value) -> Option<StackComponents> {
+        recipe_models::extract_stack_components(self, stack)
+    }
+
+    /// Compare two runtime `ItemStack`s using vanilla `ItemStack.isSameItemSameComponents`
+    /// semantics (`Ok(None)` if opaque/unmodelled components prevent a sound answer).
+    pub fn stacks_same_item_same_components(
+        &self,
+        a: &Value,
+        b: &Value,
+    ) -> Result<Option<bool>, NativeError> {
+        recipe_models::stacks_same_item_same_components(self, a, b)
+    }
+
+    /// Allocate a modelled `TooltipDisplay` handle reflecting the host's real tooltip visibility.
+    pub fn make_tooltip_display(
+        &mut self,
+        hide_tooltip: bool,
+        hidden_components: Vec<String>,
+        hidden_known: bool,
+    ) -> Value {
+        self.recipes
+            .alloc_tooltip_display(recipe_models::TooltipDisplayData {
+                hide_tooltip,
+                hidden_components,
+                hidden_known,
+            })
+    }
+
+    /// Every `minecraft:data_component_type` id registered by loaded jars on this host.
+    pub fn registered_data_component_ids(&self) -> Vec<String> {
+        self.registrations
+            .iter()
+            .filter(|entry| entry.registry == "minecraft:data_component_type")
+            .map(|entry| entry.id.clone())
+            .collect()
     }
 
     /// Finish a creative-tab callback and return the display stacks in their recorded order.
@@ -5596,6 +6338,14 @@ impl StdHost {
             }
         }
         None
+    }
+
+    fn same_item_value(a: &Value, b: &Value) -> Option<bool> {
+        match (a, b) {
+            (Value::Host(a), Value::Host(b)) => a.same_object(b),
+            (_, Value::Ref(None)) | (Value::Ref(None), _) => Some(false),
+            _ => Some(a == b),
+        }
     }
 
     fn registered_item_id_impl(&self, item: &Value) -> Option<String> {
@@ -5923,6 +6673,34 @@ impl StdHost {
         self.block_property_builders.get(marker)
     }
 
+    /// Decode a canonical Java `BlockState` into the registered block id and
+    /// serialized property values for a game adapter.
+    pub fn block_state_content(&self, state: &Value) -> Option<(String, BTreeMap<String, String>)> {
+        // Canonical default state of a vanilla `Blocks.<FIELD>` handle
+        // (`Value::Host(HostKind::GameRegistryObject, "game/default-block-state/<id>")`).
+        // A bare `game/block-state/<id>` handle from world reads has unknown
+        // properties and is intentionally not decoded here, and forged Strings
+        // never match because only real host handles are accepted.
+        if let Value::Host(handle) = state
+            && handle.kind() == HostKind::GameRegistryObject
+            && let Some(id) = handle.key().strip_prefix("game/default-block-state/")
+        {
+            return Some((id.to_owned(), BTreeMap::new()));
+        }
+        let marker = expect_ref(state)?;
+        let (block, values) = self.block_states.get(marker)?;
+        let id = self
+            .registrations
+            .iter()
+            .rev()
+            .find(|entry| {
+                entry.registry == "minecraft:block"
+                    && jar_object::object_key(&entry.value) == Some(block.as_str())
+            })
+            .map(|entry| entry.id.clone())?;
+        Some((id, values.clone()))
+    }
+
     fn captured_property(field: &str) -> Option<StatePropertyInfo> {
         crate::vanilla_block_state_properties::TABLE
             .lines()
@@ -5938,9 +6716,164 @@ impl StdHost {
                         .filter(|value| !value.is_empty())
                         .map(str::to_owned)
                         .collect();
-                    Some(StatePropertyInfo { kind, values })
+                    Some(StatePropertyInfo {
+                        field: field.to_owned(),
+                        kind,
+                        values,
+                    })
                 })?
             })
+    }
+
+    pub(crate) fn has_unknown_block_state_definition(&self, marker: &str) -> bool {
+        self.unknown_block_state_definitions.contains(marker)
+    }
+
+    /// Enumerate every state combination of `block_marker` in `BTreeMap` property-name order.
+    /// Returns `None` if the Cartesian product would exceed `max_states`.
+    pub(crate) fn enumerate_block_state_combinations(
+        &self,
+        block_marker: &str,
+        max_states: usize,
+    ) -> Option<(Vec<String>, Vec<BTreeMap<String, String>>)> {
+        let Some(props) = self.block_state_properties.get(block_marker) else {
+            return Some((Vec::new(), vec![BTreeMap::new()]));
+        };
+        let names: Vec<String> = props.keys().cloned().collect();
+        let mut combos: Vec<BTreeMap<String, String>> = vec![BTreeMap::new()];
+        for (name, info) in props {
+            if info.values.is_empty() {
+                return None;
+            }
+            let next_len = combos.len().checked_mul(info.values.len())?;
+            if next_len > max_states {
+                return None;
+            }
+            let mut next = Vec::with_capacity(next_len);
+            for base in &combos {
+                for val in &info.values {
+                    let mut entry = base.clone();
+                    entry.insert(name.clone(), val.clone());
+                    next.push(entry);
+                }
+            }
+            combos = next;
+        }
+        Some((names, combos))
+    }
+
+    fn canonical_block_state_marker(
+        block_marker: &str,
+        values: &BTreeMap<String, String>,
+    ) -> String {
+        let mut out = format!("blockstate/{block_marker}[");
+        for (i, (k, v)) in values.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            out.push_str(k);
+            out.push('=');
+            out.push_str(v);
+        }
+        out.push(']');
+        out
+    }
+
+    /// Return the canonical `BlockState` marker for `(block_marker, values)`, populating any
+    /// missing captured properties with their default/first value so every state in a block's
+    /// `StateDefinition` maps 1-to-1 to a single canonical object (matching MC 26.3
+    /// `StateHolder.setValueInternal` returning `this.neighbors[propIndex][valIndex]`).
+    ///
+    /// Canonical state markers live exactly as long as their owning `Block` object
+    /// (reachable directly through the block or through any jar reference to a state,
+    /// and dropped when the collector frees the block), keeping metadata and `==` identity
+    /// stable while the block is alive.
+    pub(crate) fn canonical_block_state(
+        &mut self,
+        block_marker: &str,
+        mut values: BTreeMap<String, String>,
+    ) -> Value {
+        if let Some(props) = self.block_state_properties.get(block_marker) {
+            for (name, info) in props {
+                if !values.contains_key(name)
+                    && let Some(val) = self
+                        .block_default_states
+                        .get(block_marker)
+                        .and_then(|d| d.get(name))
+                        .or_else(|| info.values.first())
+                {
+                    values.insert(name.clone(), val.clone());
+                }
+            }
+        }
+        let key = Self::canonical_block_state_marker(block_marker, &values);
+        self.block_states
+            .entry(key.clone())
+            .or_insert_with(|| (block_marker.to_owned(), values));
+        Value::Ref(Some(key))
+    }
+
+    pub(crate) fn mint_block_state(
+        &mut self,
+        block_marker: &str,
+        values: BTreeMap<String, String>,
+    ) -> Value {
+        self.canonical_block_state(block_marker, values)
+    }
+
+    pub(crate) fn next_shape_extraction_id(&mut self) -> u64 {
+        self.next_shape_extraction = self.next_shape_extraction.saturating_add(1);
+        self.next_shape_extraction
+    }
+
+    /// Whether an earlier leaky block-shape extraction may have left a live
+    /// `HostKind::ShapeProbe` in persistent state (so the per-opcode probe check
+    /// stays armed between extractions until GC finds no live probes left).
+    pub fn has_retained_shape_probes(&self) -> bool {
+        self.retained_shape_probes
+    }
+
+    pub(crate) fn block_has_collision_by_marker(&self, block_marker: &str) -> Option<bool> {
+        let props = self.block_property_builders.get(block_marker)?;
+        if props.contains_key("noCollision") {
+            return Some(false);
+        }
+        if self.block_copied_properties.contains(block_marker) {
+            return None;
+        }
+        Some(true)
+    }
+
+    pub(crate) fn block_to_string(&self, block_marker: &str) -> String {
+        if let Some(entry) = self.registrations.iter().find(|entry| {
+            entry.registry == "minecraft:block"
+                && crate::jar_object::object_key(&entry.value) == Some(block_marker)
+        }) {
+            return format!("Block{{{}}}", entry.id);
+        }
+        "Block{[unregistered]}".to_owned()
+    }
+
+    pub(crate) fn set_block_declaration_shapes(
+        &mut self,
+        registration_index: usize,
+        shapes_json: Option<String>,
+        collision_shapes_json: Option<String>,
+    ) {
+        if let Some(entry) = self.registrations.get_mut(registration_index)
+            && let Some(RegistryDeclaration::Block { properties, .. }) = entry.declaration.as_mut()
+        {
+            if let Some(json) = shapes_json {
+                properties.insert("shapes".to_owned(), json);
+            } else {
+                properties.remove("shapes");
+            }
+            if let Some(json) = collision_shapes_json {
+                properties.insert("collision_shapes".to_owned(), json);
+            } else {
+                properties.remove("collision_shapes");
+            }
+        }
     }
 
     /// The declared class of a captured `BlockStateProperties` field (`EnumProperty`,
@@ -5951,17 +6884,6 @@ impl StdHost {
             .find_map(|line| {
                 let mut parts = line.split('|');
                 (parts.next()? == field).then(|| parts.nth(3)).flatten()
-            })
-    }
-
-    fn captured_property_name(field: &str) -> Option<String> {
-        crate::vanilla_block_state_properties::TABLE
-            .lines()
-            .find_map(|line| {
-                let mut parts = line.split('|');
-                (parts.next()? == field)
-                    .then(|| parts.next().map(str::to_owned))
-                    .flatten()
             })
     }
 
@@ -6679,46 +7601,394 @@ impl StdHost {
             && r.descriptor.ends_with("BlockState;")
             && r.owner.starts_with("net/minecraft/world/level/block/")
         {
-            let state = format!("blockstate/{}/{}", marker, self.next_block_state);
-            self.next_block_state = self.next_block_state.saturating_add(1);
-            self.block_states
-                .insert(state.clone(), (marker.to_owned(), BTreeMap::new()));
-            return Ok(Some(Value::Ref(Some(state))));
+            let mut values = BTreeMap::new();
+            if let Some(props) = self.block_state_properties.get(marker) {
+                for (name, info) in props {
+                    if let Some(first) = info.values.first() {
+                        values.insert(name.clone(), first.clone());
+                    }
+                }
+            }
+            if let Some(defaults) = self.block_default_states.get(marker) {
+                for (name, value) in defaults {
+                    values.insert(name.clone(), value.clone());
+                }
+            }
+            return Ok(Some(self.canonical_block_state(marker, values)));
         }
-        if r.name == "setValue" && marker.starts_with("blockstate/") {
+        if marker.starts_with("blockstate/") {
             let Some((block, values)) = self.block_states.get(marker).cloned() else {
                 return Ok(None);
             };
-            let Some(property) = args.first().and_then(expect_ref) else {
-                return Ok(None);
-            };
-            let Some(name) = property
-                .strip_prefix("property/BlockStateProperties.")
-                .and_then(Self::captured_property_name)
-            else {
-                return Ok(None);
-            };
-            let value = match args.get(1) {
-                Some(Value::Int(value)) => (*value != 0)
-                    .then_some("true".to_owned())
-                    .or_else(|| Some("false".to_owned())),
-                Some(Value::Boxed(Boxed::Boolean(value))) => Some(value.to_string()),
-                Some(Value::Boxed(Boxed::Integer(value))) => Some(value.to_string()),
-                Some(Value::Ref(Some(value))) => value
-                    .rsplit('/')
-                    .next()
-                    .map(|value| value.to_ascii_lowercase()),
-                _ => None,
-            };
-            let Some(value) = value else {
-                return Ok(None);
-            };
-            let state = format!("blockstate/{}/{}", block, self.next_block_state);
-            self.next_block_state = self.next_block_state.saturating_add(1);
-            let mut values = values;
-            values.insert(name, value);
-            self.block_states.insert(state.clone(), (block, values));
-            return Ok(Some(Value::Ref(Some(state))));
+            match (r.name.as_str(), r.descriptor.as_str()) {
+                ("getBlock", "()Lnet/minecraft/world/level/block/Block;") => {
+                    return Ok(Some(jar_object::stored_value(&block)));
+                }
+                ("is", "(Lnet/minecraft/world/level/block/Block;)Z") => {
+                    if let Some(other) = args.first().and_then(jar_object::object_key) {
+                        return Ok(Some(Value::Int(i32::from(other == block))));
+                    }
+                    return Ok(None);
+                }
+                (
+                    "hasProperty",
+                    "(Lnet/minecraft/world/level/block/state/properties/Property;)Z",
+                ) => {
+                    if self.unknown_block_state_definitions.contains(&block) {
+                        return Ok(None);
+                    }
+                    if matches!(args.first(), None | Some(Value::Ref(None))) {
+                        return Ok(Some(Value::Int(0)));
+                    }
+                    let Some(field) = args
+                        .first()
+                        .and_then(expect_ref)
+                        .and_then(|p| p.strip_prefix("property/BlockStateProperties."))
+                    else {
+                        return Ok(None);
+                    };
+                    let has = self
+                        .block_state_properties
+                        .get(&block)
+                        .is_some_and(|props| props.values().any(|info| info.field == field));
+                    return Ok(Some(Value::Int(i32::from(has))));
+                }
+                (
+                    "getValue",
+                    "(Lnet/minecraft/world/level/block/state/properties/Property;)Ljava/lang/Comparable;",
+                ) => {
+                    if self.unknown_block_state_definitions.contains(&block) {
+                        return Ok(None);
+                    }
+                    if matches!(args.first(), None | Some(Value::Ref(None))) {
+                        let owner_str = self.block_to_string(&block);
+                        return Err(NativeError::UncaughtException {
+                            class: "java/lang/IllegalArgumentException".into(),
+                            message: Some(format!(
+                                "Cannot get property null as it does not exist in {owner_str}"
+                            )),
+                            frame: None,
+                        });
+                    }
+                    let Some(field) = args
+                        .first()
+                        .and_then(expect_ref)
+                        .and_then(|p| p.strip_prefix("property/BlockStateProperties."))
+                    else {
+                        return Ok(None);
+                    };
+                    let Some((prop_name, info)) = self
+                        .block_state_properties
+                        .get(&block)
+                        .and_then(|props| props.iter().find(|(_, info)| info.field == field))
+                    else {
+                        let Some(prop_str) =
+                            vanilla_block_state_properties::property_to_string(field)
+                        else {
+                            return Ok(None);
+                        };
+                        let owner_str = self.block_to_string(&block);
+                        return Err(NativeError::UncaughtException {
+                            class: "java/lang/IllegalArgumentException".into(),
+                            message: Some(format!(
+                                "Cannot get property {prop_str} as it does not exist in {owner_str}"
+                            )),
+                            frame: None,
+                        });
+                    };
+                    let Some(serialized) = values
+                        .get(prop_name)
+                        .or_else(|| {
+                            self.block_default_states
+                                .get(&block)
+                                .and_then(|d| d.get(prop_name))
+                        })
+                        .or_else(|| info.values.first())
+                    else {
+                        return Ok(None);
+                    };
+                    return Ok(vanilla_block_state_properties::property_value(
+                        field, &info.kind, serialized,
+                    ));
+                }
+                (
+                    "getOptionalValue",
+                    "(Lnet/minecraft/world/level/block/state/properties/Property;)Ljava/util/Optional;",
+                ) => {
+                    if self.unknown_block_state_definitions.contains(&block) {
+                        return Ok(None);
+                    }
+                    if matches!(args.first(), None | Some(Value::Ref(None))) {
+                        return Ok(Some(empty_optional()));
+                    }
+                    let Some(field) = args
+                        .first()
+                        .and_then(expect_ref)
+                        .and_then(|p| p.strip_prefix("property/BlockStateProperties."))
+                    else {
+                        return Ok(None);
+                    };
+                    let Some((prop_name, info)) = self
+                        .block_state_properties
+                        .get(&block)
+                        .and_then(|props| props.iter().find(|(_, info)| info.field == field))
+                    else {
+                        return Ok(Some(empty_optional()));
+                    };
+                    let Some(serialized) = values
+                        .get(prop_name)
+                        .or_else(|| {
+                            self.block_default_states
+                                .get(&block)
+                                .and_then(|d| d.get(prop_name))
+                        })
+                        .or_else(|| info.values.first())
+                    else {
+                        return Ok(None);
+                    };
+                    let Some(val) = vanilla_block_state_properties::property_value(
+                        field, &info.kind, serialized,
+                    ) else {
+                        return Ok(None);
+                    };
+                    return Ok(Some(optional_wrap(val)));
+                }
+                (
+                    "getValueOrElse",
+                    "(Lnet/minecraft/world/level/block/state/properties/Property;Ljava/lang/Comparable;)Ljava/lang/Comparable;",
+                ) => {
+                    if self.unknown_block_state_definitions.contains(&block) {
+                        return Ok(None);
+                    }
+                    let Some(field) = args
+                        .first()
+                        .and_then(expect_ref)
+                        .and_then(|p| p.strip_prefix("property/BlockStateProperties."))
+                    else {
+                        return Ok(None);
+                    };
+                    let Some((prop_name, info)) = self
+                        .block_state_properties
+                        .get(&block)
+                        .and_then(|props| props.iter().find(|(_, info)| info.field == field))
+                    else {
+                        return Ok(args.get(1).cloned());
+                    };
+                    let Some(serialized) = values
+                        .get(prop_name)
+                        .or_else(|| {
+                            self.block_default_states
+                                .get(&block)
+                                .and_then(|d| d.get(prop_name))
+                        })
+                        .or_else(|| info.values.first())
+                    else {
+                        return Ok(None);
+                    };
+                    return Ok(vanilla_block_state_properties::property_value(
+                        field, &info.kind, serialized,
+                    ));
+                }
+                ("setValue" | "trySetValue", _) => {
+                    if self.unknown_block_state_definitions.contains(&block) {
+                        return Ok(None);
+                    }
+                    if matches!(args.first(), None | Some(Value::Ref(None))) {
+                        if r.name == "trySetValue" {
+                            return Ok(Some(receiver.clone()));
+                        }
+                        let owner_str = self.block_to_string(&block);
+                        return Err(NativeError::UncaughtException {
+                            class: "java/lang/IllegalArgumentException".into(),
+                            message: Some(format!(
+                                "Cannot set property null as it does not exist in {owner_str}"
+                            )),
+                            frame: None,
+                        });
+                    }
+                    let Some(field) = args
+                        .first()
+                        .and_then(expect_ref)
+                        .and_then(|p| p.strip_prefix("property/BlockStateProperties."))
+                    else {
+                        return Ok(None);
+                    };
+                    let Some(prop_str) = vanilla_block_state_properties::property_to_string(field)
+                    else {
+                        return Ok(None);
+                    };
+                    let Some((prop_name, info)) = self
+                        .block_state_properties
+                        .get(&block)
+                        .and_then(|props| props.iter().find(|(_, info)| info.field == field))
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                    else {
+                        if r.name == "trySetValue" {
+                            return Ok(Some(receiver.clone()));
+                        }
+                        let owner_str = self.block_to_string(&block);
+                        return Err(NativeError::UncaughtException {
+                            class: "java/lang/IllegalArgumentException".into(),
+                            message: Some(format!(
+                                "Cannot set property {prop_str} as it does not exist in {owner_str}"
+                            )),
+                            frame: None,
+                        });
+                    };
+                    // Exact MC 26.3 `StateHolder.setValueInternal` -> `Property.getInternalIndex(Comparable)`
+                    // bridge-method order: checkcast first (`ClassCastException` on wrong type), then
+                    // unbox / `Enum.ordinal()` (`NullPointerException` on null), then range/membership
+                    // check (`IllegalArgumentException` for real out-of-range values).
+                    let runtime_class_for_cast = |v: &Value| -> Option<String> {
+                        if let Value::Ref(Some(text)) = v
+                            && value_class::is_plain_string(text)
+                        {
+                            return Some("java/lang/String".to_owned());
+                        }
+                        class_of_value(v)
+                    };
+                    let arg = args.get(1);
+                    let value = match info.kind.as_str() {
+                        "boolean" => match arg {
+                            None | Some(Value::Ref(None)) => {
+                                return Err(NativeError::UncaughtException {
+                                    class: "java/lang/NullPointerException".into(),
+                                    message: Some(
+                                        "Cannot invoke \"java.lang.Boolean.booleanValue()\" because \"value\" is null"
+                                            .into(),
+                                    ),
+                                    frame: None,
+                                });
+                            }
+                            Some(Value::Boxed(Boxed::Boolean(b))) => b.to_string(),
+                            Some(other) => {
+                                let Some(cls) = runtime_class_for_cast(other) else {
+                                    return Ok(None);
+                                };
+                                return Err(checkcast::class_cast_exception(
+                                    &cls,
+                                    "java/lang/Boolean",
+                                ));
+                            }
+                        },
+                        "integer" => match arg {
+                            None | Some(Value::Ref(None)) => {
+                                return Err(NativeError::UncaughtException {
+                                    class: "java/lang/NullPointerException".into(),
+                                    message: Some(
+                                        "Cannot invoke \"java.lang.Integer.intValue()\" because \"value\" is null"
+                                            .into(),
+                                    ),
+                                    frame: None,
+                                });
+                            }
+                            Some(Value::Boxed(Boxed::Integer(n)) | Value::Int(n)) => {
+                                let s = n.to_string();
+                                if !info.values.iter().any(|allowed| allowed == &s) {
+                                    let owner_str = self.block_to_string(&block);
+                                    return Err(NativeError::UncaughtException {
+                                        class: "java/lang/IllegalArgumentException".into(),
+                                        message: Some(format!(
+                                            "Cannot set property {prop_str} to {s} on {owner_str}, it is not an allowed value"
+                                        )),
+                                        frame: None,
+                                    });
+                                }
+                                s
+                            }
+                            Some(other) => {
+                                let Some(cls) = runtime_class_for_cast(other) else {
+                                    return Ok(None);
+                                };
+                                return Err(checkcast::class_cast_exception(
+                                    &cls,
+                                    "java/lang/Integer",
+                                ));
+                            }
+                        },
+                        "enum" => match arg {
+                            None | Some(Value::Ref(None)) => {
+                                return Err(NativeError::UncaughtException {
+                                    class: "java/lang/NullPointerException".into(),
+                                    message: Some(
+                                        "Cannot invoke \"java.lang.Enum.ordinal()\" because \"value\" is null"
+                                            .into(),
+                                    ),
+                                    frame: None,
+                                });
+                            }
+                            Some(Value::Ref(Some(enum_marker)))
+                                if enum_marker.starts_with("enum/")
+                                    && !enum_marker
+                                        .starts_with("enum/java/lang/StackWalker$Option/") =>
+                            {
+                                let Some((enum_cls, _)) = enum_marker
+                                    .strip_prefix("enum/")
+                                    .and_then(|rest| rest.rsplit_once('/'))
+                                else {
+                                    return Ok(None);
+                                };
+                                if vanilla_block_state_properties::enum_property_class(field)
+                                    != Some(enum_cls)
+                                {
+                                    // Cross-enum raw call indexes `ordinalToIndex[value.ordinal()]`;
+                                    // leave counted rather than guessing across unrelated enums.
+                                    return Ok(None);
+                                }
+                                match vanilla_block_state_properties::enum_serialized_name(
+                                    field,
+                                    enum_marker,
+                                )
+                                .filter(|s| info.values.iter().any(|allowed| allowed == s))
+                                {
+                                    Some(s) => s,
+                                    None => {
+                                        let val_str =
+                                            vanilla_block_state_properties::enum_value_to_string(
+                                                enum_marker,
+                                            )
+                                            .unwrap_or_else(|| enum_marker.clone());
+                                        let owner_str = self.block_to_string(&block);
+                                        return Err(NativeError::UncaughtException {
+                                            class: "java/lang/IllegalArgumentException".into(),
+                                            message: Some(format!(
+                                                "Cannot set property {prop_str} to {val_str} on {owner_str}, it is not an allowed value"
+                                            )),
+                                            frame: None,
+                                        });
+                                    }
+                                }
+                            }
+                            // A jar object or enum host handle could be a `java.lang.Enum`
+                            // subclass (which passes `checkcast java/lang/Enum`). Count it.
+                            Some(Value::Host(h))
+                                if matches!(
+                                    h.kind(),
+                                    HostKind::JarObject
+                                        | HostKind::MobEffectCategory
+                                        | HostKind::MixinSide
+                                ) =>
+                            {
+                                return Ok(None);
+                            }
+                            Some(other) => {
+                                let Some(cls) = runtime_class_for_cast(other) else {
+                                    return Ok(None);
+                                };
+                                return Err(checkcast::class_cast_exception(
+                                    &cls,
+                                    "java/lang/Enum",
+                                ));
+                            }
+                        },
+                        _ => return Ok(None),
+                    };
+                    let mut values = values;
+                    values.insert(prop_name, value);
+                    return Ok(Some(self.canonical_block_state(&block, values)));
+                }
+                _ => {}
+            }
         }
         if r.name == "registerDefaultState"
             && r.descriptor.contains("BlockState")
@@ -6787,6 +8057,9 @@ impl StdHost {
                 for (key, value) in settings {
                     record_inferred_property(builders, marker, key, Some(value));
                 }
+                if !item && r.name == "noCollision" {
+                    self.block_copied_properties.remove(marker);
+                }
                 let returns_self = if item {
                     ITEM_PROPERTIES_DESC
                 } else {
@@ -6809,6 +8082,8 @@ impl StdHost {
                 else {
                     return Ok(None);
                 };
+                let copied = self.block_copied_properties.contains(builder)
+                    && !properties.contains_key("noCollision");
                 // Only a vanilla `CraftingTableBlock` itself behaves as the crafting table (its
                 // `useWithoutItem` opens the 3x3 grid). This constructor is also the super call of
                 // a jar's subclass (Runes' altar), whose own `useWithoutItem` opens its own menu:
@@ -6824,6 +8099,11 @@ impl StdHost {
                 {
                     self.block_property_builders
                         .insert(marker.to_owned(), properties);
+                    if copied {
+                        self.block_copied_properties.insert(marker.to_owned());
+                    } else {
+                        self.block_copied_properties.remove(marker);
+                    }
                 }
                 Ok(Some(Value::Void))
             }
@@ -6869,18 +8149,29 @@ impl StdHost {
                     self.item_required_features
                         .insert(marker.to_owned(), features);
                 }
-                let builders = if r.owner == ITEM_CLASS {
-                    &mut self.item_property_builders
-                } else {
+                let is_block = r.owner == BLOCK_CLASS;
+                let builders = if is_block {
                     &mut self.block_property_builders
+                } else {
+                    &mut self.item_property_builders
                 };
                 let Some(properties) = builders.get(builder).cloned() else {
                     return Ok(None);
                 };
+                let copied = is_block
+                    && self.block_copied_properties.contains(builder)
+                    && !properties.contains_key("noCollision");
                 // Hand the finished chain to the value the mod registers, so
                 // the registration's marker names it.
                 if builders.contains_key(marker) || builders.len() < MAX_PROPERTY_BUILDERS {
                     builders.insert(marker.to_owned(), properties);
+                    if is_block {
+                        if copied {
+                            self.block_copied_properties.insert(marker.to_owned());
+                        } else {
+                            self.block_copied_properties.remove(marker);
+                        }
+                    }
                 }
                 Ok(Some(Value::Void))
             }
@@ -6959,6 +8250,19 @@ impl menu_models::StackOps for StdHost {
 }
 
 impl Host for StdHost {
+    fn host_array_values(&self, value: &Value) -> Option<(&'static str, Vec<Value>)> {
+        let Value::Host(handle) = value else {
+            return None;
+        };
+        (handle.kind() == HostKind::GameTransient)
+            .then(|| {
+                self.placement_arrays
+                    .get(handle.key())
+                    .map(|(_, values)| ("[Lnet/minecraft/core/Direction;", values.clone()))
+            })
+            .flatten()
+    }
+
     fn menu_instance_call(
         &mut self,
         r: &MethodRef,
@@ -7143,6 +8447,38 @@ impl Host for StdHost {
             .unknown_host_calls
             .entry("Block#getStateForPlacement (placement hook)".into())
             .or_default() += 1;
+    }
+
+    fn voxel_shape_or_array(
+        &mut self,
+        r: &MethodRef,
+        first: &Value,
+        others: &[Value],
+    ) -> Result<Value, NativeError> {
+        voxel_shape::or_array_call(self, r, first, others)
+    }
+
+    fn block_state_block(&self, state: &Value) -> Option<Value> {
+        let marker = expect_ref(state)?;
+        let (block_marker, _) = self.block_states.get(marker)?;
+        Some(jar_object::stored(block_marker))
+    }
+
+    fn block_has_collision(&self, block: &Value) -> Option<bool> {
+        let marker = jar_object::object_key(block)?;
+        self.block_has_collision_by_marker(marker)
+    }
+
+    fn has_retained_shape_probes(&self) -> bool {
+        self.retained_shape_probes
+    }
+
+    fn note_retained_shape_probe(&mut self) {
+        self.retained_shape_probes = true;
+    }
+
+    fn voxel_shape_to_string(&self, key: &str) -> Option<String> {
+        self.voxel_shapes.get(key).map(|s| s.to_java_string())
     }
 
     fn begin_block_state_definition(&mut self, block: &Value, builder: &Value) {
@@ -7382,6 +8718,9 @@ impl Host for StdHost {
         if let Some(value) = vec2::get_field(&self.vec2, receiver, r) {
             return value;
         }
+        if let Some(value) = voxel_shape::get_field(receiver, r) {
+            return value;
+        }
         // A façade object's own field (`facade_server.rs`).
         if let Some(value) = self.facade_field(receiver, r) {
             return Ok(value);
@@ -7568,6 +8907,12 @@ impl Host for StdHost {
         self.unmodifiable_collections.get(marker).cloned().flatten()
     }
 
+    fn reversed_view_source(&self, marker: &str) -> Option<String> {
+        self.reversed_views
+            .get(marker)
+            .map(|(base, _)| base.clone())
+    }
+
     fn mark_unmodifiable_collection(&mut self, marker: &str) {
         self.unmodifiable_collections
             .entry(marker.to_owned())
@@ -7616,6 +8961,27 @@ impl Host for StdHost {
     fn collection_generation(&self, marker: &str) -> Option<u64> {
         let marker = self.direct_collection(marker)?;
         Some(self.mutable_collections.generation(marker))
+    }
+
+    fn next_identity_run(&mut self) -> u64 {
+        self.mutable_collections.next_identity_run()
+    }
+
+    fn clear_identity_known_epochs(&mut self) {
+        self.mutable_collections.clear_identity_epochs();
+    }
+
+    fn identity_known_epoch(&self, marker: &str) -> Option<(u64, u64)> {
+        self.mutable_collections.collection_identity_epoch(marker)
+    }
+
+    fn set_identity_known_epoch(&mut self, marker: &str, run_id: u64, epoch: u64) {
+        self.mutable_collections
+            .set_collection_identity_epoch(marker.to_owned(), run_id, epoch);
+    }
+
+    fn note_identity_token_table_len(&mut self, len: usize) {
+        self.peak_identity_tokens = self.peak_identity_tokens.max(len);
     }
 
     fn collection_slice(&self, marker: &str) -> Option<&[Value]> {
@@ -7760,21 +9126,21 @@ impl Host for StdHost {
     }
 
     fn iterator_cursor(&self, marker: &str) -> Option<usize> {
-        self.iterators.get(marker).map(|(_, index)| *index)
+        self.iterators.get(marker).map(|entry| entry.index)
     }
 
     fn empty_iterator(&mut self) -> Value {
         // A shared singleton: one row, which stays empty.
         self.iterators
             .entry(host_iterator::EMPTY_ITERATOR.to_owned())
-            .or_insert((Vec::new(), 0));
+            .or_insert_with(|| HostIterator::new(Vec::new(), None));
         host_iterator::iterator(host_iterator::EMPTY_ITERATOR.to_owned())
     }
 
     fn empty_enumeration(&mut self) -> Value {
         self.iterators
             .entry(host_iterator::EMPTY_ENUMERATION.to_owned())
-            .or_insert((Vec::new(), 0));
+            .or_insert_with(|| HostIterator::new(Vec::new(), None));
         host_iterator::enumeration(host_iterator::EMPTY_ENUMERATION.to_owned())
     }
 
@@ -7787,6 +9153,12 @@ impl Host for StdHost {
 
     fn enumeration_over(&self, marker: &str) -> Option<host_iterator::EnumerationOver> {
         self.enumerations.get(marker).cloned()
+    }
+
+    fn enumeration_source(&self, marker: &str) -> Option<Value> {
+        self.enumerations
+            .get(marker)
+            .map(|over| over.held().clone())
     }
 
     fn store_enumeration(&mut self, marker: &str, over: host_iterator::EnumerationOver) {
@@ -7804,46 +9176,52 @@ impl Host for StdHost {
         self.list_iterators.get(marker).cloned()
     }
 
+    fn list_iterator_source(&self, marker: &str) -> Option<Value> {
+        self.list_iterators
+            .get(marker)
+            .map(|state| state.source().clone())
+    }
+
     fn store_list_iterator(&mut self, marker: &str, state: host_list_iterator::ListIter) {
         self.list_iterators.insert(marker.to_owned(), state);
     }
 
     fn host_iterator(&self, marker: &str) -> Option<(usize, usize, Option<String>)> {
-        let (values, index) = self.iterators.get(marker)?;
+        let entry = self.iterators.get(marker)?;
         Some((
-            *index,
-            values.len(),
+            entry.index,
+            entry.values.len(),
             self.iterator_sources.get(marker).cloned(),
         ))
     }
 
     fn host_iterator_next(&mut self, marker: &str) -> Result<Value, NativeError> {
-        let (values, index) = self
+        let entry = self
             .iterators
             .get_mut(marker)
             .ok_or_else(|| NativeError::Metadata("unknown java/util/Iterator marker".into()))?;
-        let value = values
-            .get(*index)
-            .cloned()
-            .ok_or_else(|| NativeError::UncaughtException {
+        let value = entry.values.get(entry.index).cloned().ok_or_else(|| {
+            NativeError::UncaughtException {
                 class: "java/util/NoSuchElementException".into(),
                 message: None,
                 frame: None,
-            })?;
-        *index += 1;
+            }
+        })?;
+        entry.index += 1;
         Ok(value)
     }
 
     fn set_host_iterator_cursor(&mut self, marker: &str, cursor: usize) {
-        if let Some((values, index)) = self.iterators.get_mut(marker) {
-            *index = cursor.min(values.len());
+        if let Some(entry) = self.iterators.get_mut(marker) {
+            entry.index = cursor.min(entry.values.len());
         }
     }
 
     fn new_host_iterator(&mut self, values: Vec<Value>, source: Option<String>) -> Option<Value> {
         let marker = format!("iterator/{}", self.next_iterator);
         self.next_iterator = self.next_iterator.saturating_add(1);
-        self.iterators.insert(marker.clone(), (values, 0));
+        self.iterators
+            .insert(marker.clone(), HostIterator::new(values, None));
         if let Some(source) = source {
             self.iterator_sources.insert(marker.clone(), source);
         }
@@ -7851,11 +9229,23 @@ impl Host for StdHost {
     }
 
     fn host_iterator_values(&self, marker: &str) -> Option<Vec<Value>> {
-        self.iterators.get(marker).map(|(values, _)| values.clone())
+        self.iterators.get(marker).map(|entry| entry.values.clone())
     }
 
     fn set_host_iterator_source(&mut self, marker: &str, source: String) {
         self.iterator_sources.insert(marker.to_owned(), source);
+    }
+
+    fn host_iterator_origin(&self, marker: &str) -> Option<Value> {
+        self.iterators
+            .get(marker)
+            .and_then(|entry| entry.origin.clone())
+    }
+
+    fn set_host_iterator_origin(&mut self, marker: &str, origin: Value) {
+        if let Some(entry) = self.iterators.get_mut(marker) {
+            entry.origin = Some(origin);
+        }
     }
 
     fn immutable_collection(&mut self, kind: &str, values: Vec<Value>) -> Option<Value> {
@@ -8045,6 +9435,13 @@ impl Host for StdHost {
         self.map_entry_now(value)
     }
 
+    fn map_entry_source(&self, value: &Value) -> Option<String> {
+        let Value::Host(handle) = value else {
+            return None;
+        };
+        self.map_entries.map_of(handle.key()).map(str::to_owned)
+    }
+
     fn map_entry_is_instance_of(&self, value: &Value, wanted: &str) -> Option<bool> {
         self.fastutil_entry_instance_of(value, wanted)
     }
@@ -8088,6 +9485,37 @@ impl Host for StdHost {
     /// `athrow` diagnostic names the same message `getMessage` would return.
     fn throwable_message(&self, marker: &str) -> Option<Option<String>> {
         self.throwable_messages.get(marker).cloned()
+    }
+
+    fn registered_sound_id(&self, sound: &Value) -> Option<String> {
+        self.registered_sound_id_impl(sound)
+    }
+
+    fn unwrap_sound_holder(
+        &mut self,
+        value: &Value,
+    ) -> Option<Result<(Value, Option<String>), NativeError>> {
+        host_registry_holder::unwrap_sound_holder(self, value)
+    }
+
+    fn level_random_handle(&mut self, level_marker: &str) -> Option<Value> {
+        self.level_random_handle_impl(level_marker)
+    }
+
+    fn draw_level_sound_seed(
+        &mut self,
+        level_marker: &str,
+        server_side: bool,
+    ) -> Option<level_sound::SoundSeed> {
+        self.draw_level_sound_seed_impl(level_marker, server_side)
+    }
+
+    fn mark_sound_stream_unknown(&mut self, stream: &str) {
+        StdHost::mark_sound_stream_unknown(self, stream);
+    }
+
+    fn construct_sound_event(&mut self, r: &MethodRef, args: &[Value]) -> Option<Value> {
+        sound_event::construct_record(self, r, args)
     }
 
     fn record_throwable(&mut self, marker: &str, message: Option<String>) {
@@ -8195,6 +9623,18 @@ impl Host for StdHost {
         if let Some(value) = vanilla_values::static_field(r) {
             return Ok(value);
         }
+        if let Some(value) = voxel_shape::static_field(self, r) {
+            return value;
+        }
+        if let Some(value) = block_use::static_field(r) {
+            return Ok(value);
+        }
+        if r.owner == "net/minecraft/core/BlockPos"
+            && r.name == "ZERO"
+            && r.descriptor == "Lnet/minecraft/core/BlockPos;"
+        {
+            return Ok(game_object::server_value("block-pos/0,0,0".into()));
+        }
         if let Some(value) = block_entity_types::static_field(r) {
             return Ok(value);
         }
@@ -8217,6 +9657,9 @@ impl Host for StdHost {
             return Ok(value);
         }
         // `CompoundTag.CODEC`, the root of a modelled attachment codec (`attachment_codec.rs`).
+        if let Some(value) = commons_lang::static_field(r) {
+            return Ok(value);
+        }
         if let Some(value) = dfu_codec::static_field(r) {
             return Ok(value);
         }
@@ -8486,6 +9929,7 @@ impl Host for StdHost {
     fn random_new(&mut self, class: &str) -> Option<Value> {
         recipe_models::random_new(self, class)
             .or_else(|| vanilla_values::random_new(self, class))
+            .or_else(|| block_use::random_new(self, class))
             .or_else(|| StdHost::random_new(self, class))
     }
 
@@ -8565,7 +10009,61 @@ impl Host for StdHost {
         host_creative_tab::accept_verified_stack(&mut self.creative_tab, output, stack, visibility)
     }
 
+    fn creative_tab_output_prepend_verified(
+        &mut self,
+        output: &Value,
+        stack: Value,
+        visibility_ordinal: u8,
+    ) -> bool {
+        let Some(visibility) = host_creative_tab::TabVisibility::from_ordinal(visibility_ordinal)
+        else {
+            return false;
+        };
+        host_creative_tab::prepend_verified_stack(&mut self.creative_tab, output, stack, visibility)
+    }
+
+    fn creative_tab_output_insert_relative(
+        &mut self,
+        output: &Value,
+        anchor: &Value,
+        anchor_is_stack: bool,
+        stacks: Vec<Value>,
+        visibility_ordinal: u8,
+        before: bool,
+    ) -> Result<Option<bool>, NativeError> {
+        let Some(visibility) = host_creative_tab::TabVisibility::from_ordinal(visibility_ordinal)
+        else {
+            return Ok(Some(false));
+        };
+        let mut creative_tab = std::mem::take(&mut self.creative_tab);
+        let result = {
+            let host = &*self;
+            let mut matches = |entry: &Value| -> Result<Option<bool>, NativeError> {
+                if !anchor_is_stack {
+                    let Some((entry_item, _, _)) = host.read_item_stack_impl(entry) else {
+                        return Ok(None);
+                    };
+                    return Ok(Self::same_item_value(&entry_item, anchor));
+                }
+                recipe_models::stacks_same_item_same_components(host, anchor, entry)
+            };
+            host_creative_tab::insert_relative_verified(
+                &mut creative_tab,
+                output,
+                stacks,
+                visibility,
+                before,
+                &mut matches,
+            )
+        };
+        self.creative_tab = creative_tab;
+        result
+    }
+
     fn invoke(&mut self, r: &MethodRef, args: &[Value]) -> Result<Value, NativeError> {
+        if let Some(value) = block_use::static_call(self, r, args) {
+            return value;
+        }
         if menu_models::is_menu_class(&r.owner)
             && let Some(value) =
                 menu_models::static_call(&mut self.menu_states, &mut self.next_menu_object, r, args)
@@ -8606,6 +10104,12 @@ impl Host for StdHost {
         }
         self.record(r, None, args);
         if let Some(result) = vanilla_values::static_call(self, r, args) {
+            return result;
+        }
+        if let Some(result) = voxel_shape::static_call(self, r, args) {
+            return result;
+        }
+        if let Some(result) = voxel_shape::direction_static_call(r, args) {
             return result;
         }
         if let Some(result) = self.random_static(r, args) {
@@ -9451,13 +10955,21 @@ impl Host for StdHost {
                     None => Value::Ref(None),
                 })
             }
-            ("java/util/Objects", "equals", "(Ljava/lang/Object;Ljava/lang/Object;)Z") => Ok(
-                Value::Int((Self::argument(r, args, 0)? == Self::argument(r, args, 1)?) as i32),
-            ),
+            ("java/util/Objects", "equals", "(Ljava/lang/Object;Ljava/lang/Object;)Z") => {
+                let left = Self::argument(r, args, 0)?;
+                let right = Self::argument(r, args, 1)?;
+                if matches!(left, Value::Host(h) if h.kind() == HostKind::ShapeProbe)
+                    || matches!(right, Value::Host(h) if h.kind() == HostKind::ShapeProbe)
+                {
+                    return self.unknown_host_call(r);
+                }
+                Ok(Value::Int((left == right) as i32))
+            }
             ("java/util/Objects", "hashCode", "(Ljava/lang/Object;)I") => {
                 let value = Self::argument(r, args, 0)?;
-                if expect_ref(value)
-                    .is_some_and(|marker| crate::stream_pipeline::is_stream_marker(marker))
+                if matches!(value, Value::Host(h) if h.kind() == HostKind::ShapeProbe)
+                    || expect_ref(value)
+                        .is_some_and(|marker| crate::stream_pipeline::is_stream_marker(marker))
                 {
                     return self.unknown_host_call(r);
                 }
@@ -9939,9 +11451,23 @@ impl Host for StdHost {
             (BLOCK_PROPERTIES_CLASS, "of" | "ofFullCopy" | "copy" | "ofLegacyCopy", descriptor)
                 if descriptor.ends_with(BLOCK_PROPERTIES_DESC) =>
             {
+                // MC 26.3 `ofFullCopy` calls `ofLegacyCopy` (offset 1), which reads
+                // `block.properties` (offset 8), throwing a helpful NPE on `null`.
+                if r.name != "of" && matches!(args.first(), None | Some(Value::Ref(None))) {
+                    return Err(NativeError::UncaughtException {
+                        class: "java/lang/NullPointerException".into(),
+                        message: Some(
+                            "Cannot read field \"properties\" because \"block\" is null".into(),
+                        ),
+                        frame: None,
+                    });
+                }
                 let marker = format!("block/properties/{}", self.next_property_builder);
                 self.next_property_builder = self.next_property_builder.saturating_add(1);
                 open_inferred_builder(&mut self.block_property_builders, &marker);
+                if r.name != "of" {
+                    self.block_copied_properties.insert(marker.clone());
+                }
                 Ok(Value::Ref(Some(marker)))
             }
             // `Duration` factories: configs and timeouts read across the
@@ -9993,6 +11519,9 @@ impl Host for StdHost {
         receiver: &Value,
         args: &[Value],
     ) -> Result<Value, NativeError> {
+        if let Some(value) = self.placement_context_call(r, receiver) {
+            return value;
+        }
         if let Some(value) = self.menu_instance_call(r, receiver, args) {
             return value;
         }
@@ -10096,6 +11625,37 @@ impl Host for StdHost {
         }
         if let Some(result) = vanilla_values::instance_call(self, r, receiver, args) {
             return result;
+        }
+        if let Some(result) = voxel_shape::instance_call(self, r, receiver, args) {
+            return result;
+        }
+        if let Some(result) = voxel_shape::direction_instance_call(r, receiver) {
+            return result;
+        }
+        if let Some(result) = block_use::instance_call(self, r, receiver, args) {
+            return result;
+        }
+        if let Value::Host(handle) = receiver
+            && handle.kind() == host_ref::HostKind::GameValue
+            && let Some([x, y, z]) = server_values::block_pos(handle.key())
+            && matches!(
+                r.owner.as_str(),
+                "net/minecraft/core/BlockPos" | "net/minecraft/core/Vec3i"
+            )
+        {
+            match (r.name.as_str(), r.descriptor.as_str()) {
+                ("getX", "()I") => return Ok(Value::Int(x)),
+                ("getY", "()I") => return Ok(Value::Int(y)),
+                ("getZ", "()I") => return Ok(Value::Int(z)),
+                _ => {}
+            }
+        }
+        if r.name == "getShape"
+            && r.descriptor == voxel_shape::GET_SHAPE_DESC
+            && vanilla_block_shapes::inherits_block_behaviour_get_shape(&r.owner)
+            && jar_object::object_class(receiver).is_some()
+        {
+            return Ok(voxel_shape::block_shape());
         }
         if let Some(result) = self.random_instance(r, receiver, args) {
             return result;
@@ -10368,6 +11928,9 @@ impl Host for StdHost {
         if let Some(answer) = self.client_call(r, receiver, args) {
             return answer;
         }
+        if let Some(answer) = level_sound::standalone_client_sound_call(self, receiver, r, args) {
+            return answer;
+        }
         // A game-event façade marker (server, level, player, event object)
         // answers its bounded surface; anything else refuses the listener.
         // A server's saved data (the storage, its types, a `SavedData`'s
@@ -10399,6 +11962,8 @@ impl Host for StdHost {
             let Some(mut properties) = self.block_property_builders.get(builder).cloned() else {
                 return Ok(Value::Void);
             };
+            let copied = self.block_copied_properties.contains(builder)
+                && !properties.contains_key("noCollision");
             let marker = jar_object::instance_key(receiver).unwrap_or_default();
             if jar_object::key_class(marker)
                 == Some("net/minecraft/world/level/block/CraftingTableBlock")
@@ -10410,6 +11975,11 @@ impl Host for StdHost {
             {
                 self.block_property_builders
                     .insert(marker.to_owned(), properties);
+                if copied {
+                    self.block_copied_properties.insert(marker.to_owned());
+                } else {
+                    self.block_copied_properties.remove(marker);
+                }
             }
             return Ok(Value::Void);
         }
@@ -11965,7 +13535,8 @@ impl Host for StdHost {
                 }
                 let iterator = format!("iterator/{}", self.next_iterator);
                 self.next_iterator = self.next_iterator.saturating_add(1);
-                self.iterators.insert(iterator.clone(), (Vec::new(), 0));
+                self.iterators
+                    .insert(iterator.clone(), HostIterator::new(Vec::new(), None));
                 return Ok(host_iterator::iterator(iterator));
             }
             if r.name == "findFirst"
@@ -11988,8 +13559,10 @@ impl Host for StdHost {
         if r.owner == "java/util/Enumeration"
             && matches!(r.descriptor.as_str(), "()Z" | "()Ljava/lang/Object;")
             && let Some(marker) = receiver_marker.as_deref()
-            && let Some((values, index)) = self.iterators.get_mut(marker)
+            && let Some(entry) = self.iterators.get_mut(marker)
         {
+            let values = &entry.values;
+            let index = &mut entry.index;
             match (r.name.as_str(), r.descriptor.as_str()) {
                 ("hasMoreElements", "()Z") => {
                     return Ok(Value::Int((*index < values.len()) as i32));
@@ -12038,7 +13611,10 @@ impl Host for StdHost {
             let values = host_collection_values(self, receiver)?;
             let marker = format!("iterator/{}", self.next_iterator);
             self.next_iterator = self.next_iterator.saturating_add(1);
-            self.iterators.insert(marker.clone(), (values, 0));
+            self.iterators.insert(
+                marker.clone(),
+                HostIterator::new(values, Some(receiver.clone())),
+            );
             if let Some(source) = expect_ref(receiver).and_then(|source| iterated_kind(source)) {
                 self.iterator_sources.insert(marker.clone(), source);
             }
@@ -12072,11 +13648,11 @@ impl Host for StdHost {
             if r.name == "forEachRemaining" && r.descriptor == "(Ljava/util/function/Consumer;)V" {
                 let callback = Self::argument(r, args, 0)?.clone();
                 let remaining = {
-                    let (values, index) = self.iterators.get_mut(marker).ok_or_else(|| {
+                    let entry = self.iterators.get_mut(marker).ok_or_else(|| {
                         NativeError::Metadata("unknown java/util/Iterator marker".into())
                     })?;
-                    let remaining = values.get(*index..).unwrap_or_default().to_vec();
-                    *index = values.len();
+                    let remaining = entry.values.get(entry.index..).unwrap_or_default().to_vec();
+                    entry.index = entry.values.len();
                     remaining
                 };
                 for value in remaining {
@@ -12092,10 +13668,12 @@ impl Host for StdHost {
                 }
                 return Ok(Value::Void);
             }
-            let (values, index) = self
+            let entry = self
                 .iterators
                 .get_mut(marker)
                 .ok_or_else(|| NativeError::Metadata("unknown java/util/Iterator marker".into()))?;
+            let values = &entry.values;
+            let index = &mut entry.index;
             if r.name == "remove" && r.descriptor == "()V" {
                 let source = self.iterator_sources.get(marker).cloned();
                 if source.as_deref().is_some_and(|source| {
@@ -13214,6 +14792,34 @@ impl Host for StdHost {
                     })?;
                 Ok(Value::Ref(Some(String::from_utf16_lossy(sliced))))
             }
+            ("java/lang/String", "codePointAt", "(I)I") => {
+                let index = usize::try_from(expect_int(r, Self::argument(r, args, 0)?)?)
+                    .map_err(|_| NativeError::Metadata("negative code point index".into()))?;
+                let units = expect_string(receiver).encode_utf16().collect::<Vec<_>>();
+                let first = *units.get(index).ok_or_else(|| {
+                    NativeError::Metadata("code point index out of bounds".into())
+                })?;
+                let code = if (0xD800..=0xDBFF).contains(&first)
+                    && let Some(second) = units.get(index + 1)
+                    && (0xDC00..=0xDFFF).contains(second)
+                {
+                    0x10000 + ((u32::from(first) - 0xD800) << 10) + u32::from(*second) - 0xDC00
+                } else {
+                    u32::from(first)
+                };
+                Ok(Value::Int(code as i32))
+            }
+            ("java/lang/String", "subSequence", "(II)Ljava/lang/CharSequence;") => {
+                let start = usize::try_from(expect_int(r, Self::argument(r, args, 0)?)?)
+                    .map_err(|_| NativeError::Metadata("negative subsequence start".into()))?;
+                let end = usize::try_from(expect_int(r, Self::argument(r, args, 1)?)?)
+                    .map_err(|_| NativeError::Metadata("negative subsequence end".into()))?;
+                let units = expect_string(receiver).encode_utf16().collect::<Vec<_>>();
+                let slice = units.get(start..end).ok_or_else(|| {
+                    NativeError::Metadata("subsequence range out of bounds".into())
+                })?;
+                Ok(Value::Ref(Some(String::from_utf16_lossy(slice))))
+            }
             ("java/lang/String", "charAt", "(I)C") => {
                 let index = expect_int(r, Self::argument(r, args, 0)?)?;
                 let index = usize::try_from(index).map_err(|_| {
@@ -13749,7 +15355,8 @@ impl Host for StdHost {
                 let values = registry_contents::values(self, &id);
                 let marker = format!("iterator/{}", self.next_iterator);
                 self.next_iterator = self.next_iterator.saturating_add(1);
-                self.iterators.insert(marker.clone(), (values, 0));
+                self.iterators
+                    .insert(marker.clone(), HostIterator::new(values, None));
                 Ok(host_iterator::iterator(marker))
             }
             // A `ResourceKey` or `TagKey` handle (`host_ids.rs`); `toString`/
@@ -14649,6 +16256,9 @@ fn class_of_value(value: &Value) -> Option<String> {
 /// [`class_of_value`] of a reference's text, without building a `Value` (it
 /// runs inside `is_plain_string`, on every array store of a string).
 fn class_of_text(marker: &str) -> Option<String> {
+    if marker.starts_with("blockstate/") {
+        return Some("net/minecraft/world/level/block/state/BlockState".into());
+    }
     // A text spelling an object's key (a host-made collection's included,
     // P14c) is a `String` (`jar_object.rs`).
     if jar_object::spells_key_text(marker) {
@@ -15409,6 +17019,12 @@ fn block_builder_settings(
         "jumpFactor" => push("jumpFactor", number(first)),
         "randomTicks" => push("randomTicks", Some("true".to_owned())),
         "noOcclusion" => push("noOcclusion", Some("true".to_owned())),
+        // MC 26.3 `BlockBehaviour$Properties.noCollision()` sets both `hasCollision = false` and
+        // `canOcclude = false` (offsets 0..10).
+        "noCollision" => {
+            push("noCollision", Some("true".to_owned()));
+            push("noOcclusion", Some("true".to_owned()));
+        }
         "requiresCorrectToolForDrops" => {
             push("requiresCorrectToolForDrops", Some("true".to_owned()))
         }
@@ -15512,11 +17128,138 @@ pub(crate) fn game_enum_class(class: &str) -> bool {
 fn game_enum_constants(owner: &str) -> Option<&'static [&'static str]> {
     Some(match owner {
         "net/minecraft/core/Direction" => &["DOWN", "UP", "NORTH", "SOUTH", "WEST", "EAST"],
+        "net/minecraft/world/level/EmptyBlockGetter" => &["INSTANCE"],
+        "net/minecraft/core/FrontAndTop" => &[
+            "DOWN_EAST",
+            "DOWN_NORTH",
+            "DOWN_SOUTH",
+            "DOWN_WEST",
+            "UP_EAST",
+            "UP_NORTH",
+            "UP_SOUTH",
+            "UP_WEST",
+            "WEST_UP",
+            "EAST_UP",
+            "NORTH_UP",
+            "SOUTH_UP",
+        ],
+        "net/minecraft/world/level/block/CopperGolemStatueBlock$Pose" => {
+            &["STANDING", "SITTING", "RUNNING", "STAR"]
+        }
+        "net/minecraft/world/level/block/entity/trialspawner/TrialSpawnerState" => &[
+            "INACTIVE",
+            "WAITING_FOR_PLAYERS",
+            "ACTIVE",
+            "WAITING_FOR_REWARD_EJECTION",
+            "EJECTING_REWARD",
+            "COOLDOWN",
+        ],
+        "net/minecraft/world/level/block/entity/vault/VaultState" => {
+            &["INACTIVE", "ACTIVE", "UNLOCKING", "EJECTING"]
+        }
+        "net/minecraft/world/level/block/state/properties/AttachFace" => {
+            &["FLOOR", "WALL", "CEILING"]
+        }
+        "net/minecraft/world/level/block/state/properties/BambooLeaves" => {
+            &["NONE", "SMALL", "LARGE"]
+        }
+        "net/minecraft/world/level/block/state/properties/BedPart" => &["HEAD", "FOOT"],
+        "net/minecraft/world/level/block/state/properties/BellAttachType" => {
+            &["FLOOR", "CEILING", "SINGLE_WALL", "DOUBLE_WALL"]
+        }
+        "net/minecraft/world/level/block/state/properties/ChestType" => {
+            &["SINGLE", "LEFT", "RIGHT"]
+        }
+        "net/minecraft/world/level/block/state/properties/ComparatorMode" => {
+            &["COMPARE", "SUBTRACT"]
+        }
+        "net/minecraft/world/level/block/state/properties/CreakingHeartState" => {
+            &["UPROOTED", "DORMANT", "AWAKE"]
+        }
+        "net/minecraft/world/level/block/state/properties/DoorHingeSide" => &["LEFT", "RIGHT"],
+        "net/minecraft/world/level/block/state/properties/DoubleBlockHalf" => &["UPPER", "LOWER"],
+        "net/minecraft/world/level/block/state/properties/Half" => &["TOP", "BOTTOM"],
+        "net/minecraft/world/level/block/state/properties/NoteBlockInstrument" => &[
+            "HARP",
+            "BASEDRUM",
+            "SNARE",
+            "HAT",
+            "BASS",
+            "FLUTE",
+            "BELL",
+            "GUITAR",
+            "CHIME",
+            "XYLOPHONE",
+            "IRON_XYLOPHONE",
+            "COW_BELL",
+            "DIDGERIDOO",
+            "BIT",
+            "BANJO",
+            "PLING",
+            "TRUMPET",
+            "TRUMPET_EXPOSED",
+            "TRUMPET_OXIDIZED",
+            "TRUMPET_WEATHERED",
+            "ZOMBIE",
+            "SKELETON",
+            "CREEPER",
+            "DRAGON",
+            "WITHER_SKELETON",
+            "PIGLIN",
+            "CUSTOM_HEAD",
+        ],
+        "net/minecraft/world/level/block/state/properties/PistonType" => &["DEFAULT", "STICKY"],
+        "net/minecraft/world/level/block/state/properties/PotentSulfurState" => {
+            &["DRY", "WET", "DORMANT", "ERUPTING", "CONTINUOUS"]
+        }
+        "net/minecraft/world/level/block/state/properties/RailShape" => &[
+            "NORTH_SOUTH",
+            "EAST_WEST",
+            "ASCENDING_EAST",
+            "ASCENDING_WEST",
+            "ASCENDING_NORTH",
+            "ASCENDING_SOUTH",
+            "SOUTH_EAST",
+            "SOUTH_WEST",
+            "NORTH_WEST",
+            "NORTH_EAST",
+        ],
+        "net/minecraft/world/level/block/state/properties/RedstoneSide" => &["UP", "SIDE", "NONE"],
+        "net/minecraft/world/level/block/state/properties/SculkSensorPhase" => {
+            &["INACTIVE", "ACTIVE", "COOLDOWN"]
+        }
+        "net/minecraft/world/level/block/state/properties/SideChainPart" => {
+            &["UNCONNECTED", "RIGHT", "CENTER", "LEFT"]
+        }
+        "net/minecraft/world/level/block/state/properties/SlabType" => &["TOP", "BOTTOM", "DOUBLE"],
+        "net/minecraft/world/level/block/state/properties/SpeleothemThickness" => {
+            &["TIP_MERGE", "TIP", "FRUSTUM", "MIDDLE", "BASE"]
+        }
+        "net/minecraft/world/level/block/state/properties/StairsShape" => &[
+            "STRAIGHT",
+            "INNER_LEFT",
+            "INNER_RIGHT",
+            "OUTER_LEFT",
+            "OUTER_RIGHT",
+        ],
+        "net/minecraft/world/level/block/state/properties/StructureMode" => {
+            &["SAVE", "LOAD", "CORNER", "DATA"]
+        }
+        "net/minecraft/world/level/block/state/properties/TestBlockMode" => {
+            &["START", "LOG", "FAIL", "ACCEPT"]
+        }
+        "net/minecraft/world/level/block/state/properties/Tilt" => {
+            &["NONE", "UNSTABLE", "PARTIAL", "FULL"]
+        }
+        "net/minecraft/world/level/block/state/properties/WallSide" => &["NONE", "LOW", "TALL"],
         "net/minecraft/world/phys/HitResult$Type" => &["MISS", "BLOCK", "ENTITY"],
         "net/minecraft/client/ParticleStatus" => &["ALL", "DECREASED", "MINIMAL"],
         "net/minecraft/core/Direction$Axis" => &["X", "Y", "Z"],
         "net/minecraft/core/Direction$AxisDirection" => &["POSITIVE", "NEGATIVE"],
         "net/minecraft/world/InteractionHand" => &["MAIN_HAND", "OFF_HAND"],
+        "net/minecraft/world/InteractionResult$SwingSource" => {
+            &["NONE", "PREDICTED", "SERVER_ONLY"]
+        }
         // `CreativeModeTab$TabVisibility` (`server-26.3.jar` `<clinit>` offsets 0..45).
         "net/minecraft/world/item/CreativeModeTab$TabVisibility" => &[
             "PARENT_AND_SEARCH_TABS",
@@ -15905,6 +17648,24 @@ impl host_ref::Nested for HostNested<'_> {
         facade_text::json_now(value, Some(&host.component_states))
     }
 
+    fn voxel_shape_to_string(&mut self, key: &str) -> Option<String> {
+        self.0
+            .as_deref()?
+            .voxel_shapes
+            .get(key)
+            .map(|s| s.to_java_string())
+    }
+
+    fn interaction_result_success(&mut self, key: &str) -> Option<(Value, Value)> {
+        let host = self.0.as_deref()?;
+        block_use::success_parts_in_host(host, key)
+    }
+
+    fn interaction_item_context(&mut self, key: &str) -> Option<(bool, Value)> {
+        let host = self.0.as_deref()?;
+        block_use::item_context_parts_in_host(host, key)
+    }
+
     fn uuid_bits(&mut self, value: &Value) -> Option<(i64, i64)> {
         self.0.as_deref()?.constructed_uuid(value)
     }
@@ -16102,6 +17863,12 @@ fn format_java_string_call<H: Host>(
     };
     match text {
         Some(text) => Ok(Value::Ref(Some(text))),
+        None if args
+            .iter()
+            .any(|value| runtime.contains_counted_string_deep(value)) =>
+        {
+            runtime.counted_unknown(r)
+        }
         None => runtime.host.invoke(r, args),
     }
 }
@@ -19542,7 +21309,61 @@ fn mixin_accessor_label(kind: MixinAccessorKind) -> &'static str {
     }
 }
 
+/// One placement's `BlockPlaceContext` snapshot, registered on `host` for as
+/// long as this scope lives. Dropping it releases the snapshot (and the
+/// arrays it answered), so the release runs however the invocation ends:
+/// a return, an error, or an unwind (#635).
+struct PlacementScope<'h, H: Host> {
+    host: &'h mut H,
+    context: Value,
+}
+
+impl<'h, H: Host> PlacementScope<'h, H> {
+    /// Register `data` on `host`, which must be (or wrap) a [`StdHost`].
+    fn open(host: &'h mut H, data: BlockPlaceContextData) -> Result<Self, NativeError> {
+        let context = host
+            .as_std_host_mut()
+            .ok_or_else(|| NativeError::Metadata("placement requires a standard host".into()))?
+            .new_block_place_context(data);
+        Ok(Self { host, context })
+    }
+}
+
+impl<H: Host> Drop for PlacementScope<'_, H> {
+    fn drop(&mut self) {
+        if let Some(host) = self.host.as_std_host_mut() {
+            host.release_block_place_context(&self.context);
+        }
+    }
+}
+
 impl NativeJar {
+    /// Run a block's `getStateForPlacement(BlockPlaceContext)` override with
+    /// the supplied vanilla context. A `null` answer is vanilla's refusal.
+    ///
+    /// The context snapshot is the host's only while this call runs: it is
+    /// released when the override returns, throws or unwinds, so a
+    /// placement leaves nothing on the host (#635). A context the jar keeps
+    /// (a static, a field, a collection) stays the same object to Java, and
+    /// each accessor called on it later is counted.
+    pub fn block_state_for_placement<H: Host>(
+        &self,
+        block: Value,
+        context: BlockPlaceContextData,
+        host: &mut H,
+    ) -> Result<Option<Value>, NativeError> {
+        let scope = PlacementScope::open(host, context)?;
+        let value = self.invoke_virtual_with_args(
+            "net/minecraft/world/level/block/Block",
+            "getStateForPlacement",
+            "(Lnet/minecraft/world/item/context/BlockPlaceContext;)Lnet/minecraft/world/level/block/state/BlockState;",
+            block,
+            std::slice::from_ref(&scope.context),
+            &mut *scope.host,
+        )?;
+        Ok((value != Value::Ref(None)).then_some(value))
+    }
+
     pub fn from_classes(classes: impl IntoIterator<Item = ClassFile>) -> Self {
         let classes = classes.into_iter().collect::<Vec<_>>();
         let neoforge_entrypoints = classes
@@ -22285,6 +24106,10 @@ impl NativeJar {
             pipelines: Default::default(),
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
+            counted_strings: std::collections::BTreeSet::new(),
+            identity_collections: immutable_collections::IdentityCollections::default(),
+            string_pool: reference_identity::StringPoolState::default(),
+            counted_text_objects: std::collections::BTreeSet::new(),
             gson_writers: BTreeMap::new(),
             string_builder_capacities: BTreeMap::new(),
 
@@ -22299,6 +24124,7 @@ impl NativeJar {
             io_writer_bytes: BTreeMap::new(),
             io_stream_positions: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
+            io_writer_sinks: BTreeMap::new(),
             io_paths,
             io_files,
             io_file_bytes,
@@ -22314,6 +24140,9 @@ impl NativeJar {
             stream_plan: Default::default(),
             store_verdict: Default::default(),
             depth: 0,
+            next_frame_id: 0,
+            shape_extraction: None,
+            check_shape_probes: false,
             budget,
         };
         if !runtime.classes.contains_key(&class_name) {
@@ -22473,6 +24302,34 @@ impl NativeJar {
         )
     }
 
+    /// Invoke a virtual member through the interpreter's JVM dispatch path.
+    /// This is the game bridge entry point for callbacks on host-owned
+    /// objects: a jar override is selected by `Runtime::call_virtual`, while
+    /// inherited game methods remain on the host model.
+    pub fn invoke_virtual_with_args<H: Host>(
+        &self,
+        owner: &str,
+        method: &str,
+        descriptor: &str,
+        receiver: Value,
+        args: &[Value],
+        host: &mut H,
+    ) -> Result<Value, NativeError> {
+        let mut roots = Vec::with_capacity(args.len() + 1);
+        roots.push(receiver.clone());
+        roots.extend_from_slice(args);
+        self.with_persistent_runtime(host, &roots, |runtime| {
+            runtime.call_virtual(
+                jdk_call::Site::Virtual,
+                owner,
+                method,
+                descriptor,
+                &receiver,
+                args,
+            )
+        })
+    }
+
     /// Invoke one jar method the way a later firing of a registered callback
     /// runs: against the host's persistent class state and resident heap (so a
     /// listener sees the statics and objects its entrypoint built, and the next
@@ -22487,9 +24344,34 @@ impl NativeJar {
         host: &mut H,
         budget: &ExecutionBudget,
     ) -> Result<Value, NativeError> {
+        self.invoke_persistent_inner(target, receiver, args, host, budget, None)
+    }
+
+    pub(crate) fn invoke_persistent_shape_extraction<H: Host>(
+        &self,
+        target: &MethodRef,
+        receiver: Option<Value>,
+        args: &[Value],
+        host: &mut H,
+        budget: &ExecutionBudget,
+        extraction_id: u64,
+    ) -> Result<Value, NativeError> {
+        self.invoke_persistent_inner(target, receiver, args, host, budget, Some(extraction_id))
+    }
+
+    fn invoke_persistent_inner<H: Host>(
+        &self,
+        target: &MethodRef,
+        receiver: Option<Value>,
+        args: &[Value],
+        host: &mut H,
+        budget: &ExecutionBudget,
+        shape_extraction: Option<u64>,
+    ) -> Result<Value, NativeError> {
         let (static_fields, initialized_classes) = host.persistent_class_state();
         let (io_paths, io_files, io_file_bytes, io_dirs) = host.persistent_io_state();
         let mut callback_infos = CallbackInfos::new();
+        let check_shape_probes = shape_extraction.is_some() || host.has_retained_shape_probes();
         let mut runtime = Runtime {
             classes: &self.classes,
             mixin_index: std::cell::OnceCell::new(),
@@ -22508,6 +24390,10 @@ impl NativeJar {
             pipelines: Default::default(),
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
+            counted_strings: std::collections::BTreeSet::new(),
+            identity_collections: immutable_collections::IdentityCollections::default(),
+            string_pool: reference_identity::StringPoolState::default(),
+            counted_text_objects: std::collections::BTreeSet::new(),
             gson_writers: BTreeMap::new(),
             string_builder_capacities: BTreeMap::new(),
 
@@ -22522,6 +24408,7 @@ impl NativeJar {
             io_writer_bytes: BTreeMap::new(),
             io_stream_positions: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
+            io_writer_sinks: BTreeMap::new(),
             io_paths,
             io_files,
             io_file_bytes,
@@ -22537,6 +24424,9 @@ impl NativeJar {
             stream_plan: Default::default(),
             store_verdict: Default::default(),
             depth: 0,
+            next_frame_id: 0,
+            shape_extraction,
+            check_shape_probes,
             budget,
         };
         // The callback sees the objects its entrypoint built, and the next
@@ -22544,8 +24434,15 @@ impl NativeJar {
         let resident = runtime.adopt_resident_heap();
         // What the embedder handed over, and below what it gets back: it may
         // hold either until this call's store ends (`StdHost::retain` for
-        // longer).
-        let mut crossing: Vec<Value> = receiver.iter().chain(args).cloned().collect();
+        // longer). Extraction probes are dropped as soon as `evaluate_jar_shape_states`
+        // finishes and are not collectable jar objects, so omit them from `crossing`
+        // during shape extraction to avoid keeping `retained_shape_probes` armed.
+        let mut crossing: Vec<Value> = receiver
+            .iter()
+            .chain(args.iter())
+            .filter(|v| shape_extraction.is_none() || !is_shape_probe(v))
+            .cloned()
+            .collect();
         let result = runtime.invoke(
             &target.owner,
             &target.name,
@@ -22557,7 +24454,11 @@ impl NativeJar {
         let persistence = runtime.persist_class_state();
         let io_persistence = runtime.persist_io_state();
         if resident {
-            crossing.extend(result.as_ref().ok().cloned());
+            if let Ok(value) = result.as_ref()
+                && (shape_extraction.is_none() || !is_shape_probe(value))
+            {
+                crossing.push(value.clone());
+            }
             runtime.persist_resident_heap_crossing(&crossing)?;
         }
         persistence?;
@@ -22572,6 +24473,16 @@ impl NativeJar {
         &self,
         host: &mut H,
         roots: &[Value],
+        action: impl FnOnce(&mut Runtime<'_, H>) -> Result<Value, NativeError>,
+    ) -> Result<Value, NativeError> {
+        self.with_persistent_runtime_with_budget(host, roots, &ExecutionBudget::UNBOUNDED, action)
+    }
+
+    fn with_persistent_runtime_with_budget<H: Host>(
+        &self,
+        host: &mut H,
+        roots: &[Value],
+        budget: &ExecutionBudget,
         action: impl FnOnce(&mut Runtime<'_, H>) -> Result<Value, NativeError>,
     ) -> Result<Value, NativeError> {
         let (static_fields, initialized_classes) = host.persistent_class_state();
@@ -22595,6 +24506,10 @@ impl NativeJar {
             pipelines: Default::default(),
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
+            counted_strings: std::collections::BTreeSet::new(),
+            identity_collections: immutable_collections::IdentityCollections::default(),
+            string_pool: reference_identity::StringPoolState::default(),
+            counted_text_objects: std::collections::BTreeSet::new(),
             gson_writers: BTreeMap::new(),
             string_builder_capacities: BTreeMap::new(),
 
@@ -22609,6 +24524,7 @@ impl NativeJar {
             io_writer_bytes: BTreeMap::new(),
             io_stream_positions: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
+            io_writer_sinks: BTreeMap::new(),
             io_paths,
             io_files,
             io_file_bytes,
@@ -22624,7 +24540,10 @@ impl NativeJar {
             stream_plan: Default::default(),
             store_verdict: Default::default(),
             depth: 0,
-            budget: &ExecutionBudget::UNBOUNDED,
+            next_frame_id: 0,
+            shape_extraction: None,
+            check_shape_probes: false,
+            budget,
         };
         let resident = runtime.adopt_resident_heap();
         let mut crossing = roots.to_vec();
@@ -22638,6 +24557,79 @@ impl NativeJar {
         persistence?;
         io_persistence?;
         result
+    }
+
+    /// Decode a JSON value through a modelled DFU `Codec` handle constructed by this jar.
+    pub fn decode_dfu_codec_json<H: Host>(
+        &self,
+        codec: &Value,
+        json: &serde_json::Value,
+        host: &mut H,
+    ) -> Result<DfuCodecResult<Value>, NativeError> {
+        let mut outcome: Option<DfuCodecResult<Value>> = None;
+        self.with_persistent_runtime(host, std::slice::from_ref(codec), |runtime| {
+            let res = dfu_codec::decode_value_json(runtime, codec, json)?;
+            let rooted = match &res {
+                DfuCodecResult::Ok(v)
+                | DfuCodecResult::Error {
+                    partial: Some(v), ..
+                } => v.clone(),
+                _ => Value::Void,
+            };
+            outcome = Some(res);
+            Ok(rooted)
+        })?;
+        Ok(outcome.unwrap_or_else(|| DfuCodecResult::Unmodelled("no decode outcome".into())))
+    }
+
+    /// Encode a runtime value to JSON through a modelled DFU `Codec` handle constructed by this jar.
+    pub fn encode_dfu_codec_json<H: Host>(
+        &self,
+        codec: &Value,
+        value: &Value,
+        host: &mut H,
+    ) -> Result<DfuCodecResult<serde_json::Value>, NativeError> {
+        let mut outcome: Option<DfuCodecResult<serde_json::Value>> = None;
+        let roots = [codec.clone(), value.clone()];
+        self.with_persistent_runtime(host, &roots, |runtime| {
+            outcome = Some(dfu_codec::encode_value_json(runtime, codec, value)?);
+            Ok(Value::Void)
+        })?;
+        Ok(outcome.unwrap_or_else(|| DfuCodecResult::Unmodelled("no encode outcome".into())))
+    }
+
+    /// Encode a runtime value to exact MC 26.3 wire bytes through a modelled `StreamCodec`.
+    pub fn encode_stream_codec_bytes<H: Host>(
+        &self,
+        codec: &Value,
+        value: &Value,
+        host: &mut H,
+    ) -> Result<Option<Vec<u8>>, NativeError> {
+        let mut encoded = None;
+        let roots = [codec.clone(), value.clone()];
+        self.with_persistent_runtime(host, &roots, |runtime| {
+            encoded = stream_codec::encode_bytes(runtime, codec, value)?;
+            Ok(Value::Void)
+        })?;
+        Ok(encoded)
+    }
+
+    /// Decode a runtime value from exact MC 26.3 wire bytes through a modelled `StreamCodec`,
+    /// returning `(value, bytes_consumed)`.
+    pub fn decode_stream_codec_bytes<H: Host>(
+        &self,
+        codec: &Value,
+        bytes: &[u8],
+        host: &mut H,
+    ) -> Result<Option<(Value, usize)>, NativeError> {
+        let mut decoded: Option<(Value, usize)> = None;
+        self.with_persistent_runtime(host, std::slice::from_ref(codec), |runtime| {
+            decoded = stream_codec::decode_bytes(runtime, codec, bytes)?;
+            Ok(decoded
+                .as_ref()
+                .map_or(Value::Void, |(value, _)| value.clone()))
+        })?;
+        Ok(decoded)
     }
 
     /// Invoke one jar method with the `CallbackInfo` objects of the execution
@@ -22762,6 +24754,10 @@ impl NativeJar {
             pipelines: Default::default(),
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
+            counted_strings: std::collections::BTreeSet::new(),
+            identity_collections: immutable_collections::IdentityCollections::default(),
+            string_pool: reference_identity::StringPoolState::default(),
+            counted_text_objects: std::collections::BTreeSet::new(),
             gson_writers: BTreeMap::new(),
             string_builder_capacities: BTreeMap::new(),
 
@@ -22776,6 +24772,7 @@ impl NativeJar {
             io_writer_bytes: BTreeMap::new(),
             io_stream_positions: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
+            io_writer_sinks: BTreeMap::new(),
             io_paths,
             io_files,
             io_file_bytes,
@@ -22791,6 +24788,9 @@ impl NativeJar {
             stream_plan: Default::default(),
             store_verdict: Default::default(),
             depth: 0,
+            next_frame_id: 0,
+            shape_extraction: None,
+            check_shape_probes: false,
             budget: &ExecutionBudget::UNBOUNDED,
         };
         let resident = runtime.adopt_resident_heap();
@@ -24938,6 +26938,33 @@ fn parse_value_marker(marker: &str) -> Result<Value, NativeError> {
 /// the wild are kilobytes; a crafted one must not grow host memory.
 const MAX_GSON_JSON_BYTES: usize = 1024 * 1024;
 
+/// A host-owned iterator snapshot together with its cursor and originating
+/// collection/stream handle (used for identity-collection invalidation and GC).
+#[derive(Clone, Debug)]
+pub(crate) struct HostIterator {
+    pub(crate) values: Vec<Value>,
+    pub(crate) index: usize,
+    pub(crate) origin: Option<Value>,
+}
+
+impl HostIterator {
+    fn new(values: Vec<Value>, origin: Option<Value>) -> Self {
+        Self {
+            values,
+            index: 0,
+            origin,
+        }
+    }
+}
+
+/// A runtime-owned value-list stream together with its originating collection
+/// handle (recorded when minted so derived-handle lookup needs no side map).
+#[derive(Clone, Debug)]
+pub(crate) struct StreamEntry {
+    pub(crate) values: Vec<Value>,
+    pub(crate) origin: Option<Value>,
+}
+
 struct Runtime<'a, H> {
     classes: &'a BTreeMap<String, ClassFile>,
     /// Each class a jar `@Mixin` targets, with the mixin classes naming it,
@@ -24961,7 +26988,7 @@ struct Runtime<'a, H> {
     arrays: BTreeMap<String, ArrayData>,
     next_array: usize,
     next_object: usize,
-    streams: BTreeMap<String, Vec<Value>>,
+    streams: BTreeMap<String, StreamEntry>,
     next_stream: usize,
     /// Lazy stream stages and builders (`stream_pipeline.rs`).
     pipelines: stream_pipeline::Pipelines,
@@ -24974,6 +27001,16 @@ struct Runtime<'a, H> {
     /// so a later `toString` sees every earlier append — the JDK's contract,
     /// and what a value-chain marker would lose.
     string_builders: BTreeMap<String, String>,
+    /// Allocation keys of constructors whose String text is not modelled exactly.
+    counted_strings: std::collections::BTreeSet<String>,
+    /// Runtime-wide identity epoch and per-collection provenance for
+    /// `IdentityHashMap` / `IdentityHashSet`.
+    identity_collections: immutable_collections::IdentityCollections,
+    /// Runtime-local JVM string-pool observations for `String.intern()`.
+    string_pool: reference_identity::StringPoolState,
+    /// Allocation keys (or I/O sink keys) whose held text was written from a
+    /// counted value. Reads of these objects must remain counted as well.
+    counted_text_objects: std::collections::BTreeSet<String>,
     /// JsonWriter states keyed by their jar object marker.
     gson_writers: BTreeMap<String, gson_writer::State>,
     /// The current backing capacity of each modelled StringBuilder. Its
@@ -25001,6 +27038,9 @@ struct Runtime<'a, H> {
     io_stream_positions: BTreeMap<String, usize>,
     /// Charset selected by each writer sink; UTF-8 is Java 25's default.
     io_writer_charsets: BTreeMap<String, String>,
+    /// Writer wrappers share the sink of the object they wrap (for example a
+    /// PrintWriter over a StringWriter or a PrintStream over a byte array).
+    io_writer_sinks: BTreeMap<String, String>,
     /// Charset-independent bytes committed for each virtual file. Text is
     /// retained separately for the reader model; File.length() uses these
     /// bytes, as the JDK does.
@@ -25050,6 +27090,20 @@ struct Runtime<'a, H> {
     /// thread's stack (`frame_bound.rs`) in [`Runtime::invoke`] before a frame
     /// starts.
     depth: usize,
+    /// Monotonically increasing identity for each interpreter frame invocation.
+    /// A depth is insufficient because two sequential calls at the same depth
+    /// must still get distinct allocation provenance.
+    next_frame_id: u64,
+    /// Extraction id of the active `Block.getShape` / `getCollisionShape` call,
+    /// if any. Free forwarding in [`Self::is_allowed_shape_probe_invoke`] is
+    /// granted only to `HostKind::ShapeProbe` handles tagged with this exact id
+    /// in their original slots.
+    shape_extraction: Option<u64>,
+    /// True whenever a `HostKind::ShapeProbe` may be reachable during this
+    /// execution (inside shape extraction, after an earlier extraction on this
+    /// host, or when a probe was passed directly); enables
+    /// [`Self::check_shape_probe_opcode`] in [`Runtime::invoke_frame`].
+    check_shape_probes: bool,
     /// The wall-clock budget this execution honours, checked with
     /// [`BUDGET_CHECK_INSTRUCTIONS`] and in [`Runtime::invoke`].
     budget: &'a ExecutionBudget,
@@ -25063,6 +27117,11 @@ enum Assignable {
     Counted,
     /// A name the runtime does not know: the host's nominal answer.
     Host,
+}
+
+/// Whether `value` is an opaque shape-extraction probe (`HostKind::ShapeProbe`).
+fn is_shape_probe(value: &Value) -> bool {
+    matches!(value, Value::Host(h) if h.kind() == HostKind::ShapeProbe)
 }
 
 /// Whether `file` itself declares `field` (name and descriptor).
@@ -25090,6 +27149,11 @@ impl<H: Host> Runtime<'_, H> {
             let Some(file) = self.class(&current) else {
                 if let Some(owner) =
                     menu_models::field_owner(&current, &field.name, &field.descriptor)
+                {
+                    return owner.to_owned();
+                }
+                if let Some(owner) =
+                    mutable_container::field_owner(&current, &field.name, &field.descriptor)
                 {
                     return owner.to_owned();
                 }
@@ -25405,8 +27469,23 @@ impl<H: Host> Runtime<'_, H> {
         }
     }
 
+    /// Record a `String.intern()` call on `receiver`: if its text was not
+    /// already observed in the pool, Java 25 may install a fresh receiver
+    /// itself in the pool, so fresh-vs-interned identity for that text becomes
+    /// ambiguous and must be counted.
+    pub(crate) fn note_string_intern(&mut self, r: &MethodRef, receiver: Option<&Value>) {
+        if r.owner == "java/lang/String"
+            && r.name == "intern"
+            && r.descriptor == "()Ljava/lang/String;"
+            && let Some(Value::Ref(Some(text))) = receiver
+        {
+            self.string_pool.note_intern(text);
+        }
+    }
+
     /// Replace one argument of the invoke about to run, through every
-    /// `@ModifyArg` callback bound to that call site.
+    /// `@ModifyArg` callback bound to that call site. Returns the argument
+    /// indices whose values were passed through a modifier callback.
     ///
     /// Each callback sees the value the previous one produced, matching
     /// Mixin's sequential argument modifiers.
@@ -25418,27 +27497,28 @@ impl<H: Host> Runtime<'_, H> {
         method: &str,
         descriptor: &str,
         pc: usize,
-    ) -> Result<(), NativeError> {
+    ) -> Result<Vec<usize>, NativeError> {
         if self
             .modify_hooks
             .as_deref()
             .is_none_or(|hooks| hooks.dispatching || !hooks.applies(class, method, descriptor))
         {
-            return Ok(());
+            return Ok(Vec::new());
         }
         let entries = match self.modify_hooks.as_deref_mut() {
             Some(hooks) => hooks.arg_candidates(site),
-            None => return Ok(()),
+            None => return Ok(Vec::new()),
         };
         if entries.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
+        let modified: Vec<usize> = entries.iter().map(|entry| entry.index).collect();
         self.set_modify_dispatching(true);
         let outcome = self.run_modify_arg_callbacks(&entries, args);
         self.set_modify_dispatching(false);
         outcome?;
         self.record_modify_arg_site(class, method, pc);
-        Ok(())
+        Ok(modified)
     }
 
     fn run_modify_arg_callbacks(
@@ -25498,7 +27578,8 @@ impl<H: Host> Runtime<'_, H> {
     }
 
     /// Replace the value of one local store or load through the
-    /// `@ModifyVariable` callbacks bound to it.
+    /// `@ModifyVariable` callbacks bound to it. Marks `frame_modified_identity`
+    /// when a modifier callback altered a reference local.
     fn dispatch_modify_variable(
         &mut self,
         anchor: VariableAnchor,
@@ -25509,6 +27590,7 @@ impl<H: Host> Runtime<'_, H> {
         method: &str,
         descriptor: &str,
         pc: usize,
+        frame_modified_identity: &mut bool,
     ) -> Result<Value, NativeError> {
         if self
             .modify_hooks
@@ -25529,6 +27611,9 @@ impl<H: Host> Runtime<'_, H> {
         self.set_modify_dispatching(false);
         let value = outcome?;
         self.record_modify_variable_site(class, method, pc);
+        if instruction_type == "Ljava/lang/Object;" {
+            *frame_modified_identity = true;
+        }
         Ok(value)
     }
 
@@ -26015,7 +28100,8 @@ impl<H: Host> Runtime<'_, H> {
                         )
                         .map(Some);
                 }
-                self.host.invoke_instance(&target, receiver, args).map(Some)
+                self.note_string_intern(&target, Some(receiver));
+                self.invoke_host_instance(&target, receiver, args).map(Some)
             }
         }
     }
@@ -26220,6 +28306,11 @@ impl<H: Host> Runtime<'_, H> {
                 )? {
                     return Ok(Some(value));
                 }
+                if let Some(value) =
+                    dfu_codec::runtime_instance_call(self, &callback.target, None, &values)?
+                {
+                    return Ok(Some(value));
+                }
                 let token = self.mod_count_before(&callback.target, 0xb8, None, &values)?;
                 if let Some(answer) = token.as_ref().and_then(|token| token.answer.clone()) {
                     return Ok(Some(answer));
@@ -26254,13 +28345,18 @@ impl<H: Host> Runtime<'_, H> {
                 let object = self.new_object(&callback.target.owner);
                 // `StringBuilder::new`: the interpreter's own builder, as `new`
                 // and `<init>` make it (`jdk_string_builder.rs`).
-                if self
-                    .invoke_string_builder(&callback.target, Some(&object), &values)?
-                    .is_none()
+                let builder =
+                    self.invoke_string_builder(&callback.target, Some(&object), &values)?;
+                if builder.is_none()
                     && string_constructors::count(self, &callback.target)?.is_none()
                 {
                     self.host
                         .invoke_instance(&callback.target, &object, &values)?;
+                } else if builder.is_none()
+                    && callback.target.owner == "java/lang/String"
+                    && let Some(key) = jar_object::object_key(&object)
+                {
+                    self.counted_strings.insert(key.to_owned());
                 }
                 return Ok(Some(object));
             }
@@ -26409,14 +28505,23 @@ impl<H: Host> Runtime<'_, H> {
             )? {
                 return Ok(Some(value));
             }
+            if let Some(value) =
+                dfu_codec::runtime_instance_call(self, &callback.target, Some(&receiver), &rest)?
+            {
+                return Ok(Some(value));
+            }
+            if let Some(value) =
+                stream_codec::runtime_instance_call(self, &callback.target, Some(&receiver), &rest)
+            {
+                return value.map(Some);
+            }
             // `list::add` moves the list's `modCount` as the call would.
             let token = self.mod_count_before(&callback.target, 0xb9, Some(&receiver), &rest)?;
             if let Some(answer) = token.as_ref().and_then(|token| token.answer.clone()) {
                 return Ok(Some(answer));
             }
-            let value = self
-                .host
-                .invoke_instance(&callback.target, &receiver, &rest)?;
+            self.note_string_intern(&callback.target, Some(&receiver));
+            let value = self.invoke_host_instance(&callback.target, &receiver, &rest)?;
             if let Some(token) = token {
                 self.mod_count_after(token, &value)?;
             }
@@ -26698,20 +28803,57 @@ impl<H: Host> Runtime<'_, H> {
                 },
             );
         }
-        let placement = MethodRef {
-            owner: class.to_owned(),
-            name: "getStateForPlacement".into(),
-            descriptor: "(Lnet/minecraft/world/item/context/BlockPlaceContext;)Lnet/minecraft/world/level/block/state/BlockState;".into(),
-        };
-        if self
-            .class(&placement.owner)
-            .and_then(|file| file.method(&placement.name, &placement.descriptor))
-            .is_some()
-        {
-            self.host.block_placement_unknown();
-        }
-
         Ok(())
+    }
+
+    fn is_counted_string(&self, value: &Value) -> bool {
+        jar_object::object_key(value).is_some_and(|key| self.counted_strings.contains(key))
+    }
+
+    /// Record an unknown result whose value was derived from an opaque String.
+    /// The result is opaque too: retaining its allocation key makes every later
+    /// attempt to turn it into text count rather than printing the key.
+    pub(crate) fn counted_unknown(&mut self, r: &MethodRef) -> Result<Value, NativeError> {
+        let mut value = self.host.unknown_operand_call(r)?;
+        // Unknown reference-returning calls use null as the host's neutral
+        // answer. A derived String remains a live opaque object in Java, so
+        // give it a fresh allocation key for subsequent counted uses.
+        if value == Value::Ref(None) && return_desc(&r.descriptor) == "Ljava/lang/String;" {
+            value = self.new_object("java/lang/String");
+        }
+        if let Some(key) = jar_object::object_key(&value) {
+            self.counted_strings.insert(key.to_owned());
+        }
+        Ok(value)
+    }
+
+    pub(crate) fn contains_counted_string_deep(&self, value: &Value) -> bool {
+        fn visit<H: Host>(
+            runtime: &Runtime<'_, H>,
+            value: &Value,
+            seen: &mut std::collections::HashSet<String>,
+        ) -> bool {
+            if runtime.is_counted_string(value) {
+                return true;
+            }
+            let Some(key) = host_array::array_key(value) else {
+                return false;
+            };
+            if !seen.insert(key.to_owned()) {
+                return false;
+            }
+            runtime
+                .owned_array(value)
+                .is_some_and(|values| values.iter().any(|value| visit(runtime, value, seen)))
+        }
+        visit(self, value, &mut std::collections::HashSet::new())
+    }
+
+    fn contains_counted_string(&self, receiver: Option<&Value>, args: &[Value]) -> bool {
+        receiver.is_some_and(|value| self.contains_counted_string_deep(value))
+            || args
+                .iter()
+                .any(|value| self.contains_counted_string_deep(value))
     }
 
     /// A new object of `class`: a [`HostKind::JarObject`] handle keyed by a
@@ -27817,6 +29959,11 @@ impl<H: Host> Runtime<'_, H> {
         {
             let receiver = receiver.unwrap_or(&Value::Ref(None));
             let other = StdHost::argument(r, args, 0)?;
+            if matches!(receiver, Value::Host(h) if h.kind() == HostKind::ShapeProbe)
+                || matches!(other, Value::Host(h) if h.kind() == HostKind::ShapeProbe)
+            {
+                return self.host.unknown_operand_call(r).map(Some);
+            }
             return Ok(Some(Value::Int(
                 (value_marker(receiver) == value_marker(other)) as i32,
             )));
@@ -29039,6 +31186,133 @@ impl<H: Host> Runtime<'_, H> {
         if let Some(value) = self.content_builder_call(r, receiver, args)? {
             return Ok(Some(value));
         }
+        // `Shapes.or(VoxelShape, VoxelShape...)`: needs the runtime-owned varargs array.
+        if r.owner == voxel_shape::SHAPES
+            && r.name == "or"
+            && r.descriptor
+                == "(Lnet/minecraft/world/phys/shapes/VoxelShape;[Lnet/minecraft/world/phys/shapes/VoxelShape;)Lnet/minecraft/world/phys/shapes/VoxelShape;"
+        {
+            let first = args.first().unwrap_or(&Value::Ref(None));
+            let rest_arg = args.get(1).unwrap_or(&Value::Ref(None));
+            if *rest_arg == Value::Ref(None) {
+                return Err(NativeError::UncaughtException {
+                    class: "java/lang/NullPointerException".into(),
+                    message: None,
+                    frame: None,
+                });
+            }
+            if let Some(others) = self.owned_array(rest_arg).map(|v| v.into_owned()) {
+                return self.host.voxel_shape_or_array(r, first, &others).map(Some);
+            }
+        }
+        if let Some(value) = block_use::invoke_runtime_helper(self, r, receiver, args)? {
+            return Ok(Some(value));
+        }
+        // `BlockStateBase.getShape(BlockGetter, BlockPos[, CollisionContext])`: dispatches to the
+        // block's `getShape` (MC 26.3 `BlockBehaviour$BlockStateBase.getShape`).
+        if matches!(
+            r.owner.as_str(),
+            "net/minecraft/world/level/block/state/BlockState"
+                | "net/minecraft/world/level/block/state/BlockBehaviour$BlockStateBase"
+        ) && r.name == "getShape"
+            && (r.descriptor == voxel_shape::BLOCK_STATE_GET_SHAPE_2_DESC
+                || r.descriptor == voxel_shape::BLOCK_STATE_GET_SHAPE_3_DESC)
+            && let Some(state_val) = receiver
+            && let Some(block_val) = self.host.block_state_block(state_val)
+            && let Some(block_class) = jar_object::object_class(&block_val)
+        {
+            let level = args.first().cloned().unwrap_or(Value::Ref(None));
+            let pos = args.get(1).cloned().unwrap_or(Value::Ref(None));
+            let ctx = if r.descriptor == voxel_shape::BLOCK_STATE_GET_SHAPE_3_DESC {
+                args.get(2).cloned().unwrap_or(Value::Ref(None))
+            } else {
+                voxel_shape::empty_collision_context()
+            };
+            let mut cur = block_class.to_owned();
+            let mut found = None;
+            for _ in 0..64 {
+                let Some(file) = self.class(&cur) else {
+                    break;
+                };
+                if file
+                    .method("getShape", voxel_shape::GET_SHAPE_DESC)
+                    .is_some()
+                {
+                    found = Some(cur.clone());
+                    break;
+                }
+                if file.super_name.is_empty() {
+                    break;
+                }
+                cur = file.super_name.clone();
+            }
+            if let Some(owner) = found {
+                return self
+                    .invoke(
+                        &owner,
+                        "getShape",
+                        voxel_shape::GET_SHAPE_DESC,
+                        Some(block_val),
+                        &[state_val.clone(), level, pos, ctx],
+                    )
+                    .map(Some);
+            }
+            if vanilla_block_shapes::inherits_block_behaviour_get_shape(&cur) {
+                return Ok(Some(voxel_shape::block_shape()));
+            }
+        }
+        // `super.getCollisionShape` on a vanilla class inheriting `BlockBehaviour.getCollisionShape`:
+        // `return this.hasCollision ? state.getShape(level, pos) : Shapes.empty();`
+        if r.name == "getCollisionShape"
+            && r.descriptor == voxel_shape::GET_SHAPE_DESC
+            && vanilla_block_shapes::inherits_block_behaviour_get_collision_shape(&r.owner)
+            && let Some(block_val) = receiver
+            && let Some(has_collision) = self.host.block_has_collision(block_val)
+        {
+            if !has_collision {
+                return Ok(Some(voxel_shape::empty_shape()));
+            }
+            let state_val = args.first().cloned().unwrap_or(Value::Ref(None));
+            if let Some(state_block) = self.host.block_state_block(&state_val)
+                && let Some(block_class) = jar_object::object_class(&state_block)
+            {
+                let level = args.get(1).cloned().unwrap_or(Value::Ref(None));
+                let pos = args.get(2).cloned().unwrap_or(Value::Ref(None));
+                let ctx = voxel_shape::empty_collision_context();
+                let mut cur = block_class.to_owned();
+                let mut found = None;
+                for _ in 0..64 {
+                    let Some(file) = self.class(&cur) else {
+                        break;
+                    };
+                    if file
+                        .method("getShape", voxel_shape::GET_SHAPE_DESC)
+                        .is_some()
+                    {
+                        found = Some(cur.clone());
+                        break;
+                    }
+                    if file.super_name.is_empty() {
+                        break;
+                    }
+                    cur = file.super_name.clone();
+                }
+                if let Some(owner) = found {
+                    return self
+                        .invoke(
+                            &owner,
+                            "getShape",
+                            voxel_shape::GET_SHAPE_DESC,
+                            Some(state_block),
+                            &[state_val, level, pos, ctx],
+                        )
+                        .map(Some);
+                }
+                if vanilla_block_shapes::inherits_block_behaviour_get_shape(&cur) {
+                    return Ok(Some(voxel_shape::block_shape()));
+                }
+            }
+        }
         // `BlockPos.betweenClosedStream` is the game's own bounding-box stream.
         // A mod filters and maps it for a shape offset table; the bounded host
         // models the stream shape, not every position in a crafted box.
@@ -29179,6 +31453,9 @@ impl<H: Host> Runtime<'_, H> {
 
     /// The sink a modelled writer marker appends into.
     fn io_sink_key(&self, marker: &str) -> Option<String> {
+        if let Some(key) = self.io_writer_sinks.get(marker) {
+            return Some(key.clone());
+        }
         if let Some(path) = self.io_paths.get(marker) {
             return Some(format!("file:{path}"));
         }
@@ -29190,6 +31467,23 @@ impl<H: Host> Runtime<'_, H> {
         }
         let key = format!("mem:{marker}");
         self.io_writers.contains_key(&key).then_some(key)
+    }
+
+    fn mark_counted_text_object(&mut self, value: &Value) {
+        if let Some(key) = jar_object::object_key(value) {
+            self.counted_text_objects.insert(key.to_owned());
+        }
+    }
+
+    fn mark_counted_io_sink(&mut self, marker: &str) {
+        if let Some(key) = self.io_sink_key(marker) {
+            self.counted_text_objects.insert(key);
+        }
+    }
+
+    fn counted_io_sink(&self, marker: &str) -> bool {
+        self.io_sink_key(marker)
+            .is_some_and(|key| self.counted_text_objects.contains(&key))
     }
 
     /// Open a writer marker over `path`, or in memory when the writer wraps a
@@ -29267,6 +31561,37 @@ impl<H: Host> Runtime<'_, H> {
             self.watch_writer_opened(path, false);
         }
         Ok(())
+    }
+
+    fn io_bind_writer(&mut self, marker: &str, wrapped: &Value) -> bool {
+        let Some(wrapped) = jar_object::object_key(wrapped) else {
+            return false;
+        };
+        if !matches!(
+            jar_object::key_class(wrapped),
+            Some(
+                "java/io/BufferedWriter"
+                    | "java/io/FileWriter"
+                    | "java/io/OutputStreamWriter"
+                    | "java/io/StringWriter"
+                    | "java/io/PrintWriter"
+                    | "java/io/PrintStream"
+                    | "java/io/OutputStream"
+                    | "java/io/FileOutputStream"
+                    | "java/io/ByteArrayOutputStream"
+            )
+        ) {
+            return false;
+        }
+        let Some(key) = self.io_sink_key(wrapped) else {
+            return false;
+        };
+        if let Some(path) = self.io_paths.get(wrapped).cloned() {
+            self.io_paths.insert(marker.to_owned(), path);
+        }
+        self.io_writer_sinks.insert(marker.to_owned(), key.clone());
+        self.io_writers.entry(key).or_default();
+        true
     }
 
     /// Append text to a modelled writer's sink.
@@ -30181,11 +32506,14 @@ impl<H: Host> Runtime<'_, H> {
                 // `PrintWriter(Writer)` and `PrintWriter(OutputStream)` wrap one
                 // of ours; a `File`/`String` argument is a file the constructor
                 // itself opens.
-                if let Some(wrapped) = args.first().filter(|value| {
-                    expect_ref(value).is_some_and(|marker| self.io_paths.contains_key(marker))
-                }) {
+                if let Some(wrapped) = args
+                    .first()
+                    .filter(|value| self.io_bind_writer(&marker, value))
+                {
                     let path = self.io_path_of(wrapped);
-                    self.io_open_writer(&marker, path, false)?;
+                    if path.is_some() {
+                        self.io_open_writer(&marker, path, false)?;
+                    }
                 } else {
                     let path = args.first().and_then(|value| self.io_path_of(value));
                     self.io_open_writer(&marker, path, !appending)?;
@@ -30197,8 +32525,13 @@ impl<H: Host> Runtime<'_, H> {
                 let Some(marker) = receiver_marker else {
                     return Ok(None);
                 };
-                let path = args.first().and_then(|value| self.io_path_of(value));
-                self.io_open_writer(&marker, path, false)?;
+                if !args
+                    .first()
+                    .is_some_and(|value| self.io_bind_writer(&marker, value))
+                {
+                    let path = args.first().and_then(|value| self.io_path_of(value));
+                    self.io_open_writer(&marker, path, false)?;
+                }
                 self.io_set_writer_charset(&marker, args);
                 Ok(Some(Value::Void))
             }
@@ -30206,8 +32539,13 @@ impl<H: Host> Runtime<'_, H> {
                 let Some(marker) = receiver_marker else {
                     return Ok(None);
                 };
-                let path = args.first().and_then(|value| self.io_path_of(value));
-                self.io_open_writer(&marker, path, false)?;
+                if !args
+                    .first()
+                    .is_some_and(|value| self.io_bind_writer(&marker, value))
+                {
+                    let path = args.first().and_then(|value| self.io_path_of(value));
+                    self.io_open_writer(&marker, path, false)?;
+                }
                 self.io_set_writer_charset(&marker, args);
                 Ok(Some(Value::Void))
             }
@@ -30216,6 +32554,25 @@ impl<H: Host> Runtime<'_, H> {
                     return Ok(None);
                 };
                 self.io_open_writer(&marker, None, true)?;
+                Ok(Some(Value::Void))
+            }
+            "java/io/ByteArrayOutputStream" if r.name == "<init>" => {
+                let Some(marker) = receiver_marker else {
+                    return Ok(None);
+                };
+                self.io_open_writer(&marker, None, true)?;
+                Ok(Some(Value::Void))
+            }
+            "java/io/PrintStream" if r.name == "<init>" => {
+                let Some(marker) = receiver_marker else {
+                    return Ok(None);
+                };
+                if !args
+                    .first()
+                    .is_some_and(|value| self.io_bind_writer(&marker, value))
+                {
+                    return Ok(None);
+                }
                 Ok(Some(Value::Void))
             }
             "java/io/FileOutputStream" | "java/io/FileInputStream" if r.name == "<init>" => {
@@ -30330,7 +32687,8 @@ impl<H: Host> Runtime<'_, H> {
             | "java/io/OutputStreamWriter"
             | "java/io/StringWriter"
             | "java/io/PrintWriter"
-            | "java/io/PrintStream" => {
+            | "java/io/PrintStream"
+            | "java/io/ByteArrayOutputStream" => {
                 let Some(marker) = receiver_marker else {
                     return Ok(None);
                 };
@@ -30531,7 +32889,15 @@ impl<H: Host> Runtime<'_, H> {
                             || descriptor.ends_with(")Ljava/io/StringWriter;") =>
                     {
                         let text = match args.first() {
-                            Some(value) => java_value_text(&mut *self.host, value, descriptor)?,
+                            Some(value) => {
+                                match self.java_text(value, descriptor, class, method)? {
+                                    Some(text) => text,
+                                    None if self.contains_counted_string_deep(value) => {
+                                        return self.counted_unknown(r).map(Some);
+                                    }
+                                    None => return Ok(None),
+                                }
+                            }
                             None => String::new(),
                         };
                         self.io_write(&marker, &text)?;
@@ -30549,7 +32915,13 @@ impl<H: Host> Runtime<'_, H> {
                                     .first()
                                     .cloned()
                                     .unwrap_or_else(|| "Ljava/lang/Object;".into());
-                                java_value_text(&mut *self.host, value, &argument)?
+                                match self.java_text(value, &argument, class, method)? {
+                                    Some(text) => text,
+                                    None if self.contains_counted_string_deep(value) => {
+                                        return self.counted_unknown(r).map(Some);
+                                    }
+                                    None => return Ok(None),
+                                }
                             }
                             None => String::new(),
                         };
@@ -30590,10 +32962,28 @@ impl<H: Host> Runtime<'_, H> {
                     }
                     ("checkError", "()Z") => Value::Int(0),
                     ("toString", "()Ljava/lang/String;") => {
+                        if self.counted_io_sink(&marker) {
+                            return self.counted_unknown(r).map(Some);
+                        }
                         Value::Ref(Some(self.io_sink_text(&marker)))
                     }
                     ("getBuffer", "()Ljava/lang/StringBuffer;") => {
+                        if self.counted_io_sink(&marker) {
+                            return self.counted_unknown(r).map(Some);
+                        }
                         Value::Ref(Some(self.io_sink_text(&marker)))
+                    }
+                    ("toByteArray", "()[B") => {
+                        if self.counted_io_sink(&marker) {
+                            return self.counted_unknown(r).map(Some);
+                        }
+                        self.io_bytes_array(self.io_sink_text(&marker).into_bytes())
+                    }
+                    ("size", "()I") => {
+                        if self.counted_io_sink(&marker) {
+                            return self.counted_unknown(r).map(Some);
+                        }
+                        Value::Int(self.io_sink_text(&marker).len() as i32)
                     }
                     _ => return Ok(None),
                 }))
@@ -32245,6 +34635,44 @@ impl<H: Host> Runtime<'_, H> {
             .ok_or_else(|| NativeError::Metadata("array is not owned by this invocation".into()))
     }
 
+    #[inline(never)]
+    fn materialize_host_array(&mut self, value: Value) -> Value {
+        let Some((descriptor, values)) = self.host.host_array_values(&value) else {
+            return value;
+        };
+        self.new_array_value(descriptor, values)
+    }
+
+    #[inline(never)]
+    fn invoke_host_instance(
+        &mut self,
+        r: &MethodRef,
+        receiver: &Value,
+        args: &[Value],
+    ) -> Result<Value, NativeError> {
+        let value = if level_sound::needs_block_pos_resolution(r, args) {
+            let mut resolved_args = args.to_vec();
+            level_sound::resolve_block_pos_arg(self, r, &mut resolved_args);
+            self.host.invoke_instance(r, receiver, &resolved_args)?
+        } else {
+            self.host.invoke_instance(r, receiver, args)?
+        };
+        Ok(self.materialize_host_array(value))
+    }
+
+    #[inline(never)]
+    fn invoke_host_or_client_reload_instance(
+        &mut self,
+        r: &MethodRef,
+        receiver: &Value,
+        args: &[Value],
+    ) -> Result<Value, NativeError> {
+        if let Some(value) = client_reload::runtime_instance_call(self, r, receiver, args) {
+            return value;
+        }
+        self.invoke_host_instance(r, receiver, args)
+    }
+
     /// Whether `value` is a stream this runtime made. Stream identity hashes
     /// stay unknown even when a collection asks through a nested path.
     fn is_live_stream_value(&self, value: &Value) -> bool {
@@ -32254,7 +34682,13 @@ impl<H: Host> Runtime<'_, H> {
     fn new_stream(&mut self, class: &str, method: &str, values: Vec<Value>) -> Value {
         let marker = stream_pipeline::stream_marker(class, method, self.next_stream);
         self.next_stream += 1;
-        self.streams.insert(marker.clone(), values);
+        self.streams.insert(
+            marker.clone(),
+            StreamEntry {
+                values,
+                origin: None,
+            },
+        );
         Value::Ref(Some(marker))
     }
 
@@ -32522,7 +34956,7 @@ impl<H: Host> Runtime<'_, H> {
                 }
             }
             ("isEmpty", "()Z") => Value::Int(values.is_empty() as i32),
-            _ => return self.more_stream_stages(r, &values),
+            _ => return self.more_stream_stages(r, receiver, &values),
         };
         Ok(Some(result))
     }
@@ -33559,6 +35993,75 @@ impl<H: Host> Runtime<'_, H> {
                         )?
                     }
                 }
+                menu_models::MenuAction::MenuConstructor {
+                    constructor,
+                    container_id,
+                    inventory,
+                    player,
+                } => {
+                    let ctor_args = [container_id, inventory, player];
+                    if let Some(menu) = self.invoke_callback(&constructor, &ctor_args)? {
+                        menu
+                    } else {
+                        self.call_virtual(
+                            jdk_call::Site::Interface,
+                            menu_models::MENU_CONSTRUCTOR,
+                            "createMenu",
+                            "(ILnet/minecraft/world/entity/player/Inventory;Lnet/minecraft/world/entity/player/Player;)Lnet/minecraft/world/inventory/AbstractContainerMenu;",
+                            &constructor,
+                            &ctor_args,
+                        )?
+                    }
+                }
+                menu_models::MenuAction::AccessEvaluate {
+                    function,
+                    level,
+                    pos,
+                    default,
+                } => {
+                    let fn_args = [level, pos];
+                    let applied = if let Some(v) = self.invoke_callback(&function, &fn_args)? {
+                        v
+                    } else {
+                        self.call_virtual(
+                            jdk_call::Site::Interface,
+                            "java/util/function/BiFunction",
+                            "apply",
+                            "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+                            &function,
+                            &fn_args,
+                        )?
+                    };
+                    if applied == Value::Ref(None) {
+                        return Err(NativeError::UncaughtException {
+                            class: "java/lang/NullPointerException".into(),
+                            message: None,
+                            frame: None,
+                        });
+                    }
+                    match default {
+                        Some(_) => applied,
+                        None => host_optional::optional_wrap(applied),
+                    }
+                }
+                menu_models::MenuAction::AccessExecute {
+                    consumer,
+                    level,
+                    pos,
+                } => {
+                    let fn_args = [level, pos];
+                    if self.invoke_callback(&consumer, &fn_args)?.is_none() {
+                        let _ = self.call_virtual(
+                            jdk_call::Site::Interface,
+                            "java/util/function/BiConsumer",
+                            "accept",
+                            "(Ljava/lang/Object;Ljava/lang/Object;)V",
+                            &consumer,
+                            &fn_args,
+                        )?;
+                    }
+                    Value::Void
+                }
             };
         }
         Ok(Some(value))
@@ -33608,10 +36111,21 @@ impl<H: Host> Runtime<'_, H> {
         if self.depth == 0 {
             jar_throwables::start_execution();
         }
+        let frame_id = self.next_frame_id;
+        self.next_frame_id = self.next_frame_id.wrapping_add(1);
         self.depth += 1;
+        let prev_check_shape_probes = self.check_shape_probes;
+        if self.shape_extraction.is_some()
+            || self.host.has_retained_shape_probes()
+            || receiver.as_ref().is_some_and(is_shape_probe)
+            || args.iter().any(is_shape_probe)
+        {
+            self.check_shape_probes = true;
+        }
         stack_walk::enter(class, method);
-        let result = self.invoke_frame(class, method, desc, receiver, args);
+        let result = self.invoke_frame(class, method, desc, receiver, args, frame_id);
         stack_walk::leave();
+        self.check_shape_probes = prev_check_shape_probes;
         self.depth -= 1;
         // An execution's end: a host walk's refusal no jar frame saw (the entrypoint's own
         // host call, or one that left uncaught) is counted too.
@@ -33630,6 +36144,241 @@ impl<H: Host> Runtime<'_, H> {
             instructions: self.instructions,
             instruction_limit: self.budget.instruction_limit(),
         }
+    }
+
+    /// Whether `value` is a `HostKind::ShapeProbe` that does NOT belong to the
+    /// currently active extraction (`self.shape_extraction`).
+    fn is_stale_shape_probe(&self, value: &Value) -> bool {
+        let Value::Host(handle) = value else {
+            return false;
+        };
+        if handle.kind() != HostKind::ShapeProbe {
+            return false;
+        }
+        match (
+            self.shape_extraction,
+            voxel_shape::parse_shape_probe_key(handle.key()),
+        ) {
+            (Some(current_id), Some((probe_id, _))) => probe_id != current_id,
+            _ => true,
+        }
+    }
+
+    fn count_shape_probe_use(&mut self, op: u8) -> Result<(), NativeError> {
+        let can_escape = !matches!(
+            op,
+            0x3a | 0x4b..=0x4e | 0x57..=0x5f | 0xb1 | 0xb4 | 0xc2 | 0xc3 | 0xc6 | 0xc7
+        );
+        if can_escape {
+            self.host.note_retained_shape_probe();
+        }
+        let name = match op {
+            0x3a | 0x4b..=0x4e => "<astore>",
+            0x4f..=0x56 => "<aastore>",
+            0x57..=0x5f => "<stack_op>",
+            0xac..=0xb0 => "<areturn>",
+            0xb1 => "<return>",
+            0xb3 => "<putstatic>",
+            0xb4 => "<getfield>",
+            0xb5 => "<putfield>",
+            0xba => "<invokedynamic>",
+            0xbf => "<athrow>",
+            0xc2 => "<monitorenter>",
+            0xc3 => "<monitorexit>",
+            0xc6 => "<ifnull>",
+            0xc7 => "<ifnonnull>",
+            _ => "<shape_probe>",
+        };
+        self.host
+            .unknown_operand_call(&MethodRef {
+                owner: "java/lang/Object".into(),
+                name: name.into(),
+                descriptor: "()V".into(),
+            })
+            .map(|_| ())
+    }
+
+    /// Structural allow-list enforced on every bytecode instruction while
+    /// `self.check_shape_probes` is active: a `HostKind::ShapeProbe` from the
+    /// CURRENT extraction (`self.shape_extraction`) may only move between locals
+    /// and the operand stack (loads/stores/dup/pop/swap) or be forwarded in its
+    /// exact original slot to the targets in [`Self::is_allowed_shape_probe_invoke`].
+    /// Any other use — and any stack manipulation or forwarding of a probe from
+    /// another extraction — counts as unknown.
+    fn check_shape_probe_opcode(
+        &mut self,
+        op: u8,
+        code: &[u8],
+        pc: usize,
+        stack: &[Value],
+    ) -> Result<(), NativeError> {
+        match op {
+            // (a1) Opcodes that pop nothing from the operand stack.
+            0x00..=0x2d | 0x84 | 0xa7 | 0xb2 | 0xbb | 0xc8 => return Ok(()),
+            // (a2) Local stores and stack shuffles: allowed only for probes of the
+            // CURRENT extraction; a probe from any other extraction counts.
+            0x3a | 0x4b..=0x4e | 0x57..=0x5f => {
+                let read_slots = match op {
+                    0x58 | 0x5a | 0x5c | 0x5f => 2,
+                    0x5b | 0x5d => 3,
+                    0x5e => 4,
+                    _ => 1,
+                };
+                let tail_start = stack.len().saturating_sub(read_slots);
+                if stack[tail_start..]
+                    .iter()
+                    .any(|v| self.is_stale_shape_probe(v))
+                {
+                    self.count_shape_probe_use(op)?;
+                }
+                return Ok(());
+            }
+            0xb1 => {
+                if stack.iter().any(|v| self.is_stale_shape_probe(v)) {
+                    self.count_shape_probe_use(op)?;
+                }
+                return Ok(());
+            }
+            0xac..=0xb0 => {
+                if stack.last().is_some_and(is_shape_probe)
+                    || stack.iter().any(|v| self.is_stale_shape_probe(v))
+                {
+                    self.count_shape_probe_use(op)?;
+                }
+                return Ok(());
+            }
+            0xc4 => {
+                if let Some(&wide_op) = code.get(pc) {
+                    if matches!(wide_op, 0x15..=0x19 | 0x84) {
+                        return Ok(());
+                    }
+                    if wide_op == 0x3a {
+                        if stack.last().is_some_and(|v| self.is_stale_shape_probe(v)) {
+                            self.count_shape_probe_use(wide_op)?;
+                        }
+                        return Ok(());
+                    }
+                }
+            }
+            // Checked in `0xb6..=0xb9` (`is_allowed_shape_probe_invoke`), `0xba` (captured args),
+            // and in `same_reference` / `checkcast` / `instanceof` (exact target-named counts).
+            0xa5 | 0xa6 | 0xb6..=0xba | 0xc0 | 0xc1 => return Ok(()),
+            _ => {}
+        }
+        let read_slots = match op {
+            0x4f..=0x56 => 3,
+            0x2e..=0x35 | 0x60..=0x73 | 0x78..=0x83 | 0x94..=0x98 | 0x9f..=0xa4 | 0xb5 => 2,
+            0xc5 => code.get(pc + 2).copied().map_or(stack.len(), usize::from),
+            _ => 1,
+        };
+        let tail_start = stack.len().saturating_sub(read_slots);
+        if stack[tail_start..].iter().any(is_shape_probe) {
+            self.count_shape_probe_use(op)?;
+        }
+        Ok(())
+    }
+
+    /// Walk `start_class` up the jar/linked hierarchy looking for `(name, GET_SHAPE_DESC)`.
+    /// Returns `(true, _)` if a jar class defines it (so it executes under the same allow-list),
+    /// or `(false, external_super)` at the first external superclass.
+    fn resolve_shape_method_chain(&self, start_class: &str, name: &str) -> (bool, String) {
+        let mut cur = start_class.to_owned();
+        for _ in 0..64 {
+            let Some(file) = self.class(&cur) else {
+                return (false, cur);
+            };
+            if file.method(name, voxel_shape::GET_SHAPE_DESC).is_some() {
+                return (true, cur);
+            }
+            if file.super_name.is_empty() {
+                return (false, cur);
+            }
+            cur = file.super_name.clone();
+        }
+        (false, cur)
+    }
+
+    /// Exact allow-list of method invocations that may receive `HostKind::ShapeProbe` arguments
+    /// during shape extraction without being immediately counted as unknown. Only probes tagged
+    /// with the CURRENT extraction id (`self.shape_extraction`) in their original slots are
+    /// granted free forwarding.
+    fn is_allowed_shape_probe_invoke(
+        &self,
+        op: u8,
+        r: &MethodRef,
+        receiver: Option<&Value>,
+        args: &[Value],
+    ) -> bool {
+        let Some(current_id) = self.shape_extraction else {
+            return false;
+        };
+        let Some(receiver) = receiver else {
+            return false;
+        };
+        if is_shape_probe(receiver) {
+            return false;
+        }
+        let probe_in_slot = |value: &Value, expected_role: &str| {
+            !is_shape_probe(value)
+                || matches!(
+                    value,
+                    Value::Host(h)
+                        if h.kind() == HostKind::ShapeProbe
+                            && voxel_shape::parse_shape_probe_key(h.key())
+                                == Some((current_id, expected_role))
+                )
+        };
+        // (b1) `state.getShape(level, pos[, ctx])` on a tracked jar BlockState with probes of
+        // the current extraction in their original argument positions.
+        if matches!(
+            r.owner.as_str(),
+            "net/minecraft/world/level/block/state/BlockState"
+                | "net/minecraft/world/level/block/state/BlockBehaviour$BlockStateBase"
+        ) && r.name == "getShape"
+            && ((r.descriptor == voxel_shape::BLOCK_STATE_GET_SHAPE_2_DESC
+                && args.len() == 2
+                && probe_in_slot(&args[0], "block-getter")
+                && probe_in_slot(&args[1], "block-pos"))
+                || (r.descriptor == voxel_shape::BLOCK_STATE_GET_SHAPE_3_DESC
+                    && args.len() == 3
+                    && probe_in_slot(&args[0], "block-getter")
+                    && probe_in_slot(&args[1], "block-pos")
+                    && probe_in_slot(&args[2], "collision-context")))
+            && let Some(state_block) = self.host.block_state_block(receiver)
+            && let Some(block_class) = jar_object::object_class(&state_block)
+        {
+            let (in_jar, external) = self.resolve_shape_method_chain(block_class, "getShape");
+            return in_jar || vanilla_block_shapes::inherits_block_behaviour_get_shape(&external);
+        }
+        // (b2) `super.getShape` / `this.getShape` / `super.getCollisionShape` /
+        // `this.getCollisionShape` with probes of the current extraction in their original
+        // positions (1=block-getter, 2=block-pos, 3=collision-context).
+        if matches!(op, 0xb6 | 0xb7)
+            && matches!(r.name.as_str(), "getShape" | "getCollisionShape")
+            && r.descriptor == voxel_shape::GET_SHAPE_DESC
+            && args.len() == 4
+            && !is_shape_probe(&args[0])
+            && probe_in_slot(&args[1], "block-getter")
+            && probe_in_slot(&args[2], "block-pos")
+            && probe_in_slot(&args[3], "collision-context")
+            && let Some(recv_class) = jar_object::object_class(receiver)
+        {
+            let start = if op == 0xb7 {
+                r.owner.as_str()
+            } else {
+                recv_class
+            };
+            let (in_jar, external) = self.resolve_shape_method_chain(start, &r.name);
+            if in_jar {
+                return true;
+            }
+            if r.name == "getShape" {
+                return vanilla_block_shapes::inherits_block_behaviour_get_shape(&external);
+            }
+            return vanilla_block_shapes::inherits_block_behaviour_get_collision_shape(&external)
+                && self.host.block_has_collision(receiver).is_some();
+        }
+        false
     }
 
     fn invoke_bigdecimal_static(
@@ -33772,6 +36521,11 @@ impl<H: Host> Runtime<'_, H> {
         }
         let receiver = receiver.expect("checked above");
         let other = args.first().unwrap_or(&Value::Ref(None));
+        if self.uncertain_identity_root(receiver, r).is_some()
+            || self.uncertain_identity_root(other, r).is_some()
+        {
+            return None;
+        }
         Some(
             self.abstract_set_equals(receiver, other)
                 .map(|equal| Value::Int(i32::from(equal))),
@@ -33858,6 +36612,29 @@ impl<H: Host> Runtime<'_, H> {
         Some(self.host.unknown_operand_call(r))
     }
 
+    /// Guard uncertain identity collections and any handle derived from them
+    /// ahead of JDK skeletons, spliterators, streams, iterators, and collection
+    /// models, then fall through to `unmodifiable_member`.
+    #[inline(never)]
+    fn invoke_uncertain_identity_or_unmodifiable(
+        &mut self,
+        r: &MethodRef,
+        op: u8,
+        receiver: Option<&Value>,
+        args: &[Value],
+    ) -> Result<Option<Value>, NativeError> {
+        if let Some(value) = self.count_if_uncertain_identity_operand(r, op, receiver, args)? {
+            return Ok(Some(value));
+        }
+        if let Some(marker) = receiver.and_then(expect_ref)
+            && is_collection_owner(&r.owner)
+            && let Some(result) = self.host.unmodifiable_member(r, marker, args)
+        {
+            return result.map(Some);
+        }
+        Ok(None)
+    }
+
     /// Dispatch the collection/library models as one out-of-line stage. Each
     /// model is tried in the same order as the flat dispatcher; propagating an
     /// error lets the caller deliver it through the current jar frame.
@@ -33868,6 +36645,7 @@ impl<H: Host> Runtime<'_, H> {
         op: u8,
         receiver: Option<&Value>,
         args: &mut [Value],
+        identity_args: &[reference_identity::CallIdentity],
         class: &str,
         method: &str,
     ) -> Result<Option<Value>, NativeError> {
@@ -33892,10 +36670,103 @@ impl<H: Host> Runtime<'_, H> {
         if let Some(value) = self.invoke_guava(r, receiver, args)? {
             return Ok(Some(value));
         }
-        if let Some(value) = self.invoke_immutable_collection(r, op, receiver, args)? {
+        if let Some(value) =
+            self.invoke_immutable_collection(r, op, receiver, args, identity_args)?
+        {
             return Ok(Some(value));
         }
         self.invoke_hash_collection(r, op, receiver, args)
+    }
+
+    /// Out-of-line `putfield` write for instance fields so `invoke_frame` keeps
+    /// only one catch site for the final-field and menu-field write guards.
+    #[inline(never)]
+    fn put_instance_field(
+        &mut self,
+        receiver: &Value,
+        r: &MethodRef,
+        value: Value,
+    ) -> Result<(), NativeError> {
+        let Some(key) = instance_field_key(receiver, r) else {
+            return Ok(());
+        };
+        if !self.fields.contains_key(&key) {
+            self.refuse_collected(receiver, r)?;
+        }
+        if mutable_container::is_final_field(r) {
+            self.host.unknown_operand_call(r)?;
+            return Ok(());
+        }
+        match self.host.menu_field_set(receiver, r, &value) {
+            menu_models::FieldSetResult::Written => {}
+            menu_models::FieldSetResult::NotOwned => {
+                self.fields.insert(key, value);
+            }
+            menu_models::FieldSetResult::Counted => {
+                self.host.unknown_operand_call(r)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Out-of-line stage for JDK skeletons, spliterators, NeoForge IMC, Commons Lang,
+    /// and vanilla mutable-container calls, keeping their dispatch locals out of
+    /// `invoke_frame`.
+    #[inline(never)]
+    fn invoke_jdk_and_runtime_models(
+        &mut self,
+        r: &MethodRef,
+        op: u8,
+        receiver: Option<&Value>,
+        args: &[Value],
+        class: &str,
+        method: &str,
+    ) -> Result<Option<Value>, NativeError> {
+        if let Some(value) = self.invoke_jdk_skeleton(r, op, receiver, args)? {
+            return Ok(Some(value));
+        }
+        if let Some(value) = self.invoke_jdk_spliterator(r, op, receiver, args, class, method)? {
+            return Ok(Some(value));
+        }
+        if let Some(value) = self.invoke_neoforge_imc(r, receiver, args, class, method)? {
+            return Ok(Some(value));
+        }
+        if let Some(value) = commons_lang::runtime_call(self, r, receiver, args)? {
+            return Ok(Some(value));
+        }
+        mutable_container::runtime_call(self, r, op, receiver, args)
+    }
+
+    /// Out-of-line stage for unbuilt `String` constructors, DFU codec, and recipe
+    /// runtime models, keeping their dispatch locals out of `invoke_frame`.
+    #[inline(never)]
+    fn invoke_codec_and_recipe_models(
+        &mut self,
+        r: &MethodRef,
+        receiver: Option<&Value>,
+        args: &[Value],
+    ) -> Result<Option<Value>, NativeError> {
+        if let Some(value) = string_constructors::count(self, r)? {
+            if let Some(marker) = receiver
+                .filter(|value| jar_object::is_object(value))
+                .and_then(jar_object::object_key)
+            {
+                self.counted_strings.insert(marker.to_owned());
+            }
+            return Ok(Some(value));
+        }
+        if let Some(value) = dfu_codec::runtime_instance_call(self, r, receiver, args)? {
+            return Ok(Some(value));
+        }
+        if let Some(value) = recipe_models::runtime_recipe_manager_call(self, r, receiver, args)? {
+            return Ok(Some(value));
+        }
+        if receiver.is_none()
+            && let Some(value) = recipe_models::runtime_static_call(self, r, args)?
+        {
+            return Ok(Some(value));
+        }
+        Ok(None)
     }
 
     fn prepare_entity_data_hierarchy(&mut self, args: &[Value]) {
@@ -33924,6 +36795,302 @@ impl<H: Host> Runtime<'_, H> {
         self.host.note_entity_data_hierarchy(&entries);
     }
 
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    fn collect_identity_args(
+        &self,
+        frame_modified_identity: bool,
+        receiver: Option<&Value>,
+        args: &[Value],
+        modified_args: &[usize],
+        file: &ClassFile,
+        class: &str,
+        method: &str,
+        desc: &str,
+        is_static: bool,
+        code: &[u8],
+        frame_id: u64,
+        at: usize,
+    ) -> Vec<reference_identity::CallIdentity> {
+        if frame_modified_identity || !receiver.is_some_and(|recv| self.tracks_identity_args(recv))
+        {
+            return Vec::new();
+        }
+        args.iter()
+            .enumerate()
+            .map(|(index, value)| {
+                if modified_args.contains(&index) {
+                    return None;
+                }
+                reference_identity::call_identity(
+                    file, class, method, desc, is_static, code, frame_id, at, index, value,
+                )
+            })
+            .collect()
+    }
+
+    #[inline(never)]
+    fn dispatch_counted_string_call(
+        &mut self,
+        r: &MethodRef,
+        receiver: Option<&Value>,
+        args: &[Value],
+    ) -> Result<Option<Value>, NativeError> {
+        if !self.contains_counted_string(receiver, args) {
+            return Ok(None);
+        }
+        let counted_write = matches!(
+            (r.owner.as_str(), r.name.as_str()),
+            (
+                "java/io/Writer"
+                    | "java/io/BufferedWriter"
+                    | "java/io/FileWriter"
+                    | "java/io/OutputStreamWriter"
+                    | "java/io/StringWriter"
+                    | "java/io/PrintWriter"
+                    | "java/io/PrintStream"
+                    | "java/io/OutputStream",
+                "append" | "write" | "print" | "println" | "printf" | "format"
+            )
+        );
+        if counted_write
+            && let Some(receiver) = receiver
+            && let Some(marker) = jar_object::object_key(receiver)
+        {
+            self.mark_counted_io_sink(marker);
+        }
+        if r.owner == "java/util/StringJoiner"
+            && matches!(r.name.as_str(), "add" | "merge")
+            && let Some(receiver) = receiver
+        {
+            self.mark_counted_text_object(receiver);
+        }
+        if r.owner == "java/util/Formatter"
+            && r.name == "format"
+            && let Some(receiver) = receiver
+        {
+            self.mark_counted_text_object(receiver);
+        }
+        let counted = self.counted_unknown(r)?;
+        // `append`/`insert` return their builder. The host's
+        // neutral result may be null, but Java still returns
+        // the receiver whose text is now opaque.
+        let builder_result = matches!(
+            (r.owner.as_str(), r.name.as_str()),
+            (
+                "java/lang/StringBuilder" | "java/lang/StringBuffer",
+                "append" | "insert"
+            )
+        );
+        // A text object constructed from a counted String
+        // (`new String(counted)`, `new StringBuilder(counted)`)
+        // has opaque text too. A constructor returns nothing,
+        // so its receiver is what must be tracked.
+        let text_constructor = r.name == "<init>"
+            && matches!(
+                r.owner.as_str(),
+                "java/lang/String" | "java/lang/StringBuilder" | "java/lang/StringBuffer"
+            );
+        if (builder_result || text_constructor)
+            && let Some(key) = receiver.and_then(jar_object::object_key)
+        {
+            self.counted_strings.insert(key.to_owned());
+        }
+        Ok(Some(if builder_result {
+            receiver.cloned().unwrap_or(counted)
+        } else {
+            counted
+        }))
+    }
+
+    #[inline(never)]
+    fn post_dispatch_counted_taint(
+        &mut self,
+        r: &MethodRef,
+        jar_body: bool,
+        taint_receiver: Option<&Value>,
+        args: &[Value],
+    ) {
+        if crate::guava_multimap::counted_call_may_mutate(r) {
+            crate::guava_multimap::taint_operands(self, taint_receiver, args);
+        }
+        if !jar_body && !self.counted_call_is_identity_inert(r, taint_receiver, args) {
+            self.bump_identity_epoch();
+        }
+    }
+
+    #[inline(never)]
+    fn count_if_acmp_counted_string(
+        &mut self,
+        lhs: &Value,
+        rhs: &Value,
+    ) -> Result<(), NativeError> {
+        if self.is_counted_string(lhs) || self.is_counted_string(rhs) {
+            self.host.unknown_operand_call(&MethodRef {
+                owner: "java/lang/Object".into(),
+                name: "if_acmp".into(),
+                descriptor: "(Ljava/lang/Object;Ljava/lang/Object;)Z".into(),
+            })?;
+        }
+        Ok(())
+    }
+
+    #[inline(never)]
+    fn invoke_string_or_builder(
+        &mut self,
+        r: &MethodRef,
+        receiver: Option<&Value>,
+        args: &[Value],
+    ) -> Result<Option<Value>, NativeError> {
+        if let Some(value) = self.invoke_string_content_equals(r, receiver, args)? {
+            return Ok(Some(value));
+        }
+        self.invoke_string_builder(r, receiver, args)
+    }
+
+    #[inline(never)]
+    fn dispatch_string_concat_recipe(
+        &mut self,
+        descriptor: &str,
+        recipe: &str,
+        constants: &[String],
+        mut captured: Vec<Value>,
+        class: &str,
+        method: &str,
+    ) -> Result<Option<Value>, NativeError> {
+        // A String from a constructor Decaf counted counts on every
+        // later use (#423); its text is not known, so the whole
+        // concatenation is counted, never joined from its marker.
+        if captured.iter().any(|value| self.is_counted_string(value)) {
+            let counted = self.counted_unknown(&MethodRef {
+                owner: "java/lang/invoke/StringConcatFactory".into(),
+                name: "makeConcatWithConstants".into(),
+                descriptor: descriptor.to_owned(),
+            })?;
+            return Ok(Some(counted));
+        }
+        let mut arguments = descriptor_arguments(descriptor);
+        // A `subList` operand's `toString` checks its list (`mod_count.rs`).
+        if let Some(answer) = self.sync_sub_list_operands(&captured)? {
+            return Ok(Some(answer));
+        }
+        if self.concat_object_texts(&mut captured, &mut arguments, class, method)? {
+            let counted = self.counted_unknown(&MethodRef {
+                owner: "java/lang/invoke/StringConcatFactory".into(),
+                name: "makeConcatWithConstants".into(),
+                descriptor: descriptor.to_owned(),
+            })?;
+            return Ok(Some(counted));
+        }
+        // A `StringBuilder` operand concatenates as its text
+        // (`String.valueOf` calls its `toString`), not as the
+        // builder's object marker.
+        for value in &mut captured {
+            if let Some(text) = self.builder_text(value) {
+                *value = Value::Ref(Some(text.clone()));
+            }
+        }
+        // An object a library model answers `toString` for (a
+        // Guava `TypeToken`, a proxy) concatenates as that text.
+        for value in &mut captured {
+            if let Some(text) = self.library_to_string(value, class, method)? {
+                *value = Value::Ref(Some(text));
+            }
+        }
+        // Every other model object prints its own `toString`
+        // too (`"" + id` is `a:x`, not the id's marker). A
+        // `String` operand is already its text.
+        for (value, argument) in captured.iter_mut().zip(&arguments) {
+            if argument != "Ljava/lang/String;"
+                && let Some(text) = self.host.modelled_to_string_checked(value)?
+            {
+                *value = Value::Ref(Some(text));
+            }
+        }
+        // A `Class` operand naming a class a family kind owns prints
+        // `Class.toString` or is counted (`owned_class.rs`).
+        for (value, argument) in captured.iter_mut().zip(&arguments) {
+            if argument == "Ljava/lang/Class;"
+                && let Some(text) = self.owned_class_text(value)?
+            {
+                *value = Value::Ref(Some(text));
+            }
+        }
+        let mut joined = String::new();
+        let (mut next_arg, mut next_constant) = (0, 0);
+        let mut expand = |placeholder: u8,
+                          joined: &mut String,
+                          next_arg: &mut usize,
+                          next_constant: &mut usize|
+         -> Result<(), NativeError> {
+            match placeholder {
+                1 => {
+                    let value = captured.get(*next_arg).ok_or_else(|| {
+                        NativeError::Metadata(
+                            "concat recipe has more arguments than captures".into(),
+                        )
+                    })?;
+                    let argument = arguments
+                        .get(*next_arg)
+                        .map_or("Ljava/lang/Object;", String::as_str);
+                    joined.push_str(&java_value_text(&mut *self.host, value, argument)?);
+                    *next_arg += 1;
+                }
+                _ => {
+                    let constant = constants.get(*next_constant).ok_or_else(|| {
+                        NativeError::Metadata(
+                            "concat recipe has more constants than the bootstrap".into(),
+                        )
+                    })?;
+                    joined.push_str(constant);
+                    *next_constant += 1;
+                }
+            }
+            Ok(())
+        };
+        if recipe.is_empty() {
+            for (position, value) in captured.iter().enumerate() {
+                let argument = arguments
+                    .get(position)
+                    .map_or("Ljava/lang/Object;", String::as_str);
+                joined.push_str(&java_value_text(&mut *self.host, value, argument)?);
+            }
+        } else {
+            for ch in recipe.chars() {
+                match ch {
+                    '\u{1}' | '\u{2}' => {
+                        expand(ch as u8, &mut joined, &mut next_arg, &mut next_constant)?
+                    }
+                    other => joined.push(other),
+                }
+            }
+        }
+        Ok((return_desc(descriptor) != "V").then_some(Value::Ref(Some(joined))))
+    }
+
+    #[inline(never)]
+    fn invoke_sound_event_init(
+        &mut self,
+        r: &MethodRef,
+        receiver: Option<&Value>,
+        args: &[Value],
+        stack: &mut [Value],
+        locals: &mut [Value],
+    ) -> Option<Value> {
+        if r.owner != "net/minecraft/sounds/SoundEvent" || r.name != "<init>" {
+            return None;
+        }
+        let built = self.host.construct_sound_event(r, args)?;
+        if let Some(marker) = receiver.filter(|value| jar_object::is_object(value)) {
+            for slot in stack.iter_mut().chain(locals.iter_mut()) {
+                if slot == marker {
+                    *slot = built.clone();
+                }
+            }
+        }
+        Some(Value::Void)
+    }
+
     fn invoke_frame(
         &mut self,
         class: &str,
@@ -33931,6 +37098,7 @@ impl<H: Host> Runtime<'_, H> {
         desc: &str,
         receiver: Option<Value>,
         args: &[Value],
+        frame_id: u64,
     ) -> Result<Value, NativeError> {
         // Kotlin stdlib facades and holder methods are registration/runtime
         // surfaces: the native interpreter records their exact bounded result
@@ -33968,7 +37136,10 @@ impl<H: Host> Runtime<'_, H> {
                     descriptor: desc.to_owned(),
                 };
                 return match receiver.as_ref() {
-                    Some(receiver) => self.host.invoke_instance(&r, receiver, args),
+                    Some(receiver) => {
+                        self.note_string_intern(&r, Some(receiver));
+                        self.invoke_host_instance(&r, receiver, args)
+                    }
                     None => self.host.invoke(&r, args),
                 };
             }
@@ -33991,7 +37162,10 @@ impl<H: Host> Runtime<'_, H> {
         {
             return match redirect {
                 JarCallRedirect::Host(r) => match receiver.as_ref() {
-                    Some(receiver) => self.host.invoke_instance(&r, receiver, args),
+                    Some(receiver) => {
+                        self.note_string_intern(&r, Some(receiver));
+                        self.invoke_host_instance(&r, receiver, args)
+                    }
                     None => {
                         if r.owner == "net/minecraft/network/syncher/SynchedEntityData"
                             && r.name == "defineId"
@@ -34055,7 +37229,7 @@ impl<H: Host> Runtime<'_, H> {
                     name: method.to_owned(),
                     descriptor: desc.to_owned(),
                 };
-                return self.host.invoke_instance(&r, receiver, args);
+                return self.invoke_host_instance(&r, receiver, args);
             }
             // Nothing in the jar implements the call: a `native` method (the
             // JVM's `UnsatisfiedLinkError` without its library) or an abstract
@@ -34075,7 +37249,10 @@ impl<H: Host> Runtime<'_, H> {
                 return value;
             }
             return match receiver.as_ref() {
-                Some(receiver) => self.host.invoke_instance(&r, receiver, args),
+                Some(receiver) => {
+                    self.note_string_intern(&r, Some(receiver));
+                    self.invoke_host_instance(&r, receiver, args)
+                }
                 None => {
                     if r.owner == "net/minecraft/network/syncher/SynchedEntityData"
                         && r.name == "defineId"
@@ -34089,6 +37266,11 @@ impl<H: Host> Runtime<'_, H> {
         // `if_acmp`'s producer analysis, looked up once per frame
         // (`reference_identity.rs`).
         let mut identity = reference_identity::FrameIdentity::default();
+        // Set when a Mixin modifier (`@ModifyVariable` on a reference load or
+        // store, or an anchor hook replacing a reference field/call) alters a
+        // reference in this frame so static bytecode provenance is no longer
+        // relied upon.
+        let mut frame_modified_identity = false;
         let mut locals = vec![Value::Ref(None); target.max_locals.max(1) as usize];
         let mut local = 0;
         if !target.is_static() {
@@ -34150,6 +37332,9 @@ impl<H: Host> Runtime<'_, H> {
             let at = pc;
             let op = code[pc];
             pc += 1;
+            if self.check_shape_probes {
+                invoke_or_catch!(at, self.check_shape_probe_opcode(op, code, pc, &stack));
+            }
             match op {
                 0x00 => {}
                 0x01 => stack.push(Value::Ref(None)),
@@ -34187,16 +37372,29 @@ impl<H: Host> Runtime<'_, H> {
                         method,
                         desc,
                         at,
+                        &mut frame_modified_identity,
                     )?);
                 }
                 0x12 => {
                     let i = *code.get(pc).ok_or(NativeError::Truncated)? as u16;
                     pc += 1;
-                    stack.push(constant_value(&file.pool, i)?);
+                    let value = constant_value(&file.pool, i)?;
+                    if let Value::Ref(Some(text)) = &value
+                        && matches!(file.pool.get(i as usize), Some(Cp::String(_)))
+                    {
+                        self.string_pool.note_literal(text);
+                    }
+                    stack.push(value);
                 }
                 0x13 => {
                     let i = read_u16(code, &mut pc)?;
-                    stack.push(constant_value(&file.pool, i)?);
+                    let value = constant_value(&file.pool, i)?;
+                    if let Value::Ref(Some(text)) = &value
+                        && matches!(file.pool.get(i as usize), Some(Cp::String(_)))
+                    {
+                        self.string_pool.note_literal(text);
+                    }
+                    stack.push(value);
                 }
                 0x14 => {
                     let i = read_u16(code, &mut pc)?;
@@ -34220,6 +37418,7 @@ impl<H: Host> Runtime<'_, H> {
                                 method,
                                 desc,
                                 at,
+                                &mut frame_modified_identity,
                             )?);
                         }
                         0x36..=0x3a => {
@@ -34233,6 +37432,7 @@ impl<H: Host> Runtime<'_, H> {
                                 method,
                                 desc,
                                 at,
+                                &mut frame_modified_identity,
                             )?;
                             if let Some(local) = locals.get_mut(index) {
                                 *local = value;
@@ -34514,6 +37714,7 @@ impl<H: Host> Runtime<'_, H> {
                         method,
                         desc,
                         at,
+                        &mut frame_modified_identity,
                     )?);
                 }
                 0x1e..=0x21 => {
@@ -34528,6 +37729,7 @@ impl<H: Host> Runtime<'_, H> {
                         method,
                         desc,
                         at,
+                        &mut frame_modified_identity,
                     )?);
                 }
                 0x22..=0x25 => {
@@ -34542,6 +37744,7 @@ impl<H: Host> Runtime<'_, H> {
                         method,
                         desc,
                         at,
+                        &mut frame_modified_identity,
                     )?);
                 }
                 0x26..=0x29 => {
@@ -34556,6 +37759,7 @@ impl<H: Host> Runtime<'_, H> {
                         method,
                         desc,
                         at,
+                        &mut frame_modified_identity,
                     )?);
                 }
                 0x2a..=0x2d => {
@@ -34570,12 +37774,13 @@ impl<H: Host> Runtime<'_, H> {
                         method,
                         desc,
                         at,
+                        &mut frame_modified_identity,
                     )?);
                 }
                 0x3b..=0x3e => {
                     let index = (op - 0x3b) as usize;
                     let value = pop(&mut stack, class, method, at)?;
-                    let value = self.dispatch_modify_variable(
+                    locals[index] = self.dispatch_modify_variable(
                         VariableAnchor::Store,
                         index,
                         "I",
@@ -34584,13 +37789,13 @@ impl<H: Host> Runtime<'_, H> {
                         method,
                         desc,
                         at,
+                        &mut frame_modified_identity,
                     )?;
-                    locals[index] = value;
                 }
                 0x3f..=0x42 => {
                     let index = (op - 0x3f) as usize;
                     let value = pop(&mut stack, class, method, at)?;
-                    let value = self.dispatch_modify_variable(
+                    locals[index] = self.dispatch_modify_variable(
                         VariableAnchor::Store,
                         index,
                         "J",
@@ -34599,13 +37804,13 @@ impl<H: Host> Runtime<'_, H> {
                         method,
                         desc,
                         at,
+                        &mut frame_modified_identity,
                     )?;
-                    locals[index] = value;
                 }
                 0x43..=0x46 => {
                     let index = (op - 0x43) as usize;
                     let value = pop(&mut stack, class, method, at)?;
-                    let value = self.dispatch_modify_variable(
+                    locals[index] = self.dispatch_modify_variable(
                         VariableAnchor::Store,
                         index,
                         "F",
@@ -34614,13 +37819,13 @@ impl<H: Host> Runtime<'_, H> {
                         method,
                         desc,
                         at,
+                        &mut frame_modified_identity,
                     )?;
-                    locals[index] = value;
                 }
                 0x47..=0x4a => {
                     let index = (op - 0x47) as usize;
                     let value = pop(&mut stack, class, method, at)?;
-                    let value = self.dispatch_modify_variable(
+                    locals[index] = self.dispatch_modify_variable(
                         VariableAnchor::Store,
                         index,
                         "D",
@@ -34629,13 +37834,13 @@ impl<H: Host> Runtime<'_, H> {
                         method,
                         desc,
                         at,
+                        &mut frame_modified_identity,
                     )?;
-                    locals[index] = value;
                 }
                 0x4b..=0x4e => {
                     let index = (op - 0x4b) as usize;
                     let value = pop(&mut stack, class, method, at)?;
-                    let value = self.dispatch_modify_variable(
+                    locals[index] = self.dispatch_modify_variable(
                         VariableAnchor::Store,
                         index,
                         "Ljava/lang/Object;",
@@ -34644,8 +37849,8 @@ impl<H: Host> Runtime<'_, H> {
                         method,
                         desc,
                         at,
+                        &mut frame_modified_identity,
                     )?;
-                    locals[index] = value;
                 }
                 0x36..=0x3a => {
                     let index = *code.get(pc).ok_or(NativeError::Truncated)? as usize;
@@ -34660,6 +37865,7 @@ impl<H: Host> Runtime<'_, H> {
                         method,
                         desc,
                         at,
+                        &mut frame_modified_identity,
                     )?;
                     if let Some(local) = locals.get_mut(index) {
                         *local = value;
@@ -34786,6 +37992,10 @@ impl<H: Host> Runtime<'_, H> {
                 0xa5 | 0xa6 => {
                     let rhs = pop(&mut stack, class, method, at)?;
                     let lhs = pop(&mut stack, class, method, at)?;
+                    // A String from a constructor Decaf counted (an unmodelled
+                    // charset, ...) counts on every later use, `==` included
+                    // (#423): record the comparison before answering it.
+                    self.count_if_acmp_counted_string(&lhs, &rhs)?;
                     // Identity, not value equality, for boxes and strings
                     // (`reference_identity.rs`).
                     let same = self.same_reference(
@@ -34798,6 +38008,7 @@ impl<H: Host> Runtime<'_, H> {
                         at,
                         &lhs,
                         &rhs,
+                        frame_modified_identity,
                     )?;
                     let take = if op == 0xa5 { same } else { !same };
                     let offset = read_i16(code, &mut pc)?;
@@ -35168,6 +38379,10 @@ impl<H: Host> Runtime<'_, H> {
                     invoke_or_catch!(at, self.ensure_initialized(&field.owner));
                     let outcome =
                         self.dispatch_field_anchor(&field, false, None, class, method, desc, at)?;
+                    if outcome != AnchorOutcome::Normal && field.descriptor.starts_with(['L', '['])
+                    {
+                        frame_modified_identity = true;
+                    }
                     let value = match outcome {
                         AnchorOutcome::Normal => {
                             if let Some(value) = gson_model::static_field(&field)
@@ -35247,6 +38462,9 @@ impl<H: Host> Runtime<'_, H> {
                     let receiver = pop(&mut stack, class, method, at)?;
                     let outcome =
                         self.dispatch_field_anchor(&r, false, None, class, method, desc, at)?;
+                    if outcome != AnchorOutcome::Normal && r.descriptor.starts_with(['L', '[']) {
+                        frame_modified_identity = true;
+                    }
                     let value = match outcome {
                         AnchorOutcome::Normal if receiver == Value::Ref(None) => {
                             invoke_or_catch!(at, Err(null_checks::read_field_on_null(&r)))
@@ -35299,21 +38517,8 @@ impl<H: Host> Runtime<'_, H> {
                     if outcome == AnchorOutcome::Normal && receiver == Value::Ref(None) {
                         invoke_or_catch!(at, Err(null_checks::assign_field_on_null(&r)))
                     }
-                    if outcome == AnchorOutcome::Normal
-                        && let Some(key) = instance_field_key(&receiver, &r)
-                    {
-                        if !self.fields.contains_key(&key) {
-                            self.refuse_collected(&receiver, &r)?;
-                        }
-                        match self.host.menu_field_set(&receiver, &r, &value) {
-                            menu_models::FieldSetResult::Written => {}
-                            menu_models::FieldSetResult::NotOwned => {
-                                self.fields.insert(key, value);
-                            }
-                            menu_models::FieldSetResult::Counted => {
-                                invoke_or_catch!(at, self.host.unknown_operand_call(&r));
-                            }
-                        }
+                    if outcome == AnchorOutcome::Normal {
+                        invoke_or_catch!(at, self.put_instance_field(&receiver, &r, value));
                     }
                 }
                 0xb6..=0xb9 => {
@@ -35348,7 +38553,27 @@ impl<H: Host> Runtime<'_, H> {
                     // `@ModifyArg` replaces one argument before the call runs;
                     // a redirect that replaces the whole call sees (and then
                     // discards) the modified value, deterministically.
-                    self.dispatch_modify_arg(&r, &mut args, class, method, desc, at)?;
+                    let modified_args =
+                        self.dispatch_modify_arg(&r, &mut args, class, method, desc, at)?;
+                    if !modified_args.is_empty()
+                        && r.owner == "java/lang/String"
+                        && r.name == "valueOf"
+                        && r.descriptor == "(Ljava/lang/Object;)Ljava/lang/String;"
+                    {
+                        frame_modified_identity = true;
+                    }
+                    if self.check_shape_probes
+                        && (receiver.as_ref().is_some_and(is_shape_probe)
+                            || args.iter().any(is_shape_probe))
+                        && !self.is_allowed_shape_probe_invoke(op, &r, receiver.as_ref(), &args)
+                    {
+                        self.host.note_retained_shape_probe();
+                        let value = invoke_or_catch!(at, self.host.unknown_operand_call(&r));
+                        if value != Value::Void {
+                            stack.push(value);
+                        }
+                        continue;
+                    }
                     // A cancelled `new` left a null reference behind; its
                     // matching `<init>` is skipped so the construction has no
                     // side effect.  The LIFO check keeps a constructor
@@ -35395,6 +38620,11 @@ impl<H: Host> Runtime<'_, H> {
                             AnchorOutcome::Suppress => Some(Value::default_for(&r.descriptor)),
                             AnchorOutcome::Normal => None,
                         };
+                    if anchor_replacement.is_some()
+                        && return_desc(&r.descriptor).starts_with(['L', '['])
+                    {
+                        frame_modified_identity = true;
+                    }
                     // A synchronized view runs every call on the collection it
                     // wraps (`synchronized_views.rs`): the collection models
                     // below answer for that collection, in its own order.
@@ -35408,6 +38638,25 @@ impl<H: Host> Runtime<'_, H> {
                         }
                         receiver => receiver,
                     };
+                    // Compute argument identity provenance after `@ModifyArg`
+                    // (and synchronized-view unwrapping) only for identity
+                    // collections and their views. A modified argument or a
+                    // frame whose reference locals were altered drops its
+                    // static token so equal-content identity operations count.
+                    let identity_args = self.collect_identity_args(
+                        frame_modified_identity,
+                        receiver.as_ref(),
+                        &args,
+                        &modified_args,
+                        file,
+                        class,
+                        method,
+                        desc,
+                        target.is_static(),
+                        code,
+                        frame_id,
+                        at,
+                    );
                     // A call that may move a host collection's `modCount`
                     // (`mod_count.rs`), checked and noted around the dispatch.
                     let mod_token = if anchor_replacement.is_none() {
@@ -35455,6 +38704,14 @@ impl<H: Host> Runtime<'_, H> {
                     {
                         dispatched = Some(value);
                     }
+                    if dispatched.is_none()
+                        && let Some(value) = invoke_or_catch!(
+                            at,
+                            self.dispatch_counted_string_call(&r, receiver.as_ref(), &args)
+                        )
+                    {
+                        dispatched = Some(value);
+                    }
                     // `StateDefinition.Builder.add(Property...)` inside a jar block's
                     // `createBlockStateDefinition`: each property is recorded for the block's
                     // declaration (or the duplicate counted), and `add` returns the builder.
@@ -35494,6 +38751,9 @@ impl<H: Host> Runtime<'_, H> {
                             // hook above replaced the call, so it never ran.
                             invoke_or_catch!(at, Err(null_checks::invoke_on_null(&r)))
                         });
+                    }
+                    if dispatched.is_none() {
+                        self.note_string_intern(&r, receiver.as_ref());
                     }
                     if dispatched.is_none()
                         && let Some(value) = r
@@ -35852,36 +39112,22 @@ impl<H: Host> Runtime<'_, H> {
                         dispatched = Some(invoke_or_catch!(at, value));
                     }
                     if dispatched.is_none()
-                        && let Some(value) =
-                            receiver.as_ref().and_then(expect_ref).and_then(|marker| {
-                                is_collection_owner(&r.owner)
-                                    .then(|| self.host.unmodifiable_member(&r, marker, &args))
-                                    .flatten()
-                            })
-                    {
-                        dispatched = Some(invoke_or_catch!(at, value));
-                    }
-                    if dispatched.is_none()
                         && let Some(value) = invoke_or_catch!(
                             at,
-                            self.invoke_jdk_skeleton(&r, op, receiver.as_ref(), &args)
+                            self.invoke_uncertain_identity_or_unmodifiable(
+                                &r,
+                                op,
+                                receiver.as_ref(),
+                                &args
+                            )
                         )
                     {
-                        dispatched = Some({
-                            // A JDK skeleton's body or a JDK interface default the
-                            // receiver inherits (`jdk_skeletons/`). It never
-                            // claims a call the jar copy above runs: that one
-                            // takes only static/`invokespecial` calls whose member
-                            // a jar class declares, while a skeleton
-                            // `invokespecial` needs the member to resolve to the
-                            // JDK class, as the JVM's resolution does.
-                            value
-                        });
+                        dispatched = Some(value);
                     }
                     if dispatched.is_none()
                         && let Some(value) = invoke_or_catch!(
                             at,
-                            self.invoke_jdk_spliterator(
+                            self.invoke_jdk_and_runtime_models(
                                 &r,
                                 op,
                                 receiver.as_ref(),
@@ -35889,29 +39135,6 @@ impl<H: Host> Runtime<'_, H> {
                                 class,
                                 method
                             )
-                        )
-                    {
-                        dispatched = Some({
-                            // The JDK's spliterators and `StreamSupport.stream`
-                            // (`jdk_spliterators.rs`).
-                            value
-                        });
-                    }
-                    if dispatched.is_none()
-                        && let Some(value) = invoke_or_catch!(
-                            at,
-                            self.invoke_neoforge_imc(&r, receiver.as_ref(), &args, class, method)
-                        )
-                    {
-                        dispatched = Some({
-                            // FML's `InterModComms` (`neoforge_imc.rs`).
-                            value
-                        });
-                    }
-                    if dispatched.is_none()
-                        && let Some(value) = invoke_or_catch!(
-                            at,
-                            commons_lang::runtime_call(self, &r, receiver.as_ref(), &args)
                         )
                     {
                         dispatched = Some(value);
@@ -35938,18 +39161,12 @@ impl<H: Host> Runtime<'_, H> {
                         });
                     }
                     if dispatched.is_none()
-                        && let Some(value) =
-                            invoke_or_catch!(at, string_constructors::count(self, &r))
-                    {
-                        dispatched = Some({
-                            // `new String(...)` builds no text yet: counted.
-                            value
-                        });
-                    }
-                    if dispatched.is_none()
-                        && let Some(value) = invoke_or_catch!(
-                            at,
-                            dfu_codec::runtime_instance_call(self, &r, receiver.as_ref(), &args)
+                        && let Some(value) = self.invoke_sound_event_init(
+                            &r,
+                            receiver.as_ref(),
+                            &args,
+                            &mut stack,
+                            &mut locals,
                         )
                     {
                         dispatched = Some(value);
@@ -35957,21 +39174,7 @@ impl<H: Host> Runtime<'_, H> {
                     if dispatched.is_none()
                         && let Some(value) = invoke_or_catch!(
                             at,
-                            recipe_models::runtime_recipe_manager_call(
-                                self,
-                                &r,
-                                receiver.as_ref(),
-                                &args
-                            )
-                        )
-                    {
-                        dispatched = Some(value);
-                    }
-                    if dispatched.is_none()
-                        && receiver.is_none()
-                        && let Some(value) = invoke_or_catch!(
-                            at,
-                            recipe_models::runtime_static_call(self, &r, &args)
+                            self.invoke_codec_and_recipe_models(&r, receiver.as_ref(), &args)
                         )
                     {
                         dispatched = Some(value);
@@ -35984,6 +39187,7 @@ impl<H: Host> Runtime<'_, H> {
                                 op,
                                 receiver.as_ref(),
                                 &mut args,
+                                &identity_args,
                                 class,
                                 method
                             )
@@ -36141,10 +39345,18 @@ impl<H: Host> Runtime<'_, H> {
                             match invoke_or_catch!(at, self.java_format(None, &format, values)) {
                                 Some(text) => Value::Ref(Some(text)),
                                 None => {
-                                    invoke_or_catch!(
-                                        at,
-                                        self.host.invoke_instance(&r, &format, &args)
-                                    )
+                                    if self.contains_counted_string_deep(&format)
+                                        || args
+                                            .iter()
+                                            .any(|value| self.contains_counted_string_deep(value))
+                                    {
+                                        invoke_or_catch!(at, self.counted_unknown(&r))
+                                    } else {
+                                        invoke_or_catch!(
+                                            at,
+                                            self.host.invoke_instance(&r, &format, &args)
+                                        )
+                                    }
                                 }
                             }
                         });
@@ -36444,13 +39656,10 @@ impl<H: Host> Runtime<'_, H> {
                     if dispatched.is_none()
                         && let Some(value) = invoke_or_catch!(
                             at,
-                            self.invoke_string_builder(&r, receiver.as_ref(), &args)
+                            self.invoke_string_or_builder(&r, receiver.as_ref(), &args)
                         )
                     {
-                        dispatched = Some({
-                            // `jdk_string_builder.rs`: its index checks throw.
-                            value
-                        });
+                        dispatched = Some(value);
                     }
                     if dispatched.is_none()
                         && let Some(value) = invoke_or_catch!(
@@ -36593,16 +39802,9 @@ impl<H: Host> Runtime<'_, H> {
                                         } else {
                                             invoke_or_catch!(
                                                 at,
-                                                if let Some(value) =
-                                                    client_reload::runtime_instance_call(
-                                                        self, &resolved, receiver, &args
-                                                    )
-                                                {
-                                                    value
-                                                } else {
-                                                    self.host
-                                                        .invoke_instance(&resolved, receiver, &args)
-                                                }
+                                                self.invoke_host_or_client_reload_instance(
+                                                    &resolved, receiver, &args
+                                                )
                                             )
                                         }
                                     } else {
@@ -36642,31 +39844,17 @@ impl<H: Host> Runtime<'_, H> {
                                             ),
                                             None => invoke_or_catch!(
                                                 at,
-                                                if let Some(value) =
-                                                    client_reload::runtime_instance_call(
-                                                        self, &resolved, receiver, &args
-                                                    )
-                                                {
-                                                    value
-                                                } else {
-                                                    self.host
-                                                        .invoke_instance(&resolved, receiver, &args)
-                                                }
+                                                self.invoke_host_or_client_reload_instance(
+                                                    &resolved, receiver, &args
+                                                )
                                             ),
                                         }
                                     } else {
                                         invoke_or_catch!(
                                             at,
-                                            if let Some(value) =
-                                                client_reload::runtime_instance_call(
-                                                    self, &resolved, receiver, &args
-                                                )
-                                            {
-                                                value
-                                            } else {
-                                                self.host
-                                                    .invoke_instance(&resolved, receiver, &args)
-                                            }
+                                            self.invoke_host_or_client_reload_instance(
+                                                &resolved, receiver, &args
+                                            )
                                         )
                                     }
                                 } else {
@@ -36696,10 +39884,13 @@ impl<H: Host> Runtime<'_, H> {
                     // operand.  Read-only JDK operations retain exact later multimap reads.
                     // Nested reach through arrays, collections, fields, or lambda captures is a
                     // known gap tracked separately for every host collection.
-                    if self.host.counted_unknown_calls() > unknown_before
-                        && crate::guava_multimap::counted_call_may_mutate(&r)
-                    {
-                        crate::guava_multimap::taint_operands(self, taint_receiver.as_ref(), &args);
+                    if self.host.counted_unknown_calls() > unknown_before {
+                        self.post_dispatch_counted_taint(
+                            &r,
+                            jar_body,
+                            taint_receiver.as_ref(),
+                            &args,
+                        );
                     }
                     let value = self.materialize_host_value(value);
                     // No JDK or library API answers a `null` Optional: a host
@@ -36745,6 +39936,9 @@ impl<H: Host> Runtime<'_, H> {
                         .map(|_| pop(&mut stack, class, method, at))
                         .collect::<Result<Vec<_>, _>>()?;
                     captured.reverse();
+                    if self.check_shape_probes && captured.iter().any(is_shape_probe) {
+                        invoke_or_catch!(at, self.count_shape_probe_use(op));
+                    }
                     // A pattern-matching `switch` site answers the matching
                     // label's index (`type_switch`).
                     if let Some(labels) = file.type_switch_labels(index)
@@ -36760,124 +39954,18 @@ impl<H: Host> Runtime<'_, H> {
                     // build keys, ids and exception messages through these
                     // sites, and a marker there is not the string Java returns.
                     if let Some((recipe, constants)) = file.string_concat_recipe(index) {
-                        let mut arguments = descriptor_arguments(&descriptor);
-                        // An object operand concatenates as its own
-                        // `toString` (`jar_text.rs`), then reads as a `String`.
-                        let mut captured = captured;
-                        // A `subList` operand's `toString` checks its list
-                        // (`mod_count.rs`).
-                        if let Some(answer) =
-                            invoke_or_catch!(at, self.sync_sub_list_operands(&captured))
-                        {
-                            stack.push(answer);
-                            continue;
-                        }
-                        invoke_or_catch!(
+                        if let Some(answer) = invoke_or_catch!(
                             at,
-                            self.concat_object_texts(&mut captured, &mut arguments, class, method)
-                        );
-                        // A `StringBuilder` operand concatenates as its text
-                        // (`String.valueOf` calls its `toString`), not as the
-                        // builder's object marker.
-                        let captured = captured
-                            .into_iter()
-                            .map(|value| match self.builder_text(&value) {
-                                Some(text) => Value::Ref(Some(text.clone())),
-                                None => value,
-                            })
-                            .collect::<Vec<_>>();
-                        // An object a library model answers `toString` for (a
-                        // Guava `TypeToken`, a proxy) concatenates as that text.
-                        let mut captured = captured;
-                        for value in &mut captured {
-                            if let Some(text) = self.library_to_string(value, class, method)? {
-                                *value = Value::Ref(Some(text));
-                            }
-                        }
-                        // Every other model object prints its own `toString`
-                        // too (`"" + id` is `a:x`, not the id's marker). A
-                        // `String` operand is already its text.
-                        for (value, argument) in captured.iter_mut().zip(&arguments) {
-                            if argument != "Ljava/lang/String;"
-                                && let Some(text) = self.host.modelled_to_string_checked(value)?
-                            {
-                                *value = Value::Ref(Some(text));
-                            }
-                        }
-                        // A `Class` operand naming a class a family kind owns prints
-                        // `Class.toString` or is counted (`owned_class.rs`).
-                        for (value, argument) in captured.iter_mut().zip(&arguments) {
-                            if argument == "Ljava/lang/Class;"
-                                && let Some(text) =
-                                    invoke_or_catch!(at, self.owned_class_text(value))
-                            {
-                                *value = Value::Ref(Some(text));
-                            }
-                        }
-                        let mut joined = String::new();
-                        let (mut next_arg, mut next_constant) = (0, 0);
-                        let mut expand = |placeholder: u8,
-                                          joined: &mut String,
-                                          next_arg: &mut usize,
-                                          next_constant: &mut usize|
-                         -> Result<(), NativeError> {
-                            match placeholder {
-                                1 => {
-                                    let value = captured.get(*next_arg).ok_or_else(|| {
-                                        NativeError::Metadata(
-                                            "concat recipe has more arguments than captures".into(),
-                                        )
-                                    })?;
-                                    let argument = arguments
-                                        .get(*next_arg)
-                                        .map_or("Ljava/lang/Object;", String::as_str);
-                                    joined.push_str(&java_value_text(
-                                        &mut *self.host,
-                                        value,
-                                        argument,
-                                    )?);
-                                    *next_arg += 1;
-                                }
-                                _ => {
-                                    let constant =
-                                        constants.get(*next_constant).ok_or_else(|| {
-                                            NativeError::Metadata(
-                                            "concat recipe has more constants than the bootstrap"
-                                                .into(),
-                                        )
-                                        })?;
-                                    joined.push_str(constant);
-                                    *next_constant += 1;
-                                }
-                            }
-                            Ok(())
-                        };
-                        if recipe.is_empty() {
-                            for (position, value) in captured.iter().enumerate() {
-                                let argument = arguments
-                                    .get(position)
-                                    .map_or("Ljava/lang/Object;", String::as_str);
-                                joined.push_str(&java_value_text(
-                                    &mut *self.host,
-                                    value,
-                                    argument,
-                                )?);
-                            }
-                        } else {
-                            for ch in recipe.chars() {
-                                match ch {
-                                    '\u{1}' | '\u{2}' => expand(
-                                        ch as u8,
-                                        &mut joined,
-                                        &mut next_arg,
-                                        &mut next_constant,
-                                    )?,
-                                    other => joined.push(other),
-                                }
-                            }
-                        }
-                        if return_desc(&descriptor) != "V" {
-                            stack.push(Value::Ref(Some(joined)));
+                            self.dispatch_string_concat_recipe(
+                                &descriptor,
+                                &recipe,
+                                &constants,
+                                captured,
+                                class,
+                                method,
+                            )
+                        ) {
+                            stack.push(answer);
                         }
                         continue;
                     }
@@ -41559,6 +44647,10 @@ mod tests {
             pipelines: Default::default(),
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
+            counted_strings: std::collections::BTreeSet::new(),
+            identity_collections: immutable_collections::IdentityCollections::default(),
+            string_pool: reference_identity::StringPoolState::default(),
+            counted_text_objects: std::collections::BTreeSet::new(),
             gson_writers: BTreeMap::new(),
             string_builder_capacities: BTreeMap::new(),
 
@@ -41573,6 +44665,7 @@ mod tests {
             io_writer_bytes: BTreeMap::new(),
             io_stream_positions: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
+            io_writer_sinks: BTreeMap::new(),
             io_file_bytes: BTreeMap::new(),
             io_paths: BTreeMap::new(),
             io_files: BTreeMap::new(),
@@ -41588,6 +44681,9 @@ mod tests {
             stream_plan: Default::default(),
             store_verdict: Default::default(),
             depth: 0,
+            next_frame_id: 0,
+            shape_extraction: None,
+            check_shape_probes: false,
             budget: &ExecutionBudget::UNBOUNDED,
         };
         let method = MethodRef {
@@ -41639,6 +44735,10 @@ mod tests {
             pipelines: Default::default(),
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
+            counted_strings: std::collections::BTreeSet::new(),
+            identity_collections: immutable_collections::IdentityCollections::default(),
+            string_pool: reference_identity::StringPoolState::default(),
+            counted_text_objects: std::collections::BTreeSet::new(),
             gson_writers: BTreeMap::new(),
             string_builder_capacities: BTreeMap::new(),
 
@@ -41653,6 +44753,7 @@ mod tests {
             io_writer_bytes: BTreeMap::new(),
             io_stream_positions: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
+            io_writer_sinks: BTreeMap::new(),
             io_file_bytes: BTreeMap::new(),
             io_paths: BTreeMap::new(),
             io_files: BTreeMap::new(),
@@ -41668,6 +44769,9 @@ mod tests {
             stream_plan: Default::default(),
             store_verdict: Default::default(),
             depth: 0,
+            next_frame_id: 0,
+            shape_extraction: None,
+            check_shape_probes: false,
             budget: &ExecutionBudget::UNBOUNDED,
         };
         let method = MethodRef {
@@ -48799,6 +51903,10 @@ mandatory = true
             pipelines: Default::default(),
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
+            counted_strings: std::collections::BTreeSet::new(),
+            identity_collections: immutable_collections::IdentityCollections::default(),
+            string_pool: reference_identity::StringPoolState::default(),
+            counted_text_objects: std::collections::BTreeSet::new(),
             gson_writers: BTreeMap::new(),
             string_builder_capacities: BTreeMap::new(),
 
@@ -48813,6 +51921,7 @@ mandatory = true
             io_writer_bytes: BTreeMap::new(),
             io_stream_positions: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
+            io_writer_sinks: BTreeMap::new(),
             io_file_bytes: BTreeMap::new(),
             io_paths: BTreeMap::new(),
             io_files: BTreeMap::new(),
@@ -48828,6 +51937,9 @@ mandatory = true
             stream_plan: Default::default(),
             store_verdict: Default::default(),
             depth: 0,
+            next_frame_id: 0,
+            shape_extraction: None,
+            check_shape_probes: false,
             budget: &ExecutionBudget::UNBOUNDED,
         };
         let first = runtime.new_object("demo/Fields");
@@ -49021,6 +52133,10 @@ mandatory = true
             pipelines: Default::default(),
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
+            counted_strings: std::collections::BTreeSet::new(),
+            identity_collections: immutable_collections::IdentityCollections::default(),
+            string_pool: reference_identity::StringPoolState::default(),
+            counted_text_objects: std::collections::BTreeSet::new(),
             gson_writers: BTreeMap::new(),
             string_builder_capacities: BTreeMap::new(),
 
@@ -49035,6 +52151,7 @@ mandatory = true
             io_writer_bytes: BTreeMap::new(),
             io_stream_positions: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
+            io_writer_sinks: BTreeMap::new(),
             io_file_bytes: BTreeMap::new(),
             io_paths: BTreeMap::new(),
             io_files: BTreeMap::new(),
@@ -49050,6 +52167,9 @@ mandatory = true
             stream_plan: Default::default(),
             store_verdict: Default::default(),
             depth: 0,
+            next_frame_id: 0,
+            shape_extraction: None,
+            check_shape_probes: false,
             budget: &ExecutionBudget::UNBOUNDED,
         };
         let new_instance = MethodRef {
@@ -49218,6 +52338,10 @@ mandatory = true
             pipelines: Default::default(),
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
+            counted_strings: std::collections::BTreeSet::new(),
+            identity_collections: immutable_collections::IdentityCollections::default(),
+            string_pool: reference_identity::StringPoolState::default(),
+            counted_text_objects: std::collections::BTreeSet::new(),
             gson_writers: BTreeMap::new(),
             string_builder_capacities: BTreeMap::new(),
 
@@ -49232,6 +52356,7 @@ mandatory = true
             io_writer_bytes: BTreeMap::new(),
             io_stream_positions: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
+            io_writer_sinks: BTreeMap::new(),
             io_file_bytes: BTreeMap::new(),
             io_paths: BTreeMap::new(),
             io_files: BTreeMap::new(),
@@ -49247,6 +52372,9 @@ mandatory = true
             stream_plan: Default::default(),
             store_verdict: Default::default(),
             depth: 0,
+            next_frame_id: 0,
+            shape_extraction: None,
+            check_shape_probes: false,
             budget: &ExecutionBudget::UNBOUNDED,
         };
         // A stream takes one stage or terminal (`linkedOrConsumed`): each
@@ -49591,6 +52719,10 @@ mandatory = true
             pipelines: Default::default(),
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
+            counted_strings: std::collections::BTreeSet::new(),
+            identity_collections: immutable_collections::IdentityCollections::default(),
+            string_pool: reference_identity::StringPoolState::default(),
+            counted_text_objects: std::collections::BTreeSet::new(),
             gson_writers: BTreeMap::new(),
             string_builder_capacities: BTreeMap::new(),
 
@@ -49605,6 +52737,7 @@ mandatory = true
             io_writer_bytes: BTreeMap::new(),
             io_stream_positions: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
+            io_writer_sinks: BTreeMap::new(),
             io_file_bytes: BTreeMap::new(),
             io_paths: BTreeMap::new(),
             io_files: BTreeMap::new(),
@@ -49620,6 +52753,9 @@ mandatory = true
             stream_plan: Default::default(),
             store_verdict: Default::default(),
             depth: 0,
+            next_frame_id: 0,
+            shape_extraction: None,
+            check_shape_probes: false,
             budget: &ExecutionBudget::UNBOUNDED,
         };
         let lookup = MethodRef {
@@ -49908,6 +53044,10 @@ mandatory = true
             pipelines: Default::default(),
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
+            counted_strings: std::collections::BTreeSet::new(),
+            identity_collections: immutable_collections::IdentityCollections::default(),
+            string_pool: reference_identity::StringPoolState::default(),
+            counted_text_objects: std::collections::BTreeSet::new(),
             gson_writers: BTreeMap::new(),
             string_builder_capacities: BTreeMap::new(),
 
@@ -49922,6 +53062,7 @@ mandatory = true
             io_writer_bytes: BTreeMap::new(),
             io_stream_positions: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
+            io_writer_sinks: BTreeMap::new(),
             io_file_bytes: BTreeMap::new(),
             io_paths: BTreeMap::new(),
             io_files: BTreeMap::new(),
@@ -49937,6 +53078,9 @@ mandatory = true
             stream_plan: Default::default(),
             store_verdict: Default::default(),
             depth: 0,
+            next_frame_id: 0,
+            shape_extraction: None,
+            check_shape_probes: false,
             budget: &ExecutionBudget::UNBOUNDED,
         };
         let class = host_class::class_value("demo/ReflectiveFields");
@@ -55183,6 +58327,10 @@ mandatory = true
             pipelines: Default::default(),
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
+            counted_strings: std::collections::BTreeSet::new(),
+            identity_collections: immutable_collections::IdentityCollections::default(),
+            string_pool: reference_identity::StringPoolState::default(),
+            counted_text_objects: std::collections::BTreeSet::new(),
             gson_writers: BTreeMap::new(),
             string_builder_capacities: BTreeMap::new(),
 
@@ -55197,6 +58345,7 @@ mandatory = true
             io_writer_bytes: BTreeMap::new(),
             io_stream_positions: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
+            io_writer_sinks: BTreeMap::new(),
             io_file_bytes: BTreeMap::new(),
             io_paths: BTreeMap::new(),
             io_files: BTreeMap::new(),
@@ -55212,6 +58361,9 @@ mandatory = true
             stream_plan: Default::default(),
             store_verdict: Default::default(),
             depth: 0,
+            next_frame_id: 0,
+            shape_extraction: None,
+            check_shape_probes: false,
             budget: &ExecutionBudget::UNBOUNDED,
         };
         let grid = runtime.new_multidim_array("[[I", &[2, 3]).unwrap();
@@ -55250,6 +58402,10 @@ mandatory = true
             pipelines: Default::default(),
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
+            counted_strings: std::collections::BTreeSet::new(),
+            identity_collections: immutable_collections::IdentityCollections::default(),
+            string_pool: reference_identity::StringPoolState::default(),
+            counted_text_objects: std::collections::BTreeSet::new(),
             gson_writers: BTreeMap::new(),
             string_builder_capacities: BTreeMap::new(),
 
@@ -55264,6 +58420,7 @@ mandatory = true
             io_writer_bytes: BTreeMap::new(),
             io_stream_positions: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
+            io_writer_sinks: BTreeMap::new(),
             io_file_bytes: BTreeMap::new(),
             io_paths: BTreeMap::new(),
             io_files: BTreeMap::new(),
@@ -55279,6 +58436,9 @@ mandatory = true
             stream_plan: Default::default(),
             store_verdict: Default::default(),
             depth: 0,
+            next_frame_id: 0,
+            shape_extraction: None,
+            check_shape_probes: false,
             budget: &ExecutionBudget::UNBOUNDED,
         };
         let error = runtime

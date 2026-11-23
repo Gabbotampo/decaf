@@ -80,20 +80,20 @@ use std::time::Duration;
 use attachments::Lifecycle;
 use game_hooks::Arg;
 use mod_api::{
-    AttackEntityEvent, Authority, BlocksEvent, BreakBlockEvent, ClientHost, ClientLevelLoadEvent,
-    ClientLevelUnloadEvent, ClientSetupEvent, ClientStoppingEvent, Command, CommandArgumentValue,
-    CommandSource, ConfigFileError, ConfigPath, DamageContainer, DimensionKey, EntityInteractEvent,
-    EntityJoinLevelEvent, EntityLeaveLevelEvent, EntityRef, Flow, GameRuleChangedEvent, Hand,
-    HitHost, Hooks, Host, HostSide, HurtSource, InteractionResult, ItemsEvent, LeftClickBlockEvent,
-    LevelDimension, LevelLoadEvent, LevelRef, LevelTickPostEvent, LevelTickPreEvent,
-    LevelUnloadEvent, LivingDamagePostEvent, LivingDeathEvent, LivingDeathPostEvent,
-    LivingIncomingDamageEvent, PlayerChangedDimensionEvent, PlayerCloneEvent,
-    PlayerDestroyedBlockEvent, PlayerDiedEvent, PlayerLoggedInEvent, PlayerLoggedOutEvent,
-    PlayerRef, PlayerRespawnedEvent, PlayerTickPostEvent, PlayerTickPreEvent,
-    RegisterCommandsEvent, RegistrationContext, RightClickBlockEvent, RightClickItemEvent,
-    RunModCommandEvent, ServerAboutToStartEvent, ServerHost, ServerStartedEvent,
-    ServerStartingEvent, ServerStoppedEvent, ServerStoppingEvent, ServerTickEvent, ServerTickPhase,
-    Text,
+    AttackEntityEvent, Authority, BlockState, BlocksEvent, BreakBlockEvent, ClientHost,
+    ClientLevelLoadEvent, ClientLevelUnloadEvent, ClientSetupEvent, ClientStoppingEvent, Command,
+    CommandArgumentValue, CommandSource, ConfigFileError, ConfigPath, DamageContainer,
+    DimensionKey, EntityInteractEvent, EntityJoinLevelEvent, EntityLeaveLevelEvent, EntityRef,
+    Flow, GameRuleChangedEvent, Hand, HitHost, Hooks, Host, HostSide, HurtSource,
+    InteractionResult, ItemsEvent, LeftClickBlockEvent, LevelDimension, LevelLoadEvent, LevelRef,
+    LevelSide, LevelTickPostEvent, LevelTickPreEvent, LevelUnloadEvent, LivingDamagePostEvent,
+    LivingDeathEvent, LivingDeathPostEvent, LivingIncomingDamageEvent, PlayerChangedDimensionEvent,
+    PlayerCloneEvent, PlayerDestroyedBlockEvent, PlayerDiedEvent, PlayerLoggedInEvent,
+    PlayerLoggedOutEvent, PlayerRef, PlayerRespawnedEvent, PlayerTickPostEvent, PlayerTickPreEvent,
+    RegisterCommandsEvent, Registrar, RegistrationContext, RightClickBlockEvent,
+    RightClickItemEvent, RunModCommandEvent, ServerAboutToStartEvent, ServerHost,
+    ServerStartedEvent, ServerStartingEvent, ServerStoppedEvent, ServerStoppingEvent,
+    ServerTickEvent, ServerTickPhase, StateForPlacementEvent, Text,
 };
 use runtime::brigadier::{
     self, ArgumentKind, CommandInvocation as RuntimeInvocation, CommandMessage, CommandOutcome,
@@ -107,13 +107,173 @@ use runtime::events::{
 use runtime::{ExecutionBudget, GameHookEffect, GameObject, NativeJar, StdHost};
 use serde_json::json;
 
+fn placement_direction(direction: mod_api::Direction) -> runtime::Value {
+    let name = match direction {
+        mod_api::Direction::Down => "DOWN",
+        mod_api::Direction::Up => "UP",
+        mod_api::Direction::North => "NORTH",
+        mod_api::Direction::South => "SOUTH",
+        mod_api::Direction::West => "WEST",
+        mod_api::Direction::East => "EAST",
+    };
+    runtime::Value::Ref(Some(format!("enum/net/minecraft/core/Direction/{name}")))
+}
+
+/// Apply the Java result's block identity before touching the engine-owned state. `None` means
+/// the hook did not claim the answer (a foreign block or a different block selected by Java),
+/// while `Some(None)` is Java's `null` refusal.
+fn placement_conversion(
+    _block_id: &str,
+    owned: bool,
+    returned: Option<(String, BTreeMap<String, String>)>,
+) -> Option<Option<(String, BTreeMap<String, String>)>> {
+    if !owned {
+        return None;
+    }
+    match returned {
+        None => Some(None),
+        Some((returned_block, properties)) => Some(Some((returned_block, properties))),
+    }
+}
+
+fn answer_state_for_placement(
+    state: &mut State,
+    level: LevelSide<'_>,
+    event: &mut StateForPlacementEvent<'_>,
+) -> Option<Option<BlockState>> {
+    answer_state_for_placement_snapshot(state, level, event.state, event.context)
+}
+
+fn answer_state_for_placement_snapshot(
+    state: &mut State,
+    mut level: LevelSide<'_>,
+    current_state: BlockState,
+    context: &mod_api::PlacementContext,
+) -> Option<Option<BlockState>> {
+    let block_id = match &level {
+        LevelSide::Server(host) | LevelSide::Client(host) => {
+            host.state_block(current_state)?.to_owned()
+        }
+    };
+    // Sunrise's pinned `StateForPlacementEvent`/`PlacementContext` (a2dac1ee75) does not yet carry
+    // whether a player or dispenser/non-player placed the block. Until the SDK exposes the placer,
+    // pass `Placer::Unknown` so any player- or rotation-dependent accessor is counted as unknown
+    // rather than guessed.
+    let data = runtime::BlockPlaceContextData {
+        clicked_pos: if context.replace_clicked {
+            [context.hit_pos.x, context.hit_pos.y, context.hit_pos.z]
+        } else {
+            [context.pos.x, context.pos.y, context.pos.z]
+        },
+        clicked_face: placement_direction(context.face),
+        click_location: context.hit,
+        inside: context.inside,
+        replacing_clicked_on_block: context.replace_clicked,
+        can_place: true,
+        placer: runtime::Placer::Unknown,
+        item_in_hand: match context.item {
+            Some(item) => runtime::Value::Host(runtime::HostRef::new(
+                runtime::HostKind::ItemStack,
+                format!("placement/item/{item:?}"),
+            )),
+            None => runtime::StdHost::empty_item_stack(),
+        },
+        level: runtime::Value::Host(runtime::HostRef::new(
+            runtime::HostKind::GameLevel,
+            "placement/level",
+        )),
+    };
+    if !state.has_registered_block(&block_id) {
+        return None;
+    }
+    let outcome = match state.state_for_placement_content(&block_id, data) {
+        Ok(Some(outcome)) => outcome,
+        Ok(None) => return None,
+        Err(error) => {
+            log::warn!("{LOG}: {block_id}: placement override refused: {error:?}");
+            return None;
+        }
+    };
+    let returned = match outcome {
+        content::PlacementContentOutcome::Refused => return Some(None),
+        content::PlacementContentOutcome::State(returned_block, properties) => {
+            (returned_block, properties)
+        }
+        content::PlacementContentOutcome::UnknownState => {
+            log::warn!("{LOG}: {block_id}: placement override returned an unknown state");
+            return None;
+        }
+        content::PlacementContentOutcome::CountedUnknown(count) => {
+            log::warn!(
+                "{LOG}: {block_id}: placement override hit {count} unknown host call(s); leaving placement unclaimed"
+            );
+            return None;
+        }
+    };
+    let Some(Some((returned_block, properties))) =
+        placement_conversion(&block_id, true, Some(returned))
+    else {
+        log::warn!("{LOG}: {block_id}: placement override selected an unknown state");
+        return None;
+    };
+    let mut candidate = if returned_block == block_id {
+        current_state
+    } else {
+        match &level {
+            LevelSide::Server(host) | LevelSide::Client(host) => {
+                let Some(state) = host.block_state_id(&returned_block) else {
+                    log::warn!(
+                        "{LOG}: {block_id}: placement returned unregistered block {returned_block}"
+                    );
+                    return None;
+                };
+                state
+            }
+        }
+    };
+    for (key, value) in properties {
+        let next = match &mut level {
+            LevelSide::Server(host) | LevelSide::Client(host) => {
+                host.state_with_property(candidate, &key, &value)
+            }
+        };
+        let Some(next) = next else {
+            log::warn!("{LOG}: {block_id}: placement property refused: {key}={value}");
+            return None;
+        };
+        candidate = next;
+    }
+    Some(Some(candidate))
+}
+
+pub(crate) struct JavaPlacementPart {
+    state: Arc<Mutex<State>>,
+}
+
+#[mod_api::sunrise_part]
+impl mod_api::BlockPart for JavaPlacementPart {
+    fn state_for_placement(
+        &self,
+        level: LevelSide<'_>,
+        event: &mut StateForPlacementEvent<'_>,
+    ) -> Option<Option<BlockState>> {
+        let mut state = self.state.lock().ok()?;
+        answer_state_for_placement(&mut state, level, event)
+    }
+}
+
 mod attachments;
+mod block_use;
 mod client;
 mod content;
 pub mod game_dispatch;
 mod game_hooks;
 mod runtime;
 mod server_facts;
+mod sound;
+
+#[cfg(test)]
+mod client_dispatch_tests;
 
 /// This mod's report, in its own `config/horizon_java/` folder.
 const REPORT: &str = "horizon_java/java-runtime.json";
@@ -131,7 +291,7 @@ const LOG: &str = "Horizon Java";
 /// the per-server state.
 #[derive(Default)]
 pub struct HorizonJava {
-    state: Mutex<State>,
+    state: Arc<Mutex<State>>,
     client: Mutex<client::State>,
     /// Serializes state access with top-level Java dispatches while allowing same-thread access
     /// through the thread-local frame owned by `game_dispatch`.
@@ -429,6 +589,15 @@ fn hyphenated_uuid(uuid: u128) -> String {
 
 #[mod_api::sunrise_mod]
 impl Hooks for HorizonJava {
+    /// Register scoped Sunrise block parts (placement and block-use hooks) for Java mod blocks.
+    fn register(&self, registrar: &mut dyn Registrar, context: &RegistrationContext) {
+        let mut state = self.lock();
+        content::register_placement_parts(&mut state, context, registrar, Arc::clone(&self.state));
+        drop(state);
+        content::register_block_parts(&self.state, registrar, context);
+        self.refresh_game_hook_plan_bits();
+    }
+
     /// The content root still accepts native block declarations here, at the Registration phase
     /// and before any resource loads (NeoForge's `RegisterEvent` drained from
     /// `DeferredRegister.Blocks`). This is the one moment a jar's registrations can become content
@@ -446,6 +615,27 @@ impl Hooks for HorizonJava {
         content::declare_items(&mut state, context, event);
         drop(state);
         self.refresh_game_hook_plan_bits();
+    }
+
+    /// Sunrise's build-scoped creative tab hook is the client-side equivalent of Fabric's
+    /// `CreativeModeTabEvents.modifyOutputEvent`.  Resident Java jars fill the edit in Fabric
+    /// order; the client host applies the resulting parent/search stacks to the native tab.
+    fn build_creative_mode_tab_contents(
+        &self,
+        host: HostSide<'_>,
+        event: &mut mod_api::BuildCreativeModeTabContentsEvent<'_>,
+    ) {
+        let HostSide::Client(host) = host else {
+            return;
+        };
+        self.lock_client().build_creative_tab(host, event);
+    }
+
+    /// Run a jar Item's `appendHoverText` before Sunrise's global tooltip listeners.  The
+    /// runtime returns structured Components, so translatable text and style cross the native
+    /// API boundary without flattening them.
+    fn item_tooltip(&self, host: &dyn ClientHost, event: &mut mod_api::ItemTooltipEvent<'_>) {
+        self.lock_client().append_java_tooltip(host, event);
     }
 
     /// The server is about to open its worlds (NeoForge's `ServerAboutToStartEvent`). Nothing of
@@ -641,6 +831,8 @@ impl Hooks for HorizonJava {
     ) -> Flow {
         let mut state = self.lock();
         let facade = state.facade();
+        // Every jar's host learns the level sound streams any jar found unknown (`sound.rs`).
+        sound::sync_unknown_sound_streams(&mut state.jars, |jar| &mut jar.host);
         for loaded in &mut state.jars {
             // One Java literal path can have several executable usages: the bare command and
             // each deeper argument node. The invocation carries the arguments it parsed, so the
@@ -688,11 +880,22 @@ impl Hooks for HorizonJava {
                 }
             }
             let source = runtime_source(event.source, host);
+            let source_player = match event.source {
+                CommandSource::Player { player, .. } => Some(player.uuid()),
+                _ => None,
+            };
             let invocation = RuntimeInvocation {
                 input: words.join(" "),
                 source,
                 arguments,
             };
+            if let Some(uuid) = source_player {
+                sound::seed_player_sound_facts(host, &facade, uuid, &mut loaded.host);
+            }
+            // The streams as they stood before the command ran: its sounds are delivered in call
+            // order against these, so one the runtime counted later does not void earlier ones.
+            let mut sound_streams = loaded.host.unknown_sound_streams().clone();
+            loaded.host.set_host_deferred_server_sound_seeds(true);
             let opened = attachments::open(
                 host,
                 &loaded.row.id,
@@ -713,6 +916,14 @@ impl Hooks for HorizonJava {
                     )
                 },
             );
+            loaded.host.set_host_deferred_server_sound_seeds(false);
+            loaded.host.clear_entity_sound_facts();
+            let played_sounds = loaded.host.take_played_sounds();
+            sound::apply_server_sounds(host, &played_sounds, &mut sound_streams, |reason| {
+                loaded.host.note_unknown_game_hook(reason);
+            });
+            // A refused sound's stream: the next site's sync hands it to every other jar.
+            sound::share_unknown_sound_streams([&mut loaded.host], &sound_streams);
             let unknown = loaded.host.unknown_host_call_count().saturating_sub(before);
             loaded.row.command_unknown_host_calls += unknown;
             attachments::close(
@@ -826,21 +1037,34 @@ impl Hooks for HorizonJava {
 
     /// A server level's tick starts (Fabric's `START_LEVEL_TICK`, NeoForge's
     /// `LevelTickEvent.Pre`).
-    fn level_tick_pre(&self, host: HostSide<'_>, event: &mut LevelTickPreEvent) {
+    fn level_tick_pre(&self, mut host: HostSide<'_>, event: &mut LevelTickPreEvent) {
         let has_time = side_has_time(&host);
-        if let HostSide::Server(host) = host {
+        if let HostSide::Server(ref mut server) = host {
             // The level's clocks are what `level.getGameTime()`/`getDayTime()` answer, so they
             // are refreshed from the level the hook names, before the listeners run.
-            self.refresh_level(host, event.level);
+            self.refresh_level(*server, event.level);
         }
         let context = EventContext {
             level: Some(event.level.dimension_id().to_owned()),
             has_time: Some(has_time),
             ..EventContext::default()
         };
-        self.fire_event(GameEvent::LevelTickStart, self.dedicated(), context, |_| {
-            true
-        });
+        match host {
+            HostSide::Server(server) => {
+                self.fire_event_with_server_sounds(
+                    server,
+                    GameEvent::LevelTickStart,
+                    self.dedicated(),
+                    context,
+                    |_| true,
+                );
+            }
+            HostSide::Client(_) => {
+                self.fire_event(GameEvent::LevelTickStart, self.dedicated(), context, |_| {
+                    true
+                });
+            }
+        }
     }
 
     /// A server level's tick ends (Fabric's `END_LEVEL_TICK`, NeoForge's
@@ -851,7 +1075,20 @@ impl Hooks for HorizonJava {
             has_time: Some(side_has_time(&host)),
             ..EventContext::default()
         };
-        self.fire_event(GameEvent::LevelTickEnd, self.dedicated(), context, |_| true);
+        match host {
+            HostSide::Server(server) => {
+                self.fire_event_with_server_sounds(
+                    server,
+                    GameEvent::LevelTickEnd,
+                    self.dedicated(),
+                    context,
+                    |_| true,
+                );
+            }
+            HostSide::Client(_) => {
+                self.fire_event(GameEvent::LevelTickEnd, self.dedicated(), context, |_| true);
+            }
+        }
     }
 
     /// A server level opened (Fabric's `ServerLevelEvents.LOAD`, NeoForge's `LevelEvent.Load`).
@@ -969,12 +1206,16 @@ impl Hooks for HorizonJava {
         let leaving = {
             let mut state = self.lock();
             let leaving = state.take_leaver(event.player);
-            // The leaver's `ServerPlayer` is gone: what callbacks kept on it is dropped.
+            // The leaver's `ServerPlayer` is gone: what callbacks kept on it is dropped, and so
+            // is any Java menu a jar held as its `containerMenu`.
             for object in leaving
                 .iter()
                 .filter_map(|entry| game_hooks::player_of(entry, 0))
             {
                 game_hooks::forget(&mut state, &object);
+            }
+            for jar in &mut state.jars {
+                jar.host.server_player_removed(event.player);
             }
             leaving
         };
@@ -1015,6 +1256,25 @@ impl Hooks for HorizonJava {
             context,
             |_| true,
         );
+    }
+
+    /// A window a mod opened closed (the player closed it, something replaced it, or the
+    /// player left). A jar holding the Java menu behind it runs its close, and what that close
+    /// opens goes out on Sunrise (`block_use.rs`).
+    fn menu_closed(&self, host: &mut dyn ServerHost, event: &mut mod_api::MenuClosedEvent) {
+        block_use::menu_closed(self, host, event.uuid, event.window);
+    }
+
+    /// A menu opened for a player, by anything. Its container id is the `ServerPlayer`'s
+    /// `containerCounter` now, which every jar's block-use model follows (`block_use.rs`).
+    fn player_container_open(
+        &self,
+        host: &mut dyn ServerHost,
+        event: &mut mod_api::PlayerContainerOpenEvent<'_>,
+    ) {
+        let container_id = event.menu.and_then(|menu| menu.container_id(&*host));
+        let mut state = self.lock();
+        block_use::container_opened(&mut state, event.player, container_id);
     }
 
     /// A player's data was copied to their new player (Fabric's `COPY_FROM`, NeoForge's
@@ -1104,10 +1364,11 @@ impl Hooks for HorizonJava {
     /// remaining health, so a killing hit cannot be told from a surviving one here. Such a hit
     /// is fired with its real amounts rather than dropped on a guess: the departure is named in
     /// the mod's report documentation.
-    fn living_damage_post(&self, _level: &mut dyn HitHost, event: &mut LivingDamagePostEvent<'_>) {
+    fn living_damage_post(&self, level: &mut dyn HitHost, event: &mut LivingDamagePostEvent<'_>) {
         let context =
             living_damage_context(event.entity, event.kind, event.source, event.container);
-        self.fire_event(
+        self.fire_event_with_hit_sounds(
+            level,
             GameEvent::LivingAfterDamage,
             self.dedicated(),
             context,
@@ -1221,9 +1482,9 @@ impl Hooks for HorizonJava {
     /// `PlayerInteractEvent.RightClickBlock`). The Java callback's `InteractionResult` becomes the
     /// cancellation result, and a NeoForge `setCanceled(true)` keeps the default `PASS`.
     fn right_click_block(&self, host: HostSide<'_>, event: &mut RightClickBlockEvent<'_>) -> Flow {
-        if !matches!(host, HostSide::Server(_)) {
+        let HostSide::Server(server) = host else {
             return Flow::Continue;
-        }
+        };
         let click = event.click;
         let context = EventContext {
             level: Some(dimension_id(click.dimension).to_owned()),
@@ -1233,7 +1494,13 @@ impl Hooks for HorizonJava {
             off_hand: Some(click.hand == Hand::Off),
             ..EventContext::default()
         };
-        let fired = self.fire_event(GameEvent::UseBlock, self.dedicated(), context, |_| true);
+        let fired = self.fire_event_with_server_sounds(
+            server,
+            GameEvent::UseBlock,
+            self.dedicated(),
+            context,
+            |_| true,
+        );
         if fired.cancelled {
             *event.cancellation_result = interaction_result(fired.interaction.as_deref());
             Flow::Cancel
@@ -1262,7 +1529,13 @@ impl Hooks for HorizonJava {
             held,
             ..EventContext::default()
         };
-        let fired = self.fire_event(GameEvent::UseItem, self.dedicated(), context, |_| true);
+        let fired = self.fire_event_with_server_sounds(
+            host,
+            GameEvent::UseItem,
+            self.dedicated(),
+            context,
+            |_| true,
+        );
         if fired.cancelled {
             *event.cancellation_result = interaction_result(fired.interaction.as_deref());
             Flow::Cancel
@@ -1442,7 +1715,7 @@ impl Hooks for HorizonJava {
     /// NeoForge's `LivingIncomingDamageEvent`).
     fn living_incoming_damage(
         &self,
-        _level: &mut dyn HitHost,
+        level: &mut dyn HitHost,
         event: &mut LivingIncomingDamageEvent<'_>,
     ) -> Flow {
         let context = EventContext {
@@ -1456,7 +1729,8 @@ impl Hooks for HorizonJava {
             flag: event.container.blocked() > 0.0,
             ..EventContext::default()
         };
-        let fired = self.fire_event(
+        let fired = self.fire_event_with_hit_sounds(
+            level,
             GameEvent::LivingAllowDamage,
             self.dedicated(),
             context,
@@ -1505,8 +1779,8 @@ impl Hooks for HorizonJava {
     /// initial client load and before the title screen's first frame. A dedicated server never
     /// fires it. The client owner runs its resident jars here before the native setup notification
     /// returns; this owner hook does not claim to dispatch a second Java setup event.
-    fn client_setup(&self, _host: &mut dyn ClientHost, _event: &mut ClientSetupEvent) {
-        self.on_client_setup();
+    fn client_setup(&self, host: &mut dyn ClientHost, _event: &mut ClientSetupEvent) {
+        self.on_client_setup_with_version(Some(host.game_version()), Some(&*host));
     }
 
     /// Sunrise's client level load carries the newly-created level's borrowed dimension and fires
@@ -1575,9 +1849,23 @@ impl HorizonJava {
         }
     }
 
+    #[cfg(test)]
     fn on_client_setup(&self) {
+        self.on_client_setup_with_version(None, None);
+    }
+
+    fn on_client_setup_with_version(
+        &self,
+        game_version: Option<&str>,
+        host: Option<&dyn ClientHost>,
+    ) {
         let mut client = self.lock_client();
-        client.ensure_loaded();
+        client.ensure_loaded_with_version(game_version);
+        // Client entrypoints and loading stages are Java code: what they recorded reaches
+        // Sunrise (or is counted) now.
+        if let Some(host) = host {
+            client.drain_client_sounds(host);
+        }
         let rows = client.report_rows().count();
         log::info!("{LOG}: stored {rows} client report row(s)");
         log::info!("{LOG} {}: client setup complete", env!("CARGO_PKG_VERSION"));
@@ -1636,7 +1924,56 @@ impl HorizonJava {
         context: EventContext,
         wanted: impl Fn(&GameListener) -> bool,
     ) -> Fired {
-        self.fire_bridged(None, Lifecycle::None, event, dedicated, context, wanted)
+        self.fire_bridged_with_sounds(
+            None,
+            None,
+            None,
+            Lifecycle::None,
+            event,
+            dedicated,
+            context,
+            wanted,
+        )
+    }
+
+    fn fire_event_with_server_sounds(
+        &self,
+        server: &mut dyn ServerHost,
+        event: GameEvent,
+        dedicated: bool,
+        context: EventContext,
+        wanted: impl Fn(&GameListener) -> bool,
+    ) -> Fired {
+        self.fire_bridged_with_sounds(
+            None,
+            Some(server),
+            None,
+            Lifecycle::None,
+            event,
+            dedicated,
+            context,
+            wanted,
+        )
+    }
+
+    fn fire_event_with_hit_sounds(
+        &self,
+        hit: &mut dyn HitHost,
+        event: GameEvent,
+        dedicated: bool,
+        context: EventContext,
+        wanted: impl Fn(&GameListener) -> bool,
+    ) -> Fired {
+        self.fire_bridged_with_sounds(
+            None,
+            None,
+            Some(hit),
+            Lifecycle::None,
+            event,
+            dedicated,
+            context,
+            wanted,
+        )
     }
 
     /// [`Self::fire_event`] from a hook that has a `ServerHost`: each jar with attachment types
@@ -1644,28 +1981,56 @@ impl HorizonJava {
     /// the attachment step NeoForge takes at this moment, before the listeners run.
     fn fire_bridged(
         &self,
-        mut server: Option<&mut dyn ServerHost>,
+        server: Option<&mut dyn ServerHost>,
         lifecycle: Lifecycle,
         event: GameEvent,
         dedicated: bool,
         context: EventContext,
         wanted: impl Fn(&GameListener) -> bool,
     ) -> Fired {
+        self.fire_bridged_with_sounds(
+            server, None, None, lifecycle, event, dedicated, context, wanted,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn fire_bridged_with_sounds<'a>(
+        &self,
+        mut server: Option<&'a mut dyn ServerHost>,
+        sound_server: Option<&'a mut dyn ServerHost>,
+        hit_host: Option<&mut dyn HitHost>,
+        lifecycle: Lifecycle,
+        event: GameEvent,
+        dedicated: bool,
+        mut context: EventContext,
+        wanted: impl Fn(&GameListener) -> bool,
+    ) -> Fired {
         let mut state = self.lock();
         let mut facade = state.facade();
         facade.dedicated = dedicated;
+        if let Some(host) = server.as_deref().or(sound_server.as_deref()) {
+            sound::populate_context_sound_facts(host, &facade, &mut context);
+        }
+        let defer_seeds = server.is_some() || sound_server.is_some() || hit_host.is_some();
         let mut firing = EventFiring::new(event, Arc::new(facade), context);
         // Every jar's batch opens first: the listeners then run as one event, in the loaders'
         // order across every jar (a NeoForge priority or a Fabric phase is global, as one bus or
         // one `Event` field is in a real game), and the batches close after.
         let mut opened = Vec::with_capacity(state.jars.len());
         let mut before = Vec::with_capacity(state.jars.len());
+        // The level sound streams any jar found unknown, as they stand before any listener
+        // runs: the firing's sounds are delivered in call order against these (`sound.rs`).
+        let mut sound_streams =
+            sound::sync_unknown_sound_streams(&mut state.jars, |jar| &mut jar.host);
         for loaded in &mut state.jars {
             // Every jar's host hears about the level this firing names, whether or not it has a
             // listener for the event: `MinecraftServer.getAllLevels()` answers from what the
             // game announced, and a jar that only listens for `server_started` must still see
             // the levels loaded before it.
             loaded.host.note_firing_levels(&firing);
+            loaded
+                .host
+                .set_host_deferred_server_sound_seeds(defer_seeds);
             opened.push(server.as_deref_mut().and_then(|server| {
                 attachments::open(
                     server,
@@ -1678,7 +2043,51 @@ impl HorizonJava {
             before.push(loaded.host.unknown_host_call_count());
         }
         let order = listener_order(&state.jars, &firing, &wanted);
-        let counts = run_listeners(&mut state.jars, &order, &mut firing);
+        let (counts, recorded_sounds) =
+            run_listeners_with_sounds(&mut state.jars, &order, &mut firing);
+        for loaded in &mut state.jars {
+            loaded.host.set_host_deferred_server_sound_seeds(false);
+        }
+        if let Some(host) = server.as_deref_mut().or(sound_server) {
+            for (jar_idx, effect) in &recorded_sounds {
+                sound::apply_server_sounds(
+                    host,
+                    std::slice::from_ref(effect),
+                    &mut sound_streams,
+                    |reason| {
+                        state.jars[*jar_idx].host.note_unknown_game_hook(reason);
+                    },
+                );
+            }
+        } else if let Some(hit) = hit_host {
+            for (jar_idx, effect) in &recorded_sounds {
+                sound::apply_hit_sounds(
+                    hit,
+                    None,
+                    std::slice::from_ref(effect),
+                    &mut sound_streams,
+                    |reason| {
+                        state.jars[*jar_idx].host.note_unknown_game_hook(reason);
+                    },
+                );
+            }
+        } else {
+            // No Sunrise host to play them on (seeds were not deferred, so these carry
+            // explicit seeds): counted, never dropped.
+            for (jar_idx, _) in &recorded_sounds {
+                state.jars[*jar_idx]
+                    .host
+                    .note_unknown_game_hook("level sound without a Sunrise host to play it");
+            }
+        }
+        // Streams the listeners' calls or the delivery above found unknown reach every jar.
+        sound_streams.extend(sound::gather_unknown_sound_streams(
+            state.jars.iter().map(|jar| &jar.host),
+        ));
+        sound::share_unknown_sound_streams(
+            state.jars.iter_mut().map(|jar| &mut jar.host),
+            &sound_streams,
+        );
         let (mut ran, mut failed, mut unknown) = (0, 0, 0);
         for (((loaded, opened), before), (jar_ran, jar_failed)) in
             state.jars.iter_mut().zip(opened).zip(before).zip(counts)
@@ -1832,6 +2241,11 @@ impl HorizonJava {
             player.session = session;
             player.life = life;
         }
+        // A new `ServerPlayer`: its `containerCounter` starts at 0 and its `containerMenu` is
+        // its inventory menu, in every jar (`block_use.rs`).
+        for jar in &mut state.jars {
+            jar.host.server_player_created(uuid, session, life);
+        }
     }
 
     /// The player whose action a hook hears, as the mod API's own helpers name them.
@@ -1843,7 +2257,7 @@ impl HorizonJava {
         site: &str,
         objects: impl FnOnce(&mut State) -> Option<(Option<GameObject>, Vec<Arg>)>,
     ) -> bool {
-        let fired = {
+        let (fired, mut sound_streams) = {
             let mut state = self.lock();
             if !state
                 .jars
@@ -1857,15 +2271,53 @@ impl HorizonJava {
                 game_hooks::unlisted(&mut state, site);
                 return false;
             };
-            game_hooks::fire(&mut state, site, receiver, args)
+            // The level sound streams any jar found unknown, before any callback runs: the
+            // callbacks' sounds are delivered in call order against these (`sound.rs`).
+            let sound_streams =
+                sound::sync_unknown_sound_streams(&mut state.jars, |jar| &mut jar.host);
+            let fired =
+                game_hooks::fire_with_host(&mut state, host.as_deref(), site, receiver, args);
+            (fired, sound_streams)
         };
+        let streams_before = sound_streams.len();
+        let mut unbridged = Vec::new();
         if let Some(host) = host {
-            for effect in fired.effects {
-                let GameHookEffect::SystemMessage { player, text } = effect;
-                if let Some(target) = host.player(player) {
-                    let _ = target.tell(host, Text::literal(text));
+            for (jar_idx, effect) in fired.effects {
+                match effect {
+                    GameHookEffect::SystemMessage { player, text } => {
+                        if let Some(target) = host.player(player) {
+                            let _ = target.tell(host, Text::literal(text));
+                        }
+                    }
+                    GameHookEffect::PlaySound(effect) => {
+                        sound::apply_server_sounds(host, &[effect], &mut sound_streams, |reason| {
+                            unbridged.push((jar_idx, reason.to_owned()));
+                        });
+                    }
                 }
             }
+        } else {
+            // No Sunrise host to play them on: counted, never dropped.
+            for (jar_idx, effect) in fired.effects {
+                if let GameHookEffect::PlaySound(_) = effect {
+                    unbridged.push((
+                        jar_idx,
+                        "level sound without a Sunrise host to play it".to_owned(),
+                    ));
+                }
+            }
+        }
+        if !unbridged.is_empty() || sound_streams.len() != streams_before {
+            let mut state = self.lock();
+            for (jar_idx, reason) in unbridged {
+                if let Some(loaded) = state.jars.get_mut(jar_idx) {
+                    loaded.host.note_unknown_game_hook(&reason);
+                }
+            }
+            sound::share_unknown_sound_streams(
+                state.jars.iter_mut().map(|jar| &mut jar.host),
+                &sound_streams,
+            );
         }
         fired.cancelled
     }
@@ -2072,9 +2524,22 @@ fn run_listeners(
     order: &[(usize, usize)],
     firing: &mut EventFiring,
 ) -> Vec<(usize, usize)> {
+    run_listeners_with_sounds(jars, order, firing).0
+}
+
+fn run_listeners_with_sounds(
+    jars: &mut [LoadedJar],
+    order: &[(usize, usize)],
+    firing: &mut EventFiring,
+) -> (Vec<(usize, usize)>, Vec<(usize, runtime::LevelSoundEffect)>) {
     let mut counts = vec![(0, 0); jars.len()];
+    let mut recorded_sounds = Vec::new();
     let event = firing.event;
     for &(at, slot) in order {
+        // Listeners of several jars interleave in one firing: a level sound stream any jar's
+        // call left unknown (this firing's or a nested one's) is unknown for this listener's jar
+        // too (`sound.rs`).
+        let sound_streams = sound::gather_unknown_sound_streams(jars.iter().map(|jar| &jar.host));
         let LoadedJar {
             row,
             jar,
@@ -2082,10 +2547,17 @@ fn run_listeners(
             listeners,
             ..
         } = &mut jars[at];
+        sound::share_unknown_sound_streams([&mut *host], &sound_streams);
         let (id, listener) = (&row.id, &listeners[slot]);
+        let sounds_before = firing.sounds.len();
         let outcome = caught(&format!("{} listener from {}", id, listener.source), || {
             jar.run_game_listener(listener, firing, host, &ExecutionBudget::within(JAR_BUDGET))
         });
+        if firing.sounds.len() > sounds_before {
+            for effect in firing.sounds[sounds_before..].iter().cloned() {
+                recorded_sounds.push((at, effect));
+            }
+        }
         match outcome {
             Ok(Ok(run)) => {
                 counts[at].0 += usize::from(run.ran);
@@ -2111,7 +2583,7 @@ fn run_listeners(
             }
         }
     }
-    counts
+    (counts, recorded_sounds)
 }
 
 /// Runs one Java callback, turning a panic into a named failure.
@@ -2555,8 +3027,15 @@ impl State {
             jar.row.command_unknown_host_calls = 0;
             jar.row.commands_translated = 0;
             jar.row.commands_refused_at_registration = 0;
+            jar.row.block_use = block_use::Tally::default();
+            // Every player of a new server is a new `ServerPlayer`: no Java menu or
+            // `containerCounter` carries over (`block_use.rs`).
+            jar.host.reset_player_menus();
             // No player value carries into another server's world.
             jar.host.reset_attachment_values();
+            // Nor a level sound stream: the new server's levels (and Sunrise's streams for them)
+            // start fresh.
+            jar.host.forget_unknown_server_sound_streams();
         }
         self.leavers.clear();
     }
@@ -2601,6 +3080,8 @@ struct JarRow {
     content_skipped: BTreeMap<String, (usize, usize)>,
     /// Game-class Mixin callbacks: bound or not, and what their firings did (`game_hooks.rs`).
     game_hooks: game_hooks::Tally,
+    /// Block-use hooks (`use_item_on` / `use_without_item`) and `openMenu` bridge outcomes (`block_use.rs`).
+    block_use: block_use::Tally,
 }
 
 impl JarRow {
@@ -2626,6 +3107,7 @@ impl JarRow {
             content_items: 0,
             content_skipped: BTreeMap::new(),
             game_hooks: game_hooks::Tally::default(),
+            block_use: block_use::Tally::default(),
         }
     }
 
@@ -2671,6 +3153,7 @@ impl JarRow {
             "entity_interact_client_skipped": self.entity_interact_client_skipped,
             "entity_interact_try_empty_hand": self.entity_interact_try_empty_hand,
             "game_hooks": self.game_hooks.json(),
+            "block_use": self.block_use.json(),
             "content": {
                 "blocks": self.content_blocks,
                 "items": self.content_items,
@@ -2840,6 +3323,7 @@ fn load_jar(
             content_items: 0,
             content_skipped: BTreeMap::new(),
             game_hooks: game_hooks::Tally::default(),
+            block_use: block_use::Tally::default(),
         });
     }
     let unknown = host.unknown_host_call_count();
@@ -2870,6 +3354,7 @@ fn load_jar(
             content_items: 0,
             content_skipped: BTreeMap::new(),
             game_hooks: game_hooks::Tally::default(),
+            block_use: block_use::Tally::default(),
         },
         jar,
         host,
@@ -3834,5 +4319,344 @@ mod tests {
         assert_eq!(context.amount, 0.0);
         assert!(!context.flag);
         assert_eq!(context.damage.as_deref(), Some("minecraft:player_attack"));
+    }
+
+    #[test]
+    fn placement_direction_conversion_matches_minecraft_names() {
+        for (direction, expected) in [
+            (mod_api::Direction::Down, "DOWN"),
+            (mod_api::Direction::Up, "UP"),
+            (mod_api::Direction::North, "NORTH"),
+            (mod_api::Direction::South, "SOUTH"),
+            (mod_api::Direction::West, "WEST"),
+            (mod_api::Direction::East, "EAST"),
+        ] {
+            assert_eq!(
+                placement_direction(direction),
+                runtime::Value::Ref(Some(format!(
+                    "enum/net/minecraft/core/Direction/{expected}"
+                ),))
+            );
+        }
+    }
+
+    #[test]
+    fn placement_result_conversion_refuses_null_and_leaves_foreign_blocks() {
+        let mut properties = std::collections::BTreeMap::new();
+        properties.insert("facing".to_owned(), "north".to_owned());
+        for (yaw, expected) in [
+            (0.0_f32, "north"),
+            (90.0, "east"),
+            (180.0, "south"),
+            (-90.0, "west"),
+        ] {
+            let mut facing = std::collections::BTreeMap::new();
+            facing.insert("facing".to_owned(), expected.to_owned());
+            assert_eq!(
+                placement_conversion(
+                    "demo:altar",
+                    true,
+                    Some(("demo:altar".to_owned(), facing.clone())),
+                ),
+                Some(Some(("demo:altar".to_owned(), facing))),
+                "yaw {yaw}"
+            );
+        }
+        assert_eq!(placement_conversion("demo:altar", true, None), Some(None));
+        assert_eq!(
+            placement_conversion(
+                "minecraft:stone",
+                false,
+                Some(("minecraft:stone".to_owned(), properties.clone())),
+            ),
+            None
+        );
+        assert_eq!(
+            placement_conversion(
+                "demo:altar",
+                true,
+                Some(("demo:other".to_owned(), properties.clone())),
+            ),
+            Some(Some(("demo:other".to_owned(), properties)))
+        );
+        assert_eq!(
+            placement_conversion(
+                "demo:stone_placer",
+                true,
+                Some(("minecraft:stone".to_owned(), BTreeMap::new())),
+            ),
+            Some(Some(("minecraft:stone".to_owned(), BTreeMap::new())))
+        );
+    }
+
+    struct PlacementTestLevel {
+        by_state: std::collections::HashMap<BlockState, String>,
+        by_id: BTreeMap<String, BlockState>,
+    }
+
+    impl PlacementTestLevel {
+        fn new(entries: &[(&str, u32)]) -> Self {
+            let mut by_state = std::collections::HashMap::new();
+            let mut by_id = BTreeMap::new();
+            for &(id, key) in entries {
+                let state = BlockState::from(mod_api::BlockStateRecord::new(
+                    mod_api::__private::parts_installation::block_key(key),
+                    0,
+                ));
+                by_state.insert(state, id.to_owned());
+                by_id.insert(id.to_owned(), state);
+            }
+            Self { by_state, by_id }
+        }
+
+        fn state_of(&self, id: &str) -> BlockState {
+            *self.by_id.get(id).expect("registered test block")
+        }
+    }
+
+    impl mod_api::LevelRandomHost for PlacementTestLevel {}
+
+    impl mod_api::LevelHost for PlacementTestLevel {
+        fn block_entity_data(&self, _: mod_api::BlockEntityRef) -> Option<mod_api::Compound> {
+            None
+        }
+
+        fn state_block(&self, state: BlockState) -> Option<&str> {
+            self.by_state.get(&state).map(String::as_str)
+        }
+
+        fn block_state_id(&self, name: &str) -> Option<BlockState> {
+            self.by_id.get(name).copied()
+        }
+
+        fn state_with_property(
+            &self,
+            state: BlockState,
+            _key: &str,
+            _value: &str,
+        ) -> Option<BlockState> {
+            Some(state)
+        }
+    }
+
+    fn build_placement_test_state() -> State {
+        use std::io::Write;
+        use std::path::PathBuf;
+
+        let sources: &[(&str, &str)] = &[
+            (
+                "net/minecraft/core/Direction.java",
+                "package net.minecraft.core; public enum Direction { DOWN, UP, NORTH, SOUTH, WEST, EAST; public Direction getOpposite() { return switch(this) { case DOWN -> UP; case UP -> DOWN; case NORTH -> SOUTH; case SOUTH -> NORTH; case WEST -> EAST; case EAST -> WEST; }; } }",
+            ),
+            (
+                "net/minecraft/resources/Identifier.java",
+                "package net.minecraft.resources; public final class Identifier { public static Identifier fromNamespaceAndPath(String ns, String p) { return new Identifier(); } }",
+            ),
+            (
+                "net/minecraft/core/Registry.java",
+                "package net.minecraft.core; import net.minecraft.resources.Identifier; public interface Registry<T> { static <V, T extends V> T register(Registry<V> r, Identifier id, T v) { return v; } }",
+            ),
+            (
+                "net/minecraft/core/registries/BuiltInRegistries.java",
+                "package net.minecraft.core.registries; import net.minecraft.core.Registry; import net.minecraft.world.level.block.Block; public final class BuiltInRegistries { public static final Registry<Block> BLOCK = null; }",
+            ),
+            (
+                "net/minecraft/world/level/block/state/BlockState.java",
+                "package net.minecraft.world.level.block.state; public class BlockState {}",
+            ),
+            (
+                "net/minecraft/world/item/context/BlockPlaceContext.java",
+                "package net.minecraft.world.item.context; import net.minecraft.core.Direction; public class BlockPlaceContext { public Direction getHorizontalDirection(){return null;} public Direction getClickedFace(){return null;} public boolean isSecondaryUseActive(){return false;} }",
+            ),
+            (
+                "net/minecraft/world/level/block/Block.java",
+                "package net.minecraft.world.level.block; import net.minecraft.world.level.block.state.BlockState; import net.minecraft.world.item.context.BlockPlaceContext; public class Block { public BlockState defaultBlockState(){return new BlockState();} public BlockState getStateForPlacement(BlockPlaceContext c){return defaultBlockState();} }",
+            ),
+            (
+                "net/minecraft/world/level/block/Blocks.java",
+                "package net.minecraft.world.level.block; public final class Blocks { public static final Block STONE = null; }",
+            ),
+            (
+                "demo/StoneBlock.java",
+                "package demo; import net.minecraft.world.item.context.BlockPlaceContext; import net.minecraft.world.level.block.*; import net.minecraft.world.level.block.state.BlockState; public class StoneBlock extends Block { @Override public BlockState getStateForPlacement(BlockPlaceContext c) { return Blocks.STONE.defaultBlockState(); } }",
+            ),
+            (
+                "demo/UnregisteredBlock.java",
+                "package demo; import net.minecraft.world.item.context.BlockPlaceContext; import net.minecraft.world.level.block.*; import net.minecraft.world.level.block.state.BlockState; public class UnregisteredBlock extends Block { private static final Block UNREGISTERED = new Block(); @Override public BlockState getStateForPlacement(BlockPlaceContext c) { return UNREGISTERED.defaultBlockState(); } }",
+            ),
+            (
+                "demo/MissingEngineBlock.java",
+                "package demo; import net.minecraft.world.item.context.BlockPlaceContext; import net.minecraft.world.level.block.*; import net.minecraft.world.level.block.state.BlockState; public class MissingEngineBlock extends Block { public static final Block TARGET = new Block(); @Override public BlockState getStateForPlacement(BlockPlaceContext c) { return TARGET.defaultBlockState(); } }",
+            ),
+            (
+                "demo/PlayerDependentBlock.java",
+                "package demo; import net.minecraft.world.item.context.BlockPlaceContext; import net.minecraft.world.level.block.*; import net.minecraft.world.level.block.state.BlockState; public class PlayerDependentBlock extends Block { @Override public BlockState getStateForPlacement(BlockPlaceContext c) { if (c.isSecondaryUseActive()) { return Blocks.STONE.defaultBlockState(); } return defaultBlockState(); } }",
+            ),
+            (
+                "demo/RefusingBlock.java",
+                "package demo; import net.minecraft.core.Direction; import net.minecraft.world.item.context.BlockPlaceContext; import net.minecraft.world.level.block.*; import net.minecraft.world.level.block.state.BlockState; public class RefusingBlock extends Block { @Override public BlockState getStateForPlacement(BlockPlaceContext c) { return c.getClickedFace() == Direction.DOWN ? null : defaultBlockState(); } }",
+            ),
+            (
+                "demo/Main.java",
+                "package demo; import net.minecraft.core.Registry; import net.minecraft.core.registries.BuiltInRegistries; import net.minecraft.resources.Identifier; public final class Main { public void onInitialize() { Registry.register(BuiltInRegistries.BLOCK, Identifier.fromNamespaceAndPath(\"demo\", \"stone_placer\"), new StoneBlock()); Registry.register(BuiltInRegistries.BLOCK, Identifier.fromNamespaceAndPath(\"demo\", \"unregistered_placer\"), new UnregisteredBlock()); Registry.register(BuiltInRegistries.BLOCK, Identifier.fromNamespaceAndPath(\"demo\", \"missing_in_engine\"), MissingEngineBlock.TARGET); Registry.register(BuiltInRegistries.BLOCK, Identifier.fromNamespaceAndPath(\"demo\", \"missing_engine_placer\"), new MissingEngineBlock()); Registry.register(BuiltInRegistries.BLOCK, Identifier.fromNamespaceAndPath(\"demo\", \"player_dep\"), new PlayerDependentBlock()); Registry.register(BuiltInRegistries.BLOCK, Identifier.fromNamespaceAndPath(\"demo\", \"refusing\"), new RefusingBlock()); } }",
+            ),
+        ];
+
+        let root = std::env::var_os("CARGO_TARGET_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir)
+            .join(format!("horizon-java-mod-placement-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (src, classes) = (root.join("src"), root.join("classes"));
+        let mut paths = Vec::new();
+        for (path, body) in sources {
+            let file = src.join(path);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(&file, body).unwrap();
+            paths.push(file);
+        }
+        std::fs::create_dir_all(&classes).unwrap();
+        let javac = std::env::var_os("JAVA_HOME")
+            .map(|home| PathBuf::from(home).join("bin/javac"))
+            .unwrap_or_else(|| "javac".into());
+        let status = std::process::Command::new(javac)
+            .args(["--release", "17", "-nowarn", "-d"])
+            .arg(&classes)
+            .args(&paths)
+            .status()
+            .expect("javac runs");
+        assert!(status.success(), "javac failed");
+
+        let mut bytes = Vec::new();
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut bytes));
+        let options = zip::write::SimpleFileOptions::default();
+        zip.start_file("fabric.mod.json", options).unwrap();
+        zip.write_all(br#"{"id":"placedemo","version":"1","entrypoints":{"main":["demo.Main"]}}"#)
+            .unwrap();
+        for name in [
+            "Main",
+            "StoneBlock",
+            "UnregisteredBlock",
+            "MissingEngineBlock",
+            "PlayerDependentBlock",
+            "RefusingBlock",
+        ] {
+            let path = classes.join(format!("demo/{name}.class"));
+            zip.start_file(format!("demo/{name}.class"), options)
+                .unwrap();
+            zip.write_all(&std::fs::read(path).unwrap()).unwrap();
+        }
+        zip.finish().unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+
+        let jar = Arc::new(NativeJar::from_bytes(&bytes).expect("parse jar"));
+        let mut host = jar.seed_host(StdHost::new().with_environment_type("SERVER"));
+        jar.execute("demo.Main", None, "main", &mut host)
+            .expect("run entrypoint");
+        let loaded = LoadedJar {
+            row: JarRow::refused("placedemo.jar", "placedemo".to_owned(), String::new()),
+            jar,
+            host,
+            listeners: Vec::new(),
+            orderings: Vec::new(),
+            commands: Vec::new(),
+            native_commands: Vec::new(),
+            commands_registered: false,
+            stages_ran: 1,
+            failures: Vec::new(),
+            hooks: runtime::GameHookRegistrations::default(),
+            hook_state: runtime::GameHookState::default(),
+        };
+        State {
+            jars: vec![loaded],
+            ..State::default()
+        }
+    }
+
+    #[test]
+    fn answer_state_for_placement_places_vanilla_stone_and_rejects_unregistered_or_unknown() {
+        let mut state = build_placement_test_state();
+        let level = PlacementTestLevel::new(&[
+            ("minecraft:stone", 1),
+            ("demo:stone_placer", 2),
+            ("demo:unregistered_placer", 3),
+            ("demo:missing_engine_placer", 4),
+            ("demo:player_dep", 5),
+            ("demo:refusing", 6),
+        ]);
+        let stone = level.state_of("minecraft:stone");
+        let stone_placer = level.state_of("demo:stone_placer");
+        let unreg_placer = level.state_of("demo:unregistered_placer");
+        let missing_engine_placer = level.state_of("demo:missing_engine_placer");
+        let player_dep = level.state_of("demo:player_dep");
+        let refusing = level.state_of("demo:refusing");
+        let ctx_up = mod_api::PlacementContext::new(
+            mod_api::BlockPos::new(1, 2, 3),
+            mod_api::Direction::Up,
+            None,
+        );
+        let ctx_down = mod_api::PlacementContext::new(
+            mod_api::BlockPos::new(1, 2, 3),
+            mod_api::Direction::Down,
+            None,
+        );
+
+        // 1. Mod block returning `Blocks.STONE.defaultBlockState()` places `minecraft:stone`.
+        let placed = answer_state_for_placement_snapshot(
+            &mut state,
+            LevelSide::Server(&level),
+            stone_placer,
+            &ctx_up,
+        );
+        assert_eq!(placed, Some(Some(stone)));
+        assert_eq!(state.jars[0].host.unknown_host_call_count(), 0);
+
+        // 2. Mod block returning a state of a block unregistered in Java is left unclaimed (`None`).
+        let unreg = answer_state_for_placement_snapshot(
+            &mut state,
+            LevelSide::Server(&level),
+            unreg_placer,
+            &ctx_up,
+        );
+        assert_eq!(unreg, None);
+        assert_eq!(state.jars[0].host.unknown_host_call_count(), 0);
+
+        // 3. Mod block returning a block absent from Sunrise's registry is left unclaimed (`None`).
+        let missing = answer_state_for_placement_snapshot(
+            &mut state,
+            LevelSide::Server(&level),
+            missing_engine_placer,
+            &ctx_up,
+        );
+        assert_eq!(missing, None);
+        assert_eq!(state.jars[0].host.unknown_host_call_count(), 0);
+
+        // 4. Non-player refusal (`null`) returns `Some(None)` cleanly with 0 unknowns.
+        let refused = answer_state_for_placement_snapshot(
+            &mut state,
+            LevelSide::Server(&level),
+            refusing,
+            &ctx_down,
+        );
+        assert_eq!(refused, Some(None));
+        assert_eq!(state.jars[0].host.unknown_host_call_count(), 0);
+
+        // 5. Player-dependent placement (`isSecondaryUseActive`) counts under `Placer::Unknown`
+        //    and refuses to guess a state (`None`).
+        let unknown = answer_state_for_placement_snapshot(
+            &mut state,
+            LevelSide::Server(&level),
+            player_dep,
+            &ctx_up,
+        );
+        assert_eq!(unknown, None);
+        assert_eq!(state.jars[0].host.unknown_host_call_count(), 1);
+        assert_eq!(state.jars[0].row.callback_unknown_host_calls, 1);
+
+        // 6. Each placement's `BlockPlaceContext` snapshot ended with its call (#635): five
+        //    placements, a refusal and a counted one among them, leave the jar's host holding
+        //    no context and no direction array.
+        assert_eq!(state.jars[0].host.block_place_context_count(), 0);
+        assert_eq!(state.jars[0].host.placement_array_count(), 0);
     }
 }
