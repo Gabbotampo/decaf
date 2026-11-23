@@ -21,7 +21,7 @@ pub(crate) fn field_id(field: &str) -> Option<String> {
 /// `tests/fixtures/creative_tab_modify_output/oracle/CaptureVanillaItemIds.java`.
 /// Separate from `FIELDS`, which only lists the 1,218 static fields declared on `Items`
 /// and omits block-registered items such as `minecraft:copper_block`.
-const REGISTRY_IDS_TEXT: &str = include_str!("vanilla_item_ids_java25.txt");
+const REGISTRY_IDS_TEXT: &str = crate::runtime::vendored_vanilla_item_ids_java25_txt::VENDORED_DATA;
 
 /// Whether `id` (`minecraft:...`) is a vanilla 26.3 `BuiltInRegistries.ITEM` entry.
 /// Every vanilla 26.3 item has `requiredFeatures == FeatureFlags.VANILLA_SET`

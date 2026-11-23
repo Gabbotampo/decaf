@@ -354,18 +354,33 @@ impl State {
         if self.jars.is_empty() || !event.display.name_visible(event.creative) {
             return;
         }
-        // `None` when the host has no name for the item's slot: then no jar registered it.
-        let id = event.stack.item().id(host).map(str::to_owned);
+        // `None` when the host has no name for the item's slot. Then this bridge cannot tell which
+        // jar's item it is, yet any jar that registered an item may own it and would run its
+        // `appendHoverText` in Java: each such jar counts the tooltip it could not run, as a
+        // creative tab counts a stack it cannot name, instead of the tooltip skipping it silently.
+        let Some(id) = event.stack.item().id(host).map(str::to_owned) else {
+            for loaded in &mut self.jars {
+                let registers_items = loaded
+                    .host
+                    .registrations()
+                    .iter()
+                    .any(|entry| entry.registry == "minecraft:item");
+                if registers_items {
+                    loaded
+                        .host
+                        .note_unknown_game_hook("tooltip item has no registry id");
+                    loaded.row.unknown_host_calls = loaded.host.unknown_host_call_count();
+                }
+            }
+            return;
+        };
         // The hovered stack is lent as a view and copied out once, for the first jar that owns
         // its item (`ItemStackView::project`); `None` inside means it has no owned form.
         let mut projected: Option<Option<mod_api::ItemStack>> = None;
         // Each line with the jar that produced it, so a line Sunrise refuses is counted there.
         let mut additions: Vec<(usize, mod_api::Text)> = Vec::new();
         for (index, loaded) in self.jars.iter_mut().enumerate() {
-            let Some(id) = id.as_deref() else {
-                break;
-            };
-            let Some(entry) = loaded.host.observed_registry_entry("minecraft:item", id) else {
+            let Some(entry) = loaded.host.observed_registry_entry("minecraft:item", &id) else {
                 continue;
             };
             let item = entry.value.clone();

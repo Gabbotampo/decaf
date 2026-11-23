@@ -145,6 +145,8 @@ struct CreativeTabEditorState {
 /// Sunrise's `native_text_json` component codec), and `ConfigHost::game_version`.
 struct TestClientHost {
     fake: mod_api::testing::FakeHost,
+    /// While set, `KeysBackend::item_key_id` names no item, as a host with no name for a slot.
+    hide_item_names: std::cell::Cell<bool>,
     editor: RefCell<CreativeTabEditorState>,
     /// Every `ClientHost::play_local_sound` the bridge made, with its `after` ticks.
     local_sounds: RefCell<Vec<(mod_api::SoundPlay, u32)>>,
@@ -162,6 +164,7 @@ impl TestClientHost {
             .expect("resolve test items");
         Self {
             fake,
+            hide_item_names: std::cell::Cell::new(false),
             editor: RefCell::new(CreativeTabEditorState::default()),
             local_sounds: RefCell::default(),
         }
@@ -331,6 +334,9 @@ impl mod_api::prelude::ItemsHost for TestClientHost {
 
 impl mod_api::prelude::KeysBackend for TestClientHost {
     fn item_key_id(&self, key: ItemKey) -> Option<&str> {
+        if self.hide_item_names.get() {
+            return None;
+        }
         mod_api::prelude::KeysBackend::item_key_id(&self.fake, key)
     }
 }
@@ -1136,6 +1142,34 @@ fn javac_fixture_creative_tab_anchors_visibility_flags_and_tooltip_bridge() {
                 ]
             );
             assert_eq!(report_row(&java)["unknown_host_call_count"], 3);
+
+            // 7) A hovered item the host cannot name: this jar registers items, so its
+            //    `appendHoverText` may be the one that would run. It is counted on the jar
+            //    (3 -> 4), and the tooltip keeps exactly what Sunrise built, no guessed lines.
+            host.hide_item_names.set(true);
+            let mut unnamed_lines = vec![(Text::literal("Demo Tooltip Item"), 0xFFFF_FFFF)];
+            mod_api::dispatch_item_tooltip(
+                &host,
+                mod_api::__private::ItemTooltipCall {
+                    player: 0,
+                    player_entity_id: 1,
+                    stack: ItemStackView::from_stack(&tooltip_stack),
+                    display: &display,
+                    advanced: true,
+                    creative: false,
+                    lines: TooltipLines::new(&mut VecLines(&mut unnamed_lines)),
+                },
+            );
+            host.hide_item_names.set(false);
+            assert_eq!(
+                unnamed_lines,
+                vec![(Text::literal("Demo Tooltip Item"), 0xFFFF_FFFF)]
+            );
+            assert_eq!(
+                report_row(&java)["unknown_host_call_count"],
+                4,
+                "an unnameable hovered item must be counted on the jar, not skipped silently"
+            );
 
             Ok::<_, ()>(())
         })

@@ -161,7 +161,11 @@ What it does today:
   `word`/`text` and `integer` nodes only: anything else is refused by name and logged.
 
 A native mod is one flat crate, so the runtime is copied into `mod/src/runtime/` by
-`tools/vendor.py` (which rewrites `crate::` to `crate::runtime::`). The copy is committed, so a
+`tools/vendor.py` (which rewrites `crate::` to `crate::runtime::`). A Sunrise package carries only
+the `.rs` and `.toml` files under `src/`, and the native build compiles only what it carries, so a
+data file the runtime embeds with `include_str!`/`include_bytes!` (a `.txt` table, a test oracle's
+JSON) is vendored as Rust source holding its exact bytes, and the vendored call becomes `include!`
+(Sunrise's "Embedded data" rule). The copy is committed, so a
 clean clone builds, and every commit that changes the runtime re-vendors it in the same commit.
 `python3 tools/vendor.py --check` regenerates the copy and compares it byte for byte, so it fails on a
 hand edit to `mod/src/runtime/` and on a runtime change that was not re-vendored; CI runs it on every
