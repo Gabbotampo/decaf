@@ -38,6 +38,12 @@ mod attachment_codec;
 mod bigdecimal_slice;
 mod block_entity_types;
 mod block_item_id;
+mod block_use;
+pub use block_use::{
+    BlockHitData, BlockUseContext, BlockUseOutcome, BlockUsePlayerData, BlockUseSide,
+    InteractionItemContext, InteractionResultValue, MenuCloseOutcome, MenuEffect, OpenMenuEffect,
+    PlayerContainer, SwingSource,
+};
 mod boxed;
 pub mod brigadier;
 mod callback_marker;
@@ -196,6 +202,7 @@ mod jdk_text_oracle;
 mod jvm_dispatch;
 mod kotlin_stdlib;
 mod lambda_boxing;
+pub mod level_sound;
 mod library_dispatch;
 mod linked_resources;
 mod list_equality;
@@ -285,6 +292,7 @@ mod vanilla_block_items;
 mod vanilla_block_shapes;
 mod vanilla_block_state_definers;
 mod vanilla_block_state_properties;
+mod vanilla_block_use_methods;
 mod vanilla_blocks;
 mod vanilla_entity_types;
 mod vanilla_holders;
@@ -334,6 +342,10 @@ pub(crate) use host_optional::{
 pub(crate) use host_path::{path_text, path_value, unix_normal};
 pub use host_ref::{HostKind, HostRef};
 pub use java_nbt::{MAX_DEPTH as NBT_MAX_DEPTH, Nbt, NbtCompound};
+pub use level_sound::{
+    EntitySoundFacts, LevelSoundEffect, SoundHolderKind, SoundSeed, SoundSide, SoundSource,
+    SoundTarget,
+};
 pub use mixin_extras::{GameHookShape, MixinExtrasKind, MixinExtrasPlan};
 pub use mixin_plugins::ConfigPluginReport;
 use mixin_plugins::ConfigPlugins;
@@ -3372,6 +3384,47 @@ pub trait Host {
         None
     }
 
+    /// Registry id of a registered `SoundEvent` value (`MappedRegistry.wrapAsHolder`),
+    /// or `None` when unregistered (`Holder.direct`).
+    fn registered_sound_id(&self, _sound: &Value) -> Option<String> {
+        None
+    }
+
+    /// Unwrap a `Holder<SoundEvent>` handle into `(sound_event_value, bound_registry_id)`
+    /// or an `IllegalStateException` if it is an unbound `Holder$Reference`.
+    fn unwrap_sound_holder(
+        &mut self,
+        _value: &Value,
+    ) -> Option<Result<(Value, Option<String>), NativeError>> {
+        None
+    }
+
+    /// Handle for `Level.random` (`Level.getRandom()`) of `level_marker`.
+    fn level_random_handle(&mut self, _level_marker: &str) -> Option<Value> {
+        None
+    }
+
+    /// Draw `Level.soundSeedGenerator.nextLong()` for `level_marker` (or return
+    /// [`level_sound::SoundSeed::HostDeferred`] when a live host owns the seed stream).
+    fn draw_level_sound_seed(
+        &mut self,
+        _level_marker: &str,
+        _server_side: bool,
+    ) -> Option<level_sound::SoundSeed> {
+        None
+    }
+
+    /// Mark a level sound stream unknown (see `level_sound.rs`): Java drew, or
+    /// may have drawn, from it where Decaf did not, so every later draw from
+    /// it counts. A host that models no sound streams keeps the default: its
+    /// draws already count.
+    fn mark_sound_stream_unknown(&mut self, _stream: &str) {}
+
+    /// Construct a `SoundEvent` record handle from `new SoundEvent(Identifier, Optional<Float>)`.
+    fn construct_sound_event(&mut self, _r: &MethodRef, _args: &[Value]) -> Option<Value> {
+        None
+    }
+
     /// Record the message of a throwable the interpreter caught and is about
     /// to deliver to a Java handler.
     ///
@@ -3786,11 +3839,31 @@ pub struct StdHost {
     resource_generation: u64,
     /// Per-call container stack clamp resolved virtually for `SimpleContainer.setItem`.
     pending_container_clamp: Option<menu_models::ContainerClamp>,
-    /// Host-owned snapshots handed to a jar's `BlockPlaceContext` override.
+    /// Host-owned snapshots handed to a jar's `BlockPlaceContext` override,
+    /// by handle key (`placement-context/<serial>`).
     /// The context is deliberately a value object: it has no guessed world
     /// state and every accessor is answered from the placement snapshot.
+    ///
+    /// A row lives only while the placement it was made for runs:
+    /// [`NativeJar::block_state_for_placement`] registers it on entry and
+    /// releases it when the invocation returns, fails or unwinds
+    /// (`PlacementScope`), so a placement keeps nothing once it ends (#635:
+    /// every row used to stay, rooting its player, level and item for the
+    /// server's life). While a row is here it is a root of the heap's
+    /// collections (`heap.rs`); a handle the jar kept past its placement
+    /// finds no row and every accessor on it is counted, as a tooltip sink
+    /// is once its `appendHoverText` returns.
     placement_contexts: BTreeMap<String, BlockPlaceContextData>,
-    placement_arrays: BTreeMap<String, Vec<Value>>,
+    /// The `Direction[]`s `getNearestLookingDirections` answered, by handle
+    /// key (`placement-array/<serial>`), each with the key of the context it
+    /// came from. The runtime copies one into a jar array as soon as the call
+    /// returns (`Runtime::materialize_host_array`), so the jar never holds
+    /// this row: it is a hand-off, released with its context.
+    placement_arrays: BTreeMap<String, (String, Vec<Value>)>,
+    /// The serial of the next placement context or array key. Never reused:
+    /// a key handed out again after a release would make a context the jar
+    /// kept answer for a different placement.
+    next_placement_handle: u64,
     resource_streams: BTreeMap<String, (Vec<u8>, usize)>,
     resource_marks: BTreeMap<String, usize>,
     /// Explicitly seeded class names exposed through `ClassLoader.loadClass`.
@@ -4158,6 +4231,8 @@ pub struct StdHost {
     menu_states: menu_models::States,
     next_menu_object: u64,
     freed_menu_objects: heap::FreedObjects,
+    block_use: block_use::BlockUseHostState,
+    pub(crate) level_sound: level_sound::LevelSoundState,
 }
 
 /// Who placed the block for a [`BlockPlaceContextData`] snapshot.
@@ -4198,6 +4273,64 @@ pub struct BlockPlaceContextData {
     pub placer: Placer,
     pub item_in_hand: Value,
     pub level: Value,
+}
+
+/// The key prefix of a `BlockPlaceContext` handle
+/// (`StdHost::new_block_place_context`).
+const PLACEMENT_CONTEXT_PREFIX: &str = "placement-context/";
+
+/// The `BlockPlaceContext` accessors `StdHost` answers from a placement
+/// snapshot. One list, so a registered context and a released one (#635)
+/// claim exactly the same calls: the first answers them, the second counts
+/// them, and every other call takes the ordinary host path either way.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PlacementAccessor {
+    ClickedPos,
+    ClickedFace,
+    ClickLocation,
+    Inside,
+    ItemInHand,
+    Level,
+    CanPlace,
+    ReplacingClickedOnBlock,
+    Player,
+    HorizontalDirection,
+    SecondaryUseActive,
+    Rotation,
+    NearestLookingDirection,
+    NearestLookingVerticalDirection,
+    NearestLookingDirections,
+}
+
+impl PlacementAccessor {
+    fn of(r: &MethodRef) -> Option<Self> {
+        Some(match (r.name.as_str(), r.descriptor.as_str()) {
+            ("getClickedPos", "()Lnet/minecraft/core/BlockPos;") => Self::ClickedPos,
+            ("getClickedFace", "()Lnet/minecraft/core/Direction;") => Self::ClickedFace,
+            ("getClickLocation", "()Lnet/minecraft/world/phys/Vec3;") => Self::ClickLocation,
+            ("isInside", "()Z") => Self::Inside,
+            ("getItemInHand", "()Lnet/minecraft/world/item/ItemStack;") => Self::ItemInHand,
+            ("getLevel", "()Lnet/minecraft/world/level/Level;") => Self::Level,
+            ("canPlace", "()Z") => Self::CanPlace,
+            ("replacingClickedOnBlock", "()Z") => Self::ReplacingClickedOnBlock,
+            ("getPlayer", "()Lnet/minecraft/world/entity/player/Player;") => Self::Player,
+            ("getHorizontalDirection", "()Lnet/minecraft/core/Direction;") => {
+                Self::HorizontalDirection
+            }
+            ("isSecondaryUseActive", "()Z") => Self::SecondaryUseActive,
+            ("getRotation", "()F") => Self::Rotation,
+            ("getNearestLookingDirection", "()Lnet/minecraft/core/Direction;") => {
+                Self::NearestLookingDirection
+            }
+            ("getNearestLookingVerticalDirection", "()Lnet/minecraft/core/Direction;") => {
+                Self::NearestLookingVerticalDirection
+            }
+            ("getNearestLookingDirections", "()[Lnet/minecraft/core/Direction;") => {
+                Self::NearestLookingDirections
+            }
+            _ => return None,
+        })
+    }
 }
 
 fn opposite(direction: &str) -> &'static str {
@@ -4258,6 +4391,7 @@ impl StdHost {
             pending_container_clamp: None,
             placement_contexts: BTreeMap::new(),
             placement_arrays: BTreeMap::new(),
+            next_placement_handle: 0,
             resource_streams: BTreeMap::new(),
             resource_marks: BTreeMap::new(),
             classes: BTreeMap::new(),
@@ -4417,6 +4551,8 @@ impl StdHost {
             menu_states: BTreeMap::new(),
             next_menu_object: 0,
             freed_menu_objects: heap::FreedObjects::default(),
+            block_use: block_use::BlockUseHostState::default(),
+            level_sound: level_sound::LevelSoundState::default(),
         }
     }
 
@@ -5719,26 +5855,64 @@ impl StdHost {
     }
 
     /// Register a vanilla-shaped `BlockPlaceContext` snapshot for a virtual
-    /// block call. The returned handle is rooted by the caller for the
-    /// duration of the invocation and may be reused by nested calls.
+    /// block call, until [`Self::release_block_place_context`].
+    ///
+    /// [`NativeJar::block_state_for_placement`] does both around its
+    /// invocation; a caller that passes the handle to an invocation of its own
+    /// releases it once that invocation (and any nested call reusing the
+    /// handle) is done. While registered, the snapshot is a root of the
+    /// heap's collections; once released, every accessor on a handle the jar
+    /// kept is counted, never answered from the old snapshot.
     pub fn new_block_place_context(&mut self, data: BlockPlaceContextData) -> Value {
-        let key = format!("placement-context#{}", self.placement_contexts.len());
+        let key = format!("{PLACEMENT_CONTEXT_PREFIX}{}", self.next_placement_serial());
         self.placement_contexts.insert(key.clone(), data);
         Value::Host(HostRef::new(HostKind::GameTransient, key))
+    }
+
+    /// Drop a snapshot [`Self::new_block_place_context`] registered, with
+    /// every `Direction[]` its `getNearestLookingDirections` answered (the jar
+    /// already holds its own copy of each). Releasing a value that is not a
+    /// registered context, or one already released, does nothing.
+    pub fn release_block_place_context(&mut self, context: &Value) {
+        let Value::Host(handle) = context else {
+            return;
+        };
+        if handle.kind() != HostKind::GameTransient
+            || self.placement_contexts.remove(handle.key()).is_none()
+        {
+            return;
+        }
+        self.placement_arrays
+            .retain(|_, (owner, _)| owner.as_str() != handle.key());
+    }
+
+    /// How many `BlockPlaceContext` snapshots are registered now: zero
+    /// between placements, however many ran.
+    pub fn block_place_context_count(&self) -> usize {
+        self.placement_contexts.len()
+    }
+
+    /// How many `getNearestLookingDirections` hand-off arrays the host holds
+    /// now: zero between placements, however many ran.
+    pub fn placement_array_count(&self) -> usize {
+        self.placement_arrays.len()
+    }
+
+    /// A placement handle serial that is never handed out twice by this host.
+    /// The space is `u64`, so exhaustion is unreachable in practice, but it is
+    /// a hard stop rather than a wrap: a wrapped serial would alias a context
+    /// a long-lived caller still holds.
+    fn next_placement_serial(&mut self) -> u64 {
+        let serial = self.next_placement_handle;
+        self.next_placement_handle = serial
+            .checked_add(1)
+            .expect("placement handle serials exhausted; refusing to reuse one");
+        serial
     }
 
     /// The canonical empty `ItemStack` used by vanilla contexts with no hand item.
     pub fn empty_item_stack() -> Value {
         menu_models::empty_stack()
-    }
-
-    fn placement_context(&self, value: &Value) -> Option<&BlockPlaceContextData> {
-        let Value::Host(handle) = value else {
-            return None;
-        };
-        (handle.kind() == HostKind::GameTransient)
-            .then(|| self.placement_contexts.get(handle.key()))
-            .flatten()
     }
 
     fn placement_direction(name: &str) -> Value {
@@ -5851,22 +6025,46 @@ impl StdHost {
         }
     }
 
-    fn store_placement_direction_array(&mut self, names: [&'static str; 6]) -> Value {
+    /// Hand `names` to the runtime as a fresh `Direction[]`, owned by the
+    /// context `owner` (its key), which releases it.
+    fn store_placement_direction_array(&mut self, owner: &str, names: [&'static str; 6]) -> Value {
         let values = names
             .into_iter()
             .map(Self::placement_direction)
             .collect::<Vec<_>>();
-        let key = format!("placement-array/{}", self.placement_arrays.len());
-        self.placement_arrays.insert(key.clone(), values);
+        let key = format!("placement-array/{}", self.next_placement_serial());
+        self.placement_arrays
+            .insert(key.clone(), (owner.to_owned(), values));
         Value::Host(HostRef::new(HostKind::GameTransient, key))
     }
 
+    /// A `BlockPlaceContext` accessor on a handle
+    /// [`Self::new_block_place_context`] made. `None` leaves every other call
+    /// (and every other receiver) on the ordinary host path, for a released
+    /// handle exactly as for a registered one.
     fn placement_context_call(
         &mut self,
         r: &MethodRef,
         receiver: &Value,
     ) -> Option<Result<Value, NativeError>> {
-        let context = self.placement_context(receiver)?.clone();
+        let Value::Host(handle) = receiver else {
+            return None;
+        };
+        if handle.kind() != HostKind::GameTransient
+            || !handle.key().starts_with(PLACEMENT_CONTEXT_PREFIX)
+        {
+            return None;
+        }
+        let accessor = PlacementAccessor::of(r)?;
+        let Some(context) = self.placement_contexts.get(handle.key()).cloned() else {
+            // The jar kept the context past the placement it was made for
+            // (#635). Most accessors read the player or the world as they are
+            // now (`canPlace`, the rotation family, `isSecondaryUseActive`),
+            // which the old snapshot no longer is, so each is counted rather
+            // than answered stale.
+            return Some(self.unknown_host_call(r));
+        };
+        let owner = handle.key().to_owned();
         let direction = |name| Ok(Self::placement_direction(name));
         let pos = || {
             Ok(crate::runtime::game_object::server_value(format!(
@@ -5874,50 +6072,46 @@ impl StdHost {
                 context.clicked_pos[0], context.clicked_pos[1], context.clicked_pos[2]
             )))
         };
-        let result = match (r.name.as_str(), r.descriptor.as_str()) {
-            ("getClickedPos", "()Lnet/minecraft/core/BlockPos;") => pos(),
-            ("getClickedFace", "()Lnet/minecraft/core/Direction;") => Ok(context.clicked_face),
-            ("getClickLocation", "()Lnet/minecraft/world/phys/Vec3;") => {
-                Ok(crate::runtime::game_object::client_value(format!(
-                    "client/vec3/{},{},{}",
-                    context.click_location[0], context.click_location[1], context.click_location[2]
-                )))
-            }
-            ("isInside", "()Z") => Ok(Value::Int(i32::from(context.inside))),
-            ("getItemInHand", "()Lnet/minecraft/world/item/ItemStack;") => Ok(context.item_in_hand),
-            ("getLevel", "()Lnet/minecraft/world/level/Level;") => Ok(context.level),
-            ("canPlace", "()Z") => Ok(Value::Int(i32::from(context.can_place))),
-            ("replacingClickedOnBlock", "()Z") => match context.placer {
+        let result = match accessor {
+            PlacementAccessor::ClickedPos => pos(),
+            PlacementAccessor::ClickedFace => Ok(context.clicked_face),
+            PlacementAccessor::ClickLocation => Ok(crate::runtime::game_object::client_value(format!(
+                "client/vec3/{},{},{}",
+                context.click_location[0], context.click_location[1], context.click_location[2]
+            ))),
+            PlacementAccessor::Inside => Ok(Value::Int(i32::from(context.inside))),
+            PlacementAccessor::ItemInHand => Ok(context.item_in_hand),
+            PlacementAccessor::Level => Ok(context.level),
+            PlacementAccessor::CanPlace => Ok(Value::Int(i32::from(context.can_place))),
+            PlacementAccessor::ReplacingClickedOnBlock => match context.placer {
                 Placer::None { direction: Some(_) } => Ok(Value::Int(i32::from(context.can_place))),
                 Placer::Player { .. } | Placer::None { direction: None } | Placer::Unknown => {
                     Ok(Value::Int(i32::from(context.replacing_clicked_on_block)))
                 }
             },
-            ("getPlayer", "()Lnet/minecraft/world/entity/player/Player;") => match context.placer {
+            PlacementAccessor::Player => match context.placer {
                 Placer::Player { player, .. } => Ok(player),
                 Placer::None { .. } => Ok(Value::Ref(None)),
                 Placer::Unknown => self.unknown_host_call(r),
             },
-            ("getHorizontalDirection", "()Lnet/minecraft/core/Direction;") => {
-                match context.placer {
-                    Placer::Player { yaw, .. } => direction(Self::placement_yaw_direction(yaw)),
-                    Placer::None { direction: None } => direction("NORTH"),
-                    Placer::None {
-                        direction: Some(ref dir),
-                    } => match Self::direction_name(dir) {
-                        Some("DOWN" | "UP") => direction("NORTH"),
-                        Some(name) => direction(name),
-                        None => self.unknown_host_call(r),
-                    },
-                    Placer::Unknown => self.unknown_host_call(r),
-                }
-            }
-            ("isSecondaryUseActive", "()Z") => match context.placer {
+            PlacementAccessor::HorizontalDirection => match context.placer {
+                Placer::Player { yaw, .. } => direction(Self::placement_yaw_direction(yaw)),
+                Placer::None { direction: None } => direction("NORTH"),
+                Placer::None {
+                    direction: Some(ref dir),
+                } => match Self::direction_name(dir) {
+                    Some("DOWN" | "UP") => direction("NORTH"),
+                    Some(name) => direction(name),
+                    None => self.unknown_host_call(r),
+                },
+                Placer::Unknown => self.unknown_host_call(r),
+            },
+            PlacementAccessor::SecondaryUseActive => match context.placer {
                 Placer::Player { secondary_use, .. } => Ok(Value::Int(i32::from(secondary_use))),
                 Placer::None { .. } => Ok(Value::Int(0)),
                 Placer::Unknown => self.unknown_host_call(r),
             },
-            ("getRotation", "()F") => match context.placer {
+            PlacementAccessor::Rotation => match context.placer {
                 Placer::Player { yaw, .. } => Ok(Value::Float(f64::from(yaw))),
                 Placer::None { direction: None } => Ok(Value::Float(0.0)),
                 Placer::None {
@@ -5928,60 +6122,51 @@ impl StdHost {
                 },
                 Placer::Unknown => self.unknown_host_call(r),
             },
-            ("getNearestLookingDirection", "()Lnet/minecraft/core/Direction;") => {
-                match context.placer {
-                    Placer::Player { yaw, pitch, .. } => {
-                        direction(Self::placement_ordered_directions(yaw, pitch)[0])
-                    }
-                    Placer::None { direction: Some(_) } => direction("DOWN"),
-                    Placer::None { direction: None } => Err(Self::null_entity_view_xrot_npe()),
-                    Placer::Unknown => self.unknown_host_call(r),
+            PlacementAccessor::NearestLookingDirection => match context.placer {
+                Placer::Player { yaw, pitch, .. } => {
+                    direction(Self::placement_ordered_directions(yaw, pitch)[0])
                 }
-            }
-            ("getNearestLookingVerticalDirection", "()Lnet/minecraft/core/Direction;") => {
-                match context.placer {
-                    Placer::Player { pitch, .. } => {
-                        direction(if pitch < 0.0 { "UP" } else { "DOWN" })
-                    }
-                    Placer::None { .. } => Err(Self::null_entity_view_xrot_npe()),
-                    Placer::Unknown => self.unknown_host_call(r),
-                }
-            }
-            ("getNearestLookingDirections", "()[Lnet/minecraft/core/Direction;") => {
-                match context.placer {
-                    Placer::Player { yaw, pitch, .. } => {
-                        let mut names = Self::placement_ordered_directions(yaw, pitch);
-                        if !context.replacing_clicked_on_block {
-                            let Some(clicked) = Self::direction_name(&context.clicked_face) else {
-                                return Some(self.unknown_host_call(r));
-                            };
-                            let clicked_opp = opposite(clicked);
-                            if let Some(index) = names.iter().position(|name| *name == clicked_opp)
-                                && index > 0
-                            {
-                                for i in (0..index).rev() {
-                                    names[i + 1] = names[i];
-                                }
-                                names[0] = clicked_opp;
-                            }
-                        }
-                        Ok(self.store_placement_direction_array(names))
-                    }
-                    Placer::None {
-                        direction: Some(ref dir),
-                    } => {
-                        let Some(names) = Self::direction_name(dir)
-                            .and_then(Self::directional_nearest_looking_directions)
-                        else {
+                Placer::None { direction: Some(_) } => direction("DOWN"),
+                Placer::None { direction: None } => Err(Self::null_entity_view_xrot_npe()),
+                Placer::Unknown => self.unknown_host_call(r),
+            },
+            PlacementAccessor::NearestLookingVerticalDirection => match context.placer {
+                Placer::Player { pitch, .. } => direction(if pitch < 0.0 { "UP" } else { "DOWN" }),
+                Placer::None { .. } => Err(Self::null_entity_view_xrot_npe()),
+                Placer::Unknown => self.unknown_host_call(r),
+            },
+            PlacementAccessor::NearestLookingDirections => match context.placer {
+                Placer::Player { yaw, pitch, .. } => {
+                    let mut names = Self::placement_ordered_directions(yaw, pitch);
+                    if !context.replacing_clicked_on_block {
+                        let Some(clicked) = Self::direction_name(&context.clicked_face) else {
                             return Some(self.unknown_host_call(r));
                         };
-                        Ok(self.store_placement_direction_array(names))
+                        let clicked_opp = opposite(clicked);
+                        if let Some(index) = names.iter().position(|name| *name == clicked_opp)
+                            && index > 0
+                        {
+                            for i in (0..index).rev() {
+                                names[i + 1] = names[i];
+                            }
+                            names[0] = clicked_opp;
+                        }
                     }
-                    Placer::None { direction: None } => Err(Self::null_entity_view_xrot_npe()),
-                    Placer::Unknown => self.unknown_host_call(r),
+                    Ok(self.store_placement_direction_array(&owner, names))
                 }
-            }
-            _ => return None,
+                Placer::None {
+                    direction: Some(ref dir),
+                } => {
+                    let Some(names) = Self::direction_name(dir)
+                        .and_then(Self::directional_nearest_looking_directions)
+                    else {
+                        return Some(self.unknown_host_call(r));
+                    };
+                    Ok(self.store_placement_direction_array(&owner, names))
+                }
+                Placer::None { direction: None } => Err(Self::null_entity_view_xrot_npe()),
+                Placer::Unknown => self.unknown_host_call(r),
+            },
         };
         Some(result)
     }
@@ -8077,8 +8262,7 @@ impl Host for StdHost {
             .then(|| {
                 self.placement_arrays
                     .get(handle.key())
-                    .cloned()
-                    .map(|values| ("[Lnet/minecraft/core/Direction;", values))
+                    .map(|(_, values)| ("[Lnet/minecraft/core/Direction;", values.clone()))
             })
             .flatten()
     }
@@ -9307,6 +9491,37 @@ impl Host for StdHost {
         self.throwable_messages.get(marker).cloned()
     }
 
+    fn registered_sound_id(&self, sound: &Value) -> Option<String> {
+        self.registered_sound_id_impl(sound)
+    }
+
+    fn unwrap_sound_holder(
+        &mut self,
+        value: &Value,
+    ) -> Option<Result<(Value, Option<String>), NativeError>> {
+        host_registry_holder::unwrap_sound_holder(self, value)
+    }
+
+    fn level_random_handle(&mut self, level_marker: &str) -> Option<Value> {
+        self.level_random_handle_impl(level_marker)
+    }
+
+    fn draw_level_sound_seed(
+        &mut self,
+        level_marker: &str,
+        server_side: bool,
+    ) -> Option<level_sound::SoundSeed> {
+        self.draw_level_sound_seed_impl(level_marker, server_side)
+    }
+
+    fn mark_sound_stream_unknown(&mut self, stream: &str) {
+        StdHost::mark_sound_stream_unknown(self, stream);
+    }
+
+    fn construct_sound_event(&mut self, r: &MethodRef, args: &[Value]) -> Option<Value> {
+        sound_event::construct_record(self, r, args)
+    }
+
     fn record_throwable(&mut self, marker: &str, message: Option<String>) {
         // A throw the runtime raised carries no cause (its `getCause()` is
         // `null`), except the initializer error that wraps the `<clinit>`
@@ -9414,6 +9629,9 @@ impl Host for StdHost {
         }
         if let Some(value) = voxel_shape::static_field(self, r) {
             return value;
+        }
+        if let Some(value) = block_use::static_field(r) {
+            return Ok(value);
         }
         if r.owner == "net/minecraft/core/BlockPos"
             && r.name == "ZERO"
@@ -9722,6 +9940,7 @@ impl Host for StdHost {
     fn random_new(&mut self, class: &str) -> Option<Value> {
         recipe_models::random_new(self, class)
             .or_else(|| vanilla_values::random_new(self, class))
+            .or_else(|| block_use::random_new(self, class))
             .or_else(|| StdHost::random_new(self, class))
     }
 
@@ -9853,6 +10072,9 @@ impl Host for StdHost {
     }
 
     fn invoke(&mut self, r: &MethodRef, args: &[Value]) -> Result<Value, NativeError> {
+        if let Some(value) = block_use::static_call(self, r, args) {
+            return value;
+        }
         if menu_models::is_menu_class(&r.owner)
             && let Some(value) =
                 menu_models::static_call(&mut self.menu_states, &mut self.next_menu_object, r, args)
@@ -11421,6 +11643,9 @@ impl Host for StdHost {
         if let Some(result) = voxel_shape::direction_instance_call(r, receiver) {
             return result;
         }
+        if let Some(result) = block_use::instance_call(self, r, receiver, args) {
+            return result;
+        }
         if let Value::Host(handle) = receiver
             && handle.kind() == host_ref::HostKind::GameValue
             && let Some([x, y, z]) = server_values::block_pos(handle.key())
@@ -11712,6 +11937,9 @@ impl Host for StdHost {
         // A client stand-in (`client/...`), a mod's `KeyMapping`, or a client
         // registration event answers the client surface first.
         if let Some(answer) = self.client_call(r, receiver, args) {
+            return answer;
+        }
+        if let Some(answer) = level_sound::standalone_client_sound_call(self, receiver, r, args) {
             return answer;
         }
         // A game-event façade marker (server, level, player, event object)
@@ -17076,6 +17304,9 @@ fn game_enum_constants(owner: &str) -> Option<&'static [&'static str]> {
         "net/minecraft/core/Direction$Axis" => &["X", "Y", "Z"],
         "net/minecraft/core/Direction$AxisDirection" => &["POSITIVE", "NEGATIVE"],
         "net/minecraft/world/InteractionHand" => &["MAIN_HAND", "OFF_HAND"],
+        "net/minecraft/world/InteractionResult$SwingSource" => {
+            &["NONE", "PREDICTED", "SERVER_ONLY"]
+        }
         // `CreativeModeTab$TabVisibility` (`server-26.3.jar` `<clinit>` offsets 0..45).
         "net/minecraft/world/item/CreativeModeTab$TabVisibility" => &[
             "PARENT_AND_SEARCH_TABS",
@@ -17465,6 +17696,16 @@ impl host_ref::Nested for HostNested<'_> {
             .voxel_shapes
             .get(key)
             .map(|s| s.to_java_string())
+    }
+
+    fn interaction_result_success(&mut self, key: &str) -> Option<(Value, Value)> {
+        let host = self.0.as_deref()?;
+        block_use::success_parts_in_host(host, key)
+    }
+
+    fn interaction_item_context(&mut self, key: &str) -> Option<(bool, Value)> {
+        let host = self.0.as_deref()?;
+        block_use::item_context_parts_in_host(host, key)
     }
 
     fn uuid_bits(&mut self, value: &Value) -> Option<(i64, i64)> {
@@ -21110,26 +21351,57 @@ fn mixin_accessor_label(kind: MixinAccessorKind) -> &'static str {
     }
 }
 
+/// One placement's `BlockPlaceContext` snapshot, registered on `host` for as
+/// long as this scope lives. Dropping it releases the snapshot (and the
+/// arrays it answered), so the release runs however the invocation ends:
+/// a return, an error, or an unwind (#635).
+struct PlacementScope<'h, H: Host> {
+    host: &'h mut H,
+    context: Value,
+}
+
+impl<'h, H: Host> PlacementScope<'h, H> {
+    /// Register `data` on `host`, which must be (or wrap) a [`StdHost`].
+    fn open(host: &'h mut H, data: BlockPlaceContextData) -> Result<Self, NativeError> {
+        let context = host
+            .as_std_host_mut()
+            .ok_or_else(|| NativeError::Metadata("placement requires a standard host".into()))?
+            .new_block_place_context(data);
+        Ok(Self { host, context })
+    }
+}
+
+impl<H: Host> Drop for PlacementScope<'_, H> {
+    fn drop(&mut self) {
+        if let Some(host) = self.host.as_std_host_mut() {
+            host.release_block_place_context(&self.context);
+        }
+    }
+}
+
 impl NativeJar {
     /// Run a block's `getStateForPlacement(BlockPlaceContext)` override with
     /// the supplied vanilla context. A `null` answer is vanilla's refusal.
+    ///
+    /// The context snapshot is the host's only while this call runs: it is
+    /// released when the override returns, throws or unwinds, so a
+    /// placement leaves nothing on the host (#635). A context the jar keeps
+    /// (a static, a field, a collection) stays the same object to Java, and
+    /// each accessor called on it later is counted.
     pub fn block_state_for_placement<H: Host>(
         &self,
         block: Value,
         context: BlockPlaceContextData,
         host: &mut H,
     ) -> Result<Option<Value>, NativeError> {
-        let context_value = host
-            .as_std_host_mut()
-            .ok_or_else(|| NativeError::Metadata("placement requires a standard host".into()))?
-            .new_block_place_context(context);
+        let scope = PlacementScope::open(host, context)?;
         let value = self.invoke_virtual_with_args(
             "net/minecraft/world/level/block/Block",
             "getStateForPlacement",
             "(Lnet/minecraft/world/item/context/BlockPlaceContext;)Lnet/minecraft/world/level/block/state/BlockState;",
             block,
-            &[context_value],
-            host,
+            std::slice::from_ref(&scope.context),
+            &mut *scope.host,
         )?;
         Ok((value != Value::Ref(None)).then_some(value))
     }
@@ -24245,6 +24517,16 @@ impl NativeJar {
         roots: &[Value],
         action: impl FnOnce(&mut Runtime<'_, H>) -> Result<Value, NativeError>,
     ) -> Result<Value, NativeError> {
+        self.with_persistent_runtime_with_budget(host, roots, &ExecutionBudget::UNBOUNDED, action)
+    }
+
+    fn with_persistent_runtime_with_budget<H: Host>(
+        &self,
+        host: &mut H,
+        roots: &[Value],
+        budget: &ExecutionBudget,
+        action: impl FnOnce(&mut Runtime<'_, H>) -> Result<Value, NativeError>,
+    ) -> Result<Value, NativeError> {
         let (static_fields, initialized_classes) = host.persistent_class_state();
         let (io_paths, io_files, io_file_bytes, io_dirs) = host.persistent_io_state();
         let mut callback_infos = CallbackInfos::new();
@@ -24303,7 +24585,7 @@ impl NativeJar {
             next_frame_id: 0,
             shape_extraction: None,
             check_shape_probes: false,
-            budget: &ExecutionBudget::UNBOUNDED,
+            budget,
         };
         let resident = runtime.adopt_resident_heap();
         let mut crossing = roots.to_vec();
@@ -30965,6 +31247,9 @@ impl<H: Host> Runtime<'_, H> {
                 return self.host.voxel_shape_or_array(r, first, &others).map(Some);
             }
         }
+        if let Some(value) = block_use::invoke_runtime_helper(self, r, receiver, args)? {
+            return Ok(Some(value));
+        }
         // `BlockStateBase.getShape(BlockGetter, BlockPos[, CollisionContext])`: dispatches to the
         // block's `getShape` (MC 26.3 `BlockBehaviour$BlockStateBase.getShape`).
         if matches!(
@@ -34407,7 +34692,13 @@ impl<H: Host> Runtime<'_, H> {
         receiver: &Value,
         args: &[Value],
     ) -> Result<Value, NativeError> {
-        let value = self.host.invoke_instance(r, receiver, args)?;
+        let value = if level_sound::needs_block_pos_resolution(r, args) {
+            let mut resolved_args = args.to_vec();
+            level_sound::resolve_block_pos_arg(self, r, &mut resolved_args);
+            self.host.invoke_instance(r, receiver, &resolved_args)?
+        } else {
+            self.host.invoke_instance(r, receiver, args)?
+        };
         Ok(self.materialize_host_array(value))
     }
 
@@ -35744,6 +36035,75 @@ impl<H: Host> Runtime<'_, H> {
                         )?
                     }
                 }
+                menu_models::MenuAction::MenuConstructor {
+                    constructor,
+                    container_id,
+                    inventory,
+                    player,
+                } => {
+                    let ctor_args = [container_id, inventory, player];
+                    if let Some(menu) = self.invoke_callback(&constructor, &ctor_args)? {
+                        menu
+                    } else {
+                        self.call_virtual(
+                            jdk_call::Site::Interface,
+                            menu_models::MENU_CONSTRUCTOR,
+                            "createMenu",
+                            "(ILnet/minecraft/world/entity/player/Inventory;Lnet/minecraft/world/entity/player/Player;)Lnet/minecraft/world/inventory/AbstractContainerMenu;",
+                            &constructor,
+                            &ctor_args,
+                        )?
+                    }
+                }
+                menu_models::MenuAction::AccessEvaluate {
+                    function,
+                    level,
+                    pos,
+                    default,
+                } => {
+                    let fn_args = [level, pos];
+                    let applied = if let Some(v) = self.invoke_callback(&function, &fn_args)? {
+                        v
+                    } else {
+                        self.call_virtual(
+                            jdk_call::Site::Interface,
+                            "java/util/function/BiFunction",
+                            "apply",
+                            "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+                            &function,
+                            &fn_args,
+                        )?
+                    };
+                    if applied == Value::Ref(None) {
+                        return Err(NativeError::UncaughtException {
+                            class: "java/lang/NullPointerException".into(),
+                            message: None,
+                            frame: None,
+                        });
+                    }
+                    match default {
+                        Some(_) => applied,
+                        None => host_optional::optional_wrap(applied),
+                    }
+                }
+                menu_models::MenuAction::AccessExecute {
+                    consumer,
+                    level,
+                    pos,
+                } => {
+                    let fn_args = [level, pos];
+                    if self.invoke_callback(&consumer, &fn_args)?.is_none() {
+                        let _ = self.call_virtual(
+                            jdk_call::Site::Interface,
+                            "java/util/function/BiConsumer",
+                            "accept",
+                            "(Ljava/lang/Object;Ljava/lang/Object;)V",
+                            &consumer,
+                            &fn_args,
+                        )?;
+                    }
+                    Value::Void
+                }
             };
         }
         Ok(Some(value))
@@ -36748,6 +37108,29 @@ impl<H: Host> Runtime<'_, H> {
             }
         }
         Ok((return_desc(descriptor) != "V").then_some(Value::Ref(Some(joined))))
+    }
+
+    #[inline(never)]
+    fn invoke_sound_event_init(
+        &mut self,
+        r: &MethodRef,
+        receiver: Option<&Value>,
+        args: &[Value],
+        stack: &mut [Value],
+        locals: &mut [Value],
+    ) -> Option<Value> {
+        if r.owner != "net/minecraft/sounds/SoundEvent" || r.name != "<init>" {
+            return None;
+        }
+        let built = self.host.construct_sound_event(r, args)?;
+        if let Some(marker) = receiver.filter(|value| jar_object::is_object(value)) {
+            for slot in stack.iter_mut().chain(locals.iter_mut()) {
+                if slot == marker {
+                    *slot = built.clone();
+                }
+            }
+        }
+        Some(Value::Void)
     }
 
     fn invoke_frame(
@@ -38818,6 +39201,17 @@ impl<H: Host> Runtime<'_, H> {
                             }
                             Value::Void
                         });
+                    }
+                    if dispatched.is_none()
+                        && let Some(value) = self.invoke_sound_event_init(
+                            &r,
+                            receiver.as_ref(),
+                            &args,
+                            &mut stack,
+                            &mut locals,
+                        )
+                    {
+                        dispatched = Some(value);
                     }
                     if dispatched.is_none()
                         && let Some(value) = invoke_or_catch!(
