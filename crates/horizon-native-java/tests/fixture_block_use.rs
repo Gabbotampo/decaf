@@ -573,8 +573,9 @@ fn block_use_opens_combiner_menu_via_simple_menu_provider() {
         Some(&Value::Int(1))
     );
 
-    // A second click while the window shows menu 1: `openMenu` closes it first (its vanilla
-    // `ItemCombinerMenu.removed` returns the inputs, which Decaf counts), then builds menu 2.
+    // A second click while the window shows menu 1: `openMenu` closes it first, then builds
+    // menu 2. Its vanilla `ItemCombinerMenu.removed` runs exactly (`live_menu.rs`): the cursor
+    // and both inputs are empty, so nothing goes back and nothing is counted.
     let mut showing = ctx.clone();
     showing.player.container = PlayerContainer::Open(1);
     let second = fixture
@@ -582,11 +583,11 @@ fn block_use_opens_combiner_menu_via_simple_menu_provider() {
         .block_use_without_item(&mut host, &showing)
         .unwrap();
     assert!(
-        second
+        !second
             .unknown_host_calls
             .keys()
             .any(|k| k.contains("#removed")),
-        "the combiner's vanilla removed() should count: {:?}",
+        "the combiner's vanilla removed() runs exactly: {:?}",
         second.unknown_host_calls
     );
     assert!(
