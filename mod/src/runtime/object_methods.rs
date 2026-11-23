@@ -1946,6 +1946,20 @@ impl<H: Host> host_ref::Nested for RuntimeNested<'_, '_, '_, H> {
         self.runtime.host.voxel_shape_to_string(key)
     }
 
+    fn interaction_result_success(&mut self, key: &str) -> Option<(Value, Value)> {
+        self.runtime
+            .host
+            .as_std_host()
+            .and_then(|host| crate::runtime::block_use::success_parts_in_host(host, key))
+    }
+
+    fn interaction_item_context(&mut self, key: &str) -> Option<(bool, Value)> {
+        self.runtime
+            .host
+            .as_std_host()
+            .and_then(|host| crate::runtime::block_use::item_context_parts_in_host(host, key))
+    }
+
     fn uuid_bits(&mut self, value: &Value) -> Option<(i64, i64)> {
         self.runtime.host.constructed_uuid(value)
     }
