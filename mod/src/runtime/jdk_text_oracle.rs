@@ -18,7 +18,7 @@ use serde_json::Value as Json;
 use crate::runtime::jdk_string_builder::{Answer, Arg, Outcome, call};
 use crate::runtime::{MethodRef, NativeError, Value};
 
-const SAMPLE: &str = include_str!("jdk_text_oracle.json");
+const SAMPLE: &str = crate::runtime::vendored_jdk_text_oracle_json::VENDORED_DATA;
 
 /// A JSON text: a string, or an array of UTF-16 code units (one that holds a
 /// lone surrogate, which a JSON string cannot carry).
