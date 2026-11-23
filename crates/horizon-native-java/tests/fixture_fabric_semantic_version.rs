@@ -2,11 +2,11 @@
 //! `ModMetadata.getVersion()`.
 //!
 //! `fixtures/fabric_semantic_version/demo/Probe.java` runs on Java 25 against the real Fabric
-//! Loader 0.19.3 (`oracle/OracleMain.java` hands it `Version.parse(text)`; commands in the
+//! Loader 0.20.1 (`oracle/OracleMain.java` hands it `Version.parse(text)`; commands in the
 //! README) and here as the running jar, reading its own version (`fabric.mod.json`) and the
 //! built-in `minecraft` mod's (the seeded game version). `describe` must equal `java25.txt` with
-//! nothing counted for each text the oracle parses to a `SemanticVersion`; every other text, and
-//! every call the oracle does not show, stays counted.
+//! nothing counted for each text the oracle parses to a `SemanticVersion`; every other text (the
+//! oracle's `StringVersion` texts included), and every call the oracle does not show, is counted.
 
 #[path = "support/javac_fixture.rs"]
 mod javac_fixture;
@@ -62,6 +62,17 @@ const SEMANTIC: &[&str] = &[
     "1.20.1-rc.1",
     "1.21.1",
     "25",
+    "1.2.3",
+    "1.2.0+mc26.3",
+    "0.1",
+    "2.0-beta.1",
+    "0.19.5",
+    "0.5.5",
+    "0.165.0+26.3",
+    "2.0.6+fcdff87f5d",
+    "3.1.2+fcdff87f5d",
+    "4.1.9+ffef5f675d",
+    "3.1.0+5af7744b5d",
 ];
 
 /// The texts `java25.txt` parses to a `StringVersion` (`instanceof SemanticVersion` is false).
@@ -134,47 +145,56 @@ fn the_game_version_is_java25s_for_every_semantic_text() {
     }
 }
 
-/// A text the oracle shows as a `StringVersion`, or does not show at all, is the plain `String` it
-/// was before this change: no handle, so no `SemanticVersion` accessor is answered for it
-/// (`getVersionComponentCount` on it is counted). What the interpreter answers for `instanceof` on
-/// a plain `String` is unchanged, is not Fabric's answer for a `StringVersion`, and is not asserted.
+/// Counted `ModMetadata.getVersion()` calls, as the host records them.
+fn counted_get_version(host: &StdHost) -> bool {
+    host.unknown_host_calls().iter().any(|(call, _)| {
+        call == "net/fabricmc/loader/api/metadata/ModMetadata#getVersion()Lnet/fabricmc/loader/api/Version;"
+    })
+}
+
+/// A text the oracle shows as a `StringVersion` (the loader builds one when `SemanticVersion`
+/// parsing fails), or does not show at all, is counted: `getVersion()` never hands out a plain
+/// `String`, whose casts and `instanceof` differ from a `StringVersion`'s. Through the jar's own
+/// `fabric.mod.json`, the built-in `minecraft` mod, and a cast to `SemanticVersion`.
 #[test]
-fn other_texts_stay_plain_strings() {
+fn other_texts_are_counted() {
     for text in STRING_VERSIONS.iter().chain(&["1.0.0-", "x"]) {
-        let fixture = build("fabric-semantic-version-other", text);
-        let mut host = fixture
-            .jar
-            .seed_host(StdHost::new().with_environment_type("SERVER"));
-        // Only the friendly string is checked: what `instanceof Version` answers on a plain `String`
-        // is the interpreter's, not Fabric's (Java 25: true for a `StringVersion`).
-        assert!(
-            fixture
-                .text_on(&mut host, "mod")
-                .ends_with(&format!(" friendly={text}")),
-            "{text}"
+        for method in ["mod", "count"] {
+            let fixture = build("fabric-semantic-version-other", text);
+            let mut host = fixture
+                .jar
+                .seed_host(StdHost::new().with_environment_type("SERVER"));
+            let _ = fixture.jar.invoke_method_with_args(
+                "demo/Probe",
+                method,
+                "()Ljava/lang/String;",
+                None,
+                &[],
+                &mut host,
+            );
+            assert!(
+                counted_get_version(&host),
+                "{text} {method}: {:?}",
+                host.unknown_host_calls()
+            );
+        }
+        let fixture = build("fabric-semantic-version-other-game", "1.0");
+        let mut host = fixture.jar.seed_host(
+            StdHost::new()
+                .with_environment_type("SERVER")
+                .with_game_version(*text),
         );
-        assert!(
-            host.unknown_host_calls().is_empty(),
-            "{text}: {:?}",
-            host.unknown_host_calls()
-        );
-        let fixture = build("fabric-semantic-version-other-cast", text);
-        let mut host = fixture
-            .jar
-            .seed_host(StdHost::new().with_environment_type("SERVER"));
-        let result = fixture.jar.invoke_method_with_args(
+        let _ = fixture.jar.invoke_method_with_args(
             "demo/Probe",
-            "count",
+            "minecraft",
             "()Ljava/lang/String;",
             None,
             &[],
             &mut host,
         );
         assert!(
-            host.unknown_host_calls()
-                .iter()
-                .any(|(call, _)| call.contains("SemanticVersion#")),
-            "{text}: {result:?} {:?}",
+            counted_get_version(&host),
+            "{text} minecraft: {:?}",
             host.unknown_host_calls()
         );
     }

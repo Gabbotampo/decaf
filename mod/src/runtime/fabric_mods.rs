@@ -46,7 +46,8 @@
 //! `builtin_metadata`).
 //!
 //! **Version:** `getVersion()` is a `SemanticVersion` object for the texts
-//! `fabric_version.rs` has an oracle row for, and the version text otherwise (as before).
+//! `fabric_version.rs` has an oracle row for, and counted for every other text (the loader
+//! answers those with a `StringVersion`, which is not modelled).
 //!
 //! **Counted, not answered:** iterating a custom object or array
 //! (`serde_json` here keeps object keys sorted, not in file order),
@@ -656,9 +657,15 @@ impl StdHost {
         match (r.name.as_str(), r.descriptor.as_str()) {
             ("getId", "()Ljava/lang/String;") => Ok(text(id)),
             ("getType", "()Ljava/lang/String;") => Ok(text("fabric")),
-            ("getVersion", "()Lnet/fabricmc/loader/api/Version;") => Ok(field("version")
-                .and_then(serde_json::Value::as_str)
-                .map_or(Value::Ref(None), crate::runtime::fabric_version::version_value)),
+            ("getVersion", "()Lnet/fabricmc/loader/api/Version;") => {
+                match field("version").and_then(serde_json::Value::as_str) {
+                    None => Ok(Value::Ref(None)),
+                    Some(version) => match crate::runtime::fabric_version::version_value(version) {
+                        Some(value) => Ok(value),
+                        None => self.unknown_host_call(r),
+                    },
+                }
+            }
             ("getName", "()Ljava/lang/String;") => Ok(text(
                 field("name")
                     .and_then(serde_json::Value::as_str)
@@ -777,13 +784,11 @@ impl StdHost {
             ("getType", "()Ljava/lang/String;") => Some(text("builtin")),
             ("getVersion", "()Lnet/fabricmc/loader/api/Version;") => {
                 if id == "java" {
-                    Some(crate::runtime::fabric_version::version_value(
-                        JAVA_SPECIFICATION_VERSION,
-                    ))
+                    crate::runtime::fabric_version::version_value(JAVA_SPECIFICATION_VERSION)
                 } else {
                     self.game_version
                         .as_deref()
-                        .map(crate::runtime::fabric_version::version_value)
+                        .and_then(crate::runtime::fabric_version::version_value)
                 }
             }
             ("getName", "()Ljava/lang/String;") if id == "minecraft" => Some(text("Minecraft")),

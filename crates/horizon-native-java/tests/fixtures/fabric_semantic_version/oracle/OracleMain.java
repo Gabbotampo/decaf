@@ -12,7 +12,11 @@ import net.fabricmc.loader.api.VersionParsingException;
 public final class OracleMain {
     private static final String[] CASES = {
         "26.3+v260915", "1.0.0", "1.0.0-beta.2+build.5", "1.2", "1.0.0-SNAPSHOT", "1.0", "1",
-        "v1.0.0", "1.0.0.0", "26.3", "1.20.1-rc.1", "abc", "1.21.1", "25", "",
+        "v1.0.0", "1.0.0.0", "26.3", "1.20.1-rc.1", "abc", "1.21.1", "25",
+        // The texts of the built-in mods' metadata and of the other fixtures' mods.
+        "1.2.3", "1.2.0+mc26.3", "0.1", "2.0-beta.1", "0.19.5", "0.5.5", "0.165.0+26.3",
+        "2.0.6+fcdff87f5d", "3.1.2+fcdff87f5d", "4.1.9+ffef5f675d", "3.1.0+5af7744b5d",
+        "",
     };
 
     public static void main(String[] args) {

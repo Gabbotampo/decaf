@@ -1,5 +1,5 @@
 //! Fabric Loader's `SemanticVersion`, for the version texts Java 25 has shown
-//! (`tests/fixtures/fabric_semantic_version/java25.txt`, Fabric Loader 0.19.3).
+//! (`tests/fixtures/fabric_semantic_version/java25.txt`, Fabric Loader 0.20.1).
 //!
 //! `ModMetadata.getVersion()` is `Version.parse(text)` (`V1ModMetadataParser` and
 //! `BuiltinModMetadata`): a `SemanticVersionImpl` when `SemanticVersionImpl(text, false)`
@@ -7,11 +7,13 @@
 //! (`(SemanticVersion) version`, then `getVersionComponent(1)` and `(2)`).
 //!
 //! The runtime holds no parser: a text it answers for is one row of [`SEMANTIC`], each row a case
-//! the oracle printed, with every accessor the oracle exercised. Every other text stays the
-//! `String` it always was (no handle: a `SemanticVersion` method on it is counted, and the
-//! interpreter's answer for `instanceof` on a plain `String` is what it was before), including the texts the oracle showed to be a `StringVersion` (`v1.0.0`, `abc`): a
-//! `StringVersion` has no `toString` of its own and its cast failure names a loader class, neither
-//! of which the oracle fixes.
+//! the oracle printed, with every accessor the oracle exercised. For every other text
+//! `getVersion()` is counted (an unknown host call), never a plain `String`: the loader answers
+//! those texts, including the ones the oracle showed to be a `StringVersion` (`v1.0.0`, `abc`),
+//! with a `StringVersion`, a class this runtime does not model, so a cast, `instanceof`,
+//! `getClass()` or `toString` on a `String` would differ from it even where the friendly string
+//! matches. This holds for every route to a `Version` (a jar's `fabric.mod.json`, the built-in
+//! `minecraft` and `java` mods, and a mod known only by the host's mod list).
 //!
 //! Answered on a handle: `getFriendlyString`, `toString`, `getVersionComponentCount`,
 //! `getVersionComponent(int)` (negative: `RuntimeException`; at or past the count: `0`; both
@@ -68,6 +70,17 @@ const SEMANTIC: &[Row] = &[
     row("1.20.1-rc.1", &[1, 20, 1], Some("rc.1"), None),
     row("1.21.1", &[1, 21, 1], None, None),
     row("25", &[25], None, None),
+    row("1.2.3", &[1, 2, 3], None, None),
+    row("1.2.0+mc26.3", &[1, 2, 0], None, Some("mc26.3")),
+    row("0.1", &[0, 1], None, None),
+    row("2.0-beta.1", &[2, 0], Some("beta.1"), None),
+    row("0.19.5", &[0, 19, 5], None, None),
+    row("0.5.5", &[0, 5, 5], None, None),
+    row("0.165.0+26.3", &[0, 165, 0], None, Some("26.3")),
+    row("2.0.6+fcdff87f5d", &[2, 0, 6], None, Some("fcdff87f5d")),
+    row("3.1.2+fcdff87f5d", &[3, 1, 2], None, Some("fcdff87f5d")),
+    row("4.1.9+ffef5f675d", &[4, 1, 9], None, Some("ffef5f675d")),
+    row("3.1.0+5af7744b5d", &[3, 1, 0], None, Some("5af7744b5d")),
 ];
 
 fn lookup(text: &str) -> Option<&'static Row> {
@@ -75,13 +88,12 @@ fn lookup(text: &str) -> Option<&'static Row> {
 }
 
 /// The `Version` a mod reads for `text`: a handle for a text the oracle shows as a
-/// `SemanticVersion`, the plain `String` otherwise.
-pub(crate) fn version_value(text: &str) -> Value {
-    if lookup(text).is_some() {
-        Value::Host(HostRef::new(HostKind::FabricVersion, text))
-    } else {
-        Value::Ref(Some(text.to_owned()))
-    }
+/// `SemanticVersion`, `None` otherwise. The caller counts `getVersion()` for `None`: no plain
+/// `String` is ever handed out as a `Version`, because the loader's answer for such a text is a
+/// `StringVersion` (a class this runtime does not model), so a cast or `instanceof` on a `String`
+/// would differ from it even where the text matches.
+pub(crate) fn version_value(text: &str) -> Option<Value> {
+    lookup(text).map(|_| Value::Host(HostRef::new(HostKind::FabricVersion, text)))
 }
 
 /// The classes a version handle is declared as (`ClassRule::Unknown`): its class is the loader's
