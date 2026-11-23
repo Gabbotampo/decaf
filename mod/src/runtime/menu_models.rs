@@ -2963,7 +2963,7 @@ mod tests {
             };
             writeln!(observed, "{name}={value}").unwrap();
         }
-        assert_eq!(observed, include_str!("menu_models_oracle.txt"));
+        assert_eq!(observed, crate::runtime::vendored_menu_models_oracle_txt::VENDORED_DATA);
     }
 
     #[test]
