@@ -119,6 +119,23 @@ impl ConfigPlugins {
         }
     }
 
+    /// What the plugin of `config` answered `shouldApplyMixin` for `mixin` at `target`
+    /// (internal names): `Some(true)` / `Some(false)` when its session ran and the
+    /// question answered, `None` when that is not known (no session, a refused session,
+    /// a failed question). Mixin asks before it maps the class to the target
+    /// (`MixinInfo.readDeclaredTargets` drops every target the plugin declines), so a
+    /// declined pair is never applied nor validated there.
+    pub(crate) fn verdict(&self, config: &str, mixin: &str, target: &str) -> Option<bool> {
+        let session = self.sessions.get(config)?;
+        if session.report.refused.is_some() {
+            return None;
+        }
+        match session.answers.get(&(mixin.to_owned(), target.to_owned())) {
+            Some(Ok(answer)) => Some(*answer),
+            _ => None,
+        }
+    }
+
     /// Whether a plugin's `getMixins()` added `mixin` (an internal name).
     pub(crate) fn is_companion(&self, mixin: &str) -> bool {
         self.companions.contains(mixin)

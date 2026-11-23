@@ -50,7 +50,10 @@
 //! * A jar class a rejected mixin (`InvalidMixinException`) of a `required` Mixin
 //!   config targets never loads in real Fabric: Mixin rethrows, and Knot fails the
 //!   class load with `RuntimeException: Mixin transformation of <class> failed`.
-//!   Its initialization is refused here (a later load's behavior is not modelled).
+//!   The jar's own references to it are counted where they resolve it
+//!   (`mixin_class_loading.rs`); an initialization that still reaches it is refused
+//!   here (a later load's behavior is not modelled), or counted when the failure
+//!   depends on a config plugin answer that is not known.
 //!
 //! The state lives in the runtime's initialized-class set, which the host
 //! persists between entrypoints and callbacks. An erroneous class is recorded
@@ -331,15 +334,30 @@ impl<H: Host> Runtime<'_, H> {
     /// Refuse a jar class a `required` Mixin config's rejected mixin targets (module
     /// docs): real Fabric fails its class load with a `RuntimeException` from Knot, and
     /// what a later load does is not modelled, so this is a refusal, not a Java throw.
+    /// The jar's own references to the class are counted before they get here
+    /// (`mixin_class_loading.rs`); this is what is left, a load the jar's code does not
+    /// resolve itself. A failure that depends on a config plugin answer that is not known
+    /// is counted instead, and the class initialises.
     #[inline(never)]
-    fn refuse_failed_mixin_target(&self, class: &str) -> Result<(), NativeError> {
-        match self.required_mixin_failure(class) {
-            Some(reason) => Err(NativeError::Metadata(format!(
-                "jar class {class} fails to load: {reason}; Mixin rethrows for a required config and Fabric's Knot throws \"Mixin transformation of {} failed\"",
-                class.replace('/', ".")
-            ))),
-            None => Ok(()),
+    fn refuse_failed_mixin_target(&mut self, class: &str) -> Result<(), NativeError> {
+        let Some(failure) = self.required_mixin_failure(class) else {
+            return Ok(());
+        };
+        if !failure.certain {
+            return self
+                .host
+                .unknown_operand_call(&crate::runtime::MethodRef {
+                    owner: class.to_owned(),
+                    name: "<load>".to_owned(),
+                    descriptor: "()V".to_owned(),
+                })
+                .map(|_| ());
         }
+        Err(NativeError::Metadata(format!(
+            "jar class {class} fails to load: {}; Mixin rethrows for a required config and Fabric's Knot throws \"Mixin transformation of {} failed\"",
+            failure.reason,
+            class.replace('/', ".")
+        )))
     }
 
     /// The `<clinit>` of every mixin Mixin appends to `class`'s, in apply order, after

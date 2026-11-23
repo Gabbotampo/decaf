@@ -823,9 +823,10 @@ pub enum MixinSkipReason {
     InvalidMixin(String),
     /// [`Self::InvalidMixin`] in a `required` config: `apply` rethrows, Mixin
     /// raises `MixinApplyError`, and Fabric's Knot fails the target's class load
-    /// (`RuntimeException: Mixin transformation of <target> failed`). The game
-    /// does not run past that, so the plan is refused, not dropped. Its bounded
-    /// reason.
+    /// (`RuntimeException: Mixin transformation of <target> failed`), so the plan
+    /// is refused, not dropped: the runtime counts the jar's first use of that
+    /// class, and refuses the jar's code when the server loads the class before any
+    /// mod runs (`mixin_class_loading.rs`). Its bounded reason.
     RequiredMixinFailed(String),
 }
 
@@ -21142,8 +21143,10 @@ pub struct NativeJar {
     client_config_plugins: Arc<std::sync::OnceLock<mixin_plugins::ConfigPlugins>>,
     /// Cached jar classes a `required` config's rejected mixin fails, per physical
     /// side ([`NativeJar::failed_required_targets`]).
-    server_failed_required_targets: Arc<std::sync::OnceLock<BTreeMap<String, String>>>,
-    client_failed_required_targets: Arc<std::sync::OnceLock<BTreeMap<String, String>>>,
+    server_failed_required_targets:
+        Arc<std::sync::OnceLock<BTreeMap<String, interface_mixins::FailedTarget>>>,
+    client_failed_required_targets:
+        Arc<std::sync::OnceLock<BTreeMap<String, interface_mixins::FailedTarget>>>,
 }
 
 /// Zero-length array backing a host answer such as `Thread.getStackTrace`
@@ -24305,14 +24308,10 @@ impl NativeJar {
         if !runtime.classes.contains_key(&class_name) {
             return Err(NativeError::MissingMethod(format!("class {class}")));
         }
-        // The loader loads an entrypoint class by name; one in a Mixin config's package
-        // fails that load in real Fabric (`mixin_class_loading.rs`), and the loader does
-        // not get past a failed entrypoint, so the entrypoint is refused.
-        if runtime.is_unloadable_by_name(&class_name) {
-            return Err(NativeError::Metadata(format!(
-                "entrypoint {class} is in a Mixin config's package: Mixin refuses to load it (IllegalClassLoadError) and Fabric's Knot fails the load (\"Mixin transformation of {} failed\")",
-                class_name.replace('/', ".")
-            )));
+        // The loader loads an entrypoint class by name; one whose load fails in real
+        // Fabric (`mixin_class_loading.rs`) stops the loader there, so it is refused.
+        if let Some(refusal) = runtime.entrypoint_load_failure(&class_name) {
+            return Err(NativeError::Metadata(refusal));
         }
         // The objects an earlier entrypoint of this jar built are this one's
         // too, and what this one builds outlives it for the callbacks it
@@ -28541,6 +28540,10 @@ impl<H: Host> Runtime<'_, H> {
         class: &str,
         method: &str,
     ) -> Result<Option<(Value, bool)>, NativeError> {
+        // A game object whose class failed to load (`mixin_class_loading.rs`).
+        if let Some(value) = self.count_failed_game_receiver(r, receiver)? {
+            return Ok(Some((value, false)));
+        }
         if let Some(value) = self.invoke_game_helpers(r, receiver, args, class, method)? {
             return Ok(Some((value, false)));
         }
@@ -29358,6 +29361,12 @@ impl<H: Host> Runtime<'_, H> {
             return Err(not_found());
         }
         let internal = binary.replace('.', "/");
+        // A class real Fabric refuses to load (`mixin_class_loading.rs`). An array of one
+        // too, of any dimension: JDK 25's `forName("[Lfoo.Bar;", ..)` loads the element
+        // class through the loader (`loader.loadClass("foo.Bar")`).
+        if let Some(counted) = self.count_unloadable_class_by_name(&internal)? {
+            return Ok(counted);
+        }
         // An array class by its `getName` (`[I`, `[Ljava.lang.String;`): one
         // when its element class is (`[V` and a bare `[L…` are not).
         if let Some((dimensions, _)) = host_class::array_element(&internal) {
@@ -29382,10 +29391,6 @@ impl<H: Host> Runtime<'_, H> {
                     frame: None,
                 })
             };
-        }
-        // A class real Fabric refuses to load (`mixin_class_loading.rs`).
-        if let Some(counted) = self.count_unloadable_class_by_name(&internal)? {
-            return Ok(counted);
         }
         if self.has_class(&internal) {
             let initialize = match r.descriptor.as_str() {

@@ -13,25 +13,50 @@
 //!   (`ClassInfo.hasSuperClass`, interfaces included only for the interface).
 //!
 //! fabric-loader 0.20.1's Knot rethrows the error as `RuntimeException: Mixin
-//! transformation of <class> failed` from the class load. What a later load of the same
-//! class does is not modelled (the processor's state after the throw is not), so the
-//! runtime counts such a load rather than throwing, and runs nothing for it.
+//! transformation of <class> failed` from the class load. Measured on a real Fabric
+//! 26.3 server, from a mod's `onInitialize`: the context class loader and a mod class's
+//! own loader (both `KnotClassLoader`) throw exactly that from `loadClass`, a second
+//! attempt the same, and `Class.forName` of the class or of an array of it (any
+//! dimension: the JVM loads the element class) as well; Knot's `loadClass` of an array
+//! name is a `ClassNotFoundException`, with nothing transformed. The system class loader
+//! is the JDK's `AppClassLoader`, which never sees a mod class
+//! (`ClassNotFoundException`, in a mixin package or not); the runtime does not model it,
+//! so `getSystemClassLoader()` is counted. The runtime counts a refused load rather than
+//! throwing it (the exception's cause, and how a bytecode resolution surfaces it, are not
+//! modelled), and runs nothing for it.
+//!
+//! Two more loads fail the same way ([`Runtime::class_load_fails`]):
+//!
+//! - a class a `required` Mixin config's rejected mixin targets: Mixin rethrows from that
+//!   class's transformation ([`NativeJar::failed_required_targets`], which a config
+//!   plugin's `shouldApplyMixin` gates as Mixin does). When the class is a game class a
+//!   real Fabric 26.3 dedicated server loads before any mod's initializer runs
+//!   ([`server_loads_before_mods`], measured with `-Xlog:class+load`), the game does not
+//!   start, and the jar's code is refused as a whole
+//!   ([`Runtime::refuse_failed_game_mixin_target`]);
+//! - a class whose superclass or a superinterface fails to load (the JVM loads them with
+//!   it), a jar class through the class files and a game class through
+//!   `vanilla_host_methods.tsv`.
 //!
 //! A mixin's own code is merged into its target, and Mixin rewrites a merged method's
 //! references to its own class (`MixinTargetContext.transformMethodRef` /
 //! `transformFieldRef`, and inner classes through `innerClasses`): those never load the
-//! mixin class. So a reference is refused only from code that is not merged with the
-//! class it names ([`Runtime::is_unloadable_reference`]).
+//! mixin class. So a reference to a mixin package is refused only from code that is not
+//! merged with the class it names ([`Runtime::is_unloadable_reference`]).
 //!
 //! The one point that sees every bytecode class reference is the constant pool: `new`,
 //! `anewarray`, `multianewarray`, `checkcast`, `instanceof`, `ldc` of a class, method type
 //! or handle, field and method references and `invokedynamic` all resolve a pool entry.
 //! Each frame looks up once which of its class's pool entries would load a refused class
 //! ([`Runtime::unloadable_pool_entries`]); an instruction resolving one is counted and
-//! skipped with its stack effect ([`Runtime::skip_unloadable_instruction`]). A reflective
-//! load (`Class.forName`) and a loader's entrypoint load go through
-//! [`Runtime::is_unloadable_by_name`], with no merged exemption: Mixin rewrites bytecode
-//! references, not strings.
+//! skipped with its stack effect ([`Runtime::skip_unloadable_instruction`]). A load by
+//! name goes through [`Runtime::is_unloadable_by_name`], with no merged exemption (Mixin
+//! rewrites bytecode references, not strings): `Class.forName` and Knot's `loadClass`
+//! from a call, a method reference or a method handle
+//! ([`Runtime::count_refused_reflective_load`]), a `ServiceLoader` provider, and the
+//! loader's own entrypoint load ([`Runtime::entrypoint_load_failure`]). A call on a game
+//! object whose class failed to load is counted too ([`Runtime::count_failed_game_receiver`]):
+//! real Fabric never made such an object.
 //!
 //! Mixin config plugins run inside Mixin's own selection and application, where the
 //! processor is re-entrant and loads pass through: nothing is refused while one runs.
@@ -47,6 +72,46 @@ const TARGET_SELECTOR_DYNAMIC: &str =
 
 /// The name of a counted class load ([`Runtime::skip_unloadable_instruction`]).
 const LOAD: &str = "<load>";
+
+/// The game classes a real Fabric 26.3 dedicated server loads before its first `main`
+/// entrypoint, measured with `-Xlog:class+load` (`tools/trace_fabric_bootstrap_classes.py`).
+const SERVER_BOOTSTRAP_CLASSES: &str = include_str!("fabric_server_bootstrap_classes_26_3.txt");
+
+/// Whether a real Fabric 26.3 dedicated server loads game class `class` (internal name)
+/// before any mod's initializer runs ([`SERVER_BOOTSTRAP_CLASSES`]). Every such load goes
+/// through Mixin: its processor is up before the first game class loads.
+pub(crate) fn server_loads_before_mods(class: &str) -> bool {
+    static CLASSES: std::sync::OnceLock<BTreeSet<&'static str>> = std::sync::OnceLock::new();
+    CLASSES
+        .get_or_init(|| {
+            SERVER_BOOTSTRAP_CLASSES
+                .lines()
+                .filter(|line| !line.is_empty() && !line.starts_with('#'))
+                .collect()
+        })
+        .contains(class)
+}
+
+/// The class an array name's elements are (`[[Lfoo/Bar;` is `foo/Bar`), the name itself
+/// for a plain class, `None` for an array of primitives or a malformed array name.
+fn loaded_class(name: &str) -> Option<String> {
+    match name.strip_prefix('[') {
+        Some(_) => descriptor_classes(name).into_iter().next(),
+        None => Some(name.to_owned()),
+    }
+}
+
+/// `ClassLoader.loadClass(String)` / `loadClass(String, boolean)` on the runtime's one
+/// loader marker (`getSystemClassLoader()`, `Thread.getContextClassLoader()`,
+/// `Class.getClassLoader()` all answer it), whatever class the call names as its owner.
+fn is_loader_load_class(r: &MethodRef, receiver: Option<&Value>) -> bool {
+    r.name == "loadClass"
+        && matches!(
+            r.descriptor.as_str(),
+            "(Ljava/lang/String;)Ljava/lang/Class;" | "(Ljava/lang/String;Z)Ljava/lang/Class;"
+        )
+        && matches!(receiver, Some(Value::Ref(Some(marker))) if marker.starts_with("classloader/"))
+}
 
 /// The classes resolving pool entry `index` of `file` loads (JVMS §5.4.3): a class
 /// entry's class (an array's element class), a field or method reference's class, a
@@ -161,26 +226,126 @@ impl<H: Host> Runtime<'_, H> {
         })
     }
 
-    /// Whether loading class `name` (internal name) by name, from anywhere, is refused:
-    /// it is in a selected mixin package and no coprocessor or library-type exemption
-    /// applies (module docs).
+    /// Whether loading class `name` (internal name; an array loads its element class) by
+    /// name, from anywhere, fails on real Fabric (module docs): it is in a selected mixin
+    /// package and no coprocessor or library-type exemption applies, or its load fails
+    /// otherwise ([`Self::class_load_fails`]).
     #[inline(never)]
     pub(crate) fn is_unloadable_by_name(&self, name: &str) -> bool {
         if crate::runtime::mixin_plugins::running_config_plugins() {
             return false;
         }
-        let name = match name.strip_prefix('[') {
-            Some(_) => match descriptor_classes(name).into_iter().next() {
-                Some(element) => element,
-                None => return false,
-            },
-            None => name.to_owned(),
+        let Some(name) = loaded_class(name) else {
+            return false;
         };
+        self.in_refused_mixin_package(&name) || self.class_load_fails(&name, 0)
+    }
+
+    /// Why the loader's load of entrypoint class `class` fails on real Fabric, which stops
+    /// the loader there: the class is in a mixin package, a `required` config's rejected
+    /// mixin surely targets it, or a supertype fails to load. `None` when it loads (a
+    /// failure that hangs on an unknown plugin answer is counted when the class
+    /// initialises instead).
+    pub(crate) fn entrypoint_load_failure(&self, class: &str) -> Option<String> {
+        if crate::runtime::mixin_plugins::running_config_plugins() {
+            return None;
+        }
+        let binary = class.replace('/', ".");
+        if self.in_refused_mixin_package(class) {
+            return Some(format!(
+                "entrypoint {binary} is in a Mixin config's package: Mixin refuses to load it (IllegalClassLoadError) and Fabric's Knot fails the load (\"Mixin transformation of {binary} failed\")"
+            ));
+        }
+        if let Some(failure) = self.required_mixin_failure(class) {
+            return failure.certain.then(|| {
+                format!(
+                    "entrypoint {binary} fails to load: {}; Mixin rethrows for a required config and Fabric's Knot throws \"Mixin transformation of {binary} failed\"",
+                    failure.reason
+                )
+            });
+        }
+        let file = self.class(class)?;
+        std::iter::once(file.super_name.clone())
+            .chain(file.interface_names())
+            .filter(|parent| !parent.is_empty())
+            .find(|parent| self.in_refused_mixin_package(parent) || self.class_load_fails(parent, 1))
+            .map(|parent| {
+                format!(
+                    "entrypoint {binary} fails to load: its supertype {} does not load on real Fabric (a Mixin package or a failed required Mixin target)",
+                    parent.replace('/', ".")
+                )
+            })
+    }
+
+    /// Mixin's own refusal ([`Self::is_unloadable_by_name`]'s first half).
+    fn in_refused_mixin_package(&self, name: &str) -> bool {
         self.mixin_package_prefixes()
             .iter()
             .any(|prefix| name.starts_with(prefix.as_str()))
-            && !self.is_passthrough_accessor(&name)
-            && !self.is_mixin_library_subtype(&name)
+            && !self.is_passthrough_accessor(name)
+            && !self.is_mixin_library_subtype(name)
+    }
+
+    /// Whether class `name`'s load fails for any reason but its own mixin package:
+    ///
+    /// - a `required` config's rejected mixin targets it
+    ///   ([`NativeJar::failed_required_targets`]): Mixin rethrows from the class's
+    ///   transformation and Knot fails the load;
+    /// - a jar class's superclass or superinterface fails to load: the JVM loads them with
+    ///   the class (JVMS §5.3.5), so the class fails with them;
+    /// - a game class whose supertypes include a failed game class (`ServerPlayer` when
+    ///   `Player` failed), by `vanilla_host_methods.tsv`; a game class that table does not
+    ///   hold the hierarchy of cannot be told apart, and counts as failing while any game
+    ///   class has failed.
+    pub(crate) fn class_load_fails(&self, name: &str, depth: usize) -> bool {
+        let failed = &self.mixin_index.failed_required_targets;
+        if failed.contains_key(name) {
+            return true;
+        }
+        if depth >= MAX_SUPERCLASS_WALK {
+            return false;
+        }
+        if let Some(known) = self.mixin_index.load_failures.borrow().get(name) {
+            return *known;
+        }
+        let fails = match self.class(name) {
+            Some(_) if self.mixin_package_prefixes().is_empty() && failed.is_empty() => false,
+            Some(file) => std::iter::once(file.super_name.clone())
+                .chain(file.interface_names())
+                .filter(|parent| !parent.is_empty())
+                .any(|parent| {
+                    self.in_refused_mixin_package(&parent)
+                        || self.class_load_fails(&parent, depth + 1)
+                }),
+            None => self.game_class_load_fails(name),
+        };
+        self.mixin_index
+            .load_failures
+            .borrow_mut()
+            .insert(name.to_owned(), fails);
+        fails
+    }
+
+    /// A class no jar declares whose load fails because a failed game class is among its
+    /// supertypes ([`Self::class_load_fails`]).
+    fn game_class_load_fails(&self, name: &str) -> bool {
+        let failed_game: Vec<&str> = self
+            .mixin_index
+            .failed_required_targets
+            .keys()
+            .filter(|target| !self.has_class(target))
+            .map(String::as_str)
+            .collect();
+        if failed_game.is_empty()
+            || library_dispatch::jdk_class_exists(name)
+            || crate::runtime::jdk_closure::in_jdk_package(name)
+        {
+            return false;
+        }
+        match crate::runtime::interface_mixins::vanilla_supertypes(name) {
+            Some(supertypes) => supertypes.iter().any(|ty| failed_game.contains(ty)),
+            None => true,
+        }
     }
 
     /// Whether code in `frame_class` resolving a reference to class `named` is refused:
@@ -324,7 +489,8 @@ impl<H: Host> Runtime<'_, H> {
         file: &ClassFile,
     ) -> Option<Rc<BTreeSet<u16>>> {
         if crate::runtime::mixin_plugins::running_config_plugins()
-            || self.mixin_package_prefixes().is_empty()
+            || (self.mixin_package_prefixes().is_empty()
+                && self.mixin_index.failed_required_targets.is_empty())
         {
             return None;
         }
@@ -465,8 +631,11 @@ impl<H: Host> Runtime<'_, H> {
         Ok(Some(pc + length))
     }
 
-    /// Count a reflective load (`Class.forName`) of a class real Fabric refuses
-    /// ([`Self::is_unloadable_by_name`]): the counted placeholder stands for the class.
+    /// Count a reflective load (`Class.forName`, `ClassLoader.loadClass`, a
+    /// `ServiceLoader` provider) of a class real Fabric refuses
+    /// ([`Self::is_unloadable_by_name`]; an array name loads its element class, as
+    /// `Class.forName("[Lfoo.Bar;", ..)` does through `loader.loadClass("foo.Bar")`): the
+    /// counted placeholder stands for the class.
     #[inline(never)]
     pub(crate) fn count_unloadable_class_by_name(
         &mut self,
@@ -475,12 +644,85 @@ impl<H: Host> Runtime<'_, H> {
         if !self.is_unloadable_by_name(name) {
             return Ok(None);
         }
+        let owner = loaded_class(name).unwrap_or_else(|| name.to_owned());
         self.host
             .unknown_operand_call(&MethodRef {
-                owner: name.to_owned(),
+                owner,
                 name: LOAD.to_owned(),
                 descriptor: "()Ljava/lang/Class;".to_owned(),
             })
             .map(Some)
+    }
+
+    /// A reflective load by name that real Fabric refuses, from every path a call takes
+    /// into the library models (a direct call, a method reference, a method handle):
+    /// `Class.forName` in each overload, and `ClassLoader.loadClass` on the runtime's
+    /// loader, whose Knot implementation runs the class through Mixin. Counted, with the
+    /// placeholder as the call's answer; `None` for any other call, or a load that
+    /// passes. `loadClass` takes no array name (it answers `ClassNotFoundException`
+    /// without transforming anything), so only a plain name is checked there.
+    #[inline(never)]
+    pub(crate) fn count_refused_reflective_load(
+        &mut self,
+        r: &MethodRef,
+        receiver: Option<&Value>,
+        args: &[Value],
+    ) -> Result<Option<Value>, NativeError> {
+        let name = if r.owner == "java/lang/Class"
+            && r.name == "forName"
+            && r.descriptor.ends_with(")Ljava/lang/Class;")
+        {
+            let index = usize::from(r.descriptor.starts_with("(Ljava/lang/Module;"));
+            args.get(index)
+        } else if is_loader_load_class(r, receiver) {
+            args.first()
+                .filter(|name| !matches!(name, Value::Ref(Some(name)) if name.starts_with('[')))
+        } else {
+            return Ok(None);
+        };
+        let Some(Value::Ref(Some(binary))) = name else {
+            return Ok(None);
+        };
+        // A binary name: `java/lang/String` names no class at all.
+        if binary.contains('/') {
+            return Ok(None);
+        }
+        let internal = binary.replace('.', "/");
+        self.count_unloadable_class_by_name(&internal)
+    }
+
+    /// A call on a game object whose class cannot exist: one of its declared types failed
+    /// to load ([`Self::class_load_fails`]), so real Fabric never made such an object and
+    /// the jar's code never reaches it. Counted where the jar's code first uses one, with
+    /// the placeholder as the call's answer (or `void`); `None` otherwise. A call naming
+    /// the failed class itself is already counted at the constant pool
+    /// ([`Self::skip_unloadable_instruction`]); this covers calls that name another type,
+    /// such as an interface a mixin injected.
+    #[inline(never)]
+    pub(crate) fn count_failed_game_receiver(
+        &mut self,
+        r: &MethodRef,
+        receiver: Option<&Value>,
+    ) -> Result<Option<Value>, NativeError> {
+        if self.mixin_index.failed_required_targets.is_empty() {
+            return Ok(None);
+        }
+        let Some(key) = receiver.and_then(crate::runtime::game_object::handle_key) else {
+            return Ok(None);
+        };
+        let Some(failed) = self
+            .game_handle_types(key)
+            .into_iter()
+            .find(|ty| self.class_load_fails(ty, 0))
+        else {
+            return Ok(None);
+        };
+        let returns = return_desc(&r.descriptor).to_owned();
+        let counted = self.host.unknown_operand_call(&MethodRef {
+            owner: failed,
+            name: LOAD.to_owned(),
+            descriptor: format!("(){returns}"),
+        })?;
+        Ok(Some(if returns == "V" { Value::Void } else { counted }))
     }
 }

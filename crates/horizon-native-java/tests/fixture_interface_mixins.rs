@@ -5406,34 +5406,126 @@ public final class ShadowMethodProbe {
 /// What a rejected mixin (`InvalidMixinException`) does depends on its config's
 /// `required` flag (false when omitted, sponge-mixin 0.17.5 `MixinConfig`):
 /// `MixinApplicatorStandard.apply` drops it from a non-required config and the target
-/// loads normally; for a required one it rethrows, and fabric-loader 0.20.1's Knot fails
-/// the target's class load (`RuntimeException: Mixin transformation of <target> failed`).
+/// loads normally (`invalid-mixin`); for a required one it rethrows, and fabric-loader
+/// 0.20.1's Knot fails the target's class load (`required-mixin-failed`).
 ///
-/// - a jar target of a required failure refuses to initialize; the rest of the jar runs;
-/// - a game target (the game loads that class itself, so the real game does not run
-///   past it) refuses every entry into the jar's code: a game class has no single point
-///   of loading here;
-/// - the rows are `required-mixin-failed` / `invalid-mixin`.
+/// Where a required failure shows:
+///
+/// - a jar target: the jar's code counts at the first reference that resolves it (the
+///   constant pool, `Class.forName`), and an entrypoint that is the target is refused;
+/// - a game class a real Fabric 26.3 dedicated server loads before any mod runs
+///   (`Player`, measured with `-Xlog:class+load`): the game does not start, so the jar's
+///   code is refused as a whole;
+/// - any other game class (`MinecraftServer` loads after the mods' initializers; the
+///   client's bootstrap is not measured): the jar's code runs, and counts where it first
+///   names the class, a subclass (`ServerPlayer`), or calls a game object of it;
+/// - a config plugin that declines the pair keeps Mixin off it (`readDeclaredTargets`):
+///   nothing fails; one that keeps it fails it as without a plugin.
 #[test]
 fn required_mixin_configs_fail_the_target_and_others_drop_the_mixin() {
-    let build = |name: &str, targets: &str, required: Option<bool>| {
+    let build = |name: &str, targets: &str, required: Option<bool>, plugin: Option<&str>| {
         let mut sources = mixin_stubs();
         sources.insert(
+            "net/minecraft/server/MinecraftServer.java",
+            "package net.minecraft.server;\npublic abstract class MinecraftServer {}\n",
+        );
+        sources.insert(
+            "org/objectweb/asm/tree/ClassNode.java",
+            "package org.objectweb.asm.tree;\npublic class ClassNode {}\n",
+        );
+        sources.insert(
+            "org/spongepowered/asm/mixin/extensibility/IMixinInfo.java",
+            "package org.spongepowered.asm.mixin.extensibility;\npublic interface IMixinInfo {}\n",
+        );
+        sources.insert(
+            "org/spongepowered/asm/mixin/extensibility/IMixinConfigPlugin.java",
+            r#"package org.spongepowered.asm.mixin.extensibility;
+import java.util.List;
+import java.util.Set;
+import org.objectweb.asm.tree.ClassNode;
+public interface IMixinConfigPlugin {
+    void onLoad(String mixinPackage);
+    String getRefMapperConfig();
+    boolean shouldApplyMixin(String targetClassName, String mixinClassName);
+    void acceptTargets(Set<String> myTargets, Set<String> otherTargets);
+    List<String> getMixins();
+    void preApply(String targetClassName, ClassNode targetClass, String mixinClassName, IMixinInfo mixinInfo);
+    void postApply(String targetClassName, ClassNode targetClass, String mixinClassName, IMixinInfo mixinInfo);
+}
+"#,
+        );
+        for (class, keeps) in [("DeclinePlugin", "false"), ("KeepPlugin", "true")] {
+            let source = format!(
+                r#"package demoprobe;
+import java.util.List;
+import java.util.Set;
+import org.objectweb.asm.tree.ClassNode;
+import org.spongepowered.asm.mixin.extensibility.IMixinConfigPlugin;
+import org.spongepowered.asm.mixin.extensibility.IMixinInfo;
+
+public class {class} implements IMixinConfigPlugin {{
+    @Override public void onLoad(String mixinPackage) {{}}
+    @Override public String getRefMapperConfig() {{ return null; }}
+    @Override public boolean shouldApplyMixin(String targetClassName, String mixinClassName) {{
+        return mixinClassName.endsWith("RejectedMixin") ? {keeps} : true;
+    }}
+    @Override public void acceptTargets(Set<String> myTargets, Set<String> otherTargets) {{}}
+    @Override public List<String> getMixins() {{ return null; }}
+    @Override public void preApply(String targetClassName, ClassNode targetClass, String mixinClassName, IMixinInfo mixinInfo) {{}}
+    @Override public void postApply(String targetClassName, ClassNode targetClass, String mixinClassName, IMixinInfo mixinInfo) {{}}
+}}
+"#
+            );
+            sources.insert(
+                Box::leak(format!("demoprobe/{class}.java").into_boxed_str()),
+                Box::leak(source.into_boxed_str()),
+            );
+        }
+        sources.insert(
             "demoprobe/RequiredTarget.java",
-            "package demoprobe;\npublic class RequiredTarget {\n    public static int VALUE = 6;\n}\n",
+            "package demoprobe;\npublic class RequiredTarget {\n    public static int VALUE = 6;\n    public void onInitialize() {}\n}\n",
+        );
+        sources.insert(
+            "demoprobe/Tagged.java",
+            "package demoprobe;\npublic interface Tagged { int tag(); }\n",
         );
         sources.insert(
             "demoprobe/RequiredProbe.java",
             r#"package demoprobe;
+import net.minecraft.server.MinecraftServer;
+import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.world.entity.player.Player;
+
 public final class RequiredProbe {
     public static int plain() { return 1; }
     public static int targetValue() { return RequiredTarget.VALUE; }
+    public static String targetByName() throws Exception {
+        return Class.forName("demoprobe.RequiredTarget").getName();
+    }
+    public static String playerClass() { return Player.class.getName(); }
+    public static String serverPlayerClass() { return ServerPlayer.class.getName(); }
+    public static String serverClass() { return MinecraftServer.class.getName(); }
+    public static int tag(Object player) { return ((Tagged) player).tag(); }
+}
+"#,
+        );
+        sources.insert(
+            "demo/TagMixin.java",
+            r#"package demo;
+import demoprobe.Tagged;
+import net.minecraft.world.entity.player.Player;
+import org.spongepowered.asm.mixin.Mixin;
+
+@Mixin(Player.class)
+public abstract class TagMixin implements Tagged {
+    public int tag() { return 5; }
 }
 "#,
         );
         let mixin = format!(
             r#"package demo;
 import demoprobe.RequiredTarget;
+import net.minecraft.server.MinecraftServer;
 import net.minecraft.world.entity.player.Player;
 import org.spongepowered.asm.mixin.Mixin;
 
@@ -5448,18 +5540,30 @@ public abstract class RejectedMixin {{
             Some(flag) => format!(r#""required":{flag},"#),
             None => String::new(),
         };
-        let config = format!(r#"{{{required}"package":"demo","mixins":["RejectedMixin"]}}"#);
+        let plugin = plugin
+            .map(|class| format!(r#""plugin":"demoprobe.{class}","#))
+            .unwrap_or_default();
+        let config = format!(
+            r#"{{{required}{plugin}"package":"demo","mixins":["RejectedMixin","TagMixin"]}}"#
+        );
+        let mut excluded = COMPILE_ONLY_STUBS.to_vec();
+        excluded.extend([
+            "net/minecraft/server/MinecraftServer.class",
+            "org/objectweb/asm/tree/ClassNode.class",
+            "org/spongepowered/asm/mixin/extensibility/IMixinInfo.class",
+            "org/spongepowered/asm/mixin/extensibility/IMixinConfigPlugin.class",
+        ]);
         let jar_path = build_jar(
             name,
             sources,
             &[
                 (
                     "fabric.mod.json",
-                    r#"{"id":"requiredmixin","version":"1.0","mixins":["demo.mixins.json"]}"#,
+                    r#"{"id":"requiredmixin","version":"1.0","entrypoints":{"main":["demoprobe.RequiredTarget"]},"mixins":["demo.mixins.json"]}"#,
                 ),
                 ("demo.mixins.json", Box::leak(config.into_boxed_str())),
             ],
-            COMPILE_ONLY_STUBS,
+            &excluded,
         );
         NativeJar::from_path(&jar_path).unwrap()
     };
@@ -5475,26 +5579,82 @@ public abstract class RejectedMixin {{
         rows.sort_by(|a, b| a.0.cmp(&b.0));
         rows
     };
-    let int = |jar: &NativeJar, method: &str| {
-        let mut host = StdHost::new().with_environment_type("SERVER");
-        jar.invoke_method("demoprobe.RequiredProbe", method, "()I", None, &mut host)
+    let run = |jar: &NativeJar, side: &str, method: &str, desc: &str, args: &[Value]| {
+        let mut host = StdHost::new().with_environment_type(side);
+        let outcome = jar
+            .invoke_method_with_args(
+                "demoprobe.RequiredProbe",
+                method,
+                desc,
+                None,
+                args,
+                &mut host,
+            )
+            .map_err(|error| error.to_string());
+        (outcome, host.unknown_host_calls())
+    };
+    let string = |text: &str| Value::Ref(Some(text.to_owned()));
+    let player = server_player(0x51, "Ada", 1, 1, 7);
+    let loads = |calls: &[(String, usize)], class: &str| {
+        calls
+            .iter()
+            .any(|(call, _)| call.starts_with(&format!("{class}#<load>")))
     };
 
-    // A non-required config (omitted `required`): dropped, the target loads.
-    let dropped = build("required-omitted", "RequiredTarget.class", None);
+    // A non-required config (omitted `required`): dropped, the targets load.
+    let dropped = build(
+        "required-omitted",
+        "RequiredTarget.class, Player.class",
+        None,
+        None,
+    );
     assert!(!dropped.mixin_configs()[0].required);
     assert_eq!(
         rows(&dropped),
-        [(
-            "demoprobe/RequiredTarget".to_owned(),
-            MixinSkipReason::InvalidMixin(detail.into())
-        )]
+        [
+            (
+                "demoprobe/RequiredTarget".to_owned(),
+                MixinSkipReason::InvalidMixin(detail.into())
+            ),
+            (
+                "net/minecraft/world/entity/player/Player".to_owned(),
+                MixinSkipReason::InvalidMixin(detail.into())
+            ),
+        ]
     );
-    assert_eq!(int(&dropped, "targetValue").unwrap(), Value::Int(6));
+    for side in ["SERVER", "CLIENT"] {
+        assert_eq!(
+            run(&dropped, side, "targetValue", "()I", &[]),
+            (Ok(Value::Int(6)), vec![])
+        );
+        assert_eq!(
+            run(&dropped, side, "playerClass", "()Ljava/lang/String;", &[]),
+            (
+                Ok(string("net.minecraft.world.entity.player.Player")),
+                vec![]
+            )
+        );
+        // The interface the other (valid) mixin injects answers on a game player.
+        assert_eq!(
+            run(
+                &dropped,
+                side,
+                "tag",
+                "(Ljava/lang/Object;)I",
+                std::slice::from_ref(&player)
+            ),
+            (Ok(Value::Int(5)), vec![])
+        );
+    }
 
-    // A required config failing a jar class: that class refuses to load, every time;
-    // other classes still run.
-    let jar_only = build("required-jar-target", "RequiredTarget.class", Some(true));
+    // A required config failing a jar class: the jar's references to it count (never
+    // the real 6 or name), an entrypoint that is the class is refused, others run.
+    let jar_only = build(
+        "required-jar-target",
+        "RequiredTarget.class",
+        Some(true),
+        None,
+    );
     assert_eq!(
         rows(&jar_only),
         [(
@@ -5502,27 +5662,61 @@ public abstract class RejectedMixin {{
             MixinSkipReason::RequiredMixinFailed(detail.into())
         )]
     );
-    assert_eq!(int(&jar_only, "plain").unwrap(), Value::Int(1));
-    for _ in 0..2 {
-        let refused = int(&jar_only, "targetValue");
+    assert_eq!(
+        run(&jar_only, "SERVER", "plain", "()I", &[]),
+        (Ok(Value::Int(1)), vec![])
+    );
+    for (method, desc, real) in [
+        ("targetValue", "()I", Value::Int(6)),
+        (
+            "targetByName",
+            "()Ljava/lang/String;",
+            string("demoprobe.RequiredTarget"),
+        ),
+    ] {
+        let (outcome, calls) = run(&jar_only, "SERVER", method, desc, &[]);
         assert!(
-            matches!(
-                &refused,
-                Err(NativeError::Metadata(message))
-                    if message.contains("jar class demoprobe/RequiredTarget fails to load")
-                        && message.contains("demo.mixins.json")
-                        && message.contains("Mixin transformation of demoprobe.RequiredTarget failed")
-            ),
-            "{refused:?}"
+            outcome.as_ref().map_or(true, |value| *value != real),
+            "{method}: {outcome:?}"
+        );
+        assert!(
+            loads(&calls, "demoprobe/RequiredTarget"),
+            "{method}: {calls:?}"
+        );
+        let mut strict = StdHost::new()
+            .with_environment_type("SERVER")
+            .with_strict_unknown_host_calls();
+        assert!(
+            jar_only
+                .invoke_method("demoprobe.RequiredProbe", method, desc, None, &mut strict)
+                .is_err(),
+            "{method} must refuse on a strict host"
         );
     }
+    let refused = jar_only.execute(
+        "demoprobe.RequiredTarget",
+        None,
+        "main",
+        &mut StdHost::new().with_environment_type("SERVER"),
+    );
+    assert!(
+        matches!(
+            &refused,
+            Err(NativeError::Metadata(message))
+                if message.contains("entrypoint demoprobe.RequiredTarget fails to load")
+                    && message.contains("demo.mixins.json")
+                    && message.contains("Mixin transformation of demoprobe.RequiredTarget failed")
+        ),
+        "{refused:?}"
+    );
 
-    // A required config failing a game class: the game does not run past that load, so
-    // every entry into the jar's code refuses.
+    // A required config failing `Player`, which a 26.3 dedicated server loads before any
+    // mod initializer: the game does not start, so the jar's code is refused.
     let game = build(
         "required-game-target",
         "RequiredTarget.class, Player.class",
         Some(true),
+        None,
     );
     assert_eq!(
         rows(&game),
@@ -5537,18 +5731,128 @@ public abstract class RejectedMixin {{
             ),
         ]
     );
-    let refused = int(&game, "plain");
-    assert!(
+    let game_does_not_start = |outcome: &Result<Value, String>| {
         matches!(
-            &refused,
-            Err(NativeError::Metadata(message))
-                if message.contains("jar code refused")
+            outcome,
+            Err(message)
+                if message.contains("the game does not start")
                     && message.contains(
                         "Mixin transformation of net.minecraft.world.entity.player.Player failed"
                     )
-        ),
-        "{refused:?}"
+                    && message.contains("before any mod initializer runs")
+        )
+    };
+    let (refused, _) = run(&game, "SERVER", "plain", "()I", &[]);
+    assert!(game_does_not_start(&refused), "{refused:?}");
+
+    // The same failure on the client, whose bootstrap is not measured: the jar's code runs
+    // and counts where it names `Player` or `ServerPlayer` (which loads `Player` as its
+    // superclass), or calls a player through the interface a mixin injected into it.
+    let client = build("required-client-player", "Player.class", Some(true), None);
+    assert_eq!(
+        run(&client, "CLIENT", "plain", "()I", &[]),
+        (Ok(Value::Int(1)), vec![])
     );
+    for (method, desc, args, real) in [
+        (
+            "playerClass",
+            "()Ljava/lang/String;",
+            vec![],
+            string("net.minecraft.world.entity.player.Player"),
+        ),
+        (
+            "serverPlayerClass",
+            "()Ljava/lang/String;",
+            vec![],
+            string("net.minecraft.server.level.ServerPlayer"),
+        ),
+        (
+            "tag",
+            "(Ljava/lang/Object;)I",
+            vec![player.clone()],
+            Value::Int(5),
+        ),
+    ] {
+        let (outcome, calls) = run(&client, "CLIENT", method, desc, &args);
+        assert!(
+            outcome.as_ref().map_or(true, |value| *value != real),
+            "{method}: {outcome:?}"
+        );
+        assert!(
+            calls.iter().any(|(call, _)| call.contains("#<load>")),
+            "{method}: {calls:?}"
+        );
+    }
+
+    // A game class the server loads only after the mods' initializers (`MinecraftServer`):
+    // the jar's code runs, and counts where it names that class, not `Player`.
+    let server = build("required-server", "MinecraftServer.class", Some(true), None);
+    assert_eq!(
+        run(&server, "SERVER", "plain", "()I", &[]),
+        (Ok(Value::Int(1)), vec![])
+    );
+    assert_eq!(
+        run(
+            &server,
+            "SERVER",
+            "playerClass",
+            "()Ljava/lang/String;",
+            &[]
+        ),
+        (
+            Ok(string("net.minecraft.world.entity.player.Player")),
+            vec![]
+        )
+    );
+    let (outcome, calls) = run(
+        &server,
+        "SERVER",
+        "serverClass",
+        "()Ljava/lang/String;",
+        &[],
+    );
+    assert_ne!(
+        outcome.ok(),
+        Some(string("net.minecraft.server.MinecraftServer"))
+    );
+    assert!(
+        loads(&calls, "net/minecraft/server/MinecraftServer"),
+        "{calls:?}"
+    );
+
+    // A config plugin that declines the rejected mixin keeps Mixin off `Player`: the game
+    // starts and nothing counts. One that keeps it fails `Player` as before.
+    let declined = build(
+        "required-plugin-declines",
+        "Player.class",
+        Some(true),
+        Some("DeclinePlugin"),
+    );
+    assert_eq!(
+        run(&declined, "SERVER", "plain", "()I", &[]),
+        (Ok(Value::Int(1)), vec![])
+    );
+    assert_eq!(
+        run(
+            &declined,
+            "SERVER",
+            "playerClass",
+            "()Ljava/lang/String;",
+            &[]
+        ),
+        (
+            Ok(string("net.minecraft.world.entity.player.Player")),
+            vec![]
+        )
+    );
+    let kept = build(
+        "required-plugin-keeps",
+        "Player.class",
+        Some(true),
+        Some("KeepPlugin"),
+    );
+    let (refused, _) = run(&kept, "SERVER", "plain", "()I", &[]);
+    assert!(game_does_not_start(&refused), "{refused:?}");
 }
 
 /// A mixin's own static field lives on its target once merged: `mergeNewFields` moves it
@@ -5799,6 +6103,112 @@ public abstract class {name} {{
     );
 }
 
+/// Merged statics follow Mixin's apply order, not class names. sponge-mixin 0.17.5 keeps a
+/// target's mixins in a `TreeSet` ordered by `MixinInfo.compareTo`: `@Mixin(priority)`,
+/// then the order the `MixinInfo`s were made (configs in `MixinConfig.compareTo` order,
+/// each config's `mixins` list in order). Here `ZWriter` (priority 500) applies first and
+/// merges `ORDER`; `AReader` (1000, listed first) applies next and its `@Shadow` finds
+/// `ZWriter`'s field; `BWriter` (1000, listed second) applies last, and its own `ORDER`
+/// collides with the merged one (Mixin renames a private `@Unique`, not modelled: counted).
+/// By name, `BWriter` would come before `ZWriter` and the shadow would bind to it.
+#[test]
+fn merged_statics_follow_mixin_apply_order() {
+    let mut sources = mixin_stubs();
+    sources.insert(
+        "demoprobe/OrderTarget.java",
+        "package demoprobe;\npublic class OrderTarget {}\n",
+    );
+    sources.insert(
+        "demo/ZWriter.java",
+        r#"package demo;
+import demoprobe.OrderTarget;
+import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.Unique;
+
+@Mixin(value = OrderTarget.class, priority = 500)
+public abstract class ZWriter {
+    @Unique private static int ORDER = 4;
+    public static void set(int v) { ORDER = v; }
+}
+"#,
+    );
+    sources.insert(
+        "demo/BWriter.java",
+        r#"package demo;
+import demoprobe.OrderTarget;
+import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.Unique;
+
+@Mixin(OrderTarget.class)
+public abstract class BWriter {
+    @Unique private static int ORDER;
+    public static int view() { return ORDER; }
+}
+"#,
+    );
+    sources.insert(
+        "demo/AReader.java",
+        r#"package demo;
+import demoprobe.OrderTarget;
+import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.Shadow;
+
+@Mixin(OrderTarget.class)
+public abstract class AReader {
+    @Shadow private static int ORDER;
+    public static int read() { return ORDER; }
+}
+"#,
+    );
+    let jar_path = build_jar(
+        "merged-static-order",
+        sources,
+        &[
+            (
+                "fabric.mod.json",
+                r#"{"id":"staticorder","version":"1.0","mixins":["demo.mixins.json"]}"#,
+            ),
+            (
+                "demo.mixins.json",
+                r#"{"package":"demo","mixins":["AReader","BWriter","ZWriter"]}"#,
+            ),
+        ],
+        COMPILE_ONLY_STUBS,
+    );
+    let jar = NativeJar::from_path(&jar_path).unwrap();
+    let mut host = StdHost::new().with_environment_type("SERVER");
+    let read = |host: &mut StdHost| {
+        jar.invoke_method("demo.AReader", "read", "()I", None, host)
+            .unwrap()
+    };
+    assert_eq!(read(&mut host), Value::Int(4));
+    jar.invoke_method_with_args(
+        "demo.ZWriter",
+        "set",
+        "(I)V",
+        None,
+        &[Value::Int(21)],
+        &mut host,
+    )
+    .unwrap();
+    assert_eq!(read(&mut host), Value::Int(21));
+    assert_eq!(
+        host.unknown_host_call_count(),
+        0,
+        "{:?}",
+        host.unknown_host_calls()
+    );
+    // The later declarer's own field: counted, never ZWriter's slot.
+    let view = jar
+        .invoke_method("demo.BWriter", "view", "()I", None, &mut host)
+        .unwrap();
+    assert_ne!(view, Value::Int(21));
+    assert_eq!(
+        host.unknown_host_calls(),
+        vec![("demo/BWriter#ORDERI".to_owned(), 1)]
+    );
+}
+
 /// Real Fabric refuses to load any class in a selected Mixin config's package from code
 /// not merged with it: sponge-mixin 0.17.5's `MixinProcessor.applyMixins` throws
 /// `IllegalClassLoadError` for a `packageMatch` (the config's `package` plus `.`), and
@@ -5809,9 +6219,14 @@ public abstract class {name} {{
 /// Every bytecode class reference resolves a constant-pool entry, so one point covers
 /// `new`, `instanceof`, `checkcast`, a class literal, an array of the class, static and
 /// instance fields and method calls: each is counted and nothing it names runs (a strict
-/// host refuses). `Class.forName` takes the same rule, with no merged exemption. An
-/// entrypoint the loader would load from the package is refused. `instanceof` /
-/// `checkcast` of `null` resolve nothing and run as usual.
+/// host refuses). A load by name takes the same rule, with no merged exemption:
+/// `Class.forName` (of an array of the class too, any dimension), Knot's `loadClass`
+/// through the context loader or a class's own loader, from a method reference as well,
+/// and a `ServiceLoader` provider. Measured on a real Fabric 26.3 server, each of those
+/// throws `RuntimeException: Mixin transformation of <class> failed`, every time; the
+/// system class loader is the JDK's application loader, which never sees a mod class, and
+/// stays counted. An entrypoint the loader would load from the package is refused.
+/// `instanceof` / `checkcast` of `null` resolve nothing and run as usual.
 #[test]
 fn mixin_package_classes_load_only_from_merged_code() {
     let mut sources = mixin_stubs();
@@ -5900,8 +6315,54 @@ public final class LoadProbe {
         return Class.forName("demo.LoadAccessor").getName();
     }
     public static String injectionPoint() { return CustomPoint.class.getName(); }
+    // Knot's `loadClass` runs the class through Mixin: the context loader and a class's
+    // own loader (both Knot on real Fabric 26.3) refuse it, from a method reference too.
+    // The system loader is the JDK's application loader, which never sees a mod class.
+    public interface Loader { Class<?> load(String name) throws Exception; }
+    public static String loadSystem() throws Exception {
+        return ClassLoader.getSystemClassLoader().loadClass("demo.HelperInPackage").getName();
+    }
+    public static String loadContext() throws Exception {
+        return Thread.currentThread().getContextClassLoader()
+            .loadClass("demo.HelperInPackage").getName();
+    }
+    public static String loadOwn() throws Exception {
+        return LoadProbe.class.getClassLoader().loadClass("demo.HelperInPackage").getName();
+    }
+    public static String loadReference() throws Exception {
+        Loader loader = Thread.currentThread().getContextClassLoader()::loadClass;
+        return loader.load("demo.HelperInPackage").getName();
+    }
+    public static String forNameReference() throws Exception {
+        Loader loader = Class::forName;
+        return loader.load("demo.HelperInPackage").getName();
+    }
+    // An array class loads its element class (JDK 25: `loader.loadClass("demo.X")`).
+    public static String forNameArray() throws Exception {
+        return Class.forName("[Ldemo.HelperInPackage;").getName();
+    }
+    public static String forNameArray2() throws Exception {
+        return Class.forName("[[Ldemo.HelperInPackage;", false, LoadProbe.class.getClassLoader())
+            .getName();
+    }
+    public static String forNameArrayOutside() throws Exception {
+        return Class.forName("[Ldemoprobe.LoadTarget;").getName();
+    }
+    // A `ServiceLoader` provider is loaded by name too.
+    public static int service() {
+        java.util.Iterator<Service> providers = java.util.ServiceLoader.load(Service.class).iterator();
+        return providers.hasNext() && providers.next() != null ? 1 : 0;
+    }
 }
 "#,
+    );
+    sources.insert(
+        "demoprobe/Service.java",
+        "package demoprobe;\npublic interface Service {}\n",
+    );
+    sources.insert(
+        "demo/ServiceInPackage.java",
+        "package demo;\npublic class ServiceInPackage implements demoprobe.Service {\n    public ServiceInPackage() {}\n}\n",
     );
     let mut excluded = COMPILE_ONLY_STUBS.to_vec();
     excluded.push("org/spongepowered/asm/mixin/injection/InjectionPoint.class");
@@ -5916,6 +6377,10 @@ public final class LoadProbe {
             (
                 "demo.mixins.json",
                 r#"{"package":"demo","mixins":["LoadMixin","LoadAccessor"]}"#,
+            ),
+            (
+                "META-INF/services/demoprobe.Service",
+                "demo.ServiceInPackage\n",
             ),
         ],
         &excluded,
@@ -5939,6 +6404,16 @@ public final class LoadProbe {
     assert_eq!(
         probe("injectionPoint", "()Ljava/lang/String;", &[], &mut host).unwrap(),
         Value::Ref(Some("demo.CustomPoint".into()))
+    );
+    assert_eq!(
+        probe(
+            "forNameArrayOutside",
+            "()Ljava/lang/String;",
+            &[],
+            &mut host
+        )
+        .unwrap(),
+        Value::Ref(Some("[Ldemoprobe.LoadTarget;".into()))
     );
     // `instanceof` / `checkcast` of null resolve nothing.
     assert_eq!(
@@ -6023,8 +6498,46 @@ public final class LoadProbe {
             Value::Ref(Some("demo.LoadMixin".into())),
         ),
         ("mixinCall", "()I", vec![], Value::Int(7)),
+        (
+            "loadContext",
+            "()Ljava/lang/String;",
+            vec![],
+            Value::Ref(Some("demo.HelperInPackage".into())),
+        ),
+        (
+            "loadOwn",
+            "()Ljava/lang/String;",
+            vec![],
+            Value::Ref(Some("demo.HelperInPackage".into())),
+        ),
+        (
+            "loadReference",
+            "()Ljava/lang/String;",
+            vec![],
+            Value::Ref(Some("demo.HelperInPackage".into())),
+        ),
+        (
+            "forNameReference",
+            "()Ljava/lang/String;",
+            vec![],
+            Value::Ref(Some("demo.HelperInPackage".into())),
+        ),
+        (
+            "forNameArray",
+            "()Ljava/lang/String;",
+            vec![],
+            Value::Ref(Some("[Ldemo.HelperInPackage;".into())),
+        ),
+        (
+            "forNameArray2",
+            "()Ljava/lang/String;",
+            vec![],
+            Value::Ref(Some("[[Ldemo.HelperInPackage;".into())),
+        ),
+        ("service", "()I", vec![], Value::Int(1)),
     ] {
-        let mut lenient = StdHost::new().with_environment_type("SERVER");
+        // Seeded as a real run is: the jar's resources and `META-INF/services` rows.
+        let mut lenient = jar.seed_host(StdHost::new().with_environment_type("SERVER"));
         let outcome = probe(method, desc, &args, &mut lenient);
         assert!(
             outcome.as_ref().map_or(true, |value| *value != real),
@@ -6038,14 +6551,35 @@ public final class LoadProbe {
             "{method}: {:?}",
             lenient.unknown_host_calls()
         );
-        let mut strict = StdHost::new()
-            .with_environment_type("SERVER")
-            .with_strict_unknown_host_calls();
+        let mut strict = jar.seed_host(
+            StdHost::new()
+                .with_environment_type("SERVER")
+                .with_strict_unknown_host_calls(),
+        );
         assert!(
             probe(method, desc, &args, &mut strict).is_err(),
             "{method} must refuse on a strict host"
         );
     }
+
+    // The system loader is not Knot on real Fabric 26.3 (`AppClassLoader`: a mod class,
+    // in a mixin package or not, is a `ClassNotFoundException` there, and Mixin never sees
+    // it). The runtime does not model it: `getSystemClassLoader()` is counted, and the load
+    // never answers the class.
+    let mut system = StdHost::new().with_environment_type("SERVER");
+    let outcome = probe("loadSystem", "()Ljava/lang/String;", &[], &mut system);
+    assert_ne!(
+        outcome.ok(),
+        Some(Value::Ref(Some("demo.HelperInPackage".into())))
+    );
+    assert!(
+        system
+            .unknown_host_calls()
+            .iter()
+            .any(|(call, _)| call.starts_with("java/lang/ClassLoader#getSystemClassLoader")),
+        "{:?}",
+        system.unknown_host_calls()
+    );
 
     // The loader's entrypoint load: refused in the mixin package, fine outside it.
     let mut entry_host = StdHost::new().with_environment_type("SERVER");

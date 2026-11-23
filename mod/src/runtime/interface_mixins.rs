@@ -597,6 +597,35 @@ fn vanilla_host_methods() -> &'static VanillaHostMethods {
     TABLE.get_or_init(|| VanillaHostMethods::parse(VANILLA_HOST_METHODS_TSV))
 }
 
+/// Game class or interface `class` and every supertype it loads with (its superclass
+/// chain and every superinterface, `java/lang/Object` left out), by
+/// `vanilla_host_methods.tsv`; `None` when the table lacks any edge of that closure, so
+/// the answer is not known.
+pub(crate) fn vanilla_supertypes(class: &str) -> Option<Vec<&'static str>> {
+    let table = vanilla_host_methods();
+    let mut out: Vec<&'static str> = Vec::new();
+    let mut pending: Vec<&str> = vec![class];
+    while let Some(current) = pending.pop() {
+        if current.is_empty() || current == "java/lang/Object" {
+            continue;
+        }
+        let (key, info) = table
+            .classes
+            .get_key_value(current)
+            .or_else(|| table.interfaces.get_key_value(current))?;
+        if out.contains(key) {
+            continue;
+        }
+        if out.len() >= 256 {
+            return None;
+        }
+        out.push(key);
+        pending.push(info.super_name);
+        pending.extend(info.interfaces.iter().copied());
+    }
+    Some(out)
+}
+
 /// Resolve the owning target class for a `@Shadow` member on a `@Mixin` class given its
 /// declared targets and the actual receiver's vanilla class hierarchy.
 ///
@@ -674,6 +703,19 @@ pub(crate) fn active_host_mixin_targets(
     active
 }
 
+/// A class a `required` Mixin config's rejected mixin fails to load
+/// ([`NativeJar::failed_required_targets`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FailedTarget {
+    /// Which config and mixin, and Mixin's own message.
+    pub(crate) reason: String,
+    /// `false` when a config plugin governs the pair and its `shouldApplyMixin` answer
+    /// is not known (a refused session, a failed question): the class fails only if the
+    /// plugin kept the mixin, so the failure is counted where it would happen, never
+    /// refused.
+    pub(crate) certain: bool,
+}
+
 /// Per-`Runtime` mixin configuration gate and lazy index.
 #[derive(Debug, Default)]
 pub(crate) struct RuntimeMixinState {
@@ -682,9 +724,9 @@ pub(crate) struct RuntimeMixinState {
     plugins: ConfigPlugins,
     pub(crate) side: Option<MixinSide>,
     require_config: bool,
-    /// Jar classes a `required` config's rejected mixin fails to load, with why
-    /// ([`NativeJar::failed_required_targets`]).
-    failed_required_targets: BTreeMap<String, String>,
+    /// Classes (jar and game) a `required` config's rejected mixin fails to load, with
+    /// why ([`NativeJar::failed_required_targets`]).
+    pub(crate) failed_required_targets: BTreeMap<String, FailedTarget>,
     index: OnceCell<RuntimeMixinIndex>,
     /// The selected Mixin configs' packages as internal-name prefixes
     /// (`mixin_class_loading.rs`).
@@ -692,6 +734,8 @@ pub(crate) struct RuntimeMixinState {
     /// Per class: the pool entries its code may not resolve (`mixin_class_loading.rs`).
     pub(crate) unloadable_pools:
         std::cell::RefCell<BTreeMap<String, Option<std::rc::Rc<BTreeSet<u16>>>>>,
+    /// Per class: whether its load fails (`Runtime::class_load_fails`).
+    pub(crate) load_failures: std::cell::RefCell<BTreeMap<String, bool>>,
 }
 
 impl RuntimeMixinState {
@@ -713,6 +757,7 @@ impl RuntimeMixinState {
             index: OnceCell::new(),
             package_prefixes: OnceCell::new(),
             unloadable_pools: Default::default(),
+            load_failures: Default::default(),
         }
     }
 
@@ -730,6 +775,7 @@ impl RuntimeMixinState {
             index: OnceCell::new(),
             package_prefixes: OnceCell::new(),
             unloadable_pools: Default::default(),
+            load_failures: Default::default(),
         }
     }
 
@@ -1342,16 +1388,37 @@ impl NativeJar {
     /// The classes a `required` config's rejected mixin fails on `side`, each with why:
     /// Mixin rethrows the `InvalidMixinException` (`MixinApplicatorStandard.apply`), and
     /// Fabric's Knot turns it into `RuntimeException: Mixin transformation of <target>
-    /// failed` from the class load, for a jar class and a game class alike. What a later
-    /// load does is not modelled, so the runtime refuses instead: a jar class's
-    /// initialization ([`Runtime::required_mixin_failure`]), and, for a game class (which
-    /// the game itself loads, so the game does not run past it), every entry into the
-    /// jar's code ([`Runtime::required_game_mixin_failure`]). Cached per side.
-    pub(crate) fn failed_required_targets(&self, side: MixinSide) -> &BTreeMap<String, String> {
+    /// failed` from the class load, for a jar class and a game class alike.
+    ///
+    /// Only where Mixin applies the class: a config plugin that declines `(mixin, target)`
+    /// keeps it off that target (`MixinInfo.readDeclaredTargets`), so it neither applies
+    /// nor validates there; a plugin answer that is not known leaves the failure
+    /// [`FailedTarget::certain`] `false`. What the runtime does with the map:
+    /// [`Runtime::class_load_fails`] (the use of such a class is counted where the jar's
+    /// code first resolves it) and [`Runtime::refuse_failed_game_mixin_target`] (a game
+    /// class the server loads before any mod runs: the game does not start). Cached per
+    /// side.
+    pub(crate) fn failed_required_targets(
+        &self,
+        side: MixinSide,
+    ) -> &BTreeMap<String, FailedTarget> {
+        static NONE: std::sync::OnceLock<BTreeMap<String, FailedTarget>> =
+            std::sync::OnceLock::new();
+        // A plugin session's own runtime (`mixin_plugins.rs`) runs inside Mixin's
+        // selection, where nothing is applied; asking for the plugins here would also
+        // re-enter the session that is computing them.
+        if crate::runtime::mixin_plugins::running_config_plugins() {
+            return NONE.get_or_init(BTreeMap::new);
+        }
         let slot = match side {
             MixinSide::Server => &self.server_failed_required_targets,
             MixinSide::Client => &self.client_failed_required_targets,
         };
+        if let Some(failed) = slot.get() {
+            return failed;
+        }
+        // Before the cell: the sessions build runtimes of their own.
+        let plugins = self.cached_config_plugins(side);
         slot.get_or_init(|| {
             let configs = self.mixin_configs();
             let config_sides = self.mixin_config_sides();
@@ -1374,13 +1441,32 @@ impl NativeJar {
                     continue;
                 };
                 for target in details.targets {
-                    failed.entry(target).or_insert_with(|| {
-                        format!(
-                            "required Mixin config {} rejects {}: {detail}",
-                            config.path,
-                            details.mixin.replace('/', ".")
-                        )
+                    // The plain gate passes it, or defers to the config's plugin.
+                    let certain =
+                        match mixin_config_gate(&configs, &config_sides, &details.mixin, side) {
+                            Ok(()) => true,
+                            Err(MixinSkipReason::ConfigPlugin) => {
+                                match plugins.verdict(&config.path, &details.mixin, &target) {
+                                    Some(true) => true,
+                                    Some(false) => continue,
+                                    None => false,
+                                }
+                            }
+                            Err(_) => continue,
+                        };
+                    let reason = format!(
+                        "required Mixin config {} rejects {}: {detail}",
+                        config.path,
+                        details.mixin.replace('/', ".")
+                    );
+                    // A certain failure names the class that surely fails the target.
+                    let entry = failed.entry(target).or_insert_with(|| FailedTarget {
+                        reason: reason.clone(),
+                        certain,
                     });
+                    if certain && !entry.certain {
+                        *entry = FailedTarget { reason, certain };
+                    }
                 }
             }
             failed
@@ -1709,7 +1795,7 @@ impl<H: Host> Runtime<'_, H> {
 
     /// Declared vanilla classes of a game handle (using host override when running under
     /// `GameHookHost`, falling back to `game_object::declared_types`).
-    fn game_handle_types(&self, key: &str) -> Vec<String> {
+    pub(crate) fn game_handle_types(&self, key: &str) -> Vec<String> {
         if let Some(types) = self.host.game_object_types(key) {
             return types;
         }
@@ -2193,6 +2279,19 @@ impl<H: Host> Runtime<'_, H> {
         if self.target_declares_field(&target, field) != Some(false) {
             return StaticShadowResolution::Unresolved;
         }
+        // A mixin applied earlier merged a static of that name and descriptor first: this
+        // one's then collides with it (the same unmodelled rename / discard / adopt).
+        let (order, exact) = self.static_declarers_in_apply_order(&target, field, &field.owner);
+        let earlier = order
+            .iter()
+            .take_while(|(mixin, _)| *mixin != field.owner)
+            .any(|(_, access)| access.is_some());
+        let others = order
+            .iter()
+            .any(|(mixin, access)| *mixin != field.owner && access.is_some());
+        if earlier || (others && !exact) {
+            return StaticShadowResolution::Unresolved;
+        }
         self.merged_static(&target, &field.owner, field, declared)
     }
 
@@ -2213,59 +2312,102 @@ impl<H: Host> Runtime<'_, H> {
 
     /// The shared slot of `field` when a mixin applied to `target` before the one whose
     /// `@Shadow` this is declares it as its own static: `mergeNewFields` added it to the
-    /// target before this shadow's `findAliasedField` looked. A field declared only by a
-    /// mixin applied later is not there yet, so Mixin rejects the shadow (unresolved).
+    /// target before this shadow's `findAliasedField` looked. The first such mixin in apply
+    /// order is the one whose field is there; a later one's collides with it. A field
+    /// declared only by a mixin applied later is not there yet, so Mixin rejects the shadow
+    /// (unresolved), and so is an apply order this runtime cannot read exactly.
     fn merged_static_declared_before(
         &self,
         target: &str,
         field: &MethodRef,
     ) -> Option<StaticShadowResolution> {
-        let key = |mixin: &str| {
-            crate::runtime::mixin_apply_order_key(
-                self.classes.get(mixin),
-                mixin,
-                &self.mixin_index.configs,
-                self.mixin_index.side,
-                &self.mixin_index.config_sides,
-            )
-        };
-        let shadow_key = key(&field.owner);
-        for mixin in self.mixins_applied_to_target(target) {
-            if mixin == field.owner {
-                continue;
-            }
-            let Some(access) = self.class(&mixin).and_then(|file| {
-                file.fields
-                    .iter()
-                    .find(|f| {
-                        f.name == field.name && f.descriptor == field.descriptor && f.is_static()
-                    })
-                    .map(|f| f.access)
-            }) else {
-                continue;
-            };
-            let own = self
-                .runtime_mixin_index()
-                .meta
-                .get(&mixin)
-                .is_some_and(|meta| {
-                    meta.targets.len() == 1
-                        && !meta
-                            .shadow_fields
-                            .contains(&(field.name.clone(), field.descriptor.clone()))
-                });
-            if !own {
-                continue;
-            }
-            // The declaring mixin's own field must itself merge as one slot.
-            if (key(&mixin), mixin.as_str()) < (shadow_key, field.owner.as_str())
-                && self.target_declares_field(target, field) == Some(false)
-            {
-                return Some(self.merged_static(target, &mixin, field, access));
-            }
+        let (order, exact) = self.static_declarers_in_apply_order(target, field, &field.owner);
+        let first = order
+            .iter()
+            .position(|(mixin, access)| *mixin != field.owner && access.is_some())?;
+        if !exact {
             return Some(StaticShadowResolution::Unresolved);
         }
-        None
+        let shadow = order.iter().position(|(mixin, _)| *mixin == field.owner)?;
+        let (declaring, access) = &order[first];
+        // The declaring mixin's own field must itself merge as one slot.
+        let single_target = self
+            .runtime_mixin_index()
+            .meta
+            .get(declaring)
+            .is_some_and(|meta| meta.targets.len() == 1);
+        if first < shadow
+            && single_target
+            && self.target_declares_field(target, field) == Some(false)
+            && let Some(access) = access
+        {
+            return Some(self.merged_static(target, declaring, field, *access));
+        }
+        Some(StaticShadowResolution::Unresolved)
+    }
+
+    /// The mixins applied to `target` that declare `field` (name and descriptor) as a
+    /// static of their own (not a `@Shadow`), each with its access flags, and `with`
+    /// (`None` flags when it declares no such field), in the order real Mixin applies
+    /// them to `target`: `MixinInfo.compareTo` sorts a target's mixins by `@Mixin(priority)`,
+    /// then by the order their `MixinInfo`s were made, which is config order
+    /// (`MixinConfig.compareTo`: the config's `priority`, then its registration) and the
+    /// position in the config's `mixins` list, then its side's list
+    /// ([`crate::runtime::mixin_apply_order_key`]). The flag is `false` when that order is not known:
+    /// two or more of them and one from a linked jar, whose configs' registration order
+    /// against this jar's is not modelled.
+    fn static_declarers_in_apply_order(
+        &self,
+        target: &str,
+        field: &MethodRef,
+        with: &str,
+    ) -> (Vec<(String, Option<u16>)>, bool) {
+        let member = (field.name.clone(), field.descriptor.clone());
+        let mut order: Vec<(String, Option<u16>)> = self
+            .mixins_applied_to_target(target)
+            .into_iter()
+            .filter_map(|mixin| {
+                let shadow = self
+                    .runtime_mixin_index()
+                    .meta
+                    .get(&mixin)
+                    .is_some_and(|meta| meta.shadow_fields.contains(&member));
+                let access = self
+                    .class(&mixin)
+                    .and_then(|file| {
+                        file.fields
+                            .iter()
+                            .find(|f| {
+                                f.name == field.name
+                                    && f.descriptor == field.descriptor
+                                    && f.is_static()
+                            })
+                            .map(|f| f.access)
+                    })
+                    .filter(|_| !shadow);
+                (access.is_some() || mixin == with).then_some((mixin, access))
+            })
+            .collect();
+        if !order.iter().any(|(mixin, _)| mixin == with) {
+            order.push((with.to_owned(), None));
+        }
+        let exact = order.len() < 2
+            || order
+                .iter()
+                .all(|(mixin, _)| self.classes.contains_key(mixin.as_str()));
+        order.sort_by_cached_key(|(mixin, _)| {
+            (
+                crate::runtime::mixin_apply_order_key(
+                    self.classes.get(mixin.as_str()),
+                    mixin,
+                    &self.mixin_index.configs,
+                    self.mixin_index.side,
+                    &self.mixin_index.config_sides,
+                ),
+                mixin.clone(),
+            )
+        });
+        (order, exact)
     }
 
     /// The [`StaticShadowResolution::Merged`] slot `target#name` of a static `declaring`
@@ -2480,38 +2622,47 @@ impl<H: Host> Runtime<'_, H> {
             .collect()
     }
 
-    /// Why jar class `class` cannot load, when a `required` Mixin config's rejected mixin
-    /// targets it: Mixin rethrows the `InvalidMixinException` and Fabric's Knot fails the
-    /// class load ([`NativeJar::failed_required_targets`]).
-    pub(crate) fn required_mixin_failure(&self, class: &str) -> Option<&str> {
-        self.mixin_index
-            .failed_required_targets
-            .get(class)
-            .map(String::as_str)
+    /// Why class `class` (a jar or a game class) cannot load, when a `required` Mixin
+    /// config's rejected mixin targets it: Mixin rethrows the `InvalidMixinException` and
+    /// Fabric's Knot fails the class load ([`NativeJar::failed_required_targets`]).
+    pub(crate) fn required_mixin_failure(&self, class: &str) -> Option<&FailedTarget> {
+        self.mixin_index.failed_required_targets.get(class)
     }
 
-    /// A game class (not one the jar or a linked library declares) that a `required` Mixin
-    /// config's rejected mixin targets, with why. Knot fails that class's load in the game
-    /// itself, so the real game does not run past it; this runtime has no single point
-    /// where a game class loads, so it refuses every entry into the jar's code instead
-    /// ([`NativeJar::failed_required_targets`]).
-    pub(crate) fn required_game_mixin_failure(&self) -> Option<(&str, &str)> {
+    /// The game class whose failed load stops the game before any mod runs, with why: a
+    /// certain failure of a class no jar declares that a real Fabric 26.3 dedicated server
+    /// loads before its first `main` entrypoint
+    /// ([`crate::runtime::mixin_class_loading::server_loads_before_mods`], measured, not guessed).
+    /// Any other failed class (one the game loads later or never, or any on the client,
+    /// whose bootstrap is not measured) is counted where the jar's code first uses it
+    /// ([`Self::class_load_fails`]).
+    pub(crate) fn game_fails_before_mods(&self) -> Option<(&str, &FailedTarget)> {
+        if self.mixin_index.side != Some(MixinSide::Server) {
+            return None;
+        }
         self.mixin_index
             .failed_required_targets
             .iter()
-            .find(|(target, _)| !self.has_class(target))
-            .map(|(target, reason)| (target.as_str(), reason.as_str()))
+            .find(|(target, failure)| {
+                failure.certain
+                    && !self.has_class(target)
+                    && crate::runtime::mixin_class_loading::server_loads_before_mods(target)
+            })
+            .map(|(target, failure)| (target.as_str(), failure))
     }
 
-    /// Refuse an entry into the jar's code when a `required` config's rejected mixin
-    /// targets a game class ([`Self::required_game_mixin_failure`]).
+    /// Refuse an entry into the jar's code when the game does not start
+    /// ([`Self::game_fails_before_mods`]).
     #[inline(never)]
     pub(crate) fn refuse_failed_game_mixin_target(&self) -> Result<(), NativeError> {
-        match self.required_game_mixin_failure() {
-            Some((target, reason)) => Err(NativeError::Metadata(format!(
-                "jar code refused: {reason}; Mixin rethrows for a required config and Fabric's Knot fails the game's own load of {target} (\"Mixin transformation of {} failed\"), which the game does not run past",
-                target.replace('/', ".")
-            ))),
+        match self.game_fails_before_mods() {
+            Some((target, failure)) => {
+                let binary = target.replace('/', ".");
+                Err(NativeError::Metadata(format!(
+                    "the game does not start: {}; Mixin rethrows for a required config and Fabric's Knot fails the game's own load of {binary} (\"Mixin transformation of {binary} failed\"), which a 26.3 dedicated server makes before any mod initializer runs",
+                    failure.reason
+                )))
+            }
             None => Ok(()),
         }
     }
