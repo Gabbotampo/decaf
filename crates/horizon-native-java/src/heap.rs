@@ -2255,6 +2255,7 @@ mod tests {
                         player: Value::Ref(None),
                     }),
                     seq: i as u64,
+                    live: crate::menu_models::LiveState::default(),
                 }),
             );
         }
