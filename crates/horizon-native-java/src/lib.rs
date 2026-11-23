@@ -28577,6 +28577,10 @@ impl<H: Host> Runtime<'_, H> {
         if let Some(value) = self.count_failed_game_receiver(r, receiver)? {
             return Ok(Some((value, false)));
         }
+        // A mixin constructor's own `super()` on a game object (`interface_mixins.rs`).
+        if self.is_unmerged_mixin_super_init(op, r, receiver, class) {
+            return Ok(Some((Value::Void, false)));
+        }
         if let Some(value) = self.invoke_game_helpers(r, receiver, args, class, method)? {
             return Ok(Some((value, false)));
         }

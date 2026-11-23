@@ -1806,6 +1806,24 @@ impl<H: Host> Runtime<'_, H> {
             .collect()
     }
 
+    /// Whether `r`, run by `invokespecial` in a frame of `frame_class` on a game object, is a
+    /// `@Mixin` class's constructor delegating to its superclass (`super()`): Mixin merges
+    /// only the instructions after that call into the target's constructors
+    /// (`Constructor.getRange` starts the initialiser after the delegating `<init>`), so on
+    /// the target it is no call at all.
+    pub(crate) fn is_unmerged_mixin_super_init(
+        &self,
+        op: u8,
+        r: &MethodRef,
+        receiver: Option<&Value>,
+        frame_class: &str,
+    ) -> bool {
+        op == 0xb7
+            && r.name == "<init>"
+            && receiver.and_then(crate::runtime::game_object::handle_key).is_some()
+            && self.runtime_mixin_index().meta.contains_key(frame_class)
+    }
+
     /// Run a mixin's no-argument `<init>()V` field initialiser once per `(mixin, handle_key)`
     /// pair before its first method invocation or field access on that game handle.
     pub(crate) fn ensure_game_mixin_initialized(
