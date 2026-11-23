@@ -329,7 +329,7 @@ const JAVA_OBJECT_METHODS: &[(&str, &str)] = &[
     ("wait", "(JI)V"),
 ];
 
-const VANILLA_HOST_METHODS_TSV: &str = include_str!("vanilla_host_methods.tsv");
+const VANILLA_HOST_METHODS_TSV: &str = crate::runtime::vendored_vanilla_host_methods_tsv::VENDORED_DATA;
 
 #[derive(Default)]
 struct VanillaTypeInfo {

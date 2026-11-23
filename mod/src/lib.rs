@@ -64,11 +64,13 @@
 //!
 //! At `register_commands` the recorded Fabric `CommandRegistrationCallback` (and NeoForge
 //! `RegisterCommandsEvent`) listeners build their Brigadier tree on the runtime's façade, and this
-//! mod translates the literals and the string/integer argument nodes into [`Command`] usages.
-//! `run_mod_command` maps the game's typed invocation back onto the runtime's parsed command, runs
-//! the Java `Command.run` callback with a `CommandSourceStack` façade, and sends what it replied
-//! through `Commands::feedback` (or to the player it named). A node whose argument type, redirect or
-//! requirement this bridge cannot carry is refused by name and left out, never guessed.
+//! mod translates the literals and the string/integer argument nodes into [`Command`] usages, each
+//! bound to its own executor (`Command::executes`). The executor maps the game's typed invocation
+//! back onto the runtime's parsed command, runs the Java `Command.run` callback with a
+//! `CommandSourceStack` façade, sends what it replied through `Commands::feedback` (or to the
+//! player it named), and answers the command's result: `Command.run`'s `int`, or a failure with
+//! the text vanilla sends. A node whose argument type, redirect or requirement this bridge cannot
+//! carry is refused by name and left out, never guessed.
 //!
 //! Jars are run one at a time, so a jar cannot link against its neighbours yet: cross-jar classes
 //! are a later milestone ([docs/mod-plan.md](../../docs/mod-plan.md)).
@@ -82,17 +84,17 @@ use game_hooks::Arg;
 use mod_api::{
     AttackEntityEvent, Authority, BlockState, BlocksEvent, BreakBlockEvent, ClientHost,
     ClientLevelLoadEvent, ClientLevelUnloadEvent, ClientPlayerCloneEvent,
-    ClientPlayerLoggingOutEvent, ClientSetupEvent, ClientStoppingEvent, Command,
-    CommandArgumentValue, CommandSource, ConfigFileError, ConfigPath, DamageContainer,
-    DimensionKey, EntityInteractEvent, EntityJoinLevelEvent, EntityLeaveLevelEvent, EntityRef,
-    Flow, GameRuleChangedEvent, Hand, HitHost, Hooks, Host, HostSide, HurtSource,
-    InteractionResult, ItemsEvent, LeftClickBlockEvent, LevelDimension, LevelLoadEvent, LevelRef,
-    LevelSide, LevelTickPostEvent, LevelTickPreEvent, LevelUnloadEvent, LivingDamagePostEvent,
-    LivingDeathEvent, LivingDeathPostEvent, LivingIncomingDamageEvent, PlayerChangedDimensionEvent,
-    PlayerCloneEvent, PlayerDestroyedBlockEvent, PlayerDiedEvent, PlayerLoggedInEvent,
-    PlayerLoggedOutEvent, PlayerRef, PlayerRespawnedEvent, PlayerTickPostEvent, PlayerTickPreEvent,
-    RegisterCommandsEvent, Registrar, RegistrationContext, RightClickBlockEvent,
-    RightClickItemEvent, RunModCommandEvent, ServerAboutToStartEvent, ServerHost,
+    ClientPlayerLoggingOutEvent, ClientSetupContext, ClientSetupEvent, ClientStoppingEvent,
+    Command, CommandArgumentValue, CommandInvocation, CommandSource, ConfigFileError, ConfigPath,
+    DamageContainerView, DimensionKey, EntityInteractEvent, EntityJoinLevelEvent,
+    EntityLeaveLevelEvent, EntityRef, Flow, GameRuleChangedEvent, Hand, HitHost, Hooks, Host,
+    HostSide, HurtSource, InteractionResult, ItemsEvent, LeftClickBlockEvent, LevelDimension,
+    LevelLoadEvent, LevelRef, LevelSide, LevelTickPostEvent, LevelTickPreEvent, LevelUnloadEvent,
+    LivingDamagePostEvent, LivingDeathEvent, LivingDeathPostEvent, LivingIncomingDamageEvent,
+    PlayerChangedDimensionEvent, PlayerCloneEvent, PlayerDestroyedBlockEvent, PlayerDiedEvent,
+    PlayerLoggedInEvent, PlayerLoggedOutEvent, PlayerRef, PlayerRespawnedEvent,
+    PlayerTickPostEvent, PlayerTickPreEvent, RegisterCommandsEvent, Registrar, RegistrationContext,
+    RightClickBlockEvent, RightClickItemEvent, ServerAboutToStartEvent, ServerHost,
     ServerStartedEvent, ServerStartingEvent, ServerStoppedEvent, ServerStoppingEvent,
     ServerTickEvent, ServerTickPhase, StateForPlacementEvent, Text,
 };
@@ -156,7 +158,7 @@ fn answer_state_for_placement_snapshot(
             host.state_block(current_state)?.to_owned()
         }
     };
-    // Sunrise's pinned `StateForPlacementEvent`/`PlacementContext` (a2dac1ee75) does not yet carry
+    // Sunrise's pinned `StateForPlacementEvent`/`PlacementContext` (d404b5f02f) does not yet carry
     // whether a player or dispenser/non-player placed the block. Until the SDK exposes the placer,
     // pass `Placer::Unknown` so any player- or rotation-dependent accessor is counted as unknown
     // rather than guessed.
@@ -296,7 +298,7 @@ pub struct HorizonJava {
     client: Mutex<client::State>,
     /// Serializes state access with top-level Java dispatches while allowing same-thread access
     /// through the thread-local frame owned by `game_dispatch`.
-    pub(crate) dispatch_gate: Mutex<()>,
+    pub(crate) dispatch_gate: Arc<Mutex<()>>,
     pub(crate) plan_bits: game_dispatch::PlanBits,
 }
 
@@ -434,7 +436,7 @@ impl<'a> HostSelection<'a> {
 
 impl Selection for HostSelection<'_> {
     fn name(&mut self, player: PlayerRef) -> Option<String> {
-        player.name(&*self.host)
+        player.name(&*self.host).map(str::to_owned)
     }
     fn player_of(&mut self, entity: EntityRef) -> Option<PlayerRef> {
         self.online
@@ -779,6 +781,12 @@ impl Hooks for HorizonJava {
 
     /// One jar changed its commands (`Commands::refresh_commands`): the Java registrations cannot
     /// change at runtime, so the same set is offered again.
+    ///
+    /// Each translated usage is registered with its own executor (`Command::executes`), which
+    /// runs that usage's Java `Command.run` ([`run_java_command`]). The game asks for the whole
+    /// set on every call, so the executors are built afresh each time; jars register in load
+    /// order, and an overlapping later usage replaces an earlier one's executor, as Brigadier's
+    /// `CommandNode.addChild` does when a later mod registers the same node.
     fn register_commands(&self, _host: &mut dyn ServerHost, event: &mut RegisterCommandsEvent<'_>) {
         let mut state = self.lock();
         let facade = state.facade();
@@ -821,154 +829,20 @@ impl Hooks for HorizonJava {
                 loaded.native_commands = native;
                 loaded.commands = commands;
             }
-            event
-                .commands
-                .extend(loaded.native_commands.iter().cloned());
+            // `translate_commands` pushes a usage and its Java command together, so the two lists
+            // pair up one to one.
+            for (native, command) in loaded.native_commands.iter().zip(&loaded.commands) {
+                let shared = game_dispatch::StateHandle::new(self);
+                let jar = Arc::clone(&loaded.jar);
+                let command = command.clone();
+                event
+                    .commands
+                    .push(native.clone().executes(move |host, source, invocation| {
+                        let mut state = shared.lock();
+                        run_java_command(&mut state, &jar, &command, host, source, invocation)
+                    }));
+            }
         }
-    }
-
-    /// A player (or the console) ran a command this mod registered. The typed invocation is
-    /// mapped back onto the runtime's parsed command, the Java callback runs, and what it replied
-    /// goes back through the command source's own feedback.
-    fn run_mod_command(
-        &self,
-        host: &mut dyn ServerHost,
-        event: &mut RunModCommandEvent<'_>,
-    ) -> Flow {
-        let mut state = self.lock();
-        let facade = state.facade();
-        // Every jar's host learns the level sound streams any jar found unknown (`sound.rs`).
-        sound::sync_unknown_sound_streams(&mut state.jars, |jar| &mut jar.host);
-        for loaded in &mut state.jars {
-            // One Java literal path can have several executable usages: the bare command and
-            // each deeper argument node. The invocation carries the arguments it parsed, so the
-            // usage that declares exactly those (the deepest one) is the one the Java callback
-            // belongs to.
-            let Some(command) = loaded
-                .commands
-                .iter()
-                .filter(|command| command.literals == event.command.literals)
-                .filter(|command| {
-                    command
-                        .arguments
-                        .iter()
-                        .all(|(name, _)| event.command.argument(name).is_some())
-                })
-                .max_by_key(|command| command.arguments.len())
-                .cloned()
-            else {
-                continue;
-            };
-            let mut arguments = Vec::new();
-            let mut words = command.literals.clone();
-            for (name, kind) in &command.arguments {
-                match event.command.argument(name) {
-                    Some(value) => {
-                        let Some((argument, word)) =
-                            kind.runtime_value(value, &mut HostSelection::new(&mut *host))
-                        else {
-                            return refuse(
-                                host,
-                                &command.usage,
-                                format!("argument '{name}' is not the kind this bridge carries"),
-                            );
-                        };
-                        arguments.push((name.clone(), argument));
-                        words.push(word);
-                    }
-                    None => {
-                        return refuse(
-                            host,
-                            &command.usage,
-                            format!("argument '{name}' is missing"),
-                        );
-                    }
-                }
-            }
-            let source = runtime_source(event.source, host);
-            let source_player = match event.source {
-                CommandSource::Player { player, .. } => Some(player.uuid()),
-                _ => None,
-            };
-            let invocation = RuntimeInvocation {
-                input: words.join(" "),
-                source,
-                arguments,
-            };
-            if let Some(uuid) = source_player {
-                sound::seed_player_sound_facts(host, &facade, uuid, &mut loaded.host);
-            }
-            // The streams as they stood before the command ran: its sounds are delivered in call
-            // order against these, so one the runtime counted later does not void earlier ones.
-            let mut sound_streams = loaded.host.unknown_sound_streams().clone();
-            loaded.host.set_host_deferred_server_sound_seeds(true);
-            let opened = attachments::open(
-                host,
-                &loaded.row.id,
-                &loaded.jar,
-                &mut loaded.host,
-                Lifecycle::None,
-            );
-            let before = loaded.host.unknown_host_call_count();
-            let outcome = caught(
-                &format!("{} command /{}", loaded.row.id, command.usage),
-                || {
-                    loaded.jar.run_command(
-                        &command.run,
-                        &invocation,
-                        Arc::new(facade.clone()),
-                        &mut loaded.host,
-                        &ExecutionBudget::within(JAR_BUDGET),
-                    )
-                },
-            );
-            loaded.host.set_host_deferred_server_sound_seeds(false);
-            loaded.host.clear_entity_sound_facts();
-            let played_sounds = loaded.host.take_played_sounds();
-            sound::apply_server_sounds(host, &played_sounds, &mut sound_streams, |reason| {
-                loaded.host.note_unknown_game_hook(reason);
-            });
-            // A refused sound's stream: the next site's sync hands it to every other jar.
-            sound::share_unknown_sound_streams([&mut loaded.host], &sound_streams);
-            let unknown = loaded.host.unknown_host_call_count().saturating_sub(before);
-            loaded.row.command_unknown_host_calls += unknown;
-            attachments::close(
-                host,
-                &loaded.row.id,
-                &loaded.jar,
-                &mut loaded.host,
-                opened,
-                Lifecycle::None,
-            );
-            let run = match outcome {
-                Ok(run) => run,
-                Err(panic) => {
-                    // The command ran as far as the panic: a failed command, not a crashed game.
-                    loaded.row.commands_refused += 1;
-                    let usage = command.usage.clone();
-                    log_stdout(&loaded.row.id, &mut loaded.host);
-                    return refuse(host, &usage, format!("the Java command panicked: {panic}"));
-                }
-            };
-            match &run.outcome {
-                CommandOutcome::Refused(_) => loaded.row.commands_refused += 1,
-                _ => loaded.row.commands_ran += 1,
-            }
-            log_stdout(&loaded.row.id, &mut loaded.host);
-            deliver(
-                host,
-                &loaded.row.id,
-                &command.usage,
-                run.outcome.clone(),
-                &run.messages,
-            );
-            return Flow::Cancel;
-        }
-        log::warn!(
-            "{LOG}: /{} was not registered by a Java jar",
-            event.command.literals.join(" ")
-        );
-        Flow::Continue
     }
 
     /// The authoritative server tick's start and end (Fabric's `ServerTickEvents.START_SERVER_TICK`
@@ -1248,12 +1122,10 @@ impl Hooks for HorizonJava {
     }
 
     /// A player respawned (Fabric's `ServerPlayerEvents.AFTER_RESPAWN`, NeoForge's
-    /// `PlayerRespawnEvent`).
+    /// `PlayerRespawnEvent`): after a death or, since hook version 2 (d404b5f02f), after the End
+    /// credits too, as `PlayerList.respawn` does both.
     fn player_respawned(&self, host: &mut dyn ServerHost, event: &mut PlayerRespawnedEvent<'_>) {
-        let context = EventContext {
-            player: Some(event.player),
-            ..EventContext::default()
-        };
+        let context = player_respawn_context(event.player, event.end_conquered);
         self.fire_bridged(
             Some(&mut *host),
             Lifecycle::Resynced(event.player),
@@ -1288,21 +1160,25 @@ impl Hooks for HorizonJava {
     fn player_clone(&self, host: &mut dyn ServerHost, event: &mut PlayerCloneEvent<'_>) {
         // `PlayerList.respawn` built a new `ServerPlayer` with the old id: its life.
         self.next_life(event.player, false);
-        let original = event.original;
+        // The old player is lent for this hook (`getOriginal()`); its reads need no host.
+        let original = &mut event.original;
         // The old and the new `ServerPlayer` share one game profile, so one UUID and name.
         let lent = FacadeOriginal {
-            uuid: original.uuid(&*host).unwrap_or(event.player),
+            uuid: original.uuid(),
             name: Some(event.name.to_owned()),
+            // The source level: the replacement already carries its destination.
             level: original
-                .level(&*host)
+                .level()
                 .map(|level| level.dimension_id().to_owned()),
-            position: original.position(&*host),
-            health: original.health(&*host),
+            position: Some(original.position()),
+            health: Some(original.health()),
         };
         let context = player_clone_context(event.player, event.was_death, lent);
+        // Each jar's attachment batch reads its own types from the old player's store as it opens.
+        let original = std::cell::RefCell::new(original);
         self.fire_bridged(
             Some(&mut *host),
-            Lifecycle::Cloned(event.player, event.was_death, original),
+            Lifecycle::Cloned(event.player, event.was_death, &original),
             GameEvent::PlayerCopy,
             self.dedicated(),
             context,
@@ -1798,8 +1674,8 @@ impl Hooks for HorizonJava {
     /// initial client load and before the title screen's first frame. A dedicated server never
     /// fires it. The client owner runs its resident jars here before the native setup notification
     /// returns; this owner hook does not claim to dispatch a second Java setup event.
-    fn client_setup(&self, host: &mut dyn ClientHost, _event: &mut ClientSetupEvent) {
-        self.on_client_setup_with_version(Some(host.game_version()), Some(&*host));
+    fn client_setup(&self, context: &mut dyn ClientSetupContext, _event: &mut ClientSetupEvent) {
+        self.on_client_setup_with_version(Some(context.game_version()), Some(&*context));
     }
 
     /// Sunrise's client level load carries the newly-created level's borrowed dimension and fires
@@ -1893,7 +1769,7 @@ impl HorizonJava {
     fn on_client_setup_with_version(
         &self,
         game_version: Option<&str>,
-        host: Option<&dyn ClientHost>,
+        host: Option<&dyn ClientSetupContext>,
     ) {
         let mut client = self.lock_client();
         client.ensure_loaded_with_version(game_version);
@@ -2026,7 +1902,7 @@ impl HorizonJava {
     fn fire_bridged(
         &self,
         server: Option<&mut dyn ServerHost>,
-        lifecycle: Lifecycle,
+        lifecycle: Lifecycle<'_>,
         event: GameEvent,
         dedicated: bool,
         context: EventContext,
@@ -2043,7 +1919,7 @@ impl HorizonJava {
         mut server: Option<&'a mut dyn ServerHost>,
         sound_server: Option<&'a mut dyn ServerHost>,
         hit_host: Option<&mut dyn HitHost>,
-        lifecycle: Lifecycle,
+        lifecycle: Lifecycle<'_>,
         event: GameEvent,
         dedicated: bool,
         mut context: EventContext,
@@ -2225,7 +2101,7 @@ impl HorizonJava {
             .into_iter()
             .map(|player| FacadePlayer {
                 uuid: player.uuid(),
-                name: player.name(host).unwrap_or_default(),
+                name: player.name(host).unwrap_or_default().to_owned(),
                 level: player
                     .entity()
                     .level(host)
@@ -2473,6 +2349,19 @@ fn copy_from_alive(was_death: bool) -> bool {
     !was_death
 }
 
+/// The `AFTER_RESPAWN` firing context for one respawn. Fabric's `PlayerListMixin.afterRespawn`
+/// injects into `PlayerList.respawn(ServerPlayer, boolean keepAllPlayerData, RemovalReason)` and
+/// passes `keepAllPlayerData` (`iload_2`) as `alive`: true for the respawn after the End credits
+/// (the hook's `end_conquered`), false after a death. Before hook version 2 the game fired this
+/// only for deaths, so the flag was always false.
+fn player_respawn_context(player: u128, end_conquered: bool) -> EventContext {
+    EventContext {
+        player: Some(player),
+        flag: end_conquered,
+        ..EventContext::default()
+    }
+}
+
 /// The `COPY_FROM`/`AFTER_RESPAWN` firing context for one player clone.
 fn player_clone_context(player: u128, was_death: bool, original: FacadeOriginal) -> EventContext {
     EventContext {
@@ -2502,7 +2391,7 @@ fn living_damage_context(
     entity: i32,
     kind: &str,
     source: &HurtSource<'_>,
-    container: &DamageContainer,
+    container: DamageContainerView<'_>,
 ) -> EventContext {
     let (base, taken, blocked) = after_damage_arguments(
         container.original(),
@@ -2694,25 +2583,163 @@ fn log_stdout(id: &str, host: &mut StdHost) {
     }
 }
 
-/// Answers a command the bridge could not map with the jar's own failure text.
-fn refuse(host: &mut dyn ServerHost, usage: &str, reason: String) -> Flow {
+/// A player (or the console) ran one of this mod's Java command usages: the game's dispatcher
+/// reached the executor [`HorizonJava::register_commands`] bound to `command`. The typed
+/// invocation is mapped onto the runtime's parsed command, the Java callback runs, what it
+/// replied goes back through the command source's own feedback, and its outcome is the
+/// command's result: `Command.run`'s `int`, or a failure with the text vanilla would send.
+fn run_java_command(
+    state: &mut State,
+    jar: &Arc<NativeJar>,
+    command: &JavaCommand,
+    host: &mut dyn ServerHost,
+    source: &CommandSource,
+    invocation: &CommandInvocation,
+) -> Result<i32, Box<Text>> {
+    let facade = state.facade();
+    // Every jar's host learns the level sound streams any jar found unknown (`sound.rs`).
+    sound::sync_unknown_sound_streams(&mut state.jars, |jar| &mut jar.host);
+    let Some(loaded) = state
+        .jars
+        .iter_mut()
+        .find(|loaded| Arc::ptr_eq(&loaded.jar, jar))
+    else {
+        return Err(refuse(
+            &command.usage,
+            "its jar is no longer loaded".to_owned(),
+        ));
+    };
+    let mut arguments = Vec::new();
+    let mut words = command.literals.clone();
+    for (name, kind) in &command.arguments {
+        match invocation.argument(name) {
+            Some(value) => {
+                let Some((argument, word)) =
+                    kind.runtime_value(value, &mut HostSelection::new(&mut *host))
+                else {
+                    return Err(refuse(
+                        &command.usage,
+                        format!("argument '{name}' is not the kind this bridge carries"),
+                    ));
+                };
+                arguments.push((name.clone(), argument));
+                words.push(word);
+            }
+            None => {
+                return Err(refuse(
+                    &command.usage,
+                    format!("argument '{name}' is missing"),
+                ));
+            }
+        }
+    }
+    let runtime_source = runtime_source(source, host);
+    let source_player = match source {
+        CommandSource::Player { player, .. } => Some(player.uuid()),
+        _ => None,
+    };
+    let runtime_invocation = RuntimeInvocation {
+        input: words.join(" "),
+        source: runtime_source,
+        arguments,
+    };
+    if let Some(uuid) = source_player {
+        sound::seed_player_sound_facts(host, &facade, uuid, &mut loaded.host);
+    }
+    // The streams as they stood before the command ran: its sounds are delivered in call
+    // order against these, so one the runtime counted later does not void earlier ones.
+    let mut sound_streams = loaded.host.unknown_sound_streams().clone();
+    loaded.host.set_host_deferred_server_sound_seeds(true);
+    let opened = attachments::open(
+        host,
+        &loaded.row.id,
+        &loaded.jar,
+        &mut loaded.host,
+        Lifecycle::None,
+    );
+    let before = loaded.host.unknown_host_call_count();
+    let outcome = caught(
+        &format!("{} command /{}", loaded.row.id, command.usage),
+        || {
+            loaded.jar.run_command(
+                &command.run,
+                &runtime_invocation,
+                Arc::new(facade.clone()),
+                &mut loaded.host,
+                &ExecutionBudget::within(JAR_BUDGET),
+            )
+        },
+    );
+    loaded.host.set_host_deferred_server_sound_seeds(false);
+    loaded.host.clear_entity_sound_facts();
+    let played_sounds = loaded.host.take_played_sounds();
+    sound::apply_server_sounds(host, &played_sounds, &mut sound_streams, |reason| {
+        loaded.host.note_unknown_game_hook(reason);
+    });
+    // A refused sound's stream: the next site's sync hands it to every other jar.
+    sound::share_unknown_sound_streams([&mut loaded.host], &sound_streams);
+    let unknown = loaded.host.unknown_host_call_count().saturating_sub(before);
+    loaded.row.command_unknown_host_calls += unknown;
+    attachments::close(
+        host,
+        &loaded.row.id,
+        &loaded.jar,
+        &mut loaded.host,
+        opened,
+        Lifecycle::None,
+    );
+    let run = match outcome {
+        Ok(run) => run,
+        Err(panic) => {
+            // The command ran as far as the panic: a failed command, not a crashed game.
+            loaded.row.commands_refused += 1;
+            log_stdout(&loaded.row.id, &mut loaded.host);
+            return Err(refuse(
+                &command.usage,
+                format!("the Java command panicked: {panic}"),
+            ));
+        }
+    };
+    match &run.outcome {
+        CommandOutcome::Refused(_) => loaded.row.commands_refused += 1,
+        _ => loaded.row.commands_ran += 1,
+    }
+    log_stdout(&loaded.row.id, &mut loaded.host);
+    deliver(
+        host,
+        &loaded.row.id,
+        &command.usage,
+        run.outcome.clone(),
+        &run.messages,
+    )
+}
+
+/// A command the bridge could not map or run: logged, and the failure text the executor
+/// returns, which the game sends to the source as vanilla's `sendFailure` does.
+fn refuse(usage: &str, reason: String) -> Box<Text> {
     log::warn!("{LOG}: /{usage} not run: {reason}");
-    let _ = host.commands().feedback(Text::literal(format!(
+    Box::new(Text::literal(format!(
         "java command /{usage} could not run: {reason}"
-    )));
-    Flow::Cancel
+    )))
 }
 
 /// Puts a finished Java command's replies where a mod command's feedback goes: the originating
 /// source for `sendSuccess`/`sendFailure`/`sendSystemMessage`, a named player for a direct
-/// `ServerPlayer.sendSystemMessage`.
+/// `ServerPlayer.sendSystemMessage`. Answers the command's result for the executor:
+///
+/// * `Command.run` returned: that `int`, as vanilla's executor result;
+/// * a `CommandSyntaxException`: a failure with its message, which the game sends as vanilla's
+///   `CommandSourceStack.handleError` does (`sendFailure`, red, regardless of
+///   `sendCommandFeedback`), and which `execute store` records as a failure;
+/// * refused by the runtime (a call it does not model): a failure with `command.failed`, the
+///   text vanilla sends for an exception it did not expect, never a made-up result.
 fn deliver(
     host: &mut dyn ServerHost,
     id: &str,
     usage: &str,
     outcome: CommandOutcome,
     messages: &[CommandMessage],
-) {
+) -> Result<i32, Box<Text>> {
     for message in messages {
         let text = mod_text(&message.text);
         if let MessageKind::Player(uuid) = message.kind
@@ -2724,19 +2751,20 @@ fn deliver(
         let _ = host.commands().feedback(text);
     }
     match outcome {
-        CommandOutcome::Returned(result) => log::info!(
-            "{LOG}: {id}: /{usage} ran (returned {result}, {} message(s))",
-            messages.len()
-        ),
+        CommandOutcome::Returned(result) => {
+            log::info!(
+                "{LOG}: {id}: /{usage} ran (returned {result}, {} message(s))",
+                messages.len()
+            );
+            Ok(result)
+        }
         CommandOutcome::Syntax(text) => {
-            let _ = host.commands().feedback(mod_text(&text));
             log::warn!("{LOG}: {id}: /{usage} had a syntax error");
+            Err(Box::new(mod_text(&text)))
         }
         CommandOutcome::Refused(reason) => {
             log::warn!("{LOG}: {id}: /{usage} refused: {reason}");
-            let _ = host
-                .commands()
-                .feedback(Text::translate("command.failed", Vec::new()));
+            Err(Box::new(Text::translate("command.failed", Vec::new())))
         }
     }
 }
@@ -2792,7 +2820,7 @@ fn runtime_source(source: &CommandSource, host: &dyn ServerHost) -> RuntimeSourc
     };
     match source {
         CommandSource::Player { player, .. } => RuntimeSource {
-            name: player.name(host).unwrap_or_else(|| "Player".to_owned()),
+            name: player.name(host).unwrap_or("Player").to_owned(),
             level,
             player: Some(player.uuid()),
             dimension: player
@@ -4338,6 +4366,20 @@ mod tests {
         assert_eq!(context.level, None);
     }
 
+    /// `AFTER_RESPAWN`'s `alive` is `PlayerList.respawn`'s `keepAllPlayerData`
+    /// (`PlayerListMixin.afterRespawn`, `iload_2`): false after a death, true after the End
+    /// credits, which `player_respawned` now fires for as well (`end_conquered`).
+    #[test]
+    fn after_respawn_alive_is_end_conquered() {
+        let death = player_respawn_context(7, false);
+        assert_eq!(death.player, Some(7));
+        assert!(!death.flag, "a death respawn keeps no data");
+        assert!(
+            player_respawn_context(7, true).flag,
+            "the respawn after the End credits keeps all data"
+        );
+    }
+
     /// `PlayerList.respawn` passes `keepAllPlayerData = false` for a death respawn and `true`
     /// for the End return after the credits; Fabric's `COPY_FROM` forwards that flag as
     /// `alive` (`ServerPlayerMixin.onCopyFrom`, `iload_2`).
@@ -4374,10 +4416,42 @@ mod tests {
             direct: 3,
             position: None,
         };
-        // A fresh snapshot has an original and nothing else set, so the context takes the base
-        // from it and the dealt amount is the (unset here) inflicted value, not a copy.
-        let container = DamageContainer::new(10.0);
-        let context = living_damage_context(7, "minecraft:cow", &source, &container);
+        // A fresh hit has an original and nothing else set, so the context takes the base from
+        // it and the dealt amount is the (unset here) inflicted value, not a copy. The values are
+        // the old `DamageContainer::new(10.0)` snapshot's; the game now lends a live view.
+        struct FreshHit(f32);
+        impl mod_api::__private::DamageContainerRead for FreshHit {
+            fn original(&self) -> f32 {
+                self.0
+            }
+            fn new_damage(&self) -> f32 {
+                self.0
+            }
+            fn blocked(&self) -> f32 {
+                0.0
+            }
+            fn shield_damage(&self) -> f32 {
+                0.0
+            }
+            fn post_attack_invulnerability_ticks(&self) -> i32 {
+                20
+            }
+            fn should_cause_side_effects(&self) -> bool {
+                false
+            }
+            fn inflicted(&self) -> f32 {
+                0.0
+            }
+            fn health_damage(&self) -> f32 {
+                0.0
+            }
+            fn reduction(&self, _: mod_api::Reduction) -> f32 {
+                0.0
+            }
+        }
+        let hit = FreshHit(10.0);
+        let container = DamageContainerView::new(&hit);
+        let context = living_damage_context(7, "minecraft:cow", &source, container);
         assert_eq!(context.base_amount, Some(10.0));
         assert_eq!(context.amount, 0.0);
         assert!(!context.flag);
@@ -4698,10 +4772,10 @@ mod tests {
             let mut by_state = std::collections::HashMap::new();
             let mut by_id = BTreeMap::new();
             for &(id, key) in entries {
-                let state = BlockState::from(mod_api::BlockStateRecord::new(
+                let state = mod_api::__private::block_state_from_ordinal(
                     mod_api::__private::parts_installation::block_key(key),
                     0,
-                ));
+                );
                 by_state.insert(state, id.to_owned());
                 by_id.insert(id.to_owned(), state);
             }

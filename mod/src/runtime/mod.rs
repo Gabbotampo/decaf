@@ -59115,3 +59115,33 @@ mandatory = true
         );
     }
 }
+
+// Data files the runtime embeds, as the Rust source a Sunrise package carries (tools/vendor.py).
+#[path = "fabric_server_bootstrap_classes_26_3.txt.rs"]
+mod vendored_fabric_server_bootstrap_classes_26_3_txt;
+#[path = "game_rules_oracle.tsv.rs"]
+mod vendored_game_rules_oracle_tsv;
+#[path = "generated_nested_real_java25.txt.rs"]
+mod vendored_generated_nested_real_java25_txt;
+#[path = "jarjar_version_java25.txt.rs"]
+mod vendored_jarjar_version_java25_txt;
+#[path = "jdk_text_oracle.json.rs"]
+mod vendored_jdk_text_oracle_json;
+#[path = "menu_models_oracle.txt.rs"]
+mod vendored_menu_models_oracle_txt;
+#[path = "nested_jars_cases.txt.rs"]
+mod vendored_nested_jars_cases_txt;
+#[path = "nested_jars_java25.txt.rs"]
+mod vendored_nested_jars_java25_txt;
+#[path = "nested_jars_predicate_java25.txt.rs"]
+mod vendored_nested_jars_predicate_java25_txt;
+#[path = "review579_nested_real_java25.txt.rs"]
+mod vendored_review579_nested_real_java25_txt;
+#[path = "vanilla_block_items_java25.tsv.rs"]
+mod vendored_vanilla_block_items_java25_tsv;
+#[path = "vanilla_entity_data_subclass.txt.rs"]
+mod vendored_vanilla_entity_data_subclass_txt;
+#[path = "vanilla_host_methods.tsv.rs"]
+mod vendored_vanilla_host_methods_tsv;
+#[path = "vanilla_item_ids_java25.txt.rs"]
+mod vendored_vanilla_item_ids_java25_txt;

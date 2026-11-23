@@ -21,8 +21,8 @@ use std::collections::BTreeSet;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use mod_api::{
-    ClientHost, EntityRef, HitHost, LevelWriteHost, ServerHost, SoundPlay,
-    SoundSource as ApiSoundSource,
+    ClientHost, ClientSetupContext, EntityRef, HitHost, LevelWriteHost, ServerHost, SoundPlay,
+    SoundRef, SoundSource as ApiSoundSource,
 };
 
 use crate::runtime::events::{EventContext, EventFacade};
@@ -516,8 +516,27 @@ pub(crate) fn apply_hit_sounds(
     });
 }
 
-/// Deliver recorded client sounds to a Sunrise [`ClientHost`] via
-/// `ClientHost::play_local_sound`. See [`deliver_in_order`] for `unknown`.
+/// Whatever plays a recorded client sound with vanilla's `SoundEngine.playDelayed`: the world
+/// client host (`EffectsClientHost::play_local_sound`), or the setup context `client_setup`
+/// lends since d404b5f02f (`ClientSetupContext::play_local_sound`), which has no world.
+pub(crate) trait LocalSounds {
+    fn play_local_sound(&self, sound: &SoundPlay, after: u32) -> Option<SoundRef>;
+}
+
+impl LocalSounds for dyn ClientHost + '_ {
+    fn play_local_sound(&self, sound: &SoundPlay, after: u32) -> Option<SoundRef> {
+        mod_api::prelude::EffectsClientHost::play_local_sound(self, sound, after)
+    }
+}
+
+impl LocalSounds for dyn ClientSetupContext + '_ {
+    fn play_local_sound(&self, sound: &SoundPlay, after: u32) -> Option<SoundRef> {
+        ClientSetupContext::play_local_sound(self, sound, after)
+    }
+}
+
+/// Deliver recorded client sounds to a Sunrise client host ([`LocalSounds`]) via
+/// `play_local_sound`. See [`deliver_in_order`] for `unknown`.
 ///
 /// Only a [`SoundSeed::HostDeferred`] effect can play, and the client owner
 /// never turns client deferral on: `play_local_sound` draws its seed from
@@ -526,8 +545,8 @@ pub(crate) fn apply_hit_sounds(
 /// `Level.playSound`) at the call, so the seed and the stream's order would
 /// both differ. A recorded client sound (an explicit `playSeededSound` seed,
 /// say) therefore drains here and is counted, never dropped.
-pub(crate) fn apply_client_sounds(
-    host: &dyn ClientHost,
+pub(crate) fn apply_client_sounds<H: LocalSounds + ?Sized>(
+    host: &H,
     sounds: &[LevelSoundEffect],
     unknown: &mut BTreeSet<String>,
     mut on_unbridged: impl FnMut(&str),
@@ -1102,7 +1121,7 @@ mod tests {
 
         let mut refused = Vec::new();
         apply_client_sounds(
-            &host,
+            &host as &dyn ClientHost,
             &[ok, too_late, entity_bound, fixed_range, explicit_seed],
             &mut BTreeSet::new(),
             |reason| refused.push(reason.to_owned()),
@@ -1207,7 +1226,7 @@ mod tests {
         let mut client_unknown = BTreeSet::new();
         refused.clear();
         apply_client_sounds(
-            &client,
+            &client as &dyn ClientHost,
             &[level_sound.clone(), local_entity_bound, local, level_sound],
             &mut client_unknown,
             |reason| refused.push(reason.to_owned()),

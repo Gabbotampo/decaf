@@ -75,7 +75,7 @@ const LOAD: &str = "<load>";
 
 /// The game classes a real Fabric 26.3 dedicated server loads before its first `main`
 /// entrypoint, measured with `-Xlog:class+load` (`tools/trace_fabric_bootstrap_classes.py`).
-const SERVER_BOOTSTRAP_CLASSES: &str = include_str!("fabric_server_bootstrap_classes_26_3.txt");
+const SERVER_BOOTSTRAP_CLASSES: &str = crate::runtime::vendored_fabric_server_bootstrap_classes_26_3_txt::VENDORED_DATA;
 
 /// Whether a real Fabric 26.3 dedicated server loads game class `class` (internal name)
 /// before any mod's initializer runs ([`SERVER_BOOTSTRAP_CLASSES`]). Every such load goes
