@@ -207,8 +207,12 @@ pub mod level_sound;
 mod library_dispatch;
 mod linked_resources;
 mod list_equality;
+mod live_menu;
 mod map_compute;
 mod menu_models;
+pub use live_menu::{
+    ContainerInput, LiveMenuEffect, LiveMenuOutcome, MenuClick, MenuPlayerFacts, Prediction,
+};
 mod method_handles;
 mod mixin_extras;
 mod mixin_plugins;
@@ -7631,6 +7635,22 @@ impl StdHost {
                 ("is", "(Lnet/minecraft/world/level/block/Block;)Z") => {
                     if let Some(other) = args.first().and_then(jar_object::object_key) {
                         return Ok(Some(Value::Int(i32::from(other == block))));
+                    }
+                    return Ok(None);
+                }
+                // 26.3 `TypedInstance.is(T)` (the erased `is(Object)` javac picks for a
+                // `Block` argument) offsets 0-20: `typeHolder().value() == value`, where a
+                // state's `typeHolder()` is `getBlock().builtInRegistryHolder()`: the
+                // registered block itself, compared by identity.
+                ("is", "(Ljava/lang/Object;)Z") if jar_object::parse_key(&block).is_some() => {
+                    match args.first() {
+                        Some(Value::Ref(None)) => return Ok(Some(Value::Int(0))),
+                        Some(other) => {
+                            if let Some(other) = jar_object::object_key(other) {
+                                return Ok(Some(Value::Int(i32::from(other == block))));
+                            }
+                        }
+                        None => {}
                     }
                     return Ok(None);
                 }
@@ -17267,6 +17287,18 @@ fn game_enum_constants(owner: &str) -> Option<&'static [&'static str]> {
         "net/minecraft/core/Direction$Axis" => &["X", "Y", "Z"],
         "net/minecraft/core/Direction$AxisDirection" => &["POSITIVE", "NEGATIVE"],
         "net/minecraft/world/InteractionHand" => &["MAIN_HAND", "OFF_HAND"],
+        // `server-26.3.jar` `ContainerInput.<clinit>` offsets 0-97 (the click types).
+        "net/minecraft/world/inventory/ContainerInput" => &[
+            "PICKUP",
+            "QUICK_MOVE",
+            "SWAP",
+            "CLONE",
+            "THROW",
+            "QUICK_CRAFT",
+            "PICKUP_ALL",
+        ],
+        "net/minecraft/world/inventory/ClickAction" => &["PRIMARY", "SECONDARY"],
+        "net/minecraft/util/Prediction" => &["PREDICTED", "SERVER_ONLY"],
         "net/minecraft/world/InteractionResult$SwingSource" => {
             &["NONE", "PREDICTED", "SERVER_ONLY"]
         }
@@ -31213,6 +31245,9 @@ impl<H: Host> Runtime<'_, H> {
         if let Some(value) = block_use::invoke_runtime_helper(self, r, receiver, args)? {
             return Ok(Some(value));
         }
+        if let Some(value) = live_menu::invoke_helper(self, r, receiver, args)? {
+            return Ok(Some(value));
+        }
         // `BlockStateBase.getShape(BlockGetter, BlockPos[, CollisionContext])`: dispatches to the
         // block's `getShape` (MC 26.3 `BlockBehaviour$BlockStateBase.getShape`).
         if matches!(
@@ -35084,6 +35119,12 @@ impl<H: Host> Runtime<'_, H> {
             receiver,
             args,
         )? {
+            return Ok(Some(value));
+        }
+
+        // The live server menu's vanilla bodies (`live_menu.rs`): clicks, slots, containers
+        // and the player's inventory, for the menus whose state Decaf holds.
+        if let Some(value) = live_menu::invoke(self, &effective_owner, r, op, receiver, args)? {
             return Ok(Some(value));
         }
 
@@ -58659,3 +58700,31 @@ mandatory = true
         );
     }
 }
+
+// Data files the runtime embeds, as the Rust source a Sunrise package carries (tools/vendor.py).
+#[path = "game_rules_oracle.tsv.rs"]
+mod vendored_game_rules_oracle_tsv;
+#[path = "generated_nested_real_java25.txt.rs"]
+mod vendored_generated_nested_real_java25_txt;
+#[path = "jarjar_version_java25.txt.rs"]
+mod vendored_jarjar_version_java25_txt;
+#[path = "jdk_text_oracle.json.rs"]
+mod vendored_jdk_text_oracle_json;
+#[path = "live_menu_item_hooks_java25.txt.rs"]
+mod vendored_live_menu_item_hooks_java25_txt;
+#[path = "menu_models_oracle.txt.rs"]
+mod vendored_menu_models_oracle_txt;
+#[path = "nested_jars_cases.txt.rs"]
+mod vendored_nested_jars_cases_txt;
+#[path = "nested_jars_java25.txt.rs"]
+mod vendored_nested_jars_java25_txt;
+#[path = "nested_jars_predicate_java25.txt.rs"]
+mod vendored_nested_jars_predicate_java25_txt;
+#[path = "review579_nested_real_java25.txt.rs"]
+mod vendored_review579_nested_real_java25_txt;
+#[path = "vanilla_block_items_java25.tsv.rs"]
+mod vendored_vanilla_block_items_java25_tsv;
+#[path = "vanilla_entity_data_subclass.txt.rs"]
+mod vendored_vanilla_entity_data_subclass_txt;
+#[path = "vanilla_item_ids_java25.txt.rs"]
+mod vendored_vanilla_item_ids_java25_txt;

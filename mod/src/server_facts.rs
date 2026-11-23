@@ -15,9 +15,10 @@
 //!   `LevelStorageSource` lays them out under the game folder.
 //! - **Registries.** `KeysHost`'s five key lists (blocks, items, entity types,
 //!   menus, enchantments), named with `key.id(host)`, each with the order
-//!   vanilla registers it in, which decides `keySet()`'s `HashMap` order.
+//!   vanilla registers it in, which decides `keySet()`'s `HashMap` order. A
+//!   list with a key the host cannot name is incomplete and left out.
 //! - **Held items.** The use-item hook's own stack for the clicked hand, the
-//!   other hand from `LivingRef::hand_item`, and `PlayerRef::is_creative`.
+//!   other hand from `LivingRef::with_hand_item`, and `PlayerRef::is_creative`.
 //! - **Game rules.** `level.game_rules(host)` of an open level: every rule
 //!   the world has with its current value (rules are the server's, so any
 //!   level reads the same ones). Read again when a level loads and whenever
@@ -28,7 +29,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::Arc;
 
-use mod_api::{Hand, Host, ItemStack, PlayerRef, ServerHost};
+use mod_api::{Hand, Host, ItemKey, ItemStack, PlayerRef, ServerHost};
 
 use crate::runtime::events::{FacadeStack, GameRuleValue, HeldItems, ServerFacts};
 
@@ -47,34 +48,51 @@ pub(crate) fn server_facts(host: &dyn ServerHost) -> ServerFacts {
         game_rules: game_rules(host),
         ..ServerFacts::default()
     };
+    // A key the host cannot name (`id` is `None`) makes its list incomplete: the whole list is
+    // then empty, so the registry is left out below and the façade refuses it.
+    fn named(ids: impl Iterator<Item = Option<String>>) -> Vec<String> {
+        ids.collect::<Option<Vec<String>>>().unwrap_or_default()
+    }
     let lists: [(&str, Vec<String>); 5] = [
         (
             "minecraft:block",
-            host.block_keys().into_iter().map(|k| k.id(host)).collect(),
+            named(
+                host.block_keys()
+                    .into_iter()
+                    .map(|k| k.id(host).map(str::to_owned)),
+            ),
         ),
         (
             "minecraft:item",
-            host.item_keys().into_iter().map(|k| k.id(host)).collect(),
+            named(
+                host.item_keys()
+                    .into_iter()
+                    .map(|k| k.id(host).map(str::to_owned)),
+            ),
         ),
         (
             "minecraft:entity_type",
-            host.entity_type_keys()
-                .into_iter()
-                .map(|k| k.id(host))
-                .collect(),
+            named(
+                host.entity_type_keys()
+                    .into_iter()
+                    .map(|k| k.id(host).map(|id| id.to_string())),
+            ),
         ),
         (
             "minecraft:menu",
-            host.menu_keys().into_iter().map(|k| k.id(host)).collect(),
+            named(
+                host.menu_keys()
+                    .into_iter()
+                    .map(|k| k.id(host).map(|id| id.to_string())),
+            ),
         ),
         (
             "minecraft:enchantment",
-            data_pack_registration_order(
+            data_pack_registration_order(named(
                 host.enchantment_keys()
                     .into_iter()
-                    .map(|k| k.id(host))
-                    .collect(),
-            ),
+                    .map(|k| k.id(host).map(|id| id.to_string())),
+            )),
         ),
     ];
     for (registry, ids) in lists {
@@ -173,12 +191,13 @@ pub(crate) fn data_pack_registration_order(mut ids: Vec<String>) -> Vec<String> 
     ids
 }
 
-/// One mod-API stack as the façade carries it.
-fn facade_stack(host: &dyn Host, stack: &ItemStack) -> FacadeStack {
-    FacadeStack {
-        item: stack.item().id(host),
-        count: i32::try_from(stack.count()).unwrap_or(i32::MAX),
-    }
+/// One mod-API stack as the façade carries it, from its item and count. `None` when the host
+/// cannot name the item: no `FacadeStack` can stand for it.
+fn facade_stack(host: &dyn Host, item: ItemKey, count: u32) -> Option<FacadeStack> {
+    Some(FacadeStack {
+        item: item.id(host)?.to_owned(),
+        count: i32::try_from(count).unwrap_or(i32::MAX),
+    })
 }
 
 /// What `player` holds and their game mode, for a use-item or use-entity
@@ -197,11 +216,18 @@ pub(crate) fn held_items(
         Hand::Main => Hand::Off,
         _ => Hand::Main,
     };
-    // The handle was just resolved, so `None` here is an empty hand.
-    let other_stack = living
-        .hand_item(host, other)
-        .map(|stack| facade_stack(host, &stack));
-    let clicked_stack = stack.map(|stack| facade_stack(host, stack));
+    // The handle was just resolved, so `None` here is an empty hand. A stack whose item the host
+    // cannot name refuses the reads as a whole: `None` in a hand would claim it is empty.
+    let other_stack = match living.with_hand_item(host, other, |stack| {
+        facade_stack(host, stack.item(), stack.count())
+    }) {
+        None => None,
+        Some(stack) => Some(stack?),
+    };
+    let clicked_stack = match stack {
+        None => None,
+        Some(stack) => Some(facade_stack(host, stack.item(), stack.count())?),
+    };
     let (main_hand, off_hand) = match clicked {
         Hand::Main => (clicked_stack, other_stack),
         _ => (other_stack, clicked_stack),
