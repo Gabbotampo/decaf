@@ -297,6 +297,9 @@ impl StdHost {
         for entry in &self.registrations {
             value(&entry.value, out);
         }
+        // The `BlockPlaceContext` snapshots of the placements running now:
+        // each is released when its invocation ends (#635), so this roots a
+        // snapshot only while the jar can reach it through the call.
         for context in self.placement_contexts.values() {
             value(&context.clicked_face, out);
             match &context.placer {
@@ -309,7 +312,7 @@ impl StdHost {
             value(&context.item_in_hand, out);
             value(&context.level, out);
         }
-        for values in self.placement_arrays.values() {
+        for (_, values) in self.placement_arrays.values() {
             values.iter().for_each(|item| value(item, out));
         }
         self.posted_events
@@ -388,6 +391,10 @@ impl StdHost {
         self.guava_tables.root_texts(out);
         // Recipe holders, component patches, and decoded mod recipes.
         self.recipes.root_texts(out);
+        // Seeded `Level.random` handles kept per dimension (`level_sound.rs`).
+        for held in self.level_sound.level_random_handles.values() {
+            value(held, out);
+        }
     }
 
     /// The host's own state that may name a jar object without a table this
@@ -1930,6 +1937,76 @@ mod tests {
         assert_eq!(crate::entity_registration::accessor_id(&accessor), Some(8));
     }
 
+    /// A placement snapshot whose hand item is the jar object `item`.
+    fn placement_with_item(item: &str) -> crate::BlockPlaceContextData {
+        crate::BlockPlaceContextData {
+            clicked_pos: [1, 2, 3],
+            clicked_face: text("enum/net/minecraft/core/Direction/UP"),
+            click_location: [1.5, 2.5, 3.5],
+            inside: false,
+            replacing_clicked_on_block: false,
+            can_place: true,
+            placer: crate::Placer::Player {
+                player: text("demo/Player#7"),
+                yaw: 0.0,
+                pitch: 0.0,
+                secondary_use: false,
+            },
+            item_in_hand: text(item),
+            level: text("demo/Level#8"),
+        }
+    }
+
+    /// #635: a placement snapshot is a root while it is registered and
+    /// nothing once released. Its hand item, player and level (jar objects
+    /// here, so the collector may free them) survive a collection that runs
+    /// while the placement does, and the first collection after it frees
+    /// them, with the `Direction[]` hand-off it answered.
+    #[test]
+    fn a_placement_snapshot_roots_its_objects_only_until_it_is_released() {
+        let mut host = StdHost::new();
+        let mut heap = JavaHeap::default();
+        for object in ["demo/Item#6", "demo/Player#7", "demo/Level#8"] {
+            heap.fields.insert(field(object, "tag"), Value::Int(41));
+        }
+        heap.next_object = 9;
+        let context = host.new_block_place_context(placement_with_item("demo/Item#6"));
+        let array = host.store_placement_direction_array(
+            value_text(&context).unwrap(),
+            ["DOWN", "NORTH", "EAST", "SOUTH", "WEST", "UP"],
+        );
+        assert!(host.host_array_values(&array).is_some());
+        collect(&mut heap, &mut host, &[]);
+        assert_eq!(
+            objects(&heap),
+            ["demo/Item#6", "demo/Level#8", "demo/Player#7"]
+        );
+
+        host.release_block_place_context(&context);
+        assert_eq!(host.block_place_context_count(), 0);
+        assert_eq!(host.placement_array_count(), 0);
+        assert!(host.host_array_values(&array).is_none());
+        collect(&mut heap, &mut host, &[]);
+        assert!(objects(&heap).is_empty(), "{:?}", objects(&heap));
+        assert!(host.freed_objects.holds_key("demo/Item#6"));
+    }
+
+    /// The scope `NativeJar::block_state_for_placement` holds releases its
+    /// snapshot when the invocation unwinds, not only when it returns.
+    #[test]
+    fn a_placement_scope_releases_its_snapshot_on_unwind() {
+        let mut host = StdHost::new();
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let scope =
+                crate::PlacementScope::open(&mut host, placement_with_item("demo/Item#6")).unwrap();
+            assert_eq!(scope.host.block_place_context_count(), 1);
+            panic!("a host model panicked mid-placement");
+        }));
+        assert!(unwound.is_err());
+        assert_eq!(host.block_place_context_count(), 0);
+        assert_eq!(host.placement_array_count(), 0);
+    }
+
     #[test]
     fn every_host_field_is_classified_for_the_collector() {
         const COLLECTOR_READS: &[&str] = &[
@@ -2038,6 +2115,7 @@ mod tests {
             "fabric_biome_modifications",
             "recipe_sync_serializers",
             "vec2",
+            "level_sound",
         ];
         const HOLDS_NO_OBJECT: &[&str] = &[
             "next_unmodifiable_collection",
@@ -2046,6 +2124,7 @@ mod tests {
             "next_voxel_shape",
             "next_shape_extraction",
             "next_menu_object",
+            "next_placement_handle",
             "properties",
             "environment",
             "resources",

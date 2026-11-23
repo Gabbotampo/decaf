@@ -342,6 +342,10 @@ fn entity_id(marker: &str) -> Option<i32> {
     parts.nth(2)?.parse().ok()
 }
 
+pub(crate) fn entity_id_of(marker: &str) -> Option<i32> {
+    entity_id(marker)
+}
+
 /// `Entity.equals` (vanilla 26.3: `obj instanceof Entity e && e.getId() ==
 /// getId()`) between two entity keys: one key is one object; two keys with
 /// ids by id; two players without one equal when their UUID and session
