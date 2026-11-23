@@ -819,11 +819,12 @@ public final class Probe {
     System.out.println("invalidErrorCount=" + invalidErrors);
 
     // RecordCodecBuilder multi-error accumulation: bad_multi ran label xmap (total=2 vs 1 from iron_alloy)
-    // and never called the AlloyRecipe constructor (total=5 from the 5 valid recipes).
+    // and never called the AlloyRecipe constructor (5 valid + 3 partial-result bad_count* recipes = 8,
+    // matching real MC 26.3 where ItemStackTemplate.CODEC returns a count=1 partial on invalid count).
     boolean multiIsErr = mgr.byKey(ResourceKey.create(Registries.RECIPE, Identifier.parse("demo:bad_multi"))).isEmpty();
     System.out.println("multiErr:isErr=" + multiIsErr
         + "|xmapDelta=" + (AlloyRecipe.labelXmapCalls - 1)
-        + "|ctorDelta=" + (AlloyRecipe.ctorCalls - 5));
+        + "|ctorDelta=" + (AlloyRecipe.ctorCalls - 8));
 
     ItemStack taggedBase = new ItemStack(Items.COBBLESTONE, 3);
     taggedBase.set(DataComponents.REPAIR_COST, 5);

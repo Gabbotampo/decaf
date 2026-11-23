@@ -562,6 +562,8 @@ pub struct ClientPlayer {
     pub using_item: Option<bool>,
     /// `LocalPlayer.isSleeping`, filled by the game for a frame.
     pub sleeping: Option<bool>,
+    /// `Entity.isSilent`, filled by the game for a frame (`None` refuses).
+    pub silent: Option<bool>,
     pub sprinting: bool,
     pub on_ground: bool,
     /// `isFallFlying`: gliding with elytra.
@@ -846,6 +848,8 @@ pub struct ClientFrameOutput {
     /// A tooltip firing's lines after its listeners, when the frame had a
     /// tooltip; a line that is not text (null, another object) is dropped.
     pub tooltip: Option<Vec<ClientText>>,
+    /// Client-side level/local-player sounds recorded during this frame, in call order.
+    pub sounds: Vec<crate::runtime::level_sound::LevelSoundEffect>,
 }
 
 /// How a `KeyMapping` was constructed.
@@ -893,6 +897,7 @@ pub(crate) struct ClientState {
     /// A built stack's object marker → its slot.
     made_aliases: BTreeMap<String, StackSlot>,
     tasks: Vec<Value>,
+    pub(crate) sounds: Vec<crate::runtime::level_sound::LevelSoundEffect>,
     /// Currently open client screen (reused across `open_client_screen` ->
     /// `draw_client_screen_bg`, and closed via virtual `removed()` before opening
     /// a different screen so slot listeners never leak).
@@ -1458,6 +1463,7 @@ impl StdHost {
         state.made.clear();
         state.made_aliases.clear();
         state.tasks.clear();
+        state.sounds.clear();
         let lines = state.frame.as_ref().and_then(|f| {
             f.tooltip_stack.as_ref()?;
             Some(
@@ -1519,6 +1525,7 @@ impl StdHost {
                     .take(MAX_TOOLTIP_LINES)
                     .collect()
             }),
+            sounds: std::mem::take(&mut self.client.sounds),
         }
     }
 
@@ -1539,7 +1546,9 @@ impl StdHost {
             (TOOLTIP_FLAG_CLASS | TOOLTIP_FLAG_DEFAULT_CLASS, "ADVANCED") => {
                 return Some(Ok(tooltip_flag_default_const(true, false)));
             }
-            (TOOLTIP_DISPLAY_CLASS, "DEFAULT") => return Some(Ok(tooltip_display())),
+            (TOOLTIP_DISPLAY_CLASS, "DEFAULT") => {
+                return Some(Ok(crate::runtime::recipe_models::canonical_default_tooltip_display()));
+            }
             (TOOLTIP_CONTEXT_CLASS, "EMPTY") => return Some(Ok(tooltip_context_empty())),
             _ => {}
         }
@@ -2030,6 +2039,9 @@ impl StdHost {
                 Some(answer) => answer,
                 None => Err(self.refuse_client_call(r)),
             });
+        }
+        if let Some(answer) = crate::runtime::level_sound::client_frame_call(self, &text, &frame, r, args) {
+            return Some(answer);
         }
         let answer = self.client_answer(&text, &frame, r, args);
         Some(match answer {
@@ -2897,7 +2909,82 @@ impl StdHost {
                 }
                 Some(self.unknown_host_call(r))
             }
-            HostKind::TooltipDisplay => Some(self.unknown_host_call(r)),
+            HostKind::TooltipDisplay => {
+                // Keep the legacy `"default"` opaque placeholder counted for existing callers.
+                if handle.key() == "default" {
+                    return Some(self.unknown_host_call(r));
+                }
+                let td = if handle.key() == crate::runtime::recipe_models::TOOLTIP_DISPLAY_CANONICAL_DEFAULT
+                {
+                    crate::runtime::recipe_models::TooltipDisplayData {
+                        hide_tooltip: false,
+                        hidden_components: Vec::new(),
+                        hidden_known: true,
+                    }
+                } else if let Some(data) = self.recipes.tooltip_displays.get(handle.key()) {
+                    data.clone()
+                } else {
+                    return Some(self.unknown_host_call(r));
+                };
+                match (r.name.as_str(), r.descriptor.as_str()) {
+                    ("hideTooltip", "()Z") => Some(Ok(flag(td.hide_tooltip))),
+                    ("shows", "(Lnet/minecraft/core/component/DataComponentType;)Z") => {
+                        if td.hide_tooltip {
+                            return Some(Ok(flag(false)));
+                        }
+                        let Some(arg) = args.first() else {
+                            return Some(self.unknown_host_call(r));
+                        };
+                        if matches!(arg, Value::Ref(None)) {
+                            // Verified on Java 25 MC 26.3: `ReferenceLinkedOpenHashSet.contains(null)`
+                            // is `false`, so `shows(null)` returns `true` when `!hideTooltip`.
+                            return Some(Ok(flag(true)));
+                        }
+                        let Some(comp_id) =
+                            crate::runtime::recipe_models::resolve_data_component_type_id(self, arg)
+                        else {
+                            return Some(self.unknown_host_call(r));
+                        };
+                        if td.hidden_components.iter().any(|id| id == &comp_id) {
+                            Some(Ok(flag(false)))
+                        } else if td.hidden_known {
+                            Some(Ok(flag(true)))
+                        } else {
+                            Some(self.unknown_host_call(r))
+                        }
+                    }
+                    (
+                        "withHidden",
+                        "(Lnet/minecraft/core/component/DataComponentType;Z)Lnet/minecraft/world/item/component/TooltipDisplay;",
+                    ) => {
+                        if !td.hidden_known {
+                            return Some(self.unknown_host_call(r));
+                        }
+                        let (Some(arg), Some(Value::Int(hide_raw))) = (args.first(), args.get(1))
+                        else {
+                            return Some(self.unknown_host_call(r));
+                        };
+                        let hide = *hide_raw != 0;
+                        let Some(comp_id) =
+                            crate::runtime::recipe_models::resolve_data_component_type_id(self, arg)
+                        else {
+                            return Some(self.unknown_host_call(r));
+                        };
+                        let already_hidden = td.hidden_components.iter().any(|id| id == &comp_id);
+                        if already_hidden == hide {
+                            return Some(Ok(receiver.clone()));
+                        }
+                        let mut next = td;
+                        if hide {
+                            next.hidden_components.push(comp_id);
+                        } else {
+                            next.hidden_components.retain(|id| id != &comp_id);
+                        }
+                        Some(Ok(self.recipes.alloc_tooltip_display(next)))
+                    }
+                    _ => Some(self.unknown_host_call(r)),
+                }
+            }
             HostKind::TooltipFlag => {
                 let flags = (handle.key() == "frame")
                     .then(|| {

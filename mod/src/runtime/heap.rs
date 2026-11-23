@@ -196,6 +196,18 @@ impl StdHost {
         self.map_entries.len()
     }
 
+    /// How many live per-collection identity-epoch entries the host keeps in
+    /// `CollectionStore` (pruned automatically on removal, epoch bump, and GC).
+    pub fn identity_epoch_count(&self) -> usize {
+        self.mutable_collections.identity_epoch_count()
+    }
+
+    /// Peak number of `IdentityCollectionTokens` entries held concurrently in
+    /// any `Runtime` invocation on this host.
+    pub fn peak_identity_token_count(&self) -> usize {
+        self.peak_identity_tokens
+    }
+
     /// How many canonical `BlockState` rows the host keeps (`block_states`): each lives as
     /// long as its owning `Block` (reachable directly or through a jar reference to a state),
     /// so this follows live blocks rather than every block a jar ever constructed.
@@ -285,6 +297,24 @@ impl StdHost {
         for entry in &self.registrations {
             value(&entry.value, out);
         }
+        // The `BlockPlaceContext` snapshots of the placements running now:
+        // each is released when its invocation ends (#635), so this roots a
+        // snapshot only while the jar can reach it through the call.
+        for context in self.placement_contexts.values() {
+            value(&context.clicked_face, out);
+            match &context.placer {
+                crate::runtime::Placer::Player { player, .. } => value(player, out),
+                crate::runtime::Placer::None {
+                    direction: Some(direction),
+                } => value(direction, out),
+                crate::runtime::Placer::None { direction: None } | crate::runtime::Placer::Unknown => {}
+            }
+            value(&context.item_in_hand, out);
+            value(&context.level, out);
+        }
+        for (_, values) in self.placement_arrays.values() {
+            values.iter().for_each(|item| value(item, out));
+        }
         self.posted_events
             .iter()
             .for_each(|event| value(event, out));
@@ -361,6 +391,12 @@ impl StdHost {
         self.guava_tables.root_texts(out);
         // Recipe holders, component patches, and decoded mod recipes.
         self.recipes.root_texts(out);
+        // Active block-use state and open-menu effects.
+        self.block_use.root_texts(out);
+        // Seeded `Level.random` handles kept per dimension (`level_sound.rs`).
+        for held in self.level_sound.level_random_handles.values() {
+            value(held, out);
+        }
     }
 
     /// The host's own state that may name a jar object without a table this
@@ -424,6 +460,9 @@ impl StdHost {
         if let Some(text) = crate::runtime::menu_models::keyed_text(&self.menu_states, marker) {
             out.push(text);
         }
+        if let Some(text) = self.block_use.keyed_text(marker) {
+            out.push(text);
+        }
         if let Some(lines) = self.tooltip_sinks.get(marker) {
             out.push(marker.to_owned());
             for line in lines {
@@ -474,6 +513,7 @@ impl StdHost {
             .chain(self.menu_states.keys())
             .chain(self.tooltip_sinks.keys())
             .map(String::as_str)
+            .chain(self.block_use.keyed_table_keys())
     }
 
     /// Drop every per-object row of a collected object (`keep` false).
@@ -516,6 +556,7 @@ impl StdHost {
         self.ranged_attributes.retain(|key, _| keep(key));
         self.voxel_shapes.retain(|key, _| keep(key));
         self.menu_states.retain(|key, _| keep(key));
+        self.block_use.prune_keyed_tables(&keep);
         self.tooltip_sinks.retain(|key, _| keep(key));
         self.jdk_list_of.retain(|key| keep(key));
         self.render_objects.retain(|key, _| keep(key));
@@ -569,6 +610,8 @@ fn collectable(marker: &str) -> bool {
             .strip_prefix("entry")
             .or_else(|| serial.strip_prefix("node"))
             .or_else(|| serial.strip_prefix("menu"))
+            .or_else(|| serial.strip_prefix("ir"))
+            .or_else(|| serial.strip_prefix("hit"))
     {
         return !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit());
     }
@@ -621,6 +664,7 @@ fn heap_entries(heap: &JavaHeap, host: &StdHost) -> usize {
         + host.vec2.entry_count()
         + host.guava_tables.entry_count()
         + host.recipes.entry_count()
+        + host.block_use.entry_count()
 }
 
 fn over_count_bound(heap: &JavaHeap) -> bool {
@@ -801,11 +845,9 @@ fn heap_bytes(heap: &JavaHeap, host: &StdHost) -> usize {
                 .iter()
                 .map(|(key, source)| key.len() + source.len()),
         )
-        .chain(
-            host.iterators
-                .iter()
-                .map(|(key, (elements, _))| key.len() + values(elements)),
-        )
+        .chain(host.iterators.iter().map(|(key, entry)| {
+            key.len() + values(&entry.values) + entry.origin.as_ref().map_or(0, value_bytes)
+        }))
         .chain(host.component_states.iter().map(|(key, state)| {
             key.len()
                 + serde_json::Value::Object(state.base.clone())
@@ -1043,7 +1085,7 @@ fn has_live_shape_probe(heap: &JavaHeap, host: &StdHost, extra: &[String]) -> bo
         || host
             .iterators
             .values()
-            .flat_map(|(elements, _)| elements)
+            .flat_map(|entry| entry.values.iter().chain(entry.origin.iter()))
             .any(value_has_shape_probe)
         || host.iterator_last.values().any(value_has_shape_probe)
         || host
@@ -1147,7 +1189,7 @@ pub(crate) fn collect(heap: &mut JavaHeap, host: &mut StdHost, extra: &[String])
                 host.iterators
                     .iter()
                     .filter(|(key, _)| !collectable.markers.contains(key.as_str()))
-                    .flat_map(|(_, (elements, _))| elements),
+                    .flat_map(|(_, entry)| entry.values.iter().chain(entry.origin.iter())),
             );
         for value in kept_values {
             roots.extend(value_texts(value));
@@ -1206,7 +1248,7 @@ pub(crate) fn collect(heap: &mut JavaHeap, host: &mut StdHost, extra: &[String])
             .iterators
             .get(&marker)
             .into_iter()
-            .flat_map(|(elements, _)| elements);
+            .flat_map(|entry| entry.values.iter().chain(entry.origin.iter()));
         let iterator_last = host.iterator_last.get(&marker);
         // An enumeration's iterator or vector (`host_iterator.rs`).
         let enumerations = host
@@ -1905,6 +1947,76 @@ mod tests {
         assert_eq!(crate::runtime::entity_registration::accessor_id(&accessor), Some(8));
     }
 
+    /// A placement snapshot whose hand item is the jar object `item`.
+    fn placement_with_item(item: &str) -> crate::runtime::BlockPlaceContextData {
+        crate::runtime::BlockPlaceContextData {
+            clicked_pos: [1, 2, 3],
+            clicked_face: text("enum/net/minecraft/core/Direction/UP"),
+            click_location: [1.5, 2.5, 3.5],
+            inside: false,
+            replacing_clicked_on_block: false,
+            can_place: true,
+            placer: crate::runtime::Placer::Player {
+                player: text("demo/Player#7"),
+                yaw: 0.0,
+                pitch: 0.0,
+                secondary_use: false,
+            },
+            item_in_hand: text(item),
+            level: text("demo/Level#8"),
+        }
+    }
+
+    /// #635: a placement snapshot is a root while it is registered and
+    /// nothing once released. Its hand item, player and level (jar objects
+    /// here, so the collector may free them) survive a collection that runs
+    /// while the placement does, and the first collection after it frees
+    /// them, with the `Direction[]` hand-off it answered.
+    #[test]
+    fn a_placement_snapshot_roots_its_objects_only_until_it_is_released() {
+        let mut host = StdHost::new();
+        let mut heap = JavaHeap::default();
+        for object in ["demo/Item#6", "demo/Player#7", "demo/Level#8"] {
+            heap.fields.insert(field(object, "tag"), Value::Int(41));
+        }
+        heap.next_object = 9;
+        let context = host.new_block_place_context(placement_with_item("demo/Item#6"));
+        let array = host.store_placement_direction_array(
+            value_text(&context).unwrap(),
+            ["DOWN", "NORTH", "EAST", "SOUTH", "WEST", "UP"],
+        );
+        assert!(host.host_array_values(&array).is_some());
+        collect(&mut heap, &mut host, &[]);
+        assert_eq!(
+            objects(&heap),
+            ["demo/Item#6", "demo/Level#8", "demo/Player#7"]
+        );
+
+        host.release_block_place_context(&context);
+        assert_eq!(host.block_place_context_count(), 0);
+        assert_eq!(host.placement_array_count(), 0);
+        assert!(host.host_array_values(&array).is_none());
+        collect(&mut heap, &mut host, &[]);
+        assert!(objects(&heap).is_empty(), "{:?}", objects(&heap));
+        assert!(host.freed_objects.holds_key("demo/Item#6"));
+    }
+
+    /// The scope `NativeJar::block_state_for_placement` holds releases its
+    /// snapshot when the invocation unwinds, not only when it returns.
+    #[test]
+    fn a_placement_scope_releases_its_snapshot_on_unwind() {
+        let mut host = StdHost::new();
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let scope =
+                crate::runtime::PlacementScope::open(&mut host, placement_with_item("demo/Item#6")).unwrap();
+            assert_eq!(scope.host.block_place_context_count(), 1);
+            panic!("a host model panicked mid-placement");
+        }));
+        assert!(unwound.is_err());
+        assert_eq!(host.block_place_context_count(), 0);
+        assert_eq!(host.placement_array_count(), 0);
+    }
+
     #[test]
     fn every_host_field_is_classified_for_the_collector() {
         const COLLECTOR_READS: &[&str] = &[
@@ -1915,6 +2027,8 @@ mod tests {
             "menu_states",
             "posted_events",
             "registrations",
+            "placement_contexts",
+            "placement_arrays",
             "content_builders",
             "item_property_builders",
             "block_property_builders",
@@ -2011,6 +2125,8 @@ mod tests {
             "fabric_biome_modifications",
             "recipe_sync_serializers",
             "vec2",
+            "block_use",
+            "level_sound",
         ];
         const HOLDS_NO_OBJECT: &[&str] = &[
             "next_unmodifiable_collection",
@@ -2019,6 +2135,7 @@ mod tests {
             "next_voxel_shape",
             "next_shape_extraction",
             "next_menu_object",
+            "next_placement_handle",
             "properties",
             "environment",
             "resources",
@@ -2080,6 +2197,7 @@ mod tests {
             "random_seed_uniquifier",
             "random_time_origin",
             "fired_creative_tab_registrations",
+            "peak_identity_tokens",
         ];
         let debug = format!("{:#?}", StdHost::new());
         let fields: BTreeSet<&str> = debug

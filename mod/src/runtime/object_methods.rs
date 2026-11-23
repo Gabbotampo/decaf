@@ -383,6 +383,9 @@ impl<H: Host> Runtime<'_, H> {
                 .constructed_uuid(value)
                 .map(|(msb, lsb)| crate::runtime::host_jdk_value::uuid_hash_of(msb, lsb)));
         }
+        if let Some(hash) = self.identity_collection_hash(value)? {
+            return Ok(hash);
+        }
         // A handle's `hashCode` is its kind's row, a held value's own
         // `hashCode` run here (`host_ref.rs`).
         if let Value::Host(handle) = value
@@ -688,6 +691,17 @@ impl<H: Host> Runtime<'_, H> {
                         return Ok(true);
                     }
                     return Ok(left.is_empty() && right.is_empty());
+                }
+                if let Some(equal) = self.identity_collection_equals(
+                    a,
+                    b,
+                    &MethodRef {
+                        owner: "java/lang/Object".into(),
+                        name: "equals".into(),
+                        descriptor: EQUALS.into(),
+                    },
+                )? {
+                    return Ok(equal);
                 }
                 if self.host_collection_kind(a) == Some(CollectionKind::List)
                     && self.host_collection_kind(b) == Some(CollectionKind::List)
@@ -1515,6 +1529,9 @@ impl<H: Host> Runtime<'_, H> {
             if !same_family {
                 return Ok(Some(Value::Int(0)));
             }
+            if let Some(equal) = self.identity_collection_equals(receiver, other, r)? {
+                return Ok(Some(Value::Int(i32::from(equal))));
+            }
             if r.owner == "java/lang/Object" {
                 let typed = MethodRef {
                     owner: interface.into(),
@@ -1929,11 +1946,32 @@ impl<H: Host> host_ref::Nested for RuntimeNested<'_, '_, '_, H> {
         self.runtime.host.voxel_shape_to_string(key)
     }
 
+    fn interaction_result_success(&mut self, key: &str) -> Option<(Value, Value)> {
+        self.runtime
+            .host
+            .as_std_host()
+            .and_then(|host| crate::runtime::block_use::success_parts_in_host(host, key))
+    }
+
+    fn interaction_item_context(&mut self, key: &str) -> Option<(bool, Value)> {
+        self.runtime
+            .host
+            .as_std_host()
+            .and_then(|host| crate::runtime::block_use::item_context_parts_in_host(host, key))
+    }
+
     fn uuid_bits(&mut self, value: &Value) -> Option<(i64, i64)> {
         self.runtime.host.constructed_uuid(value)
     }
 
     fn map_entry_parts(&mut self, value: &Value) -> Option<(Value, Value)> {
+        if self
+            .runtime
+            .uncertain_identity_root(value, &crate::runtime::jar_text::object_to_string())
+            .is_some()
+        {
+            return None;
+        }
         self.runtime.host.map_entry_parts(value)
     }
 

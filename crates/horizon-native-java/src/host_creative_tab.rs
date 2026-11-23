@@ -11,8 +11,8 @@
 //!
 //! Every answer matches Java 25 / Minecraft 26.3 / Fabric Creative Tab API; anything whose state
 //! is not known (an item with unknown `requiredFeatures`, an unregistered item's `Item.toString`,
-//! a placement overload like `prepend`/`insertAfter`/`insertBefore`, `getDisplayStacks`, etc.)
-//! returns `None` so the host counts the call rather than guessing.
+//! a `Predicate` placement overload, `getDisplayStacks`, etc.) returns `None` so the host counts
+//! the call rather than guessing.
 
 use crate::{
     MethodRef, NativeError, Value,
@@ -656,23 +656,33 @@ pub(crate) fn tab_aligned_right(state: &State, tab: &Value) -> Option<bool> {
 
 /// Open a new `FabricCreativeModeTabOutput` collector with default vanilla features and no OP perms.
 pub(crate) fn begin_output(state: &mut State, tab: &str) -> Value {
-    begin_output_with(state, tab, FEATURE_VANILLA_SET, false)
+    begin_output_with_initial(
+        state,
+        tab,
+        FEATURE_VANILLA_SET,
+        false,
+        Vec::new(),
+        Vec::new(),
+    )
 }
 
-/// Open a new `FabricCreativeModeTabOutput` collector with explicit feature flags and OP flag.
-pub(crate) fn begin_output_with(
+/// Open a new `FabricCreativeModeTabOutput` collector seeded with the tab's existing display and
+/// search entries (`CreativeModeTabMixin.getStacks` offsets 64..102).
+pub(crate) fn begin_output_with_initial(
     state: &mut State,
     tab: &str,
     enabled_features: u64,
     has_permissions: bool,
+    display_stacks: Vec<Value>,
+    search_tab_stacks: Vec<Value>,
 ) -> Value {
     state.next += 1;
     let key = format!("out/{tab}/{}", state.next);
     state.outputs.insert(
         key.clone(),
         OutputCollector {
-            display_stacks: Vec::new(),
-            search_tab_stacks: Vec::new(),
+            display_stacks,
+            search_tab_stacks,
             enabled_features,
             has_permissions,
         },
@@ -725,6 +735,127 @@ pub(crate) fn accept_verified_stack(
         }
     }
     true
+}
+
+/// Prepend an already-validated, enabled `ItemStack` at index 0 of an active
+/// `FabricCreativeModeTabOutput` (`FabricCreativeModeTabOutput.prepend` offsets 12..98).
+pub(crate) fn prepend_verified_stack(
+    state: &mut State,
+    output: &Value,
+    stack: Value,
+    visibility: TabVisibility,
+) -> bool {
+    let Value::Host(handle) = output else {
+        return false;
+    };
+    if handle.kind() != HostKind::CreativeModeTabOutput {
+        return false;
+    }
+    let Some(collector) = state.outputs.get_mut(handle.key()) else {
+        return false;
+    };
+    match visibility {
+        TabVisibility::ParentAndSearchTabs => {
+            collector.display_stacks.insert(0, stack.clone());
+            collector.search_tab_stacks.insert(0, stack);
+        }
+        TabVisibility::ParentTabOnly => {
+            collector.display_stacks.insert(0, stack);
+        }
+        TabVisibility::SearchTabOnly => {
+            collector.search_tab_stacks.insert(0, stack);
+        }
+    }
+    true
+}
+
+fn find_relative_index(
+    list: &[Value],
+    before: bool,
+    matches: &mut impl FnMut(&Value) -> Result<Option<bool>, NativeError>,
+) -> Result<Option<usize>, NativeError> {
+    if before {
+        for (index, entry) in list.iter().enumerate() {
+            match matches(entry)? {
+                Some(true) => return Ok(Some(index)),
+                Some(false) => {}
+                None => return Ok(None),
+            }
+        }
+    } else {
+        for (index, entry) in list.iter().enumerate().rev() {
+            match matches(entry)? {
+                Some(true) => return Ok(Some(index + 1)),
+                Some(false) => {}
+                None => return Ok(None),
+            }
+        }
+    }
+    Ok(Some(list.len()))
+}
+
+/// Insert already-validated, enabled `ItemStack`s before the first matching anchor or after the
+/// last matching anchor (appending to the end when absent), matching `FabricCreativeModeTabOutput`
+/// `insertBefore` / `insertAfter` (5.0.21 offsets 655..801).
+///
+/// Computes target indices before mutating either list so an unknown comparison returns `Ok(None)`
+/// without partial state changes.
+pub(crate) fn insert_relative_verified(
+    state: &mut State,
+    output: &Value,
+    stacks: Vec<Value>,
+    visibility: TabVisibility,
+    before: bool,
+    mut matches: impl FnMut(&Value) -> Result<Option<bool>, NativeError>,
+) -> Result<Option<bool>, NativeError> {
+    let Value::Host(handle) = output else {
+        return Ok(Some(false));
+    };
+    if handle.kind() != HostKind::CreativeModeTabOutput {
+        return Ok(Some(false));
+    }
+    let Some(collector) = state.outputs.get(handle.key()) else {
+        return Ok(Some(false));
+    };
+    let display_idx = match visibility {
+        TabVisibility::ParentAndSearchTabs | TabVisibility::ParentTabOnly => {
+            let Some(idx) = find_relative_index(&collector.display_stacks, before, &mut matches)?
+            else {
+                return Ok(None);
+            };
+            Some(idx)
+        }
+        TabVisibility::SearchTabOnly => None,
+    };
+    let search_idx = match visibility {
+        TabVisibility::ParentAndSearchTabs | TabVisibility::SearchTabOnly => {
+            let Some(idx) =
+                find_relative_index(&collector.search_tab_stacks, before, &mut matches)?
+            else {
+                return Ok(None);
+            };
+            Some(idx)
+        }
+        TabVisibility::ParentTabOnly => None,
+    };
+    let collector = state
+        .outputs
+        .get_mut(handle.key())
+        .expect("verified active output collector");
+    match (display_idx, search_idx) {
+        (Some(d), Some(s)) => {
+            collector.display_stacks.splice(d..d, stacks.clone());
+            collector.search_tab_stacks.splice(s..s, stacks);
+        }
+        (Some(d), None) => {
+            collector.display_stacks.splice(d..d, stacks);
+        }
+        (None, Some(s)) => {
+            collector.search_tab_stacks.splice(s..s, stacks);
+        }
+        (None, None) => {}
+    }
+    Ok(Some(true))
 }
 
 /// Validate a stack according to `FabricCreativeModeTabOutput.checkStack(ItemStack)`

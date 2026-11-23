@@ -149,6 +149,33 @@ pub(crate) fn vanilla(registry: &str, id: &str, value: Value) -> Value {
     )
 }
 
+/// Unwrap a `Holder<T>` (`Holder$Reference` or `Holder$Direct`) for host calls
+/// such as `ServerLevel.playSeededSound` that evaluate `holder.value()`.
+/// Returns `(value, Some(registry_id))` for a bound reference holder,
+/// `(value, None)` for a direct holder, `Err(IllegalStateException)` for an
+/// unbound reference holder, or `None` when `value` is not a modelled holder.
+pub(crate) fn unwrap_sound_holder(
+    host: &mut StdHost,
+    value: &Value,
+) -> Option<Result<(Value, Option<String>), NativeError>> {
+    if let Some((inner, _components)) = direct_parts(value) {
+        return Some(Ok((inner, None)));
+    }
+    if let Some((inner, _owner)) = intrusive_value(value) {
+        return Some(Ok((inner, None)));
+    }
+    let parts = parts(value)?;
+    if parts.game_owned || parts.bound {
+        Some(Ok((parts.value, Some(parts.id))))
+    } else {
+        match unbound_value(host, &parts) {
+            Ok(Some(error)) => Some(Err(error)),
+            Ok(None) => None,
+            Err(error) => Some(Err(error)),
+        }
+    }
+}
+
 /// The registered id of a vanilla holder, for game surfaces that accept a
 /// holder as an argument while retaining the holder's typed identity.
 pub(crate) fn registered_id(value: &Value) -> Option<String> {

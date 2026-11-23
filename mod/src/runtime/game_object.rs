@@ -87,9 +87,14 @@ fn server_kind(rest: &str) -> HostKind {
         "level" => HostKind::GameLevel,
         "server" | "player-list" | "commands" | "rules" | "registries" | "saved-data"
         | "world-border" | "recipe-manager" => HostKind::GameSingleton,
-        "item" | "block" | "block-state" | "registry" | "entity_type" | "data-component-type" => {
-            HostKind::GameRegistryObject
-        }
+        "item"
+        | "block"
+        | "block-state"
+        | "default-block-state"
+        | "registry"
+        | "entity_type"
+        | "data-component-type"
+        | "menu-type" => HostKind::GameRegistryObject,
         // `damage`, `stack`, `block-hit`, `connection`, `packet-sender`,
         // `unknown`, `<what>/0` placeholders, and any family a model adds
         // before it gets a row: their own objects (never one shared object).
@@ -338,6 +343,10 @@ fn entity_id(marker: &str) -> Option<i32> {
     parts.nth(2)?.parse().ok()
 }
 
+pub(crate) fn entity_id_of(marker: &str) -> Option<i32> {
+    entity_id(marker)
+}
+
 /// `Entity.equals` (vanilla 26.3: `obj instanceof Entity e && e.getId() ==
 /// getId()`) between two entity keys: one key is one object; two keys with
 /// ids by id; two players without one equal when their UUID and session
@@ -403,7 +412,9 @@ pub(crate) fn declared_types(key: &str) -> &'static [&'static str] {
             "net/minecraft/world/level/ItemLike",
         ],
         (false, "block") => &["net/minecraft/world/level/block/Block"],
-        (false, "block-state") => &["net/minecraft/world/level/block/state/BlockState"],
+        (false, "block-state" | "default-block-state") => {
+            &["net/minecraft/world/level/block/state/BlockState"]
+        }
         (false, "stack") => &[
             "net/minecraft/world/item/ItemStack",
             "net/minecraft/world/item/ItemInstance",
@@ -411,13 +422,31 @@ pub(crate) fn declared_types(key: &str) -> &'static [&'static str] {
             "net/minecraft/core/component/DataComponentGetter",
         ],
         (false, "damage") => &["net/minecraft/world/damagesource/DamageSource"],
+        (false, "block-hit") => &[
+            "net/minecraft/world/phys/BlockHitResult",
+            "net/minecraft/world/phys/HitResult",
+        ],
+        (false, "menu-type") => &[
+            "net/minecraft/world/inventory/MenuType",
+            "net/minecraft/world/flag/FeatureElement",
+        ],
         (_, "block-pos") => &["net/minecraft/core/BlockPos"],
         (_, "level-resource") => &["net/minecraft/world/level/storage/LevelResource"],
         (_, "game-rule") => &["net/minecraft/world/level/gamerules/GameRule"],
         (_, "sound-event") => &["net/minecraft/sounds/SoundEvent"],
         (true, "minecraft") => &["net/minecraft/client/Minecraft"],
-        (true, "level") => &["net/minecraft/client/multiplayer/ClientLevel"],
-        (true, "player") => &["net/minecraft/client/player/LocalPlayer"],
+        (true, "level") => &[
+            "net/minecraft/client/multiplayer/ClientLevel",
+            "net/minecraft/world/level/Level",
+        ],
+        (true, "player") => &[
+            "net/minecraft/client/player/LocalPlayer",
+            "net/minecraft/client/player/AbstractClientPlayer",
+            "net/minecraft/world/entity/player/Player",
+            "net/minecraft/world/entity/Avatar",
+            "net/minecraft/world/entity/LivingEntity",
+            "net/minecraft/world/entity/Entity",
+        ],
         (true, "stack") => &[
             "net/minecraft/world/item/ItemStack",
             "net/minecraft/world/item/ItemInstance",
@@ -774,7 +803,10 @@ mod tests {
         );
         assert_eq!(
             declared_types("client/level"),
-            &["net/minecraft/client/multiplayer/ClientLevel"]
+            &[
+                "net/minecraft/client/multiplayer/ClientLevel",
+                "net/minecraft/world/level/Level",
+            ]
         );
     }
 }

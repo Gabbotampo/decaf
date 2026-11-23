@@ -1,16 +1,15 @@
-//! Client-side resident jar loading and registration inventory.
+//! Client-side resident jar loading, registration inventory, and creative-tab / tooltip dispatch.
 //!
 //! This phase owns one interpreter host per jar on the client. It runs client entrypoints and
-//! NeoForge's client loading stages, then records registrations and listeners for later G1 hooks.
-//! It deliberately does not draw or dispatch Java client callbacks yet; the owner hooks only keep
-//! the per-jar hosts and the report inventory alive across the client lifecycle.
+//! NeoForge's client loading stages, records registrations and listeners, and dispatches
+//! Sunrise's build-scoped creative-tab and item-tooltip hooks into each resident jar's runtime.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::{JAR_BUDGET, LOG, caught, jar_id};
 use runtime::events::{GameListener, PhaseOrdering};
-use runtime::{ExecutionBudget, NativeJar, StdHost};
+use runtime::{ExecutionBudget, NativeJar, StdHost, Value};
 
 use crate::runtime;
 
@@ -104,7 +103,7 @@ impl State {
     }
 
     /// Load the client role once, on the client setup thread, and retain every host for later G1 dispatch.
-    pub(crate) fn ensure_loaded(&mut self) {
+    pub(crate) fn ensure_loaded_with_version(&mut self, game_version: Option<&str>) {
         if self.loaded {
             return;
         }
@@ -161,7 +160,7 @@ impl State {
                     (name.clone(), Arc::clone(jar))
                 })
                 .collect();
-            match load_jar(file, jar, &links, &imc) {
+            match load_jar(file, jar, &links, &imc, game_version) {
                 Ok(jar) => self.jars.push(jar),
                 Err(row) => self.refused.push(row),
             }
@@ -200,6 +199,13 @@ impl State {
         self.world_loaded
     }
 
+    /// A resident jar and its host, for tests that set up state a client callback then reads.
+    #[cfg(test)]
+    pub(crate) fn resident(&mut self, index: usize) -> (&NativeJar, &mut StdHost) {
+        let loaded = &mut self.jars[index];
+        (&*loaded.jar, &mut loaded.host)
+    }
+
     pub(crate) fn report_rows(&self) -> impl Iterator<Item = serde_json::Value> + '_ {
         self.retired
             .iter()
@@ -210,10 +216,250 @@ impl State {
 
     pub(crate) fn level_loaded(&mut self) {
         self.world_loaded = true;
+        self.forget_client_sound_streams();
     }
 
     pub(crate) fn level_unloaded(&mut self) {
         self.world_loaded = false;
+        self.forget_client_sound_streams();
+    }
+
+    /// A client level comes with a fresh `random` and `soundSeedGenerator`: no stream position
+    /// the last level left unknown carries over.
+    fn forget_client_sound_streams(&mut self) {
+        for loaded in &mut self.jars {
+            loaded.host.forget_unknown_client_sound_streams();
+        }
+    }
+
+    /// Deliver the client sounds the resident jars' Java code recorded to Sunrise
+    /// (`sound::apply_client_sounds`), so each is played or counted on its jar, never dropped.
+    ///
+    /// Runs after every client path that executes Java code: client setup (entrypoints and
+    /// loading stages), creative-tab builds and item tooltips. The client owner opens no
+    /// `ClientSnapshot` frame, so a jar's client sounds land in its host's standalone record.
+    /// The level sound streams any jar left unknown are shared with every jar afterwards. They
+    /// are gathered after the Java code ran, so a stream one call left unknown also counts that
+    /// callback's earlier deferred sounds: conservative, and moot while the client defers none.
+    pub(crate) fn drain_client_sounds<H: crate::sound::LocalSounds + ?Sized>(&mut self, host: &H) {
+        let mut streams =
+            crate::sound::sync_unknown_sound_streams(&mut self.jars, |jar| &mut jar.host);
+        for loaded in &mut self.jars {
+            let sounds = loaded.host.take_played_sounds();
+            if sounds.is_empty() {
+                continue;
+            }
+            crate::sound::apply_client_sounds(host, &sounds, &mut streams, |reason| {
+                loaded.host.note_unknown_game_hook(reason);
+            });
+            loaded.row.unknown_host_calls = loaded.host.unknown_host_call_count();
+        }
+        crate::sound::share_unknown_sound_streams(
+            self.jars.iter_mut().map(|jar| &mut jar.host),
+            &streams,
+        );
+    }
+
+    /// Dispatch Java Fabric creative-tab output into the build-scoped Sunrise edit.  Each jar's
+    /// collector is seeded with the tab's current Sunrise parent/search stacks so `insertBefore`,
+    /// `insertAfter`, and `prepend` see real vanilla and earlier-mod anchors; the interpreter owns
+    /// Fabric's phase order, visibility and feature checks, and this adapter reconciles the
+    /// resulting lists back onto `event.edit`.
+    pub(crate) fn build_creative_tab(
+        &mut self,
+        host: &mut dyn mod_api::ClientHost,
+        event: &mut mod_api::BuildCreativeModeTabContentsEvent<'_>,
+    ) {
+        if self.jars.is_empty() {
+            return;
+        }
+        let tab = event.tab.to_owned();
+        let permissions = event.permissions == mod_api::CreativeTabPermissions::Operator;
+        let Some(enabled_features) = runtime::creative_feature_mask(&event.features) else {
+            for loaded in &mut self.jars {
+                loaded
+                    .host
+                    .note_unknown_game_hook("creative tab feature flag");
+                loaded.row.unknown_host_calls = loaded.host.unknown_host_call_count();
+            }
+            return;
+        };
+        for loaded in &mut self.jars {
+            let (Ok(parent_entries), Ok(search_entries)) = (
+                event.edit.entries(host, mod_api::CreativeTabList::Parent),
+                event.edit.entries(host, mod_api::CreativeTabList::Search),
+            ) else {
+                loaded.host.note_unknown_game_hook("creative tab entries");
+                loaded.row.unknown_host_calls = loaded.host.unknown_host_call_count();
+                continue;
+            };
+            // A stack whose item the host cannot name has no Java form: the tab's contents
+            // would be incomplete, so the jar's build is counted like unreadable entries.
+            let (Some(seeded_parent), Some(seeded_search)) = (
+                seed_creative_stacks(host, &mut loaded.host, &parent_entries),
+                seed_creative_stacks(host, &mut loaded.host, &search_entries),
+            ) else {
+                loaded.host.note_unknown_game_hook("creative tab entries");
+                loaded.row.unknown_host_calls = loaded.host.unknown_host_call_count();
+                continue;
+            };
+            let context = runtime::CreativeTabBuildContext {
+                enabled_features,
+                has_permissions: permissions,
+                initial_display_stacks: seeded_parent.iter().map(|(v, _)| v.clone()).collect(),
+                initial_search_tab_stacks: seeded_search.iter().map(|(v, _)| v.clone()).collect(),
+                ..Default::default()
+            };
+            let contents =
+                match loaded
+                    .jar
+                    .creative_tab_contents_with(&mut loaded.host, &tab, context)
+                {
+                    Ok(contents) => contents,
+                    Err(error) => {
+                        loaded.row.unknown_host_calls = loaded.host.unknown_host_call_count();
+                        log::warn!(
+                            "{LOG}: client {} creative tab {} failed: {error}",
+                            loaded.row.id,
+                            tab
+                        );
+                        continue;
+                    }
+                };
+            apply_creative_contents(
+                host,
+                event,
+                &mut loaded.host,
+                &contents,
+                &seeded_parent,
+                &seeded_search,
+            );
+            // Creative registrations are initially reported as unfired. Re-read the inventory
+            // after this tab's hook so the JSON row reflects the actual registration state.
+            let registered = loaded.host.game_listeners(&loaded.jar, false);
+            loaded.row.unsupported = registered.unsupported;
+            loaded.row.unknown_host_calls = loaded.host.unknown_host_call_count();
+        }
+        self.drain_client_sounds(host);
+    }
+
+    /// Run each resident jar's Item appendHoverText implementation for the item in a Sunrise
+    /// tooltip.  Components are converted through Sunrise's text boundary, retaining translation
+    /// keys and style; a failed conversion is counted on the jar and does not silently vanish.
+    pub(crate) fn append_java_tooltip(
+        &mut self,
+        host: &dyn mod_api::ClientHost,
+        event: &mut mod_api::ItemTooltipEvent<'_>,
+    ) {
+        if self.jars.is_empty() || !event.display.name_visible(event.creative) {
+            return;
+        }
+        // `None` when the host has no name for the item's slot. Then this bridge cannot tell which
+        // jar's item it is, yet any jar that registered an item may own it and would run its
+        // `appendHoverText` in Java: each such jar counts the tooltip it could not run, as a
+        // creative tab counts a stack it cannot name, instead of the tooltip skipping it silently.
+        let Some(id) = event.stack.item().id(host).map(str::to_owned) else {
+            for loaded in &mut self.jars {
+                let registers_items = loaded
+                    .host
+                    .registrations()
+                    .iter()
+                    .any(|entry| entry.registry == "minecraft:item");
+                if registers_items {
+                    loaded
+                        .host
+                        .note_unknown_game_hook("tooltip item has no registry id");
+                    loaded.row.unknown_host_calls = loaded.host.unknown_host_call_count();
+                }
+            }
+            return;
+        };
+        // The hovered stack is lent as a view and copied out once, for the first jar that owns
+        // its item (`ItemStackView::project`); `None` inside means it has no owned form.
+        let mut projected: Option<Option<mod_api::ItemStack>> = None;
+        // Each line with the jar that produced it, so a line Sunrise refuses is counted there.
+        let mut additions: Vec<(usize, mod_api::Text)> = Vec::new();
+        for (index, loaded) in self.jars.iter_mut().enumerate() {
+            let Some(entry) = loaded.host.observed_registry_entry("minecraft:item", &id) else {
+                continue;
+            };
+            let item = entry.value.clone();
+            let Some(api_stack) = projected
+                .get_or_insert_with(|| event.stack.project())
+                .as_ref()
+            else {
+                // Java's `appendHoverText` would see this stack; without it the call is counted.
+                loaded
+                    .host
+                    .note_unknown_game_hook("tooltip stack has no owned form");
+                loaded.row.unknown_host_calls = loaded.host.unknown_host_call_count();
+                continue;
+            };
+            let Some(stack) =
+                runtime_stack_from_api(host, &mut loaded.host, Some(item.clone()), api_stack)
+            else {
+                loaded
+                    .host
+                    .note_unknown_game_hook("tooltip stack item has no registry id");
+                loaded.row.unknown_host_calls = loaded.host.unknown_host_call_count();
+                continue;
+            };
+            let (display, malformed_display) =
+                build_tooltip_display(&mut loaded.host, event, api_stack);
+            if malformed_display {
+                loaded
+                    .host
+                    .note_unknown_game_hook("tooltip display component");
+            }
+            let lines = match loaded.jar.run_item_tooltip(
+                &item,
+                stack,
+                runtime::client_surface::tooltip_context(),
+                display,
+                runtime::client_surface::tooltip_flag(event.advanced, event.creative),
+                &mut loaded.host,
+                &ExecutionBudget::within(JAR_BUDGET),
+            ) {
+                Ok(lines) => lines,
+                Err(error) => {
+                    log::warn!(
+                        "{LOG}: client {} item tooltip {} failed: {error}",
+                        loaded.row.id,
+                        id
+                    );
+                    loaded.row.unknown_host_calls = loaded.host.unknown_host_call_count();
+                    continue;
+                }
+            };
+            for line in lines {
+                let (converted, refused) = convert_tooltip_component(host, &loaded.host, &line);
+                if refused {
+                    loaded
+                        .host
+                        .note_unknown_game_hook("tooltip component conversion");
+                } else if let Some(text) = converted {
+                    additions.push((index, text));
+                }
+            }
+            loaded.row.unknown_host_calls = loaded.host.unknown_host_call_count();
+        }
+        // The first line is the item's name. Java appendHoverText runs immediately after it.
+        // `TooltipLines` validates each line on its own: one Sunrise refuses is left out and
+        // counted on its jar, and the rest still go in, in order.
+        let mut at = event.lines.len().min(1);
+        for (index, text) in additions {
+            match event.lines.insert(at, text, u32::MAX) {
+                Ok(_) => at += 1,
+                Err(_) => {
+                    let loaded = &mut self.jars[index];
+                    loaded
+                        .host
+                        .note_unknown_game_hook("tooltip line refused by Sunrise");
+                    loaded.row.unknown_host_calls = loaded.host.unknown_host_call_count();
+                }
+            }
+        }
+        self.drain_client_sounds(host);
     }
 
     /// Drop resident hosts, listeners, and jar heaps at client shutdown. Rows stay available
@@ -226,6 +472,626 @@ impl State {
         self.loaded = false;
         self.world_loaded = false;
         count
+    }
+}
+
+/// Every entry as its runtime stack, or `None` if any entry's item has no name on the host.
+pub(crate) fn seed_creative_stacks(
+    host: &dyn mod_api::Host,
+    runtime_host: &mut StdHost,
+    entries: &[mod_api::ItemStack],
+) -> Option<Vec<(Value, mod_api::ItemStack)>> {
+    entries
+        .iter()
+        .map(|stack| {
+            let value = runtime_stack_from_api(host, runtime_host, None, stack)?;
+            Some((value, stack.clone()))
+        })
+        .collect()
+}
+
+fn java_string_utf8(s: &mod_api::JavaString) -> Option<String> {
+    String::from_utf16(&s.0).ok()
+}
+
+fn parse_tooltip_display_tag(tag: &mod_api::Tag) -> Option<(bool, Vec<String>)> {
+    let mod_api::Tag::Compound(fields) = tag else {
+        return None;
+    };
+    let mut hide_tooltip = false;
+    let mut hidden_components = Vec::new();
+    for (raw_key, val) in fields {
+        let key = java_string_utf8(raw_key)?;
+        match key.as_str() {
+            "hide_tooltip" => match val {
+                mod_api::Tag::Byte(b) => hide_tooltip = *b != 0,
+                _ => return None,
+            },
+            "hidden_components" => {
+                let mod_api::Tag::List(items) = val else {
+                    return None;
+                };
+                for item in items {
+                    let mod_api::Tag::String(raw_id) = item else {
+                        return None;
+                    };
+                    let raw = java_string_utf8(raw_id)?;
+                    // Match MC 26.3 `DataComponentType.CODEC` (`Identifier.CODEC` +
+                    // `ReferenceLinkedOpenHashSet`): normalize unqualified ids (`"damage"` ->
+                    // `"minecraft:damage"`) and deduplicate preserving first-occurrence order.
+                    let id = mod_api::Identifier::parse(&raw).ok()?.to_string();
+                    if !hidden_components.iter().any(|existing| existing == &id) {
+                        hidden_components.push(id);
+                    }
+                }
+            }
+            _ => return None,
+        }
+    }
+    Some((hide_tooltip, hidden_components))
+}
+
+fn build_tooltip_display(
+    runtime_host: &mut StdHost,
+    event: &mod_api::ItemTooltipEvent<'_>,
+    stack: &mod_api::ItemStack,
+) -> (Value, bool) {
+    let hide_tooltip = !event.display.name_visible(false);
+    let mut hidden = Vec::new();
+    let mut hidden_known = true;
+    let mut malformed = false;
+
+    let stack_td = stack.components().and_then(|components| {
+        components
+            .as_nbt()
+            .iter()
+            .find(|(id, _)| {
+                id.0.iter()
+                    .copied()
+                    .eq("minecraft:tooltip_display".encode_utf16())
+            })
+            .map(|(_, tag)| tag)
+    });
+    if let Some(tag) = stack_td {
+        if let Some((tag_hide, ids)) = parse_tooltip_display_tag(tag) {
+            if hide_tooltip {
+                if tag_hide {
+                    hidden.extend(ids);
+                } else {
+                    hidden_known = false;
+                }
+            } else {
+                for id in ids {
+                    if !event.display.shows(&id) && !hidden.iter().any(|existing| existing == &id) {
+                        hidden.push(id);
+                    }
+                }
+            }
+        } else {
+            hidden_known = false;
+            malformed = true;
+        }
+    } else if hide_tooltip {
+        // `event.display` hid everything without an explicit stack tag, so `shows(...)` returns
+        // false for every id and cannot reveal the underlying `hidden_components` set.
+        hidden_known = false;
+    }
+
+    if !hide_tooltip && !malformed {
+        for id in runtime::all_vanilla_data_component_ids() {
+            if !event.display.shows(id) && !hidden.iter().any(|existing| existing == id) {
+                hidden.push(id.to_owned());
+            }
+        }
+        for id in runtime_host.registered_data_component_ids() {
+            if !event.display.shows(&id) && !hidden.iter().any(|existing| existing == &id) {
+                hidden.push(id);
+            }
+        }
+    }
+
+    let handle = runtime_host.make_tooltip_display(hide_tooltip, hidden, hidden_known);
+    (handle, malformed)
+}
+
+fn json_to_nbt(value: &serde_json::Value) -> Option<mod_api::Tag> {
+    match value {
+        serde_json::Value::String(s) => Some(mod_api::Tag::String(s.as_str().into())),
+        serde_json::Value::Bool(b) => Some(mod_api::Tag::Byte(i8::from(*b))),
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                if let Ok(i32_val) = i32::try_from(i) {
+                    Some(mod_api::Tag::Int(i32_val))
+                } else {
+                    Some(mod_api::Tag::Long(i))
+                }
+            } else {
+                n.as_f64()
+                    .filter(|f| f.is_finite())
+                    .map(|f| mod_api::Tag::Double(f.to_bits()))
+            }
+        }
+        serde_json::Value::Array(items) => Some(mod_api::Tag::List(
+            items.iter().map(json_to_nbt).collect::<Option<Vec<_>>>()?,
+        )),
+        serde_json::Value::Object(map) => {
+            let mut compound = mod_api::Compound::new();
+            for (k, v) in map {
+                compound.insert(k.as_str().into(), json_to_nbt(v)?);
+            }
+            Some(mod_api::Tag::Compound(compound))
+        }
+        serde_json::Value::Null => None,
+    }
+}
+
+fn nbt_to_json_value(tag: &mod_api::Tag, bool_hint: bool) -> Option<serde_json::Value> {
+    match tag {
+        mod_api::Tag::String(s) => Some(serde_json::Value::String(java_string_utf8(s)?)),
+        mod_api::Tag::Byte(b) => {
+            if bool_hint {
+                Some(serde_json::Value::Bool(*b != 0))
+            } else {
+                Some(serde_json::Value::from(*b))
+            }
+        }
+        mod_api::Tag::Short(s) => Some(serde_json::Value::from(*s)),
+        mod_api::Tag::Int(i) => Some(serde_json::Value::from(*i)),
+        mod_api::Tag::Long(l) => Some(serde_json::Value::from(*l)),
+        mod_api::Tag::Float(bits) => {
+            let f = f32::from_bits(*bits);
+            serde_json::Number::from_f64(f64::from(f)).map(serde_json::Value::Number)
+        }
+        mod_api::Tag::Double(bits) => {
+            let d = f64::from_bits(*bits);
+            serde_json::Number::from_f64(d).map(serde_json::Value::Number)
+        }
+        mod_api::Tag::List(items) => Some(serde_json::Value::Array(
+            items
+                .iter()
+                .map(|item| nbt_to_json_value(item, false))
+                .collect::<Option<Vec<_>>>()?,
+        )),
+        mod_api::Tag::Compound(fields) => {
+            let mut obj = serde_json::Map::new();
+            for (raw_key, val) in fields {
+                let key = java_string_utf8(raw_key)?;
+                let is_bool_field = matches!(
+                    key.as_str(),
+                    "bold" | "italic" | "underlined" | "strikethrough" | "obfuscated"
+                );
+                obj.insert(key, nbt_to_json_value(val, is_bool_field)?);
+            }
+            Some(serde_json::Value::Object(obj))
+        }
+        _ => None,
+    }
+}
+
+fn nbt_component_to_json(tag: &mod_api::Tag) -> Option<String> {
+    let val = nbt_to_json_value(tag, false)?;
+    match &val {
+        serde_json::Value::String(_) => {}
+        serde_json::Value::Object(map)
+            if map
+                .get("text")
+                .and_then(serde_json::Value::as_str)
+                .is_some()
+                || map
+                    .get("translate")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some() => {}
+        _ => return None,
+    }
+    serde_json::to_string(&val).ok()
+}
+
+pub(crate) fn runtime_stack_from_api(
+    host: &dyn mod_api::Host,
+    runtime_host: &mut StdHost,
+    item_override: Option<Value>,
+    stack: &mod_api::ItemStack,
+) -> Option<Value> {
+    // `None` when the host has no name for the item's slot: no Java stack can stand for it, so
+    // the caller counts the call instead of handing Java a made-up item.
+    let id = stack.item().id(host)?.to_owned();
+    let count = stack.count().min(i32::MAX as u32) as i32;
+    let mut patch: Vec<(String, Option<runtime::RuntimeComponentValue>)> = Vec::new();
+    let mut opaque_keys: Vec<String> = Vec::new();
+    let mut opaque_components = false;
+
+    if let Some(damage) = stack.damage_component() {
+        if let Ok(dmg) = i32::try_from(damage) {
+            patch.push((
+                "minecraft:damage".to_owned(),
+                Some(runtime::RuntimeComponentValue::Int(dmg)),
+            ));
+        } else {
+            opaque_components = true;
+            opaque_keys.push("minecraft:damage".to_owned());
+        }
+    }
+
+    if let Some(components) = stack.components() {
+        for (raw_key, tag) in components.as_nbt() {
+            let Some(key) = java_string_utf8(raw_key) else {
+                opaque_components = true;
+                continue;
+            };
+            if let Some(removed) = key.strip_prefix('!') {
+                if matches!(tag, mod_api::Tag::Compound(fields) if fields.is_empty()) {
+                    patch.push((removed.to_owned(), None));
+                } else {
+                    opaque_components = true;
+                    opaque_keys.push(removed.to_owned());
+                }
+                continue;
+            }
+            let converted = match key.as_str() {
+                "minecraft:damage" => match tag {
+                    mod_api::Tag::Int(n) if *n >= 0 => {
+                        Some(runtime::RuntimeComponentValue::Int(*n))
+                    }
+                    _ => None,
+                },
+                "minecraft:max_stack_size" => match tag {
+                    mod_api::Tag::Int(n) if (1..=99).contains(n) => {
+                        Some(runtime::RuntimeComponentValue::Int(*n))
+                    }
+                    _ => None,
+                },
+                "minecraft:max_damage" => match tag {
+                    mod_api::Tag::Int(n) if *n >= 1 => {
+                        Some(runtime::RuntimeComponentValue::Int(*n))
+                    }
+                    _ => None,
+                },
+                "minecraft:repair_cost" => match tag {
+                    mod_api::Tag::Int(n) if *n >= 0 => {
+                        Some(runtime::RuntimeComponentValue::Int(*n))
+                    }
+                    _ => None,
+                },
+                "minecraft:unbreakable" => match tag {
+                    mod_api::Tag::Compound(fields) if fields.is_empty() => {
+                        Some(runtime::RuntimeComponentValue::Unit)
+                    }
+                    _ => None,
+                },
+                "minecraft:custom_data" => match tag {
+                    mod_api::Tag::Compound(fields) => crate::attachments::to_runtime(fields)
+                        .ok()
+                        .map(runtime::RuntimeComponentValue::CustomData),
+                    _ => None,
+                },
+                "minecraft:custom_name" | "minecraft:item_name" => {
+                    nbt_component_to_json(tag).map(runtime::RuntimeComponentValue::ComponentJson)
+                }
+                "minecraft:tooltip_display" => {
+                    parse_tooltip_display_tag(tag).map(|(hide_tooltip, hidden_components)| {
+                        runtime::RuntimeComponentValue::TooltipDisplay {
+                            hide_tooltip,
+                            hidden_components,
+                            hidden_known: true,
+                        }
+                    })
+                }
+                _ => None,
+            };
+            if let Some(val) = converted {
+                patch.push((key, Some(val)));
+            } else {
+                opaque_components = true;
+                opaque_keys.push(key);
+            }
+        }
+    }
+
+    Some(runtime_host.make_host_item_stack_with_components(
+        item_override,
+        &id,
+        count,
+        patch,
+        opaque_components,
+        opaque_keys,
+    ))
+}
+
+pub(crate) fn api_stack(
+    host: &dyn mod_api::Host,
+    runtime_host: &StdHost,
+    value: &Value,
+) -> Option<mod_api::ItemStack> {
+    let extracted = runtime_host.item_stack_components(value)?;
+    if extracted.opaque_components {
+        return None;
+    }
+    let key = host.item_key(&mod_api::Identifier::parse(&extracted.item_id).ok()?)?;
+    let count: u32 = extracted.count.try_into().ok()?;
+    let mut stack = mod_api::ItemStack::new(key, count)?;
+    if extracted.patch.is_empty() {
+        return Some(stack);
+    }
+    let mut nbt = mod_api::Compound::new();
+    for (comp_id, entry) in extracted.patch {
+        mod_api::ComponentId::new(&comp_id)?;
+        match entry {
+            None => {
+                nbt.insert(
+                    format!("!{comp_id}").as_str().into(),
+                    mod_api::Tag::Compound(mod_api::Compound::new()),
+                );
+            }
+            Some(runtime::RuntimeComponentValue::Int(n)) => {
+                let valid = match comp_id.as_str() {
+                    "minecraft:damage" | "minecraft:repair_cost" => n >= 0,
+                    "minecraft:max_damage" => n >= 1,
+                    "minecraft:max_stack_size" => (1..=99).contains(&n),
+                    _ => false,
+                };
+                if !valid {
+                    return None;
+                }
+                nbt.insert(comp_id.as_str().into(), mod_api::Tag::Int(n));
+            }
+            Some(runtime::RuntimeComponentValue::Unit) if comp_id == "minecraft:unbreakable" => {
+                nbt.insert(
+                    comp_id.as_str().into(),
+                    mod_api::Tag::Compound(mod_api::Compound::new()),
+                );
+            }
+            Some(runtime::RuntimeComponentValue::CustomData(data))
+                if comp_id == "minecraft:custom_data" =>
+            {
+                nbt.insert(
+                    comp_id.as_str().into(),
+                    mod_api::Tag::Compound(crate::attachments::to_game(&data)),
+                );
+            }
+            Some(runtime::RuntimeComponentValue::ComponentJson(json))
+                if matches!(
+                    comp_id.as_str(),
+                    "minecraft:custom_name" | "minecraft:item_name"
+                ) =>
+            {
+                let parsed: serde_json::Value = serde_json::from_str(&json).ok()?;
+                let tag = json_to_nbt(&parsed)?;
+                nbt.insert(comp_id.as_str().into(), tag);
+            }
+            Some(runtime::RuntimeComponentValue::TooltipDisplay {
+                hide_tooltip,
+                hidden_components,
+                hidden_known: true,
+            }) if comp_id == "minecraft:tooltip_display" => {
+                let mut fields = mod_api::Compound::new();
+                if hide_tooltip {
+                    fields.insert("hide_tooltip".into(), mod_api::Tag::Byte(1));
+                }
+                if !hidden_components.is_empty() {
+                    fields.insert(
+                        "hidden_components".into(),
+                        mod_api::Tag::List(
+                            hidden_components
+                                .into_iter()
+                                .map(|id| mod_api::Tag::String(id.as_str().into()))
+                                .collect(),
+                        ),
+                    );
+                }
+                nbt.insert(comp_id.as_str().into(), mod_api::Tag::Compound(fields));
+            }
+            _ => return None,
+        }
+    }
+    stack.apply_components(&nbt).ok()?;
+    Some(stack)
+}
+
+/// Indices of a longest strictly-increasing subsequence of `seq` (returns a boolean mask over
+/// `0..seq.len()`). Used to keep the maximal subset of seeded entries already in `desired` order
+/// untouched in `CreativeTabEdit`.
+fn longest_increasing_mask(seq: &[usize]) -> Vec<bool> {
+    let n = seq.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let mut tails: Vec<usize> = Vec::with_capacity(n);
+    let mut prev: Vec<Option<usize>> = vec![None; n];
+    for i in 0..n {
+        let pos = tails.partition_point(|&idx| seq[idx] < seq[i]);
+        if pos > 0 {
+            prev[i] = Some(tails[pos - 1]);
+        }
+        if pos == tails.len() {
+            tails.push(i);
+        } else {
+            tails[pos] = i;
+        }
+    }
+    let mut mask = vec![false; n];
+    let mut cur = tails.last().copied();
+    while let Some(idx) = cur {
+        mask[idx] = true;
+        cur = prev[idx];
+    }
+    mask
+}
+
+fn apply_creative_list(
+    host: &mut dyn mod_api::ClientHost,
+    event: &mut mod_api::BuildCreativeModeTabContentsEvent<'_>,
+    runtime_host: &mut StdHost,
+    resulting: &[Value],
+    seeded: &[(Value, mod_api::ItemStack)],
+    visibility: mod_api::CreativeTabVisibility,
+) {
+    // 1. Convert every entry (retaining untouched seeded stacks verbatim so Sunrise components
+    //    never downgrade, and counting/skipping any stack whose components cannot be converted),
+    //    then deduplicate in FIRST-occurrence order exactly like Fabric's
+    //    `this.displayItems.clear(); this.displayItems.addAll(displayList);` (ItemStackLinkedSet).
+    let mut desired: Vec<(Value, mod_api::ItemStack, Option<usize>)> =
+        Vec::with_capacity(resulting.len());
+    let mut claimed_seed = vec![false; seeded.len()];
+    for value in resulting {
+        let (stack, exact_seed) = if let Some((idx, (_, original))) = seeded
+            .iter()
+            .enumerate()
+            .find(|(_, (seed_value, _))| seed_value == value)
+        {
+            (original.clone(), Some(idx))
+        } else {
+            let Some(stack) = api_stack(host, runtime_host, value) else {
+                runtime_host.note_unknown_game_hook("creative tab stack conversion");
+                continue;
+            };
+            (stack, None)
+        };
+        if desired.iter().any(|(existing_val, existing_stack, _)| {
+            existing_stack.is_stackable_with(&stack)
+                || matches!(
+                    runtime_host.stacks_same_item_same_components(existing_val, value),
+                    Ok(Some(true))
+                )
+        }) {
+            continue;
+        }
+        let seed_idx = exact_seed.filter(|&idx| !claimed_seed[idx]).or_else(|| {
+            seeded
+                .iter()
+                .enumerate()
+                .find(|(idx, (_, orig))| !claimed_seed[*idx] && orig.is_stackable_with(&stack))
+                .map(|(idx, _)| idx)
+        });
+        if let Some(idx) = seed_idx {
+            claimed_seed[idx] = true;
+        }
+        desired.push((value.clone(), stack, seed_idx));
+    }
+
+    // 2. Keep the longest subsequence of already-present seeded entries that remain in their
+    //    existing relative order, and remove only entries that moved earlier or were dropped.
+    let present_in_desired: Vec<(usize, usize)> = desired
+        .iter()
+        .enumerate()
+        .filter_map(|(desired_idx, (_, _, seed_idx))| seed_idx.map(|s| (desired_idx, s)))
+        .collect();
+    let seq: Vec<usize> = present_in_desired.iter().map(|&(_, s)| s).collect();
+    let lis_mask = longest_increasing_mask(&seq);
+    let mut kept_seed = vec![false; seeded.len()];
+    for (&(_, seed_idx), &keep) in present_in_desired.iter().zip(&lis_mask) {
+        if keep {
+            kept_seed[seed_idx] = true;
+        }
+    }
+    for (idx, (_, orig)) in seeded.iter().enumerate() {
+        if !kept_seed[idx]
+            && let Err(error) = event.edit.remove(host, orig, visibility)
+        {
+            runtime_host.note_unknown_game_hook("creative tab edit");
+            log::warn!(
+                "{LOG}: creative tab {} remove refused: {error:?}",
+                event.tab
+            );
+        }
+    }
+
+    // 3. Walk `desired` left-to-right, inserting every non-kept entry immediately after `prev`
+    //    (or `First` at index 0) and advancing `prev` through every position in `desired`.
+    let mut prev: Option<mod_api::ItemStack> = None;
+    for (_, stack, seed_idx) in desired {
+        if seed_idx.is_some_and(|idx| kept_seed[idx]) {
+            prev = Some(stack);
+            continue;
+        }
+        let placement = match &prev {
+            Some(anchor) => mod_api::CreativeTabPlacement::After(anchor.clone()),
+            None => mod_api::CreativeTabPlacement::First,
+        };
+        match event
+            .edit
+            .insert(host, placement.clone(), stack.clone(), visibility)
+        {
+            Ok(()) => prev = Some(stack),
+            Err(mod_api::CreativeTabEditError::Duplicate(list)) => {
+                // Sunrise may normalize components (e.g. dropping a patch entry equal to a
+                // prototype default) so two distinct raw patches collapse to one creative key.
+                // If that existing equivalent entry sits AFTER `prev`, move it here to preserve
+                // Fabric's first-occurrence order; if it sits BEFORE `prev`, keep the earlier
+                // occurrence in place.
+                if let Ok(current) = event.edit.entries(host, list) {
+                    let prev_pos = prev.as_ref().and_then(|anchor| {
+                        current
+                            .iter()
+                            .rposition(|existing| existing.is_stackable_with(anchor))
+                    });
+                    let dup_pos = current
+                        .iter()
+                        .position(|existing| existing.is_stackable_with(&stack));
+                    let sits_after_prev = match (prev_pos, dup_pos) {
+                        (None, Some(d)) => d > 0,
+                        (Some(p), Some(d)) => d > p,
+                        _ => false,
+                    };
+                    if sits_after_prev
+                        && let Some(existing) = dup_pos.map(|d| current[d].clone())
+                        && event.edit.remove(host, &existing, visibility).is_ok()
+                        && event
+                            .edit
+                            .insert(host, placement, stack.clone(), visibility)
+                            .is_ok()
+                    {
+                        prev = Some(stack);
+                    }
+                }
+            }
+            Err(error) => {
+                runtime_host.note_unknown_game_hook("creative tab edit");
+                log::warn!(
+                    "{LOG}: creative tab {} insert refused: {error:?}",
+                    event.tab
+                );
+            }
+        }
+    }
+}
+
+pub(crate) fn apply_creative_contents(
+    host: &mut dyn mod_api::ClientHost,
+    event: &mut mod_api::BuildCreativeModeTabContentsEvent<'_>,
+    runtime_host: &mut StdHost,
+    contents: &runtime::CreativeTabContents,
+    seeded_parent: &[(Value, mod_api::ItemStack)],
+    seeded_search: &[(Value, mod_api::ItemStack)],
+) {
+    apply_creative_list(
+        host,
+        event,
+        runtime_host,
+        &contents.display_stacks,
+        seeded_parent,
+        mod_api::CreativeTabVisibility::Parent,
+    );
+    apply_creative_list(
+        host,
+        event,
+        runtime_host,
+        &contents.search_tab_stacks,
+        seeded_search,
+        mod_api::CreativeTabVisibility::Search,
+    );
+}
+
+pub(crate) fn convert_tooltip_component(
+    host: &dyn mod_api::ClientHost,
+    runtime_host: &StdHost,
+    component: &Value,
+) -> (Option<mod_api::Text>, bool) {
+    let Some(json) = runtime_host.component_json(component) else {
+        return (None, true);
+    };
+    match host.text_from_json(&json) {
+        Ok(Some(text)) => (Some(text), false),
+        Ok(None) | Err(_) => (None, true),
     }
 }
 
@@ -248,13 +1114,18 @@ fn load_jar(
     jar: Arc<NativeJar>,
     links: &[(String, Arc<NativeJar>)],
     imc: &runtime::neoforge_imc::ImcBus,
+    game_version: Option<&str>,
 ) -> Result<LoadedJar, Row> {
     let id = jar_id(&jar, &file);
     let entrypoints = jar.role_entrypoints(true);
     if entrypoints.is_empty() {
         return Err(Row::refused(&file, id, "no client entrypoint"));
     }
-    let mut host = match jar.try_seed_host(StdHost::new().with_environment_type("CLIENT")) {
+    let mut seed = StdHost::new().with_environment_type("CLIENT");
+    if let Some(version) = game_version {
+        seed = seed.with_game_version(version);
+    }
+    let mut host = match jar.try_seed_host(seed) {
         Ok(host) => host,
         Err(error) => return Err(Row::refused(&file, id, error)),
     };

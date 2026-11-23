@@ -57,10 +57,11 @@ when this was written. At that pin `cargo check --all-targets`, clippy with `-D 
 The official Horizon's native package takes only `.rs` and `.toml` files under `src/`
 (horizon-rust/horizon `docs/modding/src/how-to/native-mods/03-data-files.md`), and the launcher's
 staging leaves every other file out, so the build fails on the first `include_str!` of a `.txt`.
-`vendor.py --mod` therefore writes each embedded data file of another kind into a folder with
-`horizon-mod.toml` as `<name>.rs`, one raw string literal of the same text, and turns the vendored
-`include_str!("<name>")` into `include!("<name>.rs")`. The constant holds the same bytes;
-`tests/test_vendor_mod.py` checks the literal against the source file. `mod/` keeps the plain copy.
+`vendor.py` therefore vendors each embedded data file of another kind as `<name>.rs`, one Rust item
+holding its exact bytes, and the vendored call reads that item (the form is described at the top of
+`tools/vendor.py`). The bytes are the same in `mod/` and in `mod-horizon/`: `--mod mod-horizon`
+changes the destination only. `tests/test_vendor_mod.py` checks that the two copies match file for
+file and that the folder holds only `.rs` and `.toml` files.
 
 ## In-game proof (official launcher 0.2.95, Nightly 2026-11-20 at the pin)
 

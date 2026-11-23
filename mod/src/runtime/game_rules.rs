@@ -224,7 +224,7 @@ pub(crate) fn missing_value(id: &str) -> Option<NativeError> {
 mod tests {
     use super::*;
 
-    const ORACLE: &str = include_str!("game_rules_oracle.tsv");
+    const ORACLE: &str = crate::runtime::vendored_game_rules_oracle_tsv::VENDORED_DATA;
 
     fn call(name: &str, descriptor: &str) -> MethodRef {
         MethodRef {
