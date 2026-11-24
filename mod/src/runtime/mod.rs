@@ -187,6 +187,7 @@ mod jdk_character;
 mod jdk_character_table;
 mod jdk_closure;
 mod jdk_float_text;
+mod jdk_interface_methods;
 mod jdk_locale_thread;
 mod jdk_model;
 mod jdk_new_set_from_map;
@@ -272,6 +273,7 @@ mod reflect_generic;
 mod reflect_names;
 mod reflect_override;
 mod regex_calls;
+mod regex_matcher;
 mod registry_contents;
 mod registry_lookup;
 mod render_math;
@@ -12854,6 +12856,11 @@ impl Host for StdHost {
                     if is_collection_owner(owner) && !is_map_owner(owner) =>
                 {
                     let mut source = host_collection_values(self, Self::argument(r, args, 0)?)?;
+                    // `new ArrayDeque<>(c)` copies through `addAll`, which
+                    // rejects a null: no deque exists afterwards.
+                    if queue_rejects_null(owner) && source.contains(&Value::Ref(None)) {
+                        return Err(null_element_rejected());
+                    }
                     // A set built from a collection holds each element once
                     // (`addAll`: `equals`, so one `NaN`).
                     if is_set_owner(owner) {
@@ -12896,6 +12903,19 @@ impl Host for StdHost {
                             .set_capacity(marker.to_owned(), capacity, vector);
                     }
                     return Ok(Value::Void);
+                }
+                // A null element into a queue that rejects it, whichever class
+                // or interface the call names. `addLast` and `offerFirst` match
+                // no arm below (those name descriptors the JDK's methods do not
+                // have), so a null is the only element they answer; any other
+                // stays counted.
+                (owner, "add" | "offer" | "offerFirst" | "offerLast", "(Ljava/lang/Object;)Z")
+                | (owner, "push" | "addFirst" | "addLast", "(Ljava/lang/Object;)V")
+                    if is_list_like_owner(owner)
+                        && Self::argument(r, args, 0)? == &Value::Ref(None)
+                        && queue_insert_rejects_null(owner, marker) =>
+                {
+                    return Err(null_element_rejected());
                 }
                 (owner, "offer" | "offerLast" | "addLast", "(Ljava/lang/Object;)Z")
                     if is_queue_owner(owner) =>
@@ -13068,6 +13088,24 @@ impl Host for StdHost {
                 (owner, "addAll", "(Ljava/util/Collection;)Z") if is_list_like_owner(owner) => {
                     let source = Self::argument(r, args, 0)?;
                     let additions = host_collection_values(self, source)?;
+                    if queue_insert_rejects_null(owner, marker)
+                        && let Some(null_at) = additions.iter().position(|v| *v == Value::Ref(None))
+                    {
+                        // `ArrayDeque.addAll` adds one element at a time, so
+                        // what precedes the null stays; the concurrent queues
+                        // build a chain first and add nothing. Either way the
+                        // array may have grown, so a layout is no longer known.
+                        if owner == "java/util/ArrayDeque"
+                            || crate::runtime::jar_object::collection_class(marker) == "java/util/ArrayDeque"
+                        {
+                            self.mutable_collections
+                                .entry(marker.to_owned())
+                                .or_default()
+                                .extend(additions[..null_at].iter().cloned());
+                        }
+                        self.deque_layouts.remove(marker);
+                        return Err(null_element_rejected());
+                    }
                     let changed = !additions.is_empty();
                     let current = self.mutable_collections.get(marker).map_or(0, Vec::len);
                     self.ensure_collection_capacity(marker, current + additions.len())?;
@@ -18655,6 +18693,24 @@ fn queue_rejects_null(owner: &str) -> bool {
             | "java/util/concurrent/ConcurrentLinkedQueue"
             | "java/util/concurrent/ConcurrentLinkedDeque"
     )
+}
+
+/// Whether inserting `null` into the receiver throws
+/// `NullPointerException`. The call names a class (`ArrayDeque.add`) or an
+/// interface (`Deque.add`, `Queue.offer`, `Collection.addAll`), so both the
+/// call site's `owner` and the receiver's own class (from its marker) count.
+fn queue_insert_rejects_null(owner: &str, marker: &str) -> bool {
+    queue_rejects_null(owner) || queue_rejects_null(crate::runtime::jar_object::collection_class(marker))
+}
+
+/// The `NullPointerException` a null-rejecting queue throws: JDK 25's
+/// `new NullPointerException()`, without a message.
+fn null_element_rejected() -> NativeError {
+    NativeError::UncaughtException {
+        class: "java/lang/NullPointerException".into(),
+        message: None,
+        frame: None,
+    }
 }
 
 /// Every queue a jar constructs directly.
@@ -28855,6 +28911,21 @@ impl<H: Host> Runtime<'_, H> {
                     )
                     .map(Some);
             }
+            // `matcher::find` bound to a `Matcher`: the matcher's position is
+            // kept by `regex_matcher.rs`, so the call runs through the same
+            // chain as a direct call and moves it.
+            if callback.target.owner == "java/util/regex/Matcher" {
+                return self
+                    .call_virtual(
+                        jdk_call::Site::Virtual,
+                        &callback.target.owner,
+                        &callback.target.name,
+                        &callback.target.descriptor,
+                        &receiver,
+                        &rest,
+                    )
+                    .map(Some);
+            }
             if callback.target.name == "stream"
                 && callback.target.descriptor == "()Ljava/util/stream/Stream;"
                 && is_collection_owner(&callback.target.owner)
@@ -29813,44 +29884,10 @@ impl<H: Host> Runtime<'_, H> {
             }
             ("copyOf", _) | ("copyOfRange", _) => {
                 let source = self.array(StdHost::argument(r, args, 0)?)?.into_owned();
-                let (start, end) = if r.name == "copyOf" {
-                    let length = expect_int(r, StdHost::argument(r, args, 1)?)?;
-                    let length = usize::try_from(length).map_err(|_| {
-                        NativeError::Metadata("Arrays.copyOf length is negative".into())
-                    })?;
-                    (0, length)
-                } else {
-                    let from = expect_int(r, StdHost::argument(r, args, 1)?)?;
-                    let to = expect_int(r, StdHost::argument(r, args, 2)?)?;
-                    let from = usize::try_from(from).map_err(|_| {
-                        NativeError::Metadata("Arrays.copyOfRange start is negative".into())
-                    })?;
-                    let to = usize::try_from(to).map_err(|_| {
-                        NativeError::Metadata("Arrays.copyOfRange end is negative".into())
-                    })?;
-                    (from, to.max(from))
-                };
-                let element = return_desc(&r.descriptor)
-                    .trim_start_matches('[')
-                    .to_owned();
-                let copy_len = end.saturating_sub(start);
-                if copy_len > MAX_ARRAY_ELEMENTS {
-                    return Err(array_bound_error(copy_len as u128));
-                }
-                let mut values = Vec::new();
-                values
-                    .try_reserve_exact(copy_len)
-                    .map_err(|_| array_bound_error(copy_len as u128))?;
-                for index in start..end {
-                    values.push(
-                        source
-                            .get(index)
-                            .cloned()
-                            .unwrap_or_else(|| Value::default_for(&element)),
-                    );
-                }
                 // The copy is an array of the original's class, or of the
-                // `Class<? extends T[]> newType` the last argument names.
+                // `Class<? extends T[]> newType` the last argument names. One that is
+                // not known stays counted, before any argument check: Java reads
+                // `newType` before it allocates, so its errors may come first.
                 let class = if r.descriptor.contains("Ljava/lang/Class;") {
                     match args.last().and_then(host_class::class_name) {
                         Some(class) if class.starts_with('[') => class.replace('.', "/"),
@@ -29862,6 +29899,65 @@ impl<H: Host> Runtime<'_, H> {
                         None => return Ok(None),
                     }
                 };
+                let (from, length) = if r.name == "copyOf" {
+                    let length = expect_int(r, StdHost::argument(r, args, 1)?)?;
+                    (0, array_length(length)?)
+                } else {
+                    let from = expect_int(r, StdHost::argument(r, args, 1)?)?;
+                    let to = expect_int(r, StdHost::argument(r, args, 2)?)?;
+                    // `int newLength = to - from` wraps: `(-5, Integer.MAX_VALUE)` is
+                    // `from > to` to the JDK too.
+                    let Ok(length) = usize::try_from(to.wrapping_sub(from)) else {
+                        return Err(array_copy::thrown(
+                            "java/lang/IllegalArgumentException",
+                            Some(format!("{from} > {to}")),
+                        ));
+                    };
+                    (from, length)
+                };
+                // The copy is allocated before `System.arraycopy` checks `from`.
+                if length > MAX_ARRAY_ELEMENTS {
+                    return Err(array_bound_error(length as u128));
+                }
+                if from < 0 {
+                    let kind = value_class::array_component(StdHost::argument(r, args, 0)?)
+                        .map_or_else(
+                            || "object array".to_owned(),
+                            |component| array_copy::kind_name(&component).to_owned(),
+                        );
+                    return Err(array_copy::thrown(
+                        "java/lang/ArrayIndexOutOfBoundsException",
+                        Some(format!(
+                            "arraycopy: source index {from} out of bounds for {kind}[{}]",
+                            source.len()
+                        )),
+                    ));
+                }
+                let start = from as usize;
+                if start > source.len() {
+                    return Err(array_copy::thrown(
+                        "java/lang/ArrayIndexOutOfBoundsException",
+                        Some(format!(
+                            "arraycopy: length {} is negative",
+                            source.len() as i64 - start as i64
+                        )),
+                    ));
+                }
+                let element = return_desc(&r.descriptor)
+                    .trim_start_matches('[')
+                    .to_owned();
+                let mut values = Vec::new();
+                values
+                    .try_reserve_exact(length)
+                    .map_err(|_| array_bound_error(length as u128))?;
+                for index in start..start + length {
+                    values.push(
+                        source
+                            .get(index)
+                            .cloned()
+                            .unwrap_or_else(|| Value::default_for(&element)),
+                    );
+                }
                 // A `newType` the original's component is not a subtype of:
                 // `System.arraycopy` checks each element (`array_store.rs`).
                 if let (Some(source), Some(component)) = (
@@ -34827,7 +34923,8 @@ impl<H: Host> Runtime<'_, H> {
                     jvm_dispatch::jdk_superclass_declares(&current, name, descriptor)
                         == Some(false);
                 if host_cannot_declare
-                    && let Some(owner) = self.inherited_default_owner(&chain, name, descriptor)
+                    && let Some(owner) =
+                        self.inherited_default_owner(&chain, &current, name, descriptor)
                 {
                     return Some((owner, true));
                 }
@@ -34850,17 +34947,21 @@ impl<H: Host> Runtime<'_, H> {
     /// at `java/lang/Object` and the host answered a neutral `null` for a body
     /// the jar ships. The default is the maximally specific one (JVMS
     /// §5.4.3.3, `jvm_dispatch.rs`), so a sub-interface's override beats the
-    /// default it overrides wherever either is declared.
+    /// default it overrides wherever either is declared. `left_at` is the JDK
+    /// superclass the chain leaves the jar at, whose interfaces take part too
+    /// (#627).
     fn inherited_default_owner(
         &self,
         chain: &[String],
+        left_at: &str,
         name: &str,
         descriptor: &str,
     ) -> Option<String> {
         // JVMS §5.4.3.3's maximally specific default (`jvm_dispatch.rs`); a
-        // conflict or an abstract-only set selects nothing here.
-        match self.maximally_specific_default(chain, name, descriptor) {
-            jvm_dispatch::DefaultSelection::Selected(owner) => Some(owner),
+        // JDK default, a conflict, an abstract-only set or an outcome an
+        // unknown interface could change selects no jar body here.
+        match self.maximally_specific_default(chain, Some(left_at), name, descriptor) {
+            jvm_dispatch::DefaultSelection::Jar(owner) => Some(owner),
             _ => None,
         }
     }
@@ -35048,6 +35149,9 @@ impl<H: Host> Runtime<'_, H> {
         receiver: &Value,
         args: &[Value],
     ) -> Result<Value, NativeError> {
+        // A `Matcher` call that reaches the host unanswered may have moved the
+        // matcher: its position is no longer known (`regex_matcher.rs`).
+        regex_matcher::note_host_call(r, receiver);
         let value = if level_sound::needs_block_pos_resolution(r, args) {
             let mut resolved_args = args.to_vec();
             level_sound::resolve_block_pos_arg(self, r, &mut resolved_args);
@@ -39309,27 +39413,32 @@ impl<H: Host> Runtime<'_, H> {
                         dispatched = Some(invoke_or_catch!(at, value));
                     }
                     if dispatched.is_none()
-                        && let Some(owner) = invoke_or_catch!(
+                        && let Some(selected) = invoke_or_catch!(
                             at,
-                            self.jvm_selected_jar_body(&r, op, receiver.as_ref())
+                            self.jvm_dispatch_or_count(&r, op, receiver.as_ref())
                         )
                     {
-                        dispatched = Some({
+                        dispatched = Some(match selected {
+                            // A selection an unreadable interface decides
+                            // (`jvm_dispatch.rs`, #627): counted.
+                            jvm_dispatch::Dispatched::Counted(value) => value,
                             // The receiver's own body, before any host model
                             // (`jvm_dispatch.rs`).
-                            jar_body = true;
-                            // A clone: later arms are statements the borrow checker sees
-                            // reaching `receiver`, though `dispatched` keeps them from running.
-                            invoke_or_catch!(
-                                at,
-                                self.invoke(
-                                    &owner,
-                                    &r.name,
-                                    &r.descriptor,
-                                    receiver.clone(),
-                                    &args
+                            jvm_dispatch::Dispatched::Body(owner) => {
+                                jar_body = true;
+                                // A clone: later arms are statements the borrow checker sees
+                                // reaching `receiver`, though `dispatched` keeps them from running.
+                                invoke_or_catch!(
+                                    at,
+                                    self.invoke(
+                                        &owner,
+                                        &r.name,
+                                        &r.descriptor,
+                                        receiver.clone(),
+                                        &args
+                                    )
                                 )
-                            )
+                            }
                         });
                     }
                     if dispatched.is_none()
@@ -59134,6 +59243,8 @@ mod vendored_game_rules_oracle_tsv;
 mod vendored_generated_nested_real_java25_txt;
 #[path = "jarjar_version_java25.txt.rs"]
 mod vendored_jarjar_version_java25_txt;
+#[path = "jdk_interface_methods_25.tsv.rs"]
+mod vendored_jdk_interface_methods_25_tsv;
 #[path = "jdk_text_oracle.json.rs"]
 mod vendored_jdk_text_oracle_json;
 #[path = "live_menu_item_hooks_java25.txt.rs"]

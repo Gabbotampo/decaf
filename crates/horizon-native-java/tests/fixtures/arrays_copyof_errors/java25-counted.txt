@@ -1,0 +1,3 @@
+fields.copyOf.negLen=java.lang.NegativeArraySizeException:-1
+fields.copyOf.pad=[null, null]
+fields.copyOfRange.fromGtTo=java.lang.IllegalArgumentException:3 > 1
