@@ -5,7 +5,7 @@
 //! classes and of Mixin's `CallbackInfoReturnable`, then driven the way the
 //! game drives it: plan with `plan_load_time_weave_with_game_hooks`, bind with
 //! `register_game_hooks`, fire with `run_game_hook_returning`. What a callback
-//! saw crosses the host boundary through the compile-only `demo/HookSink`, so
+//! saw crosses the host boundary through the compile-only `demoprobe/HookSink`, so
 //! the test reads it from `StdHost`'s invocation log, not from a Rust stub.
 //!
 //! The shapes covered:
@@ -120,12 +120,15 @@ const GAME_STUBS: &[(&str, &str)] = &[
         "package net.minecraft.server.players;\npublic class PlayerList {}\n",
     ),
     (
-        "demo/HookSink.java",
-        "package demo;\npublic final class HookSink { public static void mark(String point) {} public static void speed(String point, float value) {} }\n",
+        "demoprobe/HookSink.java",
+        "package demoprobe;\npublic final class HookSink { public static void mark(String point) {} public static void speed(String point, float value) {} }\n",
     ),
 ];
 
 const HEADER: &str = "package demo;
+import demoprobe.Counter;
+import demoprobe.HookSink;
+import demoprobe.Main;
 import net.minecraft.core.BlockPos;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerPlayer;
@@ -269,12 +272,12 @@ impl Fixture {
             .map(|(path, body)| ((*path).to_owned(), (*body).to_owned()))
             .collect();
         sources.insert(
-            "demo/Counter.java".into(),
-            "package demo;\npublic final class Counter { public static int grows; }\n".into(),
+            "demoprobe/Counter.java".into(),
+            "package demoprobe;\npublic final class Counter { public static int grows; }\n".into(),
         );
         sources.insert(
-            "demo/Main.java".into(),
-            "package demo;\npublic final class Main { public static void onInitialize() {} }\n"
+            "demoprobe/Main.java".into(),
+            "package demoprobe;\npublic final class Main { public static void onInitialize() {} }\n"
                 .into(),
         );
         for (class, body) in mixins {
@@ -307,7 +310,7 @@ impl Fixture {
         let metadata = serde_json::json!({
             "id": "game-hook-shapes",
             "version": "1.0",
-            "entrypoints": { "main": ["demo.Main"] },
+            "entrypoints": { "main": ["demoprobe.Main"] },
             "mixins": files,
         })
         .to_string();
@@ -351,11 +354,11 @@ impl Drop for Fixture {
     }
 }
 
-/// What the callbacks told `demo/HookSink`, in call order.
+/// What the callbacks told `demoprobe/HookSink`, in call order.
 fn sink(host: &StdHost) -> Vec<(String, Vec<Value>)> {
     host.invocations()
         .iter()
-        .filter(|call| call.method.owner == "demo/HookSink")
+        .filter(|call| call.method.owner == "demoprobe/HookSink")
         .map(|call| (call.method.name.clone(), call.args.clone()))
         .collect()
 }

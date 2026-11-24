@@ -628,7 +628,9 @@ pub enum HostKind {
     PartDefinition,
     LayerDefinition,
     /// A `java.util.regex.Matcher` from `Pattern.matcher(input)`: a serial (one
-    /// object per call), the pattern text and the input (`host_jdk_constant.rs`).
+    /// object per call), the pattern text, the input and whether the input is a
+    /// `String` (`host_jdk_constant.rs`). Its search state is kept by serial in
+    /// `regex_matcher.rs`.
     RegexMatcher,
     /// Vanilla's ItemStackTemplate (`host_item_stack_template.rs`).
     ItemStackTemplate,

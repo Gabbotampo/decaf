@@ -8,9 +8,11 @@
 //! altar recipe makes, and checks Runes' `onTake` consumed one of each input. Closing the window
 //! hands the rest back to the inventory.
 //!
-//! Runes' `onTake` ends by casting the player to its `RuneCrafter` interface (a Mixin on
-//! `Player` that is not on this branch) for its sound cooldown: that cast and the calls after it
-//! are the counted calls on the take, and the test lists them.
+//! Runes' `onTake` ends by casting the player to its `RuneCrafter` interface (`PlayerEntityMixin`,
+//! an interface-injection Mixin on `Player`, `interface_mixins.rs`) for its sound cooldown: the
+//! cast and its `getLastRuneCrafted`/`setLastRuneCrafted` run exactly on the live player. What
+//! the take counts is the player's `tickCount` the cooldown compares against (not a fact the
+//! live menu holds) and, for that, the outer click; the test lists them.
 
 use std::{collections::BTreeMap, path::Path};
 
@@ -267,12 +269,16 @@ fn run(jar_path: &Path) {
         "taking the result counted {} calls: {:?}",
         taken.unknown_host_call_count, taken.unknown_host_calls
     );
-    assert!(
-        taken
-            .unknown_host_calls
-            .keys()
-            .any(|call| call.contains("RuneCrafter")),
-        "Runes' RuneCrafter cast is the counted part of onTake: {:?}",
+    // The `RuneCrafter` mixin runs exactly; the player's `tickCount` is the one counted read,
+    // and the outer click counts with it.
+    assert_eq!(
+        taken.unknown_host_calls.keys().cloned().collect::<Vec<_>>(),
+        vec![
+            "net/minecraft/server/network/ServerGamePacketListenerImpl#handleContainerClick(Lnet/minecraft/network/protocol/game/ServerboundContainerClickPacket;)V"
+                .to_owned(),
+            "net/minecraft/world/entity/player/Player#tickCountI".to_owned(),
+        ],
+        "{:?}",
         taken.unknown_host_calls
     );
 

@@ -301,7 +301,8 @@ pub(crate) fn previous_player_value(
 
 /// The entity with id `id`: the player of that id when the façade lists one
 /// (an attacked player is that player, not a second object), else
-/// `game/entity/<id>`.
+/// `game/entity/<id>/<incarnation>` when the façade tracks a live incarnation
+/// for `id`, or `game/entity/<id>`.
 pub(crate) fn entity_value(facade: &crate::runtime::events::EventFacade, id: i32) -> Value {
     match facade
         .players
@@ -310,7 +311,10 @@ pub(crate) fn entity_value(facade: &crate::runtime::events::EventFacade, id: i32
         .find(|player| player.entity_id == Some(id))
     {
         Some(player) => player_value(facade, player.uuid),
-        None => server_value(format!("game/entity/{id}")),
+        None => match facade.entity_incarnations.get(&id) {
+            Some(&incarnation) => server_value(format!("game/entity/{id}/{incarnation}")),
+            None => server_value(format!("game/entity/{id}")),
+        },
     }
 }
 
@@ -332,11 +336,11 @@ fn player_parts(marker: &str) -> Option<(u128, Option<u32>)> {
     Some((uuid, session))
 }
 
-/// The entity id an entity key carries: `game/entity/<id>`, or a player's
-/// trailing `/<id>`.
+/// The entity id an entity key carries: `game/entity/<id>[/<incarnation>]`,
+/// or a player's trailing `/<id>`.
 fn entity_id(marker: &str) -> Option<i32> {
-    if let Some(id) = marker.strip_prefix("game/entity/") {
-        return id.parse().ok();
+    if let Some(rest) = marker.strip_prefix("game/entity/") {
+        return rest.split('/').next()?.parse().ok();
     }
     let rest = marker.strip_prefix("game/player/")?;
     let mut parts = rest.split('/');

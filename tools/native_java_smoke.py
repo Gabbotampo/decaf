@@ -393,9 +393,10 @@ public final class Target {
     }
 }
 """,
-    "demo/TargetMixin.java": """
-package demo;
+    "demo/mixin/TargetMixin.java": """
+package demo.mixin;
 
+import demo.Probe;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
@@ -415,9 +416,10 @@ public abstract class TargetMixin {
 """,
     # A resolvable INVOKE selector becomes an executable plan that carries the
     # parsed call site, so ``unresolved`` stays empty.
-    "demo/InvokeMixin.java": """
-package demo;
+    "demo/mixin/InvokeMixin.java": """
+package demo.mixin;
 
+import demo.Probe;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
@@ -435,8 +437,8 @@ public abstract class InvokeMixin {
     # Declared under ``client``/``server`` in ``demo.mixins.json``: real mixin
     # classes with no ``@Inject``, so the config lists resolve without adding
     # a fourth plan.
-    "demo/ClientMixin.java": """
-package demo;
+    "demo/mixin/ClientMixin.java": """
+package demo.mixin;
 
 import org.spongepowered.asm.mixin.Mixin;
 
@@ -444,8 +446,8 @@ import org.spongepowered.asm.mixin.Mixin;
 public abstract class ClientMixin {
 }
 """,
-    "demo/ServerMixin.java": """
-package demo;
+    "demo/mixin/ServerMixin.java": """
+package demo.mixin;
 
 import org.spongepowered.asm.mixin.Mixin;
 
@@ -564,7 +566,7 @@ def expect_mixin_probe(archive: Path) -> dict | None:
             "target": "demo/Target",
             "method": "run",
             "descriptor": "(I)V",
-            "callback": "demo/TargetMixin#before",
+            "callback": "demo/mixin/TargetMixin#before",
             "callback_descriptor": "(I)V",
             "at": "HEAD",
             "invoke_target": None,
@@ -580,7 +582,7 @@ def expect_mixin_probe(archive: Path) -> dict | None:
             "target": "demo/Target",
             "method": "run",
             "descriptor": "(I)V",
-            "callback": "demo/InvokeMixin#invokeOnly",
+            "callback": "demo/mixin/InvokeMixin#invokeOnly",
             "callback_descriptor": "(I)V",
             "at": "INVOKE",
             "invoke_target": "demo/Probe#mark(Ljava/lang/String;)V",
@@ -596,7 +598,7 @@ def expect_mixin_probe(archive: Path) -> dict | None:
             "target": "demo/Target",
             "method": "run",
             "descriptor": "(I)V",
-            "callback": "demo/TargetMixin#after",
+            "callback": "demo/mixin/TargetMixin#after",
             "callback_descriptor": "(I)V",
             "at": "RETURN",
             "invoke_target": None,
@@ -615,10 +617,10 @@ def expect_mixin_probe(archive: Path) -> dict | None:
     expected_configs = [
         {
             "path": "demo.mixins.json",
-            "package": "demo",
-            "mixins": ["demo.TargetMixin", "demo.InvokeMixin"],
-            "client": ["demo.ClientMixin"],
-            "server": ["demo.ServerMixin"],
+            "package": "demo.mixin",
+            "mixins": ["demo.mixin.TargetMixin", "demo.mixin.InvokeMixin"],
+            "client": ["demo.mixin.ClientMixin"],
+            "server": ["demo.mixin.ServerMixin"],
             "required": False,
             "priority": 1500,
             "mixin_priority": None,
@@ -905,7 +907,11 @@ def main() -> int:
         (mixin_metadata / "demo.mixins.json").write_text(
             json.dumps(
                 {
-                    "package": "demo",
+                    # Only the mixins live in the config's package: real Fabric
+                    # refuses to load any other class there (sponge-mixin's
+                    # `MixinProcessor` `packageMatch`, rethrown by Knot), and the
+                    # entrypoint, target and probe live in `demo`.
+                    "package": "demo.mixin",
                     "mixins": ["TargetMixin", "InvokeMixin"],
                     "client": ["ClientMixin"],
                     "server": ["ServerMixin"],
@@ -1000,10 +1006,10 @@ def main() -> int:
         package_result = package_jar(
             mixin_jar,
             (classes, "demo/Target.class"),
-            (classes, "demo/TargetMixin.class"),
-            (classes, "demo/InvokeMixin.class"),
-            (classes, "demo/ClientMixin.class"),
-            (classes, "demo/ServerMixin.class"),
+            (classes, "demo/mixin/TargetMixin.class"),
+            (classes, "demo/mixin/InvokeMixin.class"),
+            (classes, "demo/mixin/ClientMixin.class"),
+            (classes, "demo/mixin/ServerMixin.class"),
             (classes, "demo/MixinEntry.class"),
             (mixin_metadata, "fabric.mod.json"),
             (mixin_metadata, "demo.mixins.json"),

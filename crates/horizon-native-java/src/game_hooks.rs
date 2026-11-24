@@ -47,7 +47,7 @@ const MAX_GAME_HOOK_FIELDS: usize = 65_536;
 const MAX_GAME_HOOK_ARRAYS: usize = 8_192;
 
 /// Mixin's `@Shadow`: the member stands for one the target class declares.
-const MIXIN_SHADOW_DESCRIPTOR: &str = "Lorg/spongepowered/asm/mixin/Shadow;";
+pub(crate) const MIXIN_SHADOW_DESCRIPTOR: &str = "Lorg/spongepowered/asm/mixin/Shadow;";
 
 /// What kind of game object a marker names; it decides the vanilla class
 /// hierarchy the object answers `instanceof` for and the members it models.
@@ -118,6 +118,9 @@ pub struct GameObject {
     /// object each. `None` for a player the host does not count, whose key
     /// names no session (comparisons counted).
     pub incarnation: Option<(u32, u32)>,
+    /// Monotonic incarnation counter for a non-player entity so a later entity
+    /// reusing the same numeric id gets a distinct `game/entity/<id>/<inc>` key.
+    pub entity_incarnation: Option<u64>,
     /// `Entity.isSilent()`, when known by the hook (`None` refuses).
     pub silent: Option<bool>,
     /// Explicit `Entity.getSoundSource()` override when not uniquely implied
@@ -146,6 +149,7 @@ impl GameObject {
             main_hand: None,
             off_hand: None,
             incarnation: None,
+            entity_incarnation: None,
             silent: None,
             sound_source: None,
         }
@@ -268,6 +272,13 @@ impl GameObject {
         self.incarnation = Some((session, life));
         self
     }
+
+    /// Monotonic incarnation counter for a non-player entity so a later entity
+    /// reusing the same numeric id never aliases its Mixin fields.
+    pub fn with_entity_incarnation(mut self, incarnation: u64) -> Self {
+        self.entity_incarnation = Some(incarnation);
+        self
+    }
     pub fn with_entity_id(mut self, id: i32) -> Self {
         self.entity_id = Some(id);
         self
@@ -335,7 +346,10 @@ impl GameObject {
                 (None, _) => format!("{GAME_OBJECT_PREFIX}player/{key}"),
             },
             GameObjectKind::Living | GameObjectKind::Entity | GameObjectKind::ItemEntity => {
-                format!("{GAME_OBJECT_PREFIX}entity/{key}")
+                match self.entity_incarnation {
+                    Some(incarnation) => format!("{GAME_OBJECT_PREFIX}entity/{key}/{incarnation}"),
+                    None => format!("{GAME_OBJECT_PREFIX}entity/{key}"),
+                }
             }
             GameObjectKind::ItemStack => format!("{GAME_OBJECT_PREFIX}stack/{key}"),
             GameObjectKind::Level => format!("{GAME_OBJECT_PREFIX}level/{key}"),
@@ -467,7 +481,10 @@ pub struct GameHookState {
     next_array: usize,
     /// `mixin class|marker` for every object a Mixin class's constructor ran on.
     initialized: BTreeSet<String>,
-    model: Option<Arc<MixinModel>>,
+    /// Game object markers forgotten via [`Self::forget_object`] since the last
+    /// resident-host firing, so any mirrored copy on the host heap is also swept.
+    forgotten: BTreeSet<String>,
+    model: Option<(MixinSide, Arc<MixinModel>)>,
 }
 
 impl GameHookState {
@@ -485,6 +502,39 @@ impl GameHookState {
         self.fields.retain(|key, _| !key.starts_with(&prefix));
         let suffix = format!("|{marker}");
         self.initialized.retain(|key| !key.ends_with(&suffix));
+        self.forgotten.insert(marker.to_owned());
+    }
+
+    /// Drop everything kept on `marker` and any incarnated child markers starting
+    /// with `{marker}/` (for example all incarnations of a despawned entity id).
+    pub fn forget_object_prefix(&mut self, marker: &str) {
+        let exact_field = format!("{marker}|");
+        let child_prefix = format!("{marker}/");
+        let mut matched: BTreeSet<String> = BTreeSet::new();
+        matched.insert(marker.to_owned());
+        self.fields.retain(|key, _| {
+            if key.starts_with(&exact_field) || key.starts_with(&child_prefix) {
+                if let Some((obj, _)) = key.split_once('|') {
+                    matched.insert(obj.to_owned());
+                }
+                false
+            } else {
+                true
+            }
+        });
+        let exact_init = format!("|{marker}");
+        let child_init = format!("|{marker}/");
+        self.initialized.retain(|entry| {
+            if entry.ends_with(&exact_init) || entry.contains(&child_init) {
+                if let Some((_, obj)) = entry.split_once('|') {
+                    matched.insert(obj.to_owned());
+                }
+                false
+            } else {
+                true
+            }
+        });
+        self.forgotten.extend(matched);
     }
 }
 
@@ -497,6 +547,9 @@ pub enum JarCallRedirect {
     /// Run this jar method instead (the Mixin class's implementation of an
     /// interface it adds to the game object).
     Jar(MethodRef),
+    /// Count or refuse an ambiguous call (for example, a multi-target `@Shadow`
+    /// that matches zero or multiple targets on the receiver).
+    Ambiguous(MethodRef),
 }
 
 /// The Mixin classes of one jar that target game classes, read once.
@@ -511,6 +564,10 @@ struct MixinModel {
     /// `class|name|descriptor` of every member that stands for a game method:
     /// `@Shadow`, abstract, `@Accessor` and `@Invoker` members of a Mixin class.
     shadow_methods: BTreeSet<String>,
+    /// `class|name|descriptor` of each `@Shadow` method whose name carries its
+    /// `@Shadow` prefix → the game method name it stands for (`shadow$getId` →
+    /// `getId`, `MixinPreProcessorStandard.prepareShadow`).
+    shadow_renames: BTreeMap<String, String>,
     /// `class|name|descriptor` of every method with a body a Mixin class
     /// declares, which a redirect may run.
     concrete_methods: BTreeSet<String>,
@@ -541,7 +598,11 @@ impl MixinModel {
                 .is_some_and(|declared| !declared.contains(member))
     }
 
-    fn build(classes: &BTreeMap<String, ClassFile>) -> Self {
+    fn build(jar: &NativeJar, side: MixinSide) -> Self {
+        let classes = &jar.classes;
+        let configs = jar.mixin_configs();
+        let config_sides = jar.mixin_config_sides();
+        let plugins = jar.cached_config_plugins(side);
         let mut model = Self::default();
         for (name, class) in classes {
             let Some(mixin) = class
@@ -558,17 +619,40 @@ impl MixinModel {
             if targets.is_empty() {
                 continue;
             }
-            for target in &targets {
+            // Only active config-, side-, and plugin-gated targets enter `by_target`,
+            // matching `RuntimeMixinIndex` so unlisted/wrong-side/plugin-rejected mixins
+            // never pass `instanceof` or dispatch inside game hooks.
+            let active_targets = crate::interface_mixins::active_host_mixin_targets(
+                jar,
+                &configs,
+                &config_sides,
+                plugins,
+                side,
+                class,
+            );
+            for target in &active_targets {
                 model
                     .by_target
                     .entry(target.clone())
                     .or_default()
                     .push(name.clone());
             }
+            // Keep target/shadow/game-heir metadata for every `@Mixin` class so an
+            // inactive mixin can still never bypass `@Shadow` or game-field refusal.
             model.targets.insert(name.clone(), targets);
-            model
-                .interfaces
-                .insert(name.clone(), class.interface_names());
+            let mut iface_closure = Vec::new();
+            let mut queue: std::collections::VecDeque<String> =
+                class.interface_names().into_iter().collect();
+            while let Some(iface) = queue.pop_front() {
+                if iface_closure.contains(&iface) {
+                    continue;
+                }
+                if let Some(file) = classes.get(&iface) {
+                    queue.extend(file.interface_names());
+                }
+                iface_closure.push(iface);
+            }
+            model.interfaces.insert(name.clone(), iface_closure);
             // The fields this class's own chain declares, if that chain
             // leaves the jar at a game class.
             let mut declared = BTreeSet::new();
@@ -589,9 +673,12 @@ impl MixinModel {
             if current.is_none() && is_game_class(&exit) {
                 model.game_heirs.insert(name.clone(), declared);
             }
-            let (fields, methods) = member_annotations(class).unwrap_or_default();
-            for (member, descriptors) in fields {
-                if descriptors.iter().any(|d| d == MIXIN_SHADOW_DESCRIPTOR) {
+            let (fields, methods) = member_annotation_values(class).unwrap_or_default();
+            for (member, annotations) in fields {
+                if annotations
+                    .iter()
+                    .any(|a| a.descriptor == MIXIN_SHADOW_DESCRIPTOR)
+                {
                     let (field, descriptor) = member.split_once('|').unwrap_or((&member, ""));
                     model
                         .shadow_fields
@@ -603,17 +690,25 @@ impl MixinModel {
                     continue;
                 }
                 let key = format!("{}|{}", method.name, method.descriptor);
-                let annotated = methods.get(&key).is_some_and(|descriptors| {
-                    descriptors.iter().any(|d| {
-                        d == MIXIN_SHADOW_DESCRIPTOR
-                            || d == MIXIN_ACCESSOR_DESCRIPTOR
-                            || d == MIXIN_INVOKER_DESCRIPTOR
+                let method_annotations = methods.get(&key);
+                let annotated = method_annotations.is_some_and(|annotations| {
+                    annotations.iter().any(|a| {
+                        a.descriptor == MIXIN_SHADOW_DESCRIPTOR
+                            || a.descriptor == MIXIN_ACCESSOR_DESCRIPTOR
+                            || a.descriptor == MIXIN_INVOKER_DESCRIPTOR
                     })
                 }) || method.annotations.iter().any(|a| {
                     a.descriptor == MIXIN_ACCESSOR_DESCRIPTOR
                         || a.descriptor == MIXIN_INVOKER_DESCRIPTOR
                 });
                 if annotated || method.access & 0x0400 != 0 {
+                    let target = crate::interface_mixins::shadow_method_target_name(
+                        &method.name,
+                        method_annotations,
+                    );
+                    if target != method.name {
+                        model.shadow_renames.insert(format!("{name}|{key}"), target);
+                    }
                     model.shadow_methods.insert(format!("{name}|{key}"));
                 } else if method.code.is_some() {
                     model.concrete_methods.insert(format!("{name}|{key}"));
@@ -635,13 +730,39 @@ impl MixinModel {
 
 /// Every field and method annotation descriptor of `class`, visible and
 /// invisible, keyed `name|descriptor`. The parser keeps neither the invisible
-/// method table nor any field annotation, and Mixin's `@Shadow` is
-/// `CLASS`-retained, so the table is read back from the class bytes.
+/// method table nor any field annotation, so the table is read back from the
+/// class bytes. sponge-mixin 0.17.5 declares `@Shadow`, `@Final` and `@Mutable`
+/// `RUNTIME`-retained (visible), but jars built against `CLASS`-retained stubs
+/// carry them invisibly, so both tables are read.
 type MemberAnnotations = BTreeMap<String, Vec<String>>;
 
-fn member_annotations(
+/// [`MemberAnnotations`] with each annotation's element values kept, for the
+/// members whose meaning depends on them (`@Shadow(prefix = ...)`).
+pub(crate) type MemberAnnotationValues = BTreeMap<String, Vec<Annotation>>;
+
+pub(crate) fn member_annotations(
     class: &ClassFile,
 ) -> Result<(MemberAnnotations, MemberAnnotations), NativeError> {
+    let (fields, methods) = member_annotation_values(class)?;
+    let descriptors = |table: MemberAnnotationValues| -> MemberAnnotations {
+        table
+            .into_iter()
+            .map(|(member, annotations)| {
+                (
+                    member,
+                    annotations.into_iter().map(|a| a.descriptor).collect(),
+                )
+            })
+            .collect()
+    };
+    Ok((descriptors(fields), descriptors(methods)))
+}
+
+/// Every field and method annotation of `class` with its element values,
+/// visible and invisible, keyed `name|descriptor` (see [`MemberAnnotations`]).
+pub(crate) fn member_annotation_values(
+    class: &ClassFile,
+) -> Result<(MemberAnnotationValues, MemberAnnotationValues), NativeError> {
     let mut r = Reader::new(&class.raw);
     if r.u4()? != 0xCAFE_BABE {
         return Err(NativeError::InvalidClass("bad magic"));
@@ -659,7 +780,7 @@ fn member_annotations(
 fn read_member_annotations(
     r: &mut Reader<'_>,
     pool: &[Cp],
-) -> Result<MemberAnnotations, NativeError> {
+) -> Result<MemberAnnotationValues, NativeError> {
     let count = r.u2()? as usize;
     let mut out = BTreeMap::new();
     for _ in 0..count {
@@ -667,7 +788,7 @@ fn read_member_annotations(
         let name = utf8(pool, r.u2()?)?;
         let descriptor = utf8(pool, r.u2()?)?;
         let attributes = r.u2()? as usize;
-        let mut descriptors = Vec::new();
+        let mut annotations = Vec::new();
         for _ in 0..attributes {
             let attribute = utf8(pool, r.u2()?)?;
             let length = r.u4()? as usize;
@@ -676,13 +797,13 @@ fn read_member_annotations(
                 || attribute == "RuntimeVisibleAnnotations"
             {
                 // A malformed table loses this member's annotations only.
-                if let Ok(annotations) = read_annotations(&mut Reader::new(bytes), pool) {
-                    descriptors.extend(annotations.into_iter().map(|a| a.descriptor));
+                if let Ok(read) = read_annotations(&mut Reader::new(bytes), pool) {
+                    annotations.extend(read);
                 }
             }
         }
-        if !descriptors.is_empty() {
-            out.insert(format!("{name}|{descriptor}"), descriptors);
+        if !annotations.is_empty() {
+            out.insert(format!("{name}|{descriptor}"), annotations);
         }
     }
     Ok(out)
@@ -804,6 +925,7 @@ struct GameHookHost<'a, H> {
     inner: &'a mut H,
     context: &'a mut GameHookContext,
     model: &'a MixinModel,
+    initialized: &'a mut BTreeSet<String>,
 }
 
 impl<H: Host> GameHookHost<'_, H> {
@@ -1950,25 +2072,60 @@ impl<H: Host> Host for GameHookHost<'_, H> {
         self.inner.level_resource_id(marker)
     }
 
+    fn mixin_side(&self) -> MixinSide {
+        self.inner.mixin_side()
+    }
+
+    fn mark_game_mixin_initialized(&mut self, mixin: &str, object: &str) -> bool {
+        self.initialized.insert(format!("{mixin}|{object}"))
+    }
+
+    fn defers_game_field_write_check(&self) -> bool {
+        true
+    }
+
+    fn game_object_types(&self, key: &str) -> Option<Vec<String>> {
+        self.context
+            .object(key)
+            .map(|object| object.hierarchy().into_iter().map(str::to_owned).collect())
+    }
+
     fn redirect_jar_call(
         &self,
         class: &str,
         method: &Method,
         receiver: Option<&Value>,
     ) -> Option<JarCallRedirect> {
-        let shadow = self.model.targets.get(class).and_then(|targets| {
-            self.model
-                .shadow_methods
-                .contains(&format!("{class}|{}|{}", method.name, method.descriptor))
-                .then(|| targets.first().cloned())
-                .flatten()
-        });
-        if let Some(target) = shadow {
-            return Some(JarCallRedirect::Host(MethodRef {
-                owner: target,
-                name: method.name.clone(),
-                descriptor: method.descriptor.clone(),
-            }));
+        let receiver_hierarchy: Vec<String> = receiver
+            .and_then(Self::is_game_object)
+            .and_then(|marker| self.context.object(marker))
+            .map(|object| object.hierarchy().into_iter().map(str::to_owned).collect())
+            .unwrap_or_default();
+        if let Some(targets) = self.model.targets.get(class) {
+            let shadow_key = format!("{class}|{}|{}", method.name, method.descriptor);
+            if self.model.shadow_methods.contains(&shadow_key) {
+                return match crate::interface_mixins::resolve_shadow_target(
+                    targets,
+                    &receiver_hierarchy,
+                ) {
+                    // The game method's name drops the `@Shadow` prefix.
+                    Some(owner) => Some(JarCallRedirect::Host(MethodRef {
+                        owner: owner.to_owned(),
+                        name: self
+                            .model
+                            .shadow_renames
+                            .get(&shadow_key)
+                            .cloned()
+                            .unwrap_or_else(|| method.name.clone()),
+                        descriptor: method.descriptor.clone(),
+                    })),
+                    None => Some(JarCallRedirect::Ambiguous(MethodRef {
+                        owner: class.to_owned(),
+                        name: method.name.clone(),
+                        descriptor: method.descriptor.clone(),
+                    })),
+                };
+            }
         }
         if method.code.is_some() {
             return None;
@@ -2139,268 +2296,323 @@ impl NativeJar {
             .map_err(|reason| game_hook_error(&reason))?;
             checked.push(self.game_hook_callback_values(entry, args)?);
         }
-        let model = Arc::clone(
-            state
-                .model
-                .get_or_insert_with(|| Arc::new(MixinModel::build(&self.classes))),
-        );
+        let side = host.mixin_side();
+        let model = match &state.model {
+            Some((cached_side, model)) if *cached_side == side => Arc::clone(model),
+            _ => {
+                let built = Arc::new(MixinModel::build(self, side));
+                state.model = Some((side, Arc::clone(&built)));
+                built
+            }
+        };
         let (persistent_static_fields, persistent_initialized_classes) =
             host.persistent_class_state();
         let (io_paths, io_files, io_file_bytes, io_dirs) = host.persistent_io_state();
-        let mut wrapped = GameHookHost {
-            inner: host,
-            context,
-            model: &model,
-        };
-        let linked = wrapped.linked_class_table().cloned().unwrap_or_default();
-        let mut callback_infos = CallbackInfos::new();
+        let mut initialized = state.initialized.clone();
+        if let Some(host_initialized) = host.initialized_game_mixins() {
+            for entry in host_initialized {
+                let forgotten = entry
+                    .split_once('|')
+                    .is_some_and(|(_, marker)| state.forgotten.contains(marker));
+                if !forgotten {
+                    initialized.insert(entry.clone());
+                }
+            }
+        }
         let mut results = Vec::with_capacity(entries.len());
         let mut cancelled = false;
-        let mut initialized = state.initialized.clone();
-        let mut runtime = Runtime {
-            classes: &self.classes,
-            mixin_index: std::cell::OnceCell::new(),
-            linked,
-            host: &mut wrapped,
-            calls: 0,
-            instructions: 0,
-            fields: state.fields.clone(),
-            static_fields: persistent_static_fields,
-            initialized_classes: persistent_initialized_classes,
-            arrays: state.arrays.clone(),
-            next_array: state.next_array.max(GAME_HOOK_OBJECT_BASE),
-            next_object: state.next_object.max(GAME_HOOK_OBJECT_BASE),
-            streams: BTreeMap::new(),
-            next_stream: 0,
-            pipelines: Default::default(),
-            enum_constants: BTreeMap::new(),
-            string_builders: BTreeMap::new(),
-            counted_strings: std::collections::BTreeSet::new(),
-            identity_collections: Default::default(),
-            string_pool: Default::default(),
-            counted_text_objects: std::collections::BTreeSet::new(),
-            gson_writers: BTreeMap::new(),
-            string_builder_capacities: BTreeMap::new(),
+        let (next_object, next_array, returned, ok_outcome) = {
+            let mut wrapped = GameHookHost {
+                inner: host,
+                context,
+                model: &model,
+                initialized: &mut initialized,
+            };
+            let linked = wrapped.linked_class_table().cloned().unwrap_or_default();
+            let mut callback_infos = CallbackInfos::new();
+            let mut runtime = Runtime {
+                classes: &self.classes,
+                mixin_index: crate::interface_mixins::RuntimeMixinState::from_jar_side(self, side),
+                linked,
+                host: &mut wrapped,
+                calls: 0,
+                instructions: 0,
+                fields: BTreeMap::new(),
+                static_fields: persistent_static_fields,
+                initialized_classes: persistent_initialized_classes,
+                arrays: state.arrays.clone(),
+                next_array: state.next_array.max(GAME_HOOK_OBJECT_BASE),
+                next_object: state.next_object.max(GAME_HOOK_OBJECT_BASE),
+                streams: BTreeMap::new(),
+                next_stream: 0,
+                pipelines: Default::default(),
+                enum_constants: BTreeMap::new(),
+                string_builders: BTreeMap::new(),
+                counted_strings: std::collections::BTreeSet::new(),
+                identity_collections: Default::default(),
+                string_pool: Default::default(),
+                counted_text_objects: std::collections::BTreeSet::new(),
+                gson_writers: BTreeMap::new(),
+                string_builder_capacities: BTreeMap::new(),
 
-            string_readers: BTreeMap::new(),
-            reader_positions_unknown: Default::default(),
-            io_reader_errors: BTreeMap::new(),
-            scanners: BTreeMap::new(),
-            io_stream_paths: BTreeMap::new(),
-            io_channel_streams: BTreeSet::new(),
-            io_writers: BTreeMap::new(),
-            io_closed: BTreeSet::new(),
-            io_writer_bytes: BTreeMap::new(),
-            io_stream_positions: BTreeMap::new(),
-            io_writer_charsets: BTreeMap::new(),
-            io_writer_sinks: BTreeMap::new(),
-            io_paths,
-            io_files,
-            io_file_bytes,
-            io_dirs,
-            watch: Default::default(),
-            annotations: BTreeMap::new(),
-            next_annotation: 0,
-            callback_infos: &mut callback_infos,
-            invoke_hooks: None,
-            anchor_hooks: None,
-            modify_hooks: None,
-            pending_skipped_new: Vec::new(),
-            stream_plan: Default::default(),
-            store_verdict: Default::default(),
-            depth: 0,
-            next_frame_id: 0,
-            shape_extraction: None,
-            check_shape_probes: false,
-            budget,
-        };
-        // `game_hook_callback_values` answers whether the callback is an
-        // instance method: only those receive the game object as `this`.
-        // The jar's own objects: what its entrypoint built and earlier
-        // firings changed. Fields on game objects come from `state`.
-        let resident = runtime.adopt_resident_heap();
-        let outcome = (|| -> Result<(), NativeError> {
-            for (entry, (is_instance, values)) in entries.iter().zip(checked) {
-                let marker = callback_info_marker(&entry.target);
-                // Every callback at one hook point shares the object Mixin would
-                // hand the injection point, so a `cancel()` in one is what the
-                // next one observes.
-                runtime.open_callback_info(&marker)?;
-                if let Some(actual) = &actual {
-                    runtime.callback_infos.set_actual(&marker, actual.clone())?;
-                }
-                let before = hook_shapes::callback_info_snapshot(runtime.callback_infos, &marker)?;
-                // No game object handed over: an object of the Mixin class
-                // stands for it (its name is a `String`, #156 P13c; #156 P16).
-                let callback_receiver = if is_instance {
-                    Some(match receiver.clone() {
-                        Some(receiver) => receiver,
-                        None => runtime.new_object(&entry.callback.owner),
-                    })
-                } else {
-                    None
-                };
-                // The first callback of a Mixin class on a game object runs the
-                // class's constructor on it: `javac` put the Mixin's field
-                // initialisers there, which real Mixin merges into the target's
-                // constructors. A Mixin that extends a game class has no
-                // no-argument constructor to run, and its fields start at Java's
-                // defaults.
-                if let Some(object) = callback_receiver
-                    .as_ref()
-                    .and_then(crate::game_object::text)
-                    .filter(|object| object.starts_with(GAME_OBJECT_PREFIX))
-                    && initialized.insert(format!("{}|{object}", entry.callback.owner))
-                    && self
-                        .classes
-                        .get(&entry.callback.owner)
-                        .is_some_and(|class| {
-                            class.super_name == "java/lang/Object"
-                                && class.method("<init>", "()V").is_some()
+                string_readers: BTreeMap::new(),
+                reader_positions_unknown: Default::default(),
+                io_reader_errors: BTreeMap::new(),
+                scanners: BTreeMap::new(),
+                io_stream_paths: BTreeMap::new(),
+                io_channel_streams: BTreeSet::new(),
+                io_writers: BTreeMap::new(),
+                io_closed: BTreeSet::new(),
+                io_writer_bytes: BTreeMap::new(),
+                io_stream_positions: BTreeMap::new(),
+                io_writer_charsets: BTreeMap::new(),
+                io_writer_sinks: BTreeMap::new(),
+                io_paths,
+                io_files,
+                io_file_bytes,
+                io_dirs,
+                watch: Default::default(),
+                annotations: BTreeMap::new(),
+                next_annotation: 0,
+                callback_infos: &mut callback_infos,
+                invoke_hooks: None,
+                anchor_hooks: None,
+                modify_hooks: None,
+                pending_skipped_new: Vec::new(),
+                stream_plan: Default::default(),
+                store_verdict: Default::default(),
+                depth: 0,
+                next_frame_id: 0,
+                shape_extraction: None,
+                check_shape_probes: false,
+                budget,
+            };
+            // `game_hook_callback_values` answers whether the callback is an
+            // instance method: only those receive the game object as `this`.
+            // The jar's own objects: what its entrypoint built and earlier
+            // firings changed. Fields on game objects combine the resident
+            // host's per-object state and `state`, with `state` winning.
+            let resident = runtime.adopt_resident_heap();
+            if !state.forgotten.is_empty() {
+                runtime.fields.retain(|key, _| {
+                    !key.split_once('|')
+                        .is_some_and(|(obj, _)| state.forgotten.contains(obj))
+                });
+            }
+            let pre_host_game_fields: BTreeMap<String, Value> = if resident {
+                runtime
+                    .fields
+                    .iter()
+                    .filter(|(key, _)| key.starts_with(GAME_OBJECT_PREFIX))
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect()
+            } else {
+                BTreeMap::new()
+            };
+            runtime.fields.extend(state.fields.clone());
+            let outcome = (|| -> Result<(), NativeError> {
+                for (entry, (is_instance, values)) in entries.iter().zip(checked) {
+                    let marker = callback_info_marker(&entry.target);
+                    // Every callback at one hook point shares the object Mixin would
+                    // hand the injection point, so a `cancel()` in one is what the
+                    // next one observes.
+                    runtime.open_callback_info(&marker)?;
+                    if let Some(actual) = &actual {
+                        runtime.callback_infos.set_actual(&marker, actual.clone())?;
+                    }
+                    let before =
+                        hook_shapes::callback_info_snapshot(runtime.callback_infos, &marker)?;
+                    // No game object handed over: an object of the Mixin class
+                    // stands for it (its name is a `String`, #156 P13c; #156 P16).
+                    let callback_receiver = if is_instance {
+                        Some(match receiver.clone() {
+                            Some(receiver) => receiver,
+                            None => runtime.new_object(&entry.callback.owner),
                         })
-                {
-                    runtime.invoke(
-                        &entry.callback.owner,
-                        "<init>",
-                        "()V",
-                        callback_receiver.clone(),
-                        &[],
-                    )?;
-                }
-                if entry.shape == GameHookShape::ModifyReturnValue {
-                    // MixinExtras chains handlers: each gets the value as the
-                    // ones before it left it, and its answer is the new one.
-                    let mut handler_args = vec![runtime.callback_infos.current(&marker)?];
-                    handler_args.extend(values);
+                    } else {
+                        None
+                    };
+                    // The first callback of a Mixin class on a game object runs the
+                    // class's constructor on it: `javac` put the Mixin's field
+                    // initialisers there, which real Mixin merges into the target's
+                    // constructors. A Mixin that extends a game class has no
+                    // no-argument constructor to run, and its fields start at Java's
+                    // defaults.
+                    if let Some(object) = callback_receiver
+                        .as_ref()
+                        .and_then(crate::game_object::text)
+                        .filter(|object| object.starts_with(GAME_OBJECT_PREFIX))
+                        .cloned()
+                        && runtime
+                            .host
+                            .mark_game_mixin_initialized(&entry.callback.owner, &object)
+                        && self
+                            .classes
+                            .get(&entry.callback.owner)
+                            .is_some_and(|class| {
+                                class.super_name == "java/lang/Object"
+                                    && class.method("<init>", "()V").is_some()
+                            })
+                    {
+                        runtime.invoke(
+                            &entry.callback.owner,
+                            "<init>",
+                            "()V",
+                            callback_receiver.clone(),
+                            &[],
+                        )?;
+                    }
+                    if entry.shape == GameHookShape::ModifyReturnValue {
+                        // MixinExtras chains handlers: each gets the value as the
+                        // ones before it left it, and its answer is the new one.
+                        let mut handler_args = vec![runtime.callback_infos.current(&marker)?];
+                        handler_args.extend(values);
+                        let result = runtime.invoke(
+                            &entry.callback.owner,
+                            &entry.callback.name,
+                            &entry.callback.descriptor,
+                            callback_receiver,
+                            &handler_args,
+                        )?;
+                        runtime.callback_infos.set_return(&marker, result.clone())?;
+                        results.push(result);
+                        continue;
+                    }
                     let result = runtime.invoke(
                         &entry.callback.owner,
                         &entry.callback.name,
                         &entry.callback.descriptor,
                         callback_receiver,
-                        &handler_args,
+                        &values,
                     )?;
-                    runtime.callback_infos.set_return(&marker, result.clone())?;
                     results.push(result);
-                    continue;
-                }
-                let result = runtime.invoke(
-                    &entry.callback.owner,
-                    &entry.callback.name,
-                    &entry.callback.descriptor,
-                    callback_receiver,
-                    &values,
-                )?;
-                results.push(result);
-                let after = hook_shapes::callback_info_snapshot(runtime.callback_infos, &marker)?;
-                if !entry.cancellable {
-                    // Mixin's `CallbackInfo.cancel()` (and the `cancel()` a
-                    // `setReturnValue` makes) throws on a callback that was not
-                    // declared cancellable.
-                    if after != before {
-                        return Err(NativeError::Metadata(format!(
-                            "uncaught exception org/spongepowered/asm/mixin/injection/callback/CancellationException: game hook callback {}#{}{} cancelled or set the result of {}#{}, which its @Inject does not declare cancellable",
-                            entry.callback.owner,
-                            entry.callback.name,
-                            entry.callback.descriptor,
-                            entry.target.owner,
-                            entry.target.name
-                        )));
+                    let after =
+                        hook_shapes::callback_info_snapshot(runtime.callback_infos, &marker)?;
+                    if !entry.cancellable {
+                        // Mixin's `CallbackInfo.cancel()` (and the `cancel()` a
+                        // `setReturnValue` makes) throws on a callback that was not
+                        // declared cancellable.
+                        if after != before {
+                            return Err(NativeError::Metadata(format!(
+                                "uncaught exception org/spongepowered/asm/mixin/injection/callback/CancellationException: game hook callback {}#{}{} cancelled or set the result of {}#{}, which its @Inject does not declare cancellable",
+                                entry.callback.owner,
+                                entry.callback.name,
+                                entry.callback.descriptor,
+                                entry.target.owner,
+                                entry.target.name
+                            )));
+                        }
+                        continue;
                     }
-                    continue;
+                    // `CallbackInfoReturnable.setReturnValue` cancels as it sets.
+                    if after.0 || after.1.is_some() {
+                        cancelled = true;
+                        break;
+                    }
                 }
-                // `CallbackInfoReturnable.setReturnValue` cancels as it sets.
-                if after.0 || after.1.is_some() {
-                    cancelled = true;
-                    break;
+                // A write to a `@Shadow` field, a game class's field or one a
+                // Mixin inherits from the game class it extends is a write to the
+                // game object's own field, which the host never sees: that
+                // callback did not do what it meant to, so the firing fails
+                // instead of keeping the write (#248's review).
+                if let Some((key, shadow)) = runtime.fields.keys().find_map(|key| {
+                    let (object, field) = key.split_once('|')?;
+                    if !object.starts_with(GAME_OBJECT_PREFIX) {
+                        return None;
+                    }
+                    let shadow = model.shadow_fields.contains(field);
+                    (shadow || model.game_field(field)).then_some((key, shadow))
+                }) {
+                    let through = if shadow { " through @Shadow" } else { "" };
+                    return Err(NativeError::Metadata(format!(
+                        "game hook callback writes the game's field {key}{through}, which the host does not apply"
+                    )));
                 }
-            }
-            // A write to a `@Shadow` field, a game class's field or one a
-            // Mixin inherits from the game class it extends is a write to the
-            // game object's own field, which the host never sees: that
-            // callback did not do what it meant to, so the firing fails
-            // instead of keeping the write (#248's review).
-            if let Some((key, shadow)) = runtime.fields.keys().find_map(|key| {
-                let (object, field) = key.split_once('|')?;
-                if !object.starts_with(GAME_OBJECT_PREFIX) {
-                    return None;
+                if !resident
+                    && (runtime.fields.len() > MAX_GAME_HOOK_FIELDS
+                        || runtime.arrays.len() > MAX_GAME_HOOK_ARRAYS)
+                {
+                    return Err(NativeError::Metadata(format!(
+                        "game hook callbacks keep more than {MAX_GAME_HOOK_FIELDS} fields or {MAX_GAME_HOOK_ARRAYS} arrays"
+                    )));
                 }
-                let shadow = model.shadow_fields.contains(field);
-                (shadow || model.game_field(field)).then_some((key, shadow))
-            }) {
-                let through = if shadow { " through @Shadow" } else { "" };
-                return Err(NativeError::Metadata(format!(
-                    "game hook callback writes the game's field {key}{through}, which the host does not apply"
-                )));
+                Ok(())
+            })();
+            let returned = outcome.as_ref().ok().map(|()| {
+                hook_shapes::game_hook_returned(
+                    first_site,
+                    runtime.callback_infos,
+                    &callback_info_marker(&first.target),
+                    cancelled,
+                )
+            });
+            let ok_outcome = outcome.is_ok();
+            if !resident {
+                // A host without a resident heap: `state` keeps every object, and
+                // a failed firing keeps nothing, as before the heap.
+                outcome?;
+                runtime.persist_class_state()?;
+                runtime.persist_io_state()?;
+                state.fields = std::mem::take(&mut runtime.fields);
+                state.arrays = std::mem::take(&mut runtime.arrays);
+            } else {
+                // Game objects' fields stay with `state` and are also mirrored back
+                // to the resident host heap so event listeners and menu callbacks
+                // observe the same per-player Mixin state. A failed firing drops its
+                // game-object writes from both.
+                let (game, jar): (BTreeMap<_, _>, BTreeMap<_, _>) =
+                    std::mem::take(&mut runtime.fields)
+                        .into_iter()
+                        .partition(|(key, _)| key.starts_with(GAME_OBJECT_PREFIX));
+                runtime.fields = jar;
+                if outcome.is_ok() {
+                    state.fields = game.clone();
+                    runtime.fields.extend(game);
+                } else {
+                    runtime.fields.extend(pre_host_game_fields);
+                }
+                state.arrays.clear();
+                // Every value a game object's field holds, of any kind (an
+                // `Optional` names its object in its key), through the heap's
+                // one root text (#226 review).
+                // What the firing hands the game (each callback's result and the
+                // value a target returns) is a root of this store too; the game
+                // retains what it keeps longer (`StdHost::retain`).
+                let returned_value = returned
+                    .as_ref()
+                    .and_then(|returned| returned.as_ref().ok())
+                    .cloned()
+                    .flatten();
+                let roots = state
+                    .fields
+                    .values()
+                    .chain(&results)
+                    .chain(returned_value.as_ref())
+                    .flat_map(crate::heap::value_texts)
+                    .map(str::to_owned)
+                    .collect();
+                let persistence = runtime.persist_class_state();
+                let io_persistence = runtime.persist_io_state();
+                let heap = runtime.persist_resident_heap_with(roots);
+                outcome?;
+                persistence?;
+                io_persistence?;
+                heap?;
             }
-            if !resident
-                && (runtime.fields.len() > MAX_GAME_HOOK_FIELDS
-                    || runtime.arrays.len() > MAX_GAME_HOOK_ARRAYS)
-            {
-                return Err(NativeError::Metadata(format!(
-                    "game hook callbacks keep more than {MAX_GAME_HOOK_FIELDS} fields or {MAX_GAME_HOOK_ARRAYS} arrays"
-                )));
-            }
-            Ok(())
-        })();
-        let returned = outcome.as_ref().ok().map(|()| {
-            hook_shapes::game_hook_returned(
-                first_site,
-                runtime.callback_infos,
-                &callback_info_marker(&first.target),
-                cancelled,
+            (
+                runtime.next_object,
+                runtime.next_array,
+                returned,
+                ok_outcome,
             )
-        });
-        if !resident {
-            // A host without a resident heap: `state` keeps every object, and
-            // a failed firing keeps nothing, as before the heap.
-            outcome?;
-            runtime.persist_class_state()?;
-            runtime.persist_io_state()?;
-            state.fields = std::mem::take(&mut runtime.fields);
-            state.arrays = std::mem::take(&mut runtime.arrays);
-        } else {
-            // Game objects' fields stay with `state`, kept per object; the
-            // jar's objects go back to the host, which keeps what the statics,
-            // its registrations or those game-object fields still reach. A
-            // failed firing's game-object writes are dropped.
-            let (game, jar): (BTreeMap<_, _>, BTreeMap<_, _>) = std::mem::take(&mut runtime.fields)
-                .into_iter()
-                .partition(|(key, _)| key.starts_with(GAME_OBJECT_PREFIX));
-            runtime.fields = jar;
-            if outcome.is_ok() {
-                state.fields = game;
-            }
-            state.arrays.clear();
-            // Every value a game object's field holds, of any kind (an
-            // `Optional` names its object in its key), through the heap's
-            // one root text (#226 review).
-            // What the firing hands the game (each callback's result and the
-            // value a target returns) is a root of this store too; the game
-            // retains what it keeps longer (`StdHost::retain`).
-            let returned_value = returned
-                .as_ref()
-                .and_then(|returned| returned.as_ref().ok())
-                .cloned()
-                .flatten();
-            let roots = state
-                .fields
-                .values()
-                .chain(&results)
-                .chain(returned_value.as_ref())
-                .flat_map(crate::heap::value_texts)
-                .map(str::to_owned)
-                .collect();
-            let persistence = runtime.persist_class_state();
-            let io_persistence = runtime.persist_io_state();
-            let heap = runtime.persist_resident_heap_with(roots);
-            outcome?;
-            persistence?;
-            io_persistence?;
-            heap?;
+        };
+        state.next_object = next_object;
+        state.next_array = next_array;
+        if ok_outcome {
+            state.initialized = initialized;
+            host.update_initialized_game_mixins(&state.initialized, &state.forgotten);
+            state.forgotten.clear();
         }
-        state.next_object = runtime.next_object;
-        state.next_array = runtime.next_array;
-        state.initialized = initialized;
         Ok(GameHookRun {
             hook: hook.to_owned(),
             ran: results.len(),
@@ -2470,10 +2682,12 @@ mod tests {
             name: "sendSystemMessage".into(),
             descriptor: "(Lnet/minecraft/network/chat/Component;)V".into(),
         };
+        let mut initialized = BTreeSet::new();
         let mut hook_host = GameHookHost {
             inner: &mut inner,
             context: &mut context,
             model: &model,
+            initialized: &mut initialized,
         };
         let result = hook_host.invoke_instance(&r, &player, &[component]);
         assert_eq!(result.unwrap(), Value::Void);
@@ -2484,6 +2698,73 @@ mod tests {
                 "net/minecraft/server/level/ServerPlayer#sendSystemMessage(Lnet/minecraft/network/chat/Component;)V".into(),
                 1
             )]
+        );
+    }
+
+    #[test]
+    fn redirect_jar_call_marks_ambiguous_multi_target_shadow_instead_of_falling_back_to_mixin_owner()
+     {
+        let mut inner = StdHost::new();
+        let mut context = GameHookContext::default();
+        let player = context.insert(
+            GameObject::player(1, "Alex")
+                .with_incarnation(1, 0)
+                .with_entity_id(42),
+        );
+        let mut model = MixinModel::default();
+        model.targets.insert(
+            "demo/AmbiguousShadowMixin".into(),
+            vec![
+                "net/minecraft/server/level/ServerPlayer".into(),
+                "net/minecraft/world/entity/player/Player".into(),
+            ],
+        );
+        model.targets.insert(
+            "demo/UnambiguousShadowMixin".into(),
+            vec![
+                "net/minecraft/world/entity/player/Player".into(),
+                "net/minecraft/world/level/Level".into(),
+            ],
+        );
+        model
+            .shadow_methods
+            .insert("demo/AmbiguousShadowMixin|getId|()I".into());
+        model
+            .shadow_methods
+            .insert("demo/UnambiguousShadowMixin|getId|()I".into());
+
+        let mut initialized = BTreeSet::new();
+        let hook_host = GameHookHost {
+            inner: &mut inner,
+            context: &mut context,
+            model: &model,
+            initialized: &mut initialized,
+        };
+        let method = Method {
+            access: 0x0401,
+            name: "getId".into(),
+            descriptor: "()I".into(),
+            code: None,
+            max_stack: 0,
+            max_locals: 0,
+            annotations: Vec::new(),
+        };
+
+        assert_eq!(
+            hook_host.redirect_jar_call("demo/UnambiguousShadowMixin", &method, Some(&player)),
+            Some(JarCallRedirect::Host(MethodRef {
+                owner: "net/minecraft/world/entity/player/Player".into(),
+                name: "getId".into(),
+                descriptor: "()I".into(),
+            }))
+        );
+        assert_eq!(
+            hook_host.redirect_jar_call("demo/AmbiguousShadowMixin", &method, Some(&player)),
+            Some(JarCallRedirect::Ambiguous(MethodRef {
+                owner: "demo/AmbiguousShadowMixin".into(),
+                name: "getId".into(),
+                descriptor: "()I".into(),
+            }))
         );
     }
 
