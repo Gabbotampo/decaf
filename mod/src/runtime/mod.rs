@@ -118,6 +118,8 @@ mod hash_map_order;
 mod hash_table;
 mod heap;
 mod hook_shapes;
+mod interface_mixins;
+pub use interface_mixins::MixinInterfacePlan;
 mod host_array;
 mod host_attachment;
 mod host_brigadier;
@@ -214,6 +216,7 @@ pub use live_menu::{
     ContainerInput, LiveMenuEffect, LiveMenuOutcome, MenuClick, MenuPlayerFacts, Prediction,
 };
 mod method_handles;
+mod mixin_class_loading;
 mod mixin_extras;
 mod mixin_plugins;
 mod mod_config_register;
@@ -821,6 +824,19 @@ pub enum MixinSkipReason {
     /// declares no injection member this runtime can name, so there is nothing
     /// a weave could apply.
     ListedWithoutPlan,
+    /// Real Mixin rejects the whole `@Mixin` class with `InvalidMixinException`
+    /// before applying it (for example a field carrying a `@Shadow` prefix), and
+    /// its config is not `required`: `MixinApplicatorStandard.apply` drops the
+    /// class and applies the target's other mixins, so none of its members reach
+    /// the target. Its bounded reason.
+    InvalidMixin(String),
+    /// [`Self::InvalidMixin`] in a `required` config: `apply` rethrows, Mixin
+    /// raises `MixinApplyError`, and Fabric's Knot fails the target's class load
+    /// (`RuntimeException: Mixin transformation of <target> failed`), so the plan
+    /// is refused, not dropped: the runtime counts the jar's first use of that
+    /// class, and refuses the jar's code when the server loads the class before any
+    /// mod runs (`mixin_class_loading.rs`). Its bounded reason.
+    RequiredMixinFailed(String),
 }
 
 impl MixinSkipReason {
@@ -842,13 +858,18 @@ impl MixinSkipReason {
             Self::ConstructorTarget => "constructor-target",
             Self::Weaver(_) => "weaver-rejected",
             Self::ListedWithoutPlan => "listed-without-plan",
+            Self::InvalidMixin(_) => "invalid-mixin",
+            Self::RequiredMixinFailed(_) => "required-mixin-failed",
         }
     }
 
-    /// The bounded sentence a reason carries, for the two variants that do.
+    /// The bounded sentence a reason carries, for the variants that do.
     pub fn detail(&self) -> Option<&str> {
         match self {
-            Self::Weaver(detail) | Self::GameHookMismatch(detail) => Some(detail),
+            Self::Weaver(detail)
+            | Self::GameHookMismatch(detail)
+            | Self::InvalidMixin(detail)
+            | Self::RequiredMixinFailed(detail) => Some(detail),
             _ => None,
         }
     }
@@ -883,9 +904,7 @@ impl std::fmt::Display for SkippedMixinPlan {
             self.callback.name,
             self.callback.descriptor,
         )?;
-        if let MixinSkipReason::Weaver(detail) | MixinSkipReason::GameHookMismatch(detail) =
-            &self.reason
-        {
+        if let Some(detail) = self.reason.detail() {
             write!(f, ": {detail}")?;
         }
         Ok(())
@@ -1475,6 +1494,9 @@ pub struct LoadTimeMixinWeave {
     pub game_hooks: Vec<GameHookPlan>,
     /// The `@Accessor`/`@Invoker` members the interpreter runs natively.
     pub accessors: Vec<MixinAccessorPlan>,
+    /// The interface-injection `@Mixin` plans (`implements X` + added fields/methods)
+    /// applied natively to host-modelled game classes (`interface_mixins.rs`).
+    pub interface_mixins: Vec<MixinInterfacePlan>,
     /// Everything else the jar's Mixin classes declare.
     pub skipped: Vec<SkippedMixinPlan>,
     /// What each config plugin's session did (`mixin_plugins.rs`): why a
@@ -3713,6 +3735,43 @@ pub trait Host {
     /// Record that a `HostKind::ShapeProbe` attempted an escaping operation
     /// (stored, passed to a non-forwarding call, returned, thrown, or captured).
     fn note_retained_shape_probe(&mut self) {}
+
+    /// Physical Mixin side for config gating on this host.
+    fn mixin_side(&self) -> MixinSide {
+        MixinSide::Server
+    }
+
+    /// Record `(mixin, object)` as having run its no-argument `<init>()V` field
+    /// initialiser on this host, returning `true` only the first time.
+    fn mark_game_mixin_initialized(&mut self, _mixin: &str, _object: &str) -> bool {
+        false
+    }
+
+    /// Snapshot of `(mixin|object)` entries already initialised on this host.
+    fn initialized_game_mixins(&self) -> Option<&BTreeSet<String>> {
+        None
+    }
+
+    /// Merge initialised `(mixin|object)` records from a game-hook firing and
+    /// drop any forgotten game-object markers.
+    fn update_initialized_game_mixins(
+        &mut self,
+        _initialized: &BTreeSet<String>,
+        _forgotten: &BTreeSet<String>,
+    ) {
+    }
+
+    /// Whether the host performs its own end-of-firing check for unmodelled
+    /// game-class / `@Shadow` field writes (`GameHookHost`).
+    fn defers_game_field_write_check(&self) -> bool {
+        false
+    }
+
+    /// Explicit vanilla class hierarchy for a game handle key when the host holds
+    /// a richer description than `game_object::declared_types` (`GameHookHost`).
+    fn game_object_types(&self, _key: &str) -> Option<Vec<String>> {
+        None
+    }
 }
 
 #[derive(Debug, Default)]
@@ -4161,6 +4220,9 @@ pub struct StdHost {
     dfu_codec_callback_roots: BTreeSet<String>,
     dfu_codec_refusals: Vec<String>,
     persistent_initialized_classes: std::collections::BTreeSet<String>,
+    /// `mixin|game_object_key` pairs whose interface-injection Mixin `<init>()V`
+    /// field initialiser has already run on this host (`interface_mixins.rs`).
+    initialized_game_mixins: BTreeSet<String>,
     /// The jar's objects retained across invocations (`heap.rs`): instance
     /// fields, arrays, builders and enum identity of what its statics and
     /// registered callbacks still reach.
@@ -4520,6 +4582,7 @@ impl StdHost {
             dfu_codec_callback_roots: BTreeSet::new(),
             dfu_codec_refusals: Vec::new(),
             persistent_initialized_classes: std::collections::BTreeSet::new(),
+            initialized_game_mixins: BTreeSet::new(),
             heap: heap::JavaHeap::default(),
             log4j_levels: crate::runtime::host_log4j_level::CustomLevels::new(),
             retained: BTreeMap::new(),
@@ -4567,6 +4630,42 @@ impl StdHost {
 
     pub(crate) fn owns_render_handle(&self, key: &str) -> bool {
         self.render_handles.contains(key)
+    }
+
+    /// Drop per-object Mixin fields and `<init>()V` records kept on `marker`
+    /// (for example a player who respawned or disconnected) so a later object
+    /// starts fresh and GC can reclaim any objects those fields rooted.
+    pub fn forget_game_object(&mut self, marker: &str) {
+        let prefix = format!("{marker}|");
+        self.heap.fields.retain(|key, _| !key.starts_with(&prefix));
+        let suffix = format!("|{marker}");
+        self.initialized_game_mixins
+            .retain(|entry| !entry.ends_with(&suffix));
+    }
+
+    /// Drop per-object Mixin fields and `<init>()V` records for `marker` and any
+    /// incarnated child markers starting with `{marker}/` (for example all incarnations
+    /// of a despawned `game/entity/<id>`).
+    pub fn forget_game_object_prefix(&mut self, marker: &str) {
+        let exact_field = format!("{marker}|");
+        let child_prefix = format!("{marker}/");
+        self.heap
+            .fields
+            .retain(|key, _| !key.starts_with(&exact_field) && !key.starts_with(&child_prefix));
+        let exact_init = format!("|{marker}");
+        let child_init = format!("|{marker}/");
+        self.initialized_game_mixins
+            .retain(|entry| !entry.ends_with(&exact_init) && !entry.contains(&child_init));
+    }
+
+    /// Drop every game object's per-instance Mixin fields and `<init>()V`
+    /// records (for example when a server world stops).
+    pub fn forget_all_game_objects(&mut self) {
+        self.heap.fields.retain(|key, _| {
+            let receiver = key.split_once('|').map_or(key.as_str(), |(obj, _)| obj);
+            !receiver.starts_with("game/") && !receiver.starts_with("client/")
+        });
+        self.initialized_game_mixins.clear();
     }
 
     /// Make an unmodeled host call fail instead of returning its neutral Java
@@ -8835,6 +8934,39 @@ impl Host for StdHost {
 
     fn mutable_collection_values(&self, value: &Value) -> Option<Vec<Value>> {
         self.mutable_values(value)
+    }
+
+    fn mixin_side(&self) -> MixinSide {
+        if self.environment_type.eq_ignore_ascii_case("CLIENT") {
+            MixinSide::Client
+        } else {
+            MixinSide::Server
+        }
+    }
+
+    fn mark_game_mixin_initialized(&mut self, mixin: &str, object: &str) -> bool {
+        self.initialized_game_mixins
+            .insert(format!("{mixin}|{object}"))
+    }
+
+    fn initialized_game_mixins(&self) -> Option<&BTreeSet<String>> {
+        Some(&self.initialized_game_mixins)
+    }
+
+    fn update_initialized_game_mixins(
+        &mut self,
+        initialized: &BTreeSet<String>,
+        forgotten: &BTreeSet<String>,
+    ) {
+        if !forgotten.is_empty() {
+            self.initialized_game_mixins.retain(|entry| {
+                !entry
+                    .split_once('|')
+                    .is_some_and(|(_, marker)| forgotten.contains(marker))
+            });
+        }
+        self.initialized_game_mixins
+            .extend(initialized.iter().cloned());
     }
 
     fn sub_list_class(&self, value: &Value) -> Option<Option<String>> {
@@ -20856,7 +20988,11 @@ enum Cp {
         reference_kind: u8,
         reference_index: u16,
     },
-    MethodType,
+    /// A `CONSTANT_MethodType`: resolving it resolves every class its descriptor names
+    /// (JVMS §5.4.3.5).
+    MethodType {
+        descriptor: u16,
+    },
     InvokeDynamic {
         bootstrap: u16,
         nt: u16,
@@ -21142,6 +21278,19 @@ pub struct LinkedClassTable {
     resources: BTreeMap<String, (String, Vec<u8>)>,
     /// Per-jar `data/` resource layers with Fabric metadata for datapack recipe/tag ordering.
     data_layers: Vec<pack_order::JarDataLayer>,
+    /// Per-linked-jar Mixin configs, config sides, cached config plugins, and declared
+    /// class names, so interface-injection Mixins from linked jars honour the exact same
+    /// config, side, and plugin gating as primary jars.
+    mixin_configs: Vec<LinkedMixinConfigSet>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct LinkedMixinConfigSet {
+    pub(crate) configs: Vec<MixinConfig>,
+    pub(crate) config_sides: BTreeMap<String, MixinSide>,
+    pub(crate) classes: BTreeSet<String>,
+    pub(crate) server_plugins: mixin_plugins::ConfigPlugins,
+    pub(crate) client_plugins: mixin_plugins::ConfigPlugins,
 }
 
 impl LinkedClassTable {
@@ -21172,6 +21321,28 @@ impl LinkedClassTable {
         let added = self.link_classes(id.clone(), jar.classes.values().cloned())?;
         self.link_resources(&id, jar);
         self.link_services(jar);
+        let configs = jar.mixin_configs();
+        if !configs.is_empty() {
+            let has_plugins = configs.iter().any(|c| c.plugin.is_some());
+            let (server_plugins, client_plugins) = if has_plugins {
+                (
+                    jar.cached_config_plugins(MixinSide::Server).clone(),
+                    jar.cached_config_plugins(MixinSide::Client).clone(),
+                )
+            } else {
+                (
+                    mixin_plugins::ConfigPlugins::default(),
+                    mixin_plugins::ConfigPlugins::default(),
+                )
+            };
+            self.mixin_configs.push(LinkedMixinConfigSet {
+                configs,
+                config_sides: jar.mixin_config_sides(),
+                classes: jar.classes.keys().cloned().collect(),
+                server_plugins,
+                client_plugins,
+            });
+        }
         Ok(added)
     }
 
@@ -21281,6 +21452,14 @@ impl LinkedClassTable {
         self.classes.get(name)
     }
 
+    pub(crate) fn mixin_config_sets(&self) -> &[LinkedMixinConfigSet] {
+        &self.mixin_configs
+    }
+
+    pub(crate) fn all_classes(&self) -> &BTreeMap<String, ClassFile> {
+        &self.classes
+    }
+
     /// Whether any linked jar declares `name`.
     pub fn contains_key(&self, name: &str) -> bool {
         self.classes.contains_key(name)
@@ -21370,6 +21549,16 @@ pub struct NativeJar {
     /// skipped so one bad attribute cannot fail the whole jar. Exposed through
     /// [`Self::class_annotation_warnings`].
     class_annotation_warnings: Vec<String>,
+    /// Cached Mixin config-plugin sessions per physical side so runtime indexing
+    /// and game-hook dispatch share one gated evaluation without re-running plugins.
+    server_config_plugins: Arc<std::sync::OnceLock<mixin_plugins::ConfigPlugins>>,
+    client_config_plugins: Arc<std::sync::OnceLock<mixin_plugins::ConfigPlugins>>,
+    /// Cached jar classes a `required` config's rejected mixin fails, per physical
+    /// side ([`NativeJar::failed_required_targets`]).
+    server_failed_required_targets:
+        Arc<std::sync::OnceLock<BTreeMap<String, interface_mixins::FailedTarget>>>,
+    client_failed_required_targets:
+        Arc<std::sync::OnceLock<BTreeMap<String, interface_mixins::FailedTarget>>>,
 }
 
 /// Zero-length array backing a host answer such as `Thread.getStackTrace`
@@ -21600,7 +21789,13 @@ pub struct MixinConfig {
     pub client: Vec<String>,
     /// `server` entries, package-qualified, in declaration order.
     pub server: Vec<String>,
-    /// Mixin's `required` flag; true when the config omits it.
+    /// Mixin's `required` flag; false when the config omits it.
+    ///
+    /// sponge-mixin 0.17.5 (`MixinConfig.onLoad`): `required = requiredValue != null
+    /// && requiredValue && !mixin.ignoreRequired`. It decides what an
+    /// `InvalidMixinException` does: a required config's failure is rethrown and
+    /// fails the target class, any other is dropped with a warning
+    /// ([`MixinSkipReason::RequiredMixinFailed`] / [`MixinSkipReason::InvalidMixin`]).
     pub required: bool,
     /// Mixin's `priority`; absent when the config omits it.
     pub priority: Option<i32>,
@@ -23308,11 +23503,12 @@ impl NativeJar {
     }
 
     fn plan_load_time_weave_on(&self, side: MixinSide, game_hooks: bool) -> LoadTimeMixinWeave {
-        let (mut plans, unresolved) = self.mixin_plan_scan();
-        let (anchors, unresolved_anchors) = self.mixin_anchor_scan();
-        let (overwrites, unresolved_overwrites) = self.mixin_overwrite_scan();
-        let (modify_args, unresolved_modify_args) = self.mixin_modify_arg_scan();
-        let (modify_variables, unresolved_modify_variables) = self.mixin_modify_variable_scan();
+        let (mut plans, mut unresolved) = self.mixin_plan_scan();
+        let (mut anchors, mut unresolved_anchors) = self.mixin_anchor_scan();
+        let (mut overwrites, mut unresolved_overwrites) = self.mixin_overwrite_scan();
+        let (mut modify_args, mut unresolved_modify_args) = self.mixin_modify_arg_scan();
+        let (mut modify_variables, mut unresolved_modify_variables) =
+            self.mixin_modify_variable_scan();
         let configs = self.mixin_configs();
         let config_sides = self.mixin_config_sides();
         self.sort_mixin_plans_in_apply_order_for_side(
@@ -23321,7 +23517,36 @@ impl NativeJar {
             Some(side),
             &config_sides,
         );
+        // Config plugins run once per weave, as Mixin runs each once per
+        // config (`mixin_plugins.rs`); only the hook tier asks them.
+        let plugins = if game_hooks {
+            self.run_config_plugins(&configs, &config_sides, side)
+        } else {
+            ConfigPlugins::default()
+        };
         let mut weave = LoadTimeMixinWeave::default();
+        // A class real Mixin rejects (`InvalidMixinException`) is dropped whole:
+        // one row per target, and no plan of any family from it is applied.
+        let rejected = self.invalid_mixin_rows(
+            side,
+            &configs,
+            &config_sides,
+            game_hooks.then_some(&plugins),
+            &mut weave.skipped,
+        );
+        if !rejected.is_empty() {
+            let kept = |owner: &String| !rejected.contains(owner);
+            plans.retain(|plan| kept(&plan.callback.owner));
+            unresolved.retain(|plan| kept(&plan.callback.owner));
+            anchors.retain(|plan| kept(&plan.callback.owner));
+            unresolved_anchors.retain(|(plan, _)| kept(&plan.callback.owner));
+            overwrites.retain(|plan| kept(&plan.callback.owner));
+            unresolved_overwrites.retain(|(plan, _)| kept(&plan.callback.owner));
+            modify_args.retain(|plan| kept(&plan.callback.owner));
+            unresolved_modify_args.retain(|(plan, _)| kept(&plan.callback.owner));
+            modify_variables.retain(|plan| kept(&plan.callback.owner));
+            unresolved_modify_variables.retain(|(plan, _)| kept(&plan.callback.owner));
+        }
         weave.skipped.extend(
             unresolved
                 .iter()
@@ -23362,14 +23587,33 @@ impl NativeJar {
                         reason: MixinSkipReason::Unresolved,
                     }),
             );
-        self.unwoven_mixin_members(&mut weave.skipped);
+        weave.config_plugins = plugins.reports();
+        let interface_summary = self.plan_interface_mixins(
+            side,
+            &configs,
+            &config_sides,
+            game_hooks.then_some(&plugins),
+            &mut weave,
+        );
+        self.unwoven_mixin_members(&interface_summary, &mut weave.skipped);
         // `@Accessor`/`@Invoker` members have no injected body. The
-        // interpreter runs their contract directly, so a member a readable
-        // config claims is applied rather than skipped; the gate's reason is
-        // kept for a class the config does not apply on this side.
+        // interpreter runs their contract directly for targets held in the jar;
+        // targets outside the jar stay skipped as `target-outside-jar`, and
+        // classes outside the config keep the config gate's reason.
         for plan in self.mixin_accessor_plans() {
+            if rejected.contains(&plan.accessor.owner) {
+                continue;
+            }
             match mixin_config_gate(&configs, &config_sides, &plan.accessor.owner, side) {
-                Ok(()) => weave.accessors.push(plan),
+                Ok(()) if self.classes.contains_key(&plan.target.owner) => {
+                    weave.accessors.push(plan);
+                }
+                Ok(()) => weave.skipped.push(SkippedMixinPlan {
+                    target: plan.target,
+                    callback: plan.accessor,
+                    at: mixin_accessor_label(plan.kind).to_owned(),
+                    reason: MixinSkipReason::TargetOutsideJar,
+                }),
                 Err(reason) => weave.skipped.push(SkippedMixinPlan {
                     target: plan.target,
                     callback: plan.accessor,
@@ -23383,14 +23627,6 @@ impl NativeJar {
         let mut modify_arg_by_owner: BTreeMap<String, Vec<MixinModifyArgPlan>> = BTreeMap::new();
         let mut modify_variable_by_owner: BTreeMap<String, Vec<MixinModifyVariablePlan>> =
             BTreeMap::new();
-        // Config plugins run once per weave, as Mixin runs each once per
-        // config (`mixin_plugins.rs`); only the hook tier asks them.
-        let plugins = if game_hooks {
-            self.run_config_plugins(&configs, &config_sides, side)
-        } else {
-            ConfigPlugins::default()
-        };
-        weave.config_plugins = plugins.reports();
         for plan in &plans {
             if game_hooks {
                 match self.game_hook_plan(plan, side, &configs, &config_sides, &plugins) {
@@ -23469,6 +23705,9 @@ impl NativeJar {
         // callbacks; every other one is a row with its reason.
         let mut extras_bound = BTreeSet::new();
         for plan in self.mixin_extras_plans() {
+            if rejected.contains(&plan.callback.owner) {
+                continue;
+            }
             let outcome = if game_hooks {
                 self.mixin_extras_game_hook_plan(&plan, side, &configs, &config_sides, &plugins)
             } else if self.classes.contains_key(&plan.target.owner) {
@@ -23510,6 +23749,13 @@ impl NativeJar {
                 modify_variable_by_owner
                     .values()
                     .flat_map(|plans| plans.iter().map(|plan| plan.callback.owner.clone())),
+            )
+            .chain(weave.interface_mixins.iter().map(|plan| plan.mixin.clone()))
+            .chain(
+                weave
+                    .accessors
+                    .iter()
+                    .map(|plan| plan.accessor.owner.clone()),
             )
             .collect::<BTreeSet<_>>();
         listed_without_plan(&configs, &all_plans, &extra_owners, &mut weave.skipped);
@@ -23556,63 +23802,10 @@ impl NativeJar {
         side: Option<MixinSide>,
         config_sides: &BTreeMap<String, MixinSide>,
     ) {
-        const DEFAULT_PRIORITY: i32 = 1000;
         plans.sort_by_cached_key(|plan| {
             let class = self.classes.get(&plan.callback.owner);
-            let annotation_priority = class
-                .and_then(|class| {
-                    class.annotations.iter().find(|annotation| {
-                        annotation.descriptor == "Lorg/spongepowered/asm/mixin/Mixin;"
-                    })
-                })
-                .and_then(|mixin| match mixin.values.get("priority") {
-                    Some(AnnotationValue::Int(priority)) => Some(*priority),
-                    _ => None,
-                });
-            let binary = plan.callback.owner.replace('/', ".");
-            let listed = configs.iter().enumerate().find_map(|(index, config)| {
-                if side.is_some_and(|side| {
-                    config_sides
-                        .get(&config.path)
-                        .is_some_and(|only| *only != side)
-                }) {
-                    return None;
-                }
-                let mut names: Box<dyn Iterator<Item = &String>> = match side {
-                    Some(MixinSide::Client) => Box::new(config.mixins.iter().chain(&config.client)),
-                    Some(MixinSide::Server) => Box::new(config.mixins.iter().chain(&config.server)),
-                    None => Box::new(
-                        config
-                            .mixins
-                            .iter()
-                            .chain(&config.client)
-                            .chain(&config.server),
-                    ),
-                };
-                names
-                    .position(|name| *name == binary)
-                    .map(|position| (index, position))
-            });
-            let mixin_priority = annotation_priority
-                .or_else(|| {
-                    // `mixinPriority` is the config's default for a class whose
-                    // annotation omits `priority`; an explicit one still wins.
-                    listed.and_then(|(index, _)| configs[index].mixin_priority)
-                })
-                .unwrap_or(DEFAULT_PRIORITY);
-            // Configs are parsed in declaration order, so `index` breaks a
-            // priority tie the way the loader registered them; within one
-            // config, the position in `mixins`/`client`/`server` does. A class
-            // no config lists sorts after every listed one.
-            let listed = listed
-                .map(|(index, position)| {
-                    (
-                        configs[index].priority.unwrap_or(DEFAULT_PRIORITY),
-                        index,
-                        position,
-                    )
-                })
-                .unwrap_or((DEFAULT_PRIORITY, usize::MAX, usize::MAX));
+            let (mixin_priority, listed) =
+                mixin_apply_order_key(class, &plan.callback.owner, configs, side, config_sides);
             let method = class
                 .and_then(|class| {
                     class.methods.iter().position(|method| {
@@ -24124,15 +24317,11 @@ impl NativeJar {
     /// Preserve the report row for a mixin member that real Mixin would merge
     /// into its target, without treating executable plan families as
     /// unsupported before the extended weaver sees them.
-    fn unwoven_mixin_members(&self, skipped: &mut Vec<SkippedMixinPlan>) {
-        const SYNTHETIC: u16 = 0x1000;
-        const PLANNED: [&str; 5] = [
-            "Lorg/spongepowered/asm/mixin/injection/Inject;",
-            "Lorg/spongepowered/asm/mixin/injection/Redirect;",
-            "Lorg/spongepowered/asm/mixin/injection/ModifyArg;",
-            "Lorg/spongepowered/asm/mixin/injection/ModifyVariable;",
-            "Lorg/spongepowered/asm/mixin/Overwrite;",
-        ];
+    fn unwoven_mixin_members(
+        &self,
+        interface_summary: &interface_mixins::InterfaceWeaveSummary,
+        skipped: &mut Vec<SkippedMixinPlan>,
+    ) {
         for class in self.classes.values() {
             if !class
                 .annotations
@@ -24141,37 +24330,13 @@ impl NativeJar {
             {
                 continue;
             }
-            let field = class
-                .fields
-                .iter()
-                .find(|field| field.access & SYNTHETIC == 0)
-                .map(|field| (&field.name, &field.descriptor));
-            let method = class
-                .methods
-                .iter()
-                .find(|method| {
-                    !method.is_static()
-                        && method.name != "<init>"
-                        && method.access & SYNTHETIC == 0
-                        && !method.annotations.iter().any(|annotation| {
-                            PLANNED.contains(&annotation.descriptor.as_str())
-                                // A MixinExtras injector has its own row
-                                // (`mixin_extras.rs`).
-                                || MixinExtrasKind::from_descriptor(&annotation.descriptor)
-                                    .is_some()
-                        })
-                        // A resolvable `@Accessor`/`@Invoker` is applied by
-                        // the interpreter, not a generic merged member. One
-                        // whose contract cannot be named stays in the report
-                        // through this row.
-                        && resolve_mixin_accessor(class, method).is_none()
-                })
-                .map(|method| (&method.name, &method.descriptor));
-            if let Some((name, descriptor)) = field.or(method) {
+            if let Some((name, descriptor)) =
+                self.unwoven_member_for_class(class, interface_summary)
+            {
                 let member = MethodRef {
                     owner: class.name.clone(),
-                    name: name.clone(),
-                    descriptor: descriptor.clone(),
+                    name,
+                    descriptor,
                 };
                 skipped.push(SkippedMixinPlan {
                     target: member.clone(),
@@ -24497,7 +24662,7 @@ impl NativeJar {
         let (io_paths, io_files, io_file_bytes, io_dirs) = host.persistent_io_state();
         let mut runtime = Runtime {
             classes: &self.classes,
-            mixin_index: std::cell::OnceCell::new(),
+            mixin_index: interface_mixins::RuntimeMixinState::from_jar(self, host),
             linked: host.linked_class_table().cloned().unwrap_or_default(),
             host,
             calls: 0,
@@ -24554,6 +24719,12 @@ impl NativeJar {
         };
         if !runtime.classes.contains_key(&class_name) {
             return Err(NativeError::MissingMethod(format!("class {class}")));
+        }
+        // The loader loads an entrypoint class by name; one whose load surely fails in
+        // real Fabric (`mixin_class_loading.rs`) stops the loader there, so it is refused
+        // (one that may fail is counted there, and runs).
+        if let Some(refusal) = runtime.entrypoint_load_failure(&class_name)? {
+            return Err(NativeError::Metadata(refusal));
         }
         // The objects an earlier entrypoint of this jar built are this one's
         // too, and what this one builds outlives it for the callbacks it
@@ -24781,7 +24952,7 @@ impl NativeJar {
         let check_shape_probes = shape_extraction.is_some() || host.has_retained_shape_probes();
         let mut runtime = Runtime {
             classes: &self.classes,
-            mixin_index: std::cell::OnceCell::new(),
+            mixin_index: interface_mixins::RuntimeMixinState::from_jar(self, host),
             linked: host.linked_class_table().cloned().unwrap_or_default(),
             host,
             calls: 0,
@@ -24897,7 +25068,7 @@ impl NativeJar {
         let mut callback_infos = CallbackInfos::new();
         let mut runtime = Runtime {
             classes: &self.classes,
-            mixin_index: std::cell::OnceCell::new(),
+            mixin_index: interface_mixins::RuntimeMixinState::from_jar(self, host),
             linked: host.linked_class_table().cloned().unwrap_or_default(),
             host,
             calls: 0,
@@ -25145,7 +25316,7 @@ impl NativeJar {
         let (io_paths, io_files, io_file_bytes, io_dirs) = host.persistent_io_state();
         let mut runtime = Runtime {
             classes: &self.classes,
-            mixin_index: std::cell::OnceCell::new(),
+            mixin_index: interface_mixins::RuntimeMixinState::from_jar(self, host),
             linked: host.linked_class_table().cloned().unwrap_or_default(),
             host,
             calls: 0,
@@ -27381,7 +27552,7 @@ struct Runtime<'a, H> {
     /// step of a superclass walk; without the index each question scanned
     /// every class of the jar (#166's re-check measured a 10M-store loop at
     /// 1.3 s → 114 s) (`checkcast.rs`).
-    mixin_index: std::cell::OnceCell<BTreeMap<String, Vec<String>>>,
+    mixin_index: interface_mixins::RuntimeMixinState,
     /// Sibling-jar tables this execution may link, snapshotted from the host
     /// so a frame that keeps a class reference does not borrow the host.
     linked: Arc<LinkedClassTable>,
@@ -28451,7 +28622,13 @@ impl<H: Host> Runtime<'_, H> {
                 let value = match value {
                     Some(value) => value,
                     None if !self.has_class(&target.owner) => {
-                        let value = self.host.get_static(&target)?;
+                        let value = if !plan.static_target
+                            && let Some(receiver) = receiver
+                        {
+                            self.host.get_field(receiver, &target)?
+                        } else {
+                            self.host.get_static(&target)?
+                        };
                         if value != Value::Ref(None) {
                             if plan.static_target {
                                 self.static_fields
@@ -28473,6 +28650,9 @@ impl<H: Host> Runtime<'_, H> {
                 }))
             }
             MixinAccessorKind::Setter => {
+                if !self.has_class(&target.owner) {
+                    self.host.unknown_operand_call(&target)?;
+                }
                 let value = args.first().cloned().unwrap_or(Value::Void);
                 if plan.static_target {
                     self.static_fields
@@ -28511,6 +28691,283 @@ impl<H: Host> Runtime<'_, H> {
                 self.invoke_host_instance(&target, receiver, args).map(Some)
             }
         }
+    }
+
+    /// Out-of-line `getstatic` body kept out of `invoke_frame` so the unoptimised
+    /// interpreter frame stays within `frame_bound`'s stack budget, while routing
+    /// `@Shadow` static fields on `@Mixin` classes to their target (or counting/refusing
+    /// ambiguous multi-target static shadows).
+    #[inline(never)]
+    fn execute_getstatic(
+        &mut self,
+        symbolic: &MethodRef,
+        class: &str,
+        method: &str,
+        desc: &str,
+        at: usize,
+    ) -> Result<(Value, bool), NativeError> {
+        let field = MethodRef {
+            owner: self.field_owner(symbolic),
+            ..symbolic.clone()
+        };
+        // `merged`: the declaring mixin of a static Mixin moved onto its target.
+        let (target, init, merged) = match self.resolve_static_shadow(&field) {
+            interface_mixins::StaticShadowResolution::NotShadow => {
+                let init = field.owner.clone();
+                (field, init, None)
+            }
+            interface_mixins::StaticShadowResolution::Resolved { target, .. } => {
+                let init = target.owner.clone();
+                (target, init, None)
+            }
+            interface_mixins::StaticShadowResolution::Merged { slot, init, .. } => {
+                (slot, init.clone(), Some(init))
+            }
+            interface_mixins::StaticShadowResolution::Unresolved => {
+                self.host.unknown_operand_call(&field)?;
+                return Ok((Value::default_for(&field.descriptor), false));
+            }
+        };
+        // Reading a static field initializes its declaring class first, exactly as
+        // the JVM does. Without this a jar's `ItemInit.HANGING_POT_ITEM` read from
+        // another class's `<clinit>` sees an unset field and answers null.
+        self.ensure_initialized(&init)?;
+        let outcome = self.dispatch_field_anchor(&target, false, None, class, method, desc, at)?;
+        let modified =
+            outcome != AnchorOutcome::Normal && target.descriptor.starts_with(['L', '[']);
+        let value = match outcome {
+            // A merged static is the runtime's own slot: its JVM default (or constant)
+            // until written, never the host's.
+            AnchorOutcome::Normal if let Some(declaring) = &merged => {
+                match self.static_fields.get(&Self::static_field_key(&target)) {
+                    Some(value) => value.clone(),
+                    None => self
+                        .static_constant(declaring, &target.name, &target.descriptor)?
+                        .unwrap_or_else(|| Value::default_for(&target.descriptor)),
+                }
+            }
+            AnchorOutcome::Normal => {
+                if let Some(value) = gson_model::static_field(&target)
+                    .or_else(|| gson_tree::static_field(&target))
+                    .or_else(|| gson_writer::static_field(&target))
+                {
+                    value
+                } else {
+                    match self.static_fields.get(&Self::static_field_key(&target)) {
+                        Some(value) => value.clone(),
+                        // A field a jar class declares and nothing assigned yet holds the
+                        // JVM default; only a static of a class the jar does not declare is
+                        // the host's to answer. A `ConstantValue` static is its constant.
+                        None if self.class(&target.owner).is_some_and(|file| {
+                            file.fields.iter().any(|declared| {
+                                declared.name == target.name
+                                    && declared.descriptor == target.descriptor
+                            })
+                        }) =>
+                        {
+                            self.static_constant(&target.owner, &target.name, &target.descriptor)?
+                                .unwrap_or_else(|| Value::default_for(&target.descriptor))
+                        }
+                        None => self.host.get_static(&target)?,
+                    }
+                }
+            }
+            AnchorOutcome::Suppress => Value::default_for(&target.descriptor),
+            AnchorOutcome::Replace(value) => value,
+        };
+        let normalized = if value == Value::Ref(None) {
+            Value::default_for(&target.descriptor)
+        } else {
+            value
+        };
+        Ok((normalized, modified))
+    }
+
+    /// Out-of-line `putstatic` body kept out of `invoke_frame` so the unoptimised
+    /// interpreter frame stays within `frame_bound`'s stack budget, while resolving a
+    /// `@Mixin` class's static `@Shadow` to the target field the merged class writes.
+    ///
+    /// Mixin keeps every instruction of a mixin's static initialiser (it removes only the
+    /// shadow field's declaration), so a `<clinit>` write through a shadow is a real write
+    /// to the target, default value or not. Whether a write is legal is the JVM's call on
+    /// the target field's own flags ([`interface_mixins::StaticShadowWrite`]); `@Final`
+    /// is a transformer diagnostic with no runtime effect.
+    #[inline(never)]
+    fn execute_putstatic(
+        &mut self,
+        symbolic: &MethodRef,
+        value: Value,
+        class: &str,
+        method: &str,
+        desc: &str,
+        at: usize,
+    ) -> Result<(), NativeError> {
+        let field = MethodRef {
+            owner: self.field_owner(symbolic),
+            ..symbolic.clone()
+        };
+        // `through_shadow`: the write names a target's own field (which a host-modelled
+        // game class never takes); `init`: the class to initialize first; `write`: how a
+        // resolved field judges the write.
+        let (target, through_shadow, init, write) = match self.resolve_static_shadow(&field) {
+            interface_mixins::StaticShadowResolution::NotShadow => {
+                let init = field.owner.clone();
+                (field, false, init, None)
+            }
+            interface_mixins::StaticShadowResolution::Unresolved => {
+                self.host.unknown_operand_call(&field)?;
+                return Ok(());
+            }
+            interface_mixins::StaticShadowResolution::Resolved { target, write } => {
+                let init = target.owner.clone();
+                (target, true, init, Some(write))
+            }
+            // The runtime's own slot for a static Mixin moved onto its target.
+            interface_mixins::StaticShadowResolution::Merged { slot, init, write } => {
+                (slot, false, init, Some(write))
+            }
+        };
+        if let Some(interface_mixins::StaticShadowWrite::Final {
+            symbolic_owner,
+            declaring,
+        }) = &write
+        {
+            // Field resolution fails before the declaring class initialises.
+            match self.judge_final_static_put(
+                symbolic_owner,
+                declaring,
+                &target.name,
+                class,
+                method,
+            ) {
+                interface_mixins::FinalStaticPut::Allowed => {}
+                interface_mixins::FinalStaticPut::Illegal(message) => {
+                    return Err(NativeError::UncaughtException {
+                        class: "java/lang/IllegalAccessError".into(),
+                        message: Some(message),
+                        frame: None,
+                    });
+                }
+                interface_mixins::FinalStaticPut::Unknown => {
+                    self.host.unknown_operand_call(&target)?;
+                    return Ok(());
+                }
+            }
+        }
+        self.ensure_initialized(&init)?;
+        let outcome =
+            self.dispatch_field_anchor(&target, true, Some(&value), class, method, desc, at)?;
+        if outcome != AnchorOutcome::Normal {
+            return Ok(());
+        }
+        if !through_shadow || self.has_class(&target.owner) {
+            self.static_fields
+                .insert(Self::static_field_key(&target), value);
+        } else if self.host.defers_game_field_write_check() {
+            return Err(NativeError::Metadata(format!(
+                "game hook callback writes the game's static field {}#{} through @Shadow, which the host does not apply",
+                target.owner, target.name
+            )));
+        } else {
+            // A host-modelled game static: the write never reaches the game.
+            self.host.unknown_operand_call(&target)?;
+        }
+        Ok(())
+    }
+
+    /// Out-of-line `getfield` body kept out of `invoke_frame` so the unoptimised
+    /// interpreter frame stays within `frame_bound`'s stack budget.
+    #[inline(never)]
+    fn read_instance_field(
+        &mut self,
+        receiver: &Value,
+        r: &MethodRef,
+    ) -> Result<Value, NativeError> {
+        if *receiver == Value::Ref(None) {
+            return Err(null_checks::read_field_on_null(r));
+        }
+        self.refuse_collected(receiver, r)?;
+        if let Some(value) = self.host.menu_field(receiver, r) {
+            return Ok(value);
+        }
+        if let Some(value) = self.game_handle_get_field(receiver, r)? {
+            return Ok(value);
+        }
+        match instance_field_key(receiver, r).and_then(|key| self.fields.get(&key).cloned()) {
+            Some(value) => Ok(value),
+            // JVMS §2.3: a jar field nothing wrote yet, unless the heap collected the object.
+            None if self.reads_unwritten_jar_field(r, receiver) => {
+                Ok(Value::default_for(&r.descriptor))
+            }
+            None => self.host.get_field(receiver, r),
+        }
+    }
+
+    /// Out-of-line `putfield` body kept out of `invoke_frame` so the unoptimised
+    /// interpreter frame stays within `frame_bound`'s stack budget.
+    #[inline(never)]
+    fn write_instance_field(
+        &mut self,
+        receiver: &Value,
+        r: &MethodRef,
+        value: Value,
+    ) -> Result<(), NativeError> {
+        if *receiver == Value::Ref(None) {
+            return Err(null_checks::assign_field_on_null(r));
+        }
+        let Some(key) = instance_field_key(receiver, r) else {
+            return Ok(());
+        };
+        if !self.fields.contains_key(&key) {
+            self.refuse_collected(receiver, r)?;
+        }
+        if mutable_container::is_final_field(r) {
+            self.host.unknown_operand_call(r)?;
+            return Ok(());
+        }
+        match self.host.menu_field_set(receiver, r, &value) {
+            menu_models::FieldSetResult::Written => Ok(()),
+            menu_models::FieldSetResult::NotOwned => {
+                match self.game_handle_put_field(receiver, r, &value)? {
+                    interface_mixins::GameFieldWrite::Stored
+                    | interface_mixins::GameFieldWrite::Handled => Ok(()),
+                    interface_mixins::GameFieldWrite::Fallthrough => {
+                        self.fields.insert(key, value);
+                        Ok(())
+                    }
+                }
+            }
+            menu_models::FieldSetResult::Counted => self.host.unknown_operand_call(r).map(|_| ()),
+        }
+    }
+
+    /// Out-of-line dispatch shared by game helpers and interface-injection Mixins,
+    /// avoiding an extra `invoke_or_catch!` slot inside `invoke_frame`.
+    #[inline(never)]
+    fn invoke_game_helpers_or_interface_mixin(
+        &mut self,
+        r: &MethodRef,
+        op: u8,
+        receiver: Option<&Value>,
+        args: &[Value],
+        class: &str,
+        method: &str,
+    ) -> Result<Option<(Value, bool)>, NativeError> {
+        // A game object whose class failed to load (`mixin_class_loading.rs`).
+        if let Some(value) = self.count_failed_game_receiver(r, receiver)? {
+            return Ok(Some((value, false)));
+        }
+        // A mixin constructor's own `super()` on a game object (`interface_mixins.rs`).
+        if self.is_unmerged_mixin_super_init(op, r, receiver, class) {
+            return Ok(Some((Value::Void, false)));
+        }
+        if let Some(value) = self.invoke_game_helpers(r, receiver, args, class, method)? {
+            return Ok(Some((value, false)));
+        }
+        if let Some(value) = self.invoke_interface_mixin(r, op, receiver, args)? {
+            return Ok(Some((value, true)));
+        }
+        Ok(None)
     }
 
     /// Run a combinator's result (`callback_marker::composite`) the way its
@@ -29336,6 +29793,12 @@ impl<H: Host> Runtime<'_, H> {
             return Err(not_found());
         }
         let internal = binary.replace('.', "/");
+        // A class real Fabric refuses to load (`mixin_class_loading.rs`). An array of one
+        // too, of any dimension: JDK 25's `forName("[Lfoo.Bar;", ..)` loads the element
+        // class through the loader (`loader.loadClass("foo.Bar")`).
+        if let Some(counted) = self.count_unloadable_class_by_name(&internal)? {
+            return Ok(counted);
+        }
         // An array class by its `getName` (`[I`, `[Ljava.lang.String;`): one
         // when its element class is (`[V` and a bare `[L…` are not).
         if let Some((dimensions, _)) = host_class::array_element(&internal) {
@@ -36568,6 +37031,10 @@ impl<H: Host> Runtime<'_, H> {
         {
             return Err(self.budget_exceeded(class, method));
         }
+        if self.depth == 0 {
+            // A required Mixin config that fails a game class stops the game itself.
+            self.refuse_failed_game_mixin_target()?;
+        }
         if method != "<clinit>" {
             self.ensure_initialized(class)?;
         }
@@ -37142,37 +37609,6 @@ impl<H: Host> Runtime<'_, H> {
         self.invoke_hash_collection(r, op, receiver, args)
     }
 
-    /// Out-of-line `putfield` write for instance fields so `invoke_frame` keeps
-    /// only one catch site for the final-field and menu-field write guards.
-    #[inline(never)]
-    fn put_instance_field(
-        &mut self,
-        receiver: &Value,
-        r: &MethodRef,
-        value: Value,
-    ) -> Result<(), NativeError> {
-        let Some(key) = instance_field_key(receiver, r) else {
-            return Ok(());
-        };
-        if !self.fields.contains_key(&key) {
-            self.refuse_collected(receiver, r)?;
-        }
-        if mutable_container::is_final_field(r) {
-            self.host.unknown_operand_call(r)?;
-            return Ok(());
-        }
-        match self.host.menu_field_set(receiver, r, &value) {
-            menu_models::FieldSetResult::Written => {}
-            menu_models::FieldSetResult::NotOwned => {
-                self.fields.insert(key, value);
-            }
-            menu_models::FieldSetResult::Counted => {
-                self.host.unknown_operand_call(r)?;
-            }
-        }
-        Ok(())
-    }
-
     /// Out-of-line stage for JDK skeletons, spliterators, NeoForge IMC, Commons Lang,
     /// and vanilla mutable-container calls, keeping their dispatch locals out of
     /// `invoke_frame`.
@@ -37642,7 +38078,15 @@ impl<H: Host> Runtime<'_, H> {
                 JarCallRedirect::Jar(r) => {
                     self.invoke(&r.owner, &r.name, &r.descriptor, receiver, args)
                 }
+                JarCallRedirect::Ambiguous(r) => {
+                    self.host.unknown_operand_call(&r)?;
+                    Ok(Value::default_for(return_desc(&r.descriptor)))
+                }
             };
+        }
+        // A static `@Shadow` method's body is a placeholder Mixin never merges.
+        if let Some(value) = self.invoke_static_shadow_body(class, &target, args)? {
+            return Ok(value);
         }
         // A `static` accessor in a Mixin interface has a placeholder body that
         // only throws; Mixin generates the real one. Run the generated contract
@@ -37781,6 +38225,8 @@ impl<H: Host> Runtime<'_, H> {
                 }
             };
         }
+        // The pool entries this frame's code may not resolve (`mixin_class_loading.rs`).
+        let unloadable_pool = self.unloadable_pool_entries(class, file);
         while pc < code.len() {
             budget_ticks = budget_ticks.wrapping_add(1);
             self.instructions = self.instructions.saturating_add(1);
@@ -37798,6 +38244,14 @@ impl<H: Host> Runtime<'_, H> {
             pc += 1;
             if self.check_shape_probes {
                 invoke_or_catch!(at, self.check_shape_probe_opcode(op, code, pc, &stack));
+            }
+            // A class real Fabric refuses to load for this code (`mixin_class_loading.rs`).
+            if let Some(refused) = &unloadable_pool
+                && let Some(next) = self
+                    .skip_unloadable_instruction(refused, class, file, op, code, pc, &mut stack)?
+            {
+                pc = next;
+                continue;
             }
             match op {
                 0x00 => {}
@@ -38829,92 +39283,23 @@ impl<H: Host> Runtime<'_, H> {
                 0xb2 => {
                     let i = read_u16(code, &mut pc)?;
                     let symbolic = file.field_ref(i)?;
-                    // An inherited field is declared by a superclass, so the
-                    // read resolves through the chain before it initializes
-                    // or keys anything.
-                    let field = MethodRef {
-                        owner: self.field_owner(&symbolic),
-                        ..symbolic
-                    };
-                    // Reading a static field initializes its declaring class
-                    // first, exactly as the JVM does. Without this a jar's
-                    // `ItemInit.HANGING_POT_ITEM` read from another class's
-                    // `<clinit>` sees an unset field and answers null.
-                    invoke_or_catch!(at, self.ensure_initialized(&field.owner));
-                    let outcome =
-                        self.dispatch_field_anchor(&field, false, None, class, method, desc, at)?;
-                    if outcome != AnchorOutcome::Normal && field.descriptor.starts_with(['L', '['])
-                    {
+                    let (value, modified) = invoke_or_catch!(
+                        at,
+                        self.execute_getstatic(&symbolic, class, method, desc, at)
+                    );
+                    if modified {
                         frame_modified_identity = true;
                     }
-                    let value = match outcome {
-                        AnchorOutcome::Normal => {
-                            if let Some(value) = gson_model::static_field(&field)
-                                .or_else(|| gson_tree::static_field(&field))
-                                .or_else(|| gson_writer::static_field(&field))
-                            {
-                                value
-                            } else {
-                                match self.static_fields.get(&Self::static_field_key(&field)) {
-                                    Some(value) => value.clone(),
-                                    // A field a jar class declares and nothing
-                                    // assigned yet holds the JVM default; only a
-                                    // static of a class the jar does not declare
-                                    // is the host's to answer (a strict host would
-                                    // refuse the read otherwise).
-                                    // A `ConstantValue` static is its constant
-                                    // (never stored, `class_init.rs`).
-                                    None if self.class(&field.owner).is_some_and(|file| {
-                                        file.fields.iter().any(|declared| {
-                                            declared.name == field.name
-                                                && declared.descriptor == field.descriptor
-                                        })
-                                    }) && gson_model::static_field(&field).is_none()
-                                        && gson_tree::static_field(&field).is_none()
-                                        && gson_writer::static_field(&field).is_none() =>
-                                    {
-                                        self.static_constant(
-                                            &field.owner,
-                                            &field.name,
-                                            &field.descriptor,
-                                        )?
-                                        .unwrap_or_else(|| Value::default_for(&field.descriptor))
-                                    }
-                                    None => self.host.get_static(&field)?,
-                                }
-                            }
-                        }
-                        AnchorOutcome::Suppress => Value::default_for(&field.descriptor),
-                        AnchorOutcome::Replace(value) => value,
-                    };
-                    stack.push(if value == Value::Ref(None) {
-                        Value::default_for(&field.descriptor)
-                    } else {
-                        value
-                    });
+                    stack.push(value);
                 }
                 0xb3 => {
                     let i = read_u16(code, &mut pc)?;
                     let symbolic = file.field_ref(i)?;
-                    let field = MethodRef {
-                        owner: self.field_owner(&symbolic),
-                        ..symbolic
-                    };
-                    invoke_or_catch!(at, self.ensure_initialized(&field.owner));
                     let value = pop(&mut stack, class, method, at)?;
-                    let outcome = self.dispatch_field_anchor(
-                        &field,
-                        true,
-                        Some(&value),
-                        class,
-                        method,
-                        desc,
+                    invoke_or_catch!(
                         at,
-                    )?;
-                    if outcome == AnchorOutcome::Normal {
-                        self.static_fields
-                            .insert(Self::static_field_key(&field), value);
-                    }
+                        self.execute_putstatic(&symbolic, value, class, method, desc, at)
+                    );
                 }
                 0xb4 => {
                     let i = read_u16(code, &mut pc)?;
@@ -38930,26 +39315,8 @@ impl<H: Host> Runtime<'_, H> {
                         frame_modified_identity = true;
                     }
                     let value = match outcome {
-                        AnchorOutcome::Normal if receiver == Value::Ref(None) => {
-                            invoke_or_catch!(at, Err(null_checks::read_field_on_null(&r)))
-                        }
                         AnchorOutcome::Normal => {
-                            self.refuse_collected(&receiver, &r)?;
-                            if let Some(value) = self.host.menu_field(&receiver, &r) {
-                                value
-                            } else {
-                                match instance_field_key(&receiver, &r)
-                                    .and_then(|key| self.fields.get(&key).cloned())
-                                {
-                                    Some(value) => value,
-                                    // JVMS §2.3: a jar field nothing wrote yet,
-                                    // unless the heap collected the object.
-                                    None if self.reads_unwritten_jar_field(&r, &receiver) => {
-                                        Value::default_for(&r.descriptor)
-                                    }
-                                    None => self.host.get_field(&receiver, &r)?,
-                                }
-                            }
+                            invoke_or_catch!(at, self.read_instance_field(&receiver, &r))
                         }
                         AnchorOutcome::Suppress => Value::default_for(&r.descriptor),
                         AnchorOutcome::Replace(value) => value,
@@ -38978,11 +39345,8 @@ impl<H: Host> Runtime<'_, H> {
                         desc,
                         at,
                     )?;
-                    if outcome == AnchorOutcome::Normal && receiver == Value::Ref(None) {
-                        invoke_or_catch!(at, Err(null_checks::assign_field_on_null(&r)))
-                    }
                     if outcome == AnchorOutcome::Normal {
-                        invoke_or_catch!(at, self.put_instance_field(&receiver, &r, value));
+                        invoke_or_catch!(at, self.write_instance_field(&receiver, &r, value));
                     }
                 }
                 0xb6..=0xb9 => {
@@ -39003,7 +39367,9 @@ impl<H: Host> Runtime<'_, H> {
                             ));
                         }
                     }
-                    let r = file.method_ref(i)?;
+                    let mut r = file.method_ref(i)?;
+                    // Mixin's rewrite of a merged method's static `@Shadow` call.
+                    self.rewrite_static_shadow_call(op, class, &mut r);
                     let n = arg_count(&r.descriptor);
                     let mut args = (0..n)
                         .map(|_| pop(&mut stack, class, method, at))
@@ -40169,11 +40535,21 @@ impl<H: Host> Runtime<'_, H> {
                         dispatched = Some(value);
                     }
                     if dispatched.is_none()
-                        && let Some(value) = invoke_or_catch!(
+                        && let Some((value, is_jar_body)) = invoke_or_catch!(
                             at,
-                            self.invoke_game_helpers(&r, receiver.as_ref(), &args, class, method)
+                            self.invoke_game_helpers_or_interface_mixin(
+                                &r,
+                                op,
+                                receiver.as_ref(),
+                                &args,
+                                class,
+                                method
+                            )
                         )
                     {
+                        if is_jar_body {
+                            jar_body = true;
+                        }
                         dispatched = Some(value);
                     }
                     if dispatched.is_none()
@@ -41491,6 +41867,27 @@ fn mixin_config_gate(
     })
 }
 
+/// The first config that applies `@Mixin` class `class` on `side`, as
+/// [`mixin_config_gate`] finds it.
+pub(crate) fn listing_mixin_config<'a>(
+    configs: &'a [MixinConfig],
+    config_sides: &BTreeMap<String, MixinSide>,
+    class: &str,
+    side: MixinSide,
+) -> Option<&'a MixinConfig> {
+    let binary = class.replace('/', ".");
+    configs.iter().find(|config| {
+        let here = match side {
+            MixinSide::Client => &config.client,
+            MixinSide::Server => &config.server,
+        };
+        (config.mixins.contains(&binary) || here.contains(&binary))
+            && config_sides
+                .get(&config.path)
+                .is_none_or(|only| *only == side)
+    })
+}
+
 /// Whether any readable config lists one `@Mixin` class, on either side.
 ///
 /// The side-agnostic interpreter entry has no physical side to split
@@ -41584,6 +41981,77 @@ impl ExecutionConfigGate {
 /// A class whose only members are outside the bounded families (or that has
 /// none at all) would otherwise read as fully applied: the config says it runs,
 /// yet no plan names it. The row keeps that gap visible.
+/// The order real Mixin applies `@Mixin` class `owner` in, as a sort key:
+/// `@Mixin(priority)` (default 1000, lower first, else the listing config's
+/// `mixinPriority`), then the config's `priority`, declaration index and the class's
+/// position in its `mixins`/`client`/`server` lists. A class no config lists (on
+/// `side`) sorts after every listed one.
+pub(crate) fn mixin_apply_order_key(
+    class: Option<&ClassFile>,
+    owner: &str,
+    configs: &[MixinConfig],
+    side: Option<MixinSide>,
+    config_sides: &BTreeMap<String, MixinSide>,
+) -> (i32, (i32, usize, usize)) {
+    const DEFAULT_PRIORITY: i32 = 1000;
+    let annotation_priority = class
+        .and_then(|class| {
+            class
+                .annotations
+                .iter()
+                .find(|annotation| annotation.descriptor == "Lorg/spongepowered/asm/mixin/Mixin;")
+        })
+        .and_then(|mixin| match mixin.values.get("priority") {
+            Some(AnnotationValue::Int(priority)) => Some(*priority),
+            _ => None,
+        });
+    let binary = owner.replace('/', ".");
+    let listed = configs.iter().enumerate().find_map(|(index, config)| {
+        if side.is_some_and(|side| {
+            config_sides
+                .get(&config.path)
+                .is_some_and(|only| *only != side)
+        }) {
+            return None;
+        }
+        let mut names: Box<dyn Iterator<Item = &String>> = match side {
+            Some(MixinSide::Client) => Box::new(config.mixins.iter().chain(&config.client)),
+            Some(MixinSide::Server) => Box::new(config.mixins.iter().chain(&config.server)),
+            None => Box::new(
+                config
+                    .mixins
+                    .iter()
+                    .chain(&config.client)
+                    .chain(&config.server),
+            ),
+        };
+        names
+            .position(|name| *name == binary)
+            .map(|position| (index, position))
+    });
+    let mixin_priority = annotation_priority
+        .or_else(|| {
+            // `mixinPriority` is the config's default for a class whose
+            // annotation omits `priority`; an explicit one still wins.
+            listed.and_then(|(index, _)| configs[index].mixin_priority)
+        })
+        .unwrap_or(DEFAULT_PRIORITY);
+    // Configs are parsed in declaration order, so `index` breaks a
+    // priority tie the way the loader registered them; within one
+    // config, the position in `mixins`/`client`/`server` does. A class
+    // no config lists sorts after every listed one.
+    let listed = listed
+        .map(|(index, position)| {
+            (
+                configs[index].priority.unwrap_or(DEFAULT_PRIORITY),
+                index,
+                position,
+            )
+        })
+        .unwrap_or((DEFAULT_PRIORITY, usize::MAX, usize::MAX));
+    (mixin_priority, listed)
+}
+
 fn listed_without_plan(
     configs: &[MixinConfig],
     plans: &[MixinInjectionPlan],
@@ -41791,10 +42259,11 @@ fn parse_mixin_config(path: &str, bytes: &[u8]) -> Result<MixinConfig, String> {
         mixins,
         client,
         server,
+        // Mixin's default is not required (see `MixinConfig::required`).
         required: object
             .get("required")
             .and_then(serde_json::Value::as_bool)
-            .unwrap_or(true),
+            .unwrap_or(false),
         priority: object
             .get("priority")
             .and_then(serde_json::Value::as_i64)
@@ -42173,10 +42642,9 @@ fn read_pool(r: &mut Reader<'_>) -> Result<Vec<Cp>, NativeError> {
                     reference_index: r.u2()?,
                 }
             }
-            16 => {
-                let _ = r.u2()?;
-                Cp::MethodType
-            }
+            16 => Cp::MethodType {
+                descriptor: r.u2()?,
+            },
             19 | 20 => {
                 r.skip(2)?;
                 Cp::Empty
@@ -45097,7 +45565,7 @@ mod tests {
         let mut host = NullHost;
         let mut runtime = Runtime {
             classes: &BTreeMap::new(),
-            mixin_index: std::cell::OnceCell::new(),
+            mixin_index: interface_mixins::RuntimeMixinState::unconfigured(),
             linked: Arc::default(),
             host: &mut host,
             calls: 0,
@@ -45177,7 +45645,7 @@ mod tests {
         let mut host = StdHost::new();
         let mut runtime = Runtime {
             classes: &BTreeMap::new(),
-            mixin_index: std::cell::OnceCell::new(),
+            mixin_index: interface_mixins::RuntimeMixinState::unconfigured(),
             linked: Arc::default(),
             host: &mut host,
             calls: 0,
@@ -45746,8 +46214,8 @@ mandatory = true
             "only root-level configs are discovered without metadata"
         );
         assert_eq!(configs[0].mixins, ["demo.AutoMixin"]);
-        // Mixin's defaults: required unless declared, no priority.
-        assert!(configs[0].required);
+        // Mixin's defaults: not required unless declared, no priority.
+        assert!(!configs[0].required);
         assert_eq!(configs[0].priority, None);
         assert!(jar.mixin_config_errors().is_empty());
         let warnings = jar.mixin_config_warnings();
@@ -52379,7 +52847,7 @@ mandatory = true
         let mut host = NullHost;
         let mut runtime = Runtime {
             classes: &classes,
-            mixin_index: std::cell::OnceCell::new(),
+            mixin_index: interface_mixins::RuntimeMixinState::unconfigured(),
             linked: Arc::default(),
             host: &mut host,
             calls: 0,
@@ -52609,7 +53077,7 @@ mandatory = true
         let mut host = NullHost;
         let mut runtime = Runtime {
             classes: &classes,
-            mixin_index: std::cell::OnceCell::new(),
+            mixin_index: interface_mixins::RuntimeMixinState::unconfigured(),
             linked: Arc::default(),
             host: &mut host,
             calls: 0,
@@ -52814,7 +53282,7 @@ mandatory = true
             .unwrap();
         let mut runtime = Runtime {
             classes: &classes,
-            mixin_index: std::cell::OnceCell::new(),
+            mixin_index: interface_mixins::RuntimeMixinState::unconfigured(),
             linked: Arc::default(),
             host: &mut host,
             calls: 0,
@@ -53187,7 +53655,7 @@ mandatory = true
         let mut host = NullHost;
         let mut runtime = Runtime {
             classes: &classes,
-            mixin_index: std::cell::OnceCell::new(),
+            mixin_index: interface_mixins::RuntimeMixinState::unconfigured(),
             linked: Arc::default(),
             host: &mut host,
             calls: 0,
@@ -53520,7 +53988,7 @@ mandatory = true
         let mut host = NullHost;
         let mut runtime = Runtime {
             classes: &classes,
-            mixin_index: std::cell::OnceCell::new(),
+            mixin_index: interface_mixins::RuntimeMixinState::unconfigured(),
             linked: Arc::default(),
             host: &mut host,
             calls: 0,
@@ -58803,7 +59271,7 @@ mandatory = true
         let classes = BTreeMap::new();
         let mut runtime = Runtime {
             classes: &classes,
-            mixin_index: std::cell::OnceCell::new(),
+            mixin_index: interface_mixins::RuntimeMixinState::unconfigured(),
             linked: Arc::default(),
             host: &mut host,
             calls: 0,
@@ -58878,7 +59346,7 @@ mandatory = true
         let classes = BTreeMap::new();
         let mut runtime = Runtime {
             classes: &classes,
-            mixin_index: std::cell::OnceCell::new(),
+            mixin_index: interface_mixins::RuntimeMixinState::unconfigured(),
             linked: Arc::default(),
             host: &mut host,
             calls: 0,
@@ -59148,6 +59616,8 @@ mandatory = true
 }
 
 // Data files the runtime embeds, as the Rust source a Sunrise package carries (tools/vendor.py).
+#[path = "fabric_server_bootstrap_classes_26_3.txt.rs"]
+mod vendored_fabric_server_bootstrap_classes_26_3_txt;
 #[path = "game_rules_oracle.tsv.rs"]
 mod vendored_game_rules_oracle_tsv;
 #[path = "generated_nested_real_java25.txt.rs"]
@@ -59174,5 +59644,7 @@ mod vendored_review579_nested_real_java25_txt;
 mod vendored_vanilla_block_items_java25_tsv;
 #[path = "vanilla_entity_data_subclass.txt.rs"]
 mod vendored_vanilla_entity_data_subclass_txt;
+#[path = "vanilla_host_methods.tsv.rs"]
+mod vendored_vanilla_host_methods_tsv;
 #[path = "vanilla_item_ids_java25.txt.rs"]
 mod vendored_vanilla_item_ids_java25_txt;
