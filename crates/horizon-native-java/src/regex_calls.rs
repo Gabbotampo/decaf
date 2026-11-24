@@ -11,7 +11,7 @@
 use crate::java_regex::{self, Thrown};
 use crate::{Host, MethodRef, NativeError, Runtime, StdHost, Value, expect_int, expect_ref};
 
-fn thrown(thrown: Thrown) -> NativeError {
+pub(crate) fn thrown(thrown: Thrown) -> NativeError {
     NativeError::UncaughtException {
         class: thrown.class.into(),
         message: Some(thrown.message),
@@ -96,11 +96,11 @@ impl<H: Host> Runtime<'_, H> {
                 }
             }
             // `pattern.matcher(input)` makes a new `Matcher` holding the pattern
-            // text and the input; of its methods only `matches()` is answered
-            // (JEI validates config names with
-            // `CONFIG_NAME_PATTERN.matcher(name).matches()`). Every other
-            // `Matcher` method, and a pattern or input the engine cannot run
-            // exactly, is counted.
+            // text and the input. `matches()` (JEI validates config names with
+            // `CONFIG_NAME_PATTERN.matcher(name).matches()`), `find()`,
+            // `find(int)`, `group`, `start`, `end`, `groupCount` and `reset()` are
+            // answered (`regex_matcher.rs`); every other `Matcher` method, and a
+            // pattern or input the engine cannot run exactly, is counted.
             (
                 "java/util/regex/Pattern",
                 "matcher",
@@ -112,7 +112,13 @@ impl<H: Host> Runtime<'_, H> {
                 ) else {
                     return Ok(None);
                 };
-                Ok(Some(crate::host_jdk_constant::matcher(&pattern, &input)))
+                // A `StringBuilder`'s text is copied: only a `String` is fixed.
+                let fixed = args
+                    .first()
+                    .is_some_and(|value| self.builder_text(value).is_none());
+                Ok(Some(crate::host_jdk_constant::matcher(
+                    &pattern, &input, fixed,
+                )))
             }
             // `pattern.asPredicate()` makes a `Predicate` whose `test` runs the
             // pattern against its argument. Only a `Pattern` handle is a
@@ -135,16 +141,6 @@ impl<H: Host> Runtime<'_, H> {
                     return Ok(None);
                 }
                 Ok(Some(crate::host_jdk_constant::predicate(&pattern)))
-            }
-            ("java/util/regex/Matcher", "matches", "()Z") => {
-                let Some((pattern, input)) =
-                    receiver.and_then(crate::host_jdk_constant::matcher_parts)
-                else {
-                    return Ok(None);
-                };
-                Ok(java_regex::matches(&pattern, &input)
-                    .ok()
-                    .map(|matched| Value::Int(i32::from(matched))))
             }
             // `predicate.test(object)` on a `Predicate` this runtime made from
             // a `Pattern.asPredicate()` it knows. The JDK's predicate is a
@@ -188,6 +184,8 @@ impl<H: Host> Runtime<'_, H> {
                 "quoteReplacement",
                 "(Ljava/lang/String;)Ljava/lang/String;",
             ) => Ok(text(0).map(|value| Value::Ref(Some(java_regex::quote_replacement(&value))))),
+            // The `Matcher` queries and `find` (`regex_matcher.rs`).
+            ("java/util/regex/Matcher", _, _) => crate::regex_matcher::invoke(r, receiver, args),
             _ => Ok(None),
         }
     }
