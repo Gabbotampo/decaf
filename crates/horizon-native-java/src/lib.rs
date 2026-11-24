@@ -269,6 +269,7 @@ mod reflect_generic;
 mod reflect_names;
 mod reflect_override;
 mod regex_calls;
+mod regex_matcher;
 mod registry_contents;
 mod registry_lookup;
 mod render_math;
@@ -28877,6 +28878,21 @@ impl<H: Host> Runtime<'_, H> {
                     )
                     .map(Some);
             }
+            // `matcher::find` bound to a `Matcher`: the matcher's position is
+            // kept by `regex_matcher.rs`, so the call runs through the same
+            // chain as a direct call and moves it.
+            if callback.target.owner == "java/util/regex/Matcher" {
+                return self
+                    .call_virtual(
+                        jdk_call::Site::Virtual,
+                        &callback.target.owner,
+                        &callback.target.name,
+                        &callback.target.descriptor,
+                        &receiver,
+                        &rest,
+                    )
+                    .map(Some);
+            }
             if callback.target.name == "stream"
                 && callback.target.descriptor == "()Ljava/util/stream/Stream;"
                 && is_collection_owner(&callback.target.owner)
@@ -35080,6 +35096,9 @@ impl<H: Host> Runtime<'_, H> {
         receiver: &Value,
         args: &[Value],
     ) -> Result<Value, NativeError> {
+        // A `Matcher` call that reaches the host unanswered may have moved the
+        // matcher: its position is no longer known (`regex_matcher.rs`).
+        regex_matcher::note_host_call(r, receiver);
         let value = if level_sound::needs_block_pos_resolution(r, args) {
             let mut resolved_args = args.to_vec();
             level_sound::resolve_block_pos_arg(self, r, &mut resolved_args);
