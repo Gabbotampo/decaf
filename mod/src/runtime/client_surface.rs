@@ -888,6 +888,10 @@ pub(crate) struct ClientState {
     /// HUD registrations as recorded: (id, element value, source).
     layers: Vec<(String, Value, &'static str)>,
     pub(crate) frame: Option<Arc<ClientSnapshot>>,
+    /// Identity `(uuid, entity_id)` of the `LocalPlayer` in the previous client
+    /// frame, used to forget stale `client/player` Mixin fields on disconnect or
+    /// rejoin even when `begin_client_frame` is driven directly outside `mod/`.
+    last_player: Option<(u128, i32)>,
     presses: Vec<KeyPress>,
     draws: Vec<DrawOp>,
     messages: Vec<ClientMessage>,
@@ -1453,7 +1457,20 @@ impl StdHost {
     /// Start a client firing: the markers answer from `snapshot`, and the
     /// jar's mappings (in [`Self::client_key_mappings`] order) have `keys`.
     pub fn begin_client_frame(&mut self, snapshot: Arc<ClientSnapshot>, keys: &[KeyPress]) {
+        let next_player = snapshot.player.as_ref().map(|p| (p.uuid, p.entity_id));
+        let prev_had_level = self
+            .client
+            .frame
+            .as_ref()
+            .is_some_and(|frame| frame.level.is_some());
+        let prev_player = self.client.last_player;
+        if prev_had_level && snapshot.level.is_none() {
+            self.forget_all_game_objects();
+        } else if prev_player.is_some() && prev_player != next_player {
+            self.forget_game_object(PLAYER);
+        }
         let state = &mut self.client;
+        state.last_player = next_player;
         state.frame = Some(snapshot);
         state.presses = keys.to_vec();
         state.presses.resize(state.keys.len(), KeyPress::default());

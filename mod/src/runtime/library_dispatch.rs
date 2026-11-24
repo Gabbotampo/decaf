@@ -19,6 +19,11 @@ impl<H: Host> Runtime<'_, H> {
         class: &str,
         method: &str,
     ) -> Result<Option<Value>, NativeError> {
+        // `Class.forName` / `ClassLoader.loadClass` of a class real Fabric refuses to load,
+        // from a method reference or handle as from a direct call (`mixin_class_loading.rs`).
+        if let Some(counted) = self.count_refused_reflective_load(r, receiver, args)? {
+            return Ok(Some(counted));
+        }
         // Also a method reference to a fastutil map's method (`map::put`), which reaches the
         // model without the call instruction's dispatch (`iteration_guard.rs`).
         self.note_fastutil_map_call(r, receiver, args);

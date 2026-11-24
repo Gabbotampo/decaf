@@ -34,8 +34,10 @@ CLASS_RETENTION_SOURCES = {
         "public @interface Inject { String method(); At at(); }"
     ),
     "demo/cr/Target.java": "package demo.cr; public class Target { public void tick() {} }",
-    "demo/cr/ClassRetentionMixin.java": (
-        "package demo.cr; import org.spongepowered.asm.mixin.Mixin; "
+    # The mixin has a package of its own: real Fabric refuses to load any other class
+    # (here the target) in a Mixin config's package.
+    "demo/cr/mixin/ClassRetentionMixin.java": (
+        "package demo.cr.mixin; import demo.cr.Target; import org.spongepowered.asm.mixin.Mixin; "
         "import org.spongepowered.asm.mixin.injection.*; "
         "@Mixin(Target.class) public class ClassRetentionMixin { "
         "@Inject(method=\"tick\", at=@At(\"HEAD\")) private void head() {} }"
@@ -123,7 +125,7 @@ class RealModFixtureTest(unittest.TestCase):
         }))
         (classes / "cr.mixins.json").write_text(json.dumps({
             "required": True,
-            "package": "demo.cr",
+            "package": "demo.cr.mixin",
             "compatibilityLevel": "JAVA_8",
             "mixins": ["ClassRetentionMixin"],
         }))
@@ -151,7 +153,7 @@ class RealModFixtureTest(unittest.TestCase):
         self.assertEqual(payload["status"], "ok")
         self.assertEqual(len(payload["plans"]), 1)
         self.assertEqual(payload["targets"], ["demo/cr/Target#tick"])
-        self.assertEqual(payload["plans"][0]["callback"], "demo/cr/ClassRetentionMixin#head")
+        self.assertEqual(payload["plans"][0]["callback"], "demo/cr/mixin/ClassRetentionMixin#head")
         # The corpus folds the same probe into the fallback reason, so discovery is visible
         # without a loader: no entrypoint, but one plan instead of "one config, no plans".
         shutil.copy2(jar, self.fabric_root / jar.name)

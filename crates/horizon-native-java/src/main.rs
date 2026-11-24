@@ -642,8 +642,27 @@ fn modify_variable_entries(
     }).collect()
 }
 
+fn interface_plan_entries(
+    plans: &[horizon_native_java::MixinInterfacePlan],
+) -> Vec<serde_json::Value> {
+    plans
+        .iter()
+        .map(|plan| {
+            serde_json::json!({
+                "mixin": plan.mixin,
+                "target": plan.target,
+                "interfaces": plan.interfaces,
+                "added_fields": plan.added_fields.iter().map(method_label).collect::<Vec<_>>(),
+                "added_methods": plan.added_methods.iter().map(method_label).collect::<Vec<_>>(),
+                "has_initializer": plan.has_initializer,
+            })
+        })
+        .collect()
+}
+
 fn mixin_plans_json(jar: &NativeJar) -> serde_json::Value {
     let plans = jar.mixin_injection_plans();
+    let interface_plans = jar.mixin_interface_plans();
     let unresolved = jar.unresolved_invoke_plans();
     let class_warnings = jar.class_annotation_warnings();
     let selectors = jar.mixin_plan_selectors();
@@ -667,6 +686,7 @@ fn mixin_plans_json(jar: &NativeJar) -> serde_json::Value {
         "status": "ok",
         "targets": mixin_target_labels(plans.iter().map(|plan| &plan.target)),
         "plans": mixin_plan_entries(&plans, &selectors),
+        "interface_plans": interface_plan_entries(&interface_plans),
         "unresolved": mixin_plan_entries(&unresolved, &selectors),
         "anchor_plans": anchor_plan_entries(&jar.mixin_anchor_plans(), &selectors),
         "unresolved_anchor_plans": anchor_plan_entries(&jar.unresolved_anchor_plans().into_iter().map(|(plan, _)| plan).collect::<Vec<_>>(), &selectors),
@@ -708,6 +728,13 @@ fn execution_json(
             })
             .collect()
     };
+    let interface_plans = jar.mixin_interface_plans();
+    let mut interface_targets: Vec<String> = interface_plans
+        .iter()
+        .map(|plan| plan.target.clone())
+        .collect();
+    interface_targets.sort();
+    interface_targets.dedup();
     serde_json::json!({
         "status": "ok",
         "kind": kind,
@@ -742,6 +769,8 @@ fn execution_json(
             jar.discovered_mixin_targets().iter()
         ),
         "mixin_plans": jar.mixin_injection_plans().len(),
+        "mixin_interface_plans": interface_plans.len(),
+        "mixin_interface_targets": interface_targets,
         "mixin_configs": jar.mixin_configs().len(),
     })
 }

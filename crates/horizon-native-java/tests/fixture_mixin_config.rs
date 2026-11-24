@@ -78,8 +78,10 @@ fn reads_fabric_declared_and_root_configs() {
             refmap: Some("demo.refmap.json".into()),
         }
     );
-    // An auto-discovered config keeps Mixin's defaults.
-    assert!(configs[1].required);
+    // A config that omits them keeps Mixin's defaults: sponge-mixin 0.17.5 sets
+    // `required = requiredValue != null && requiredValue && !ignoreRequired`, so an
+    // omitted `required` is false.
+    assert!(!configs[1].required);
     assert_eq!(configs[1].priority, None);
     assert_eq!(configs[1].mixin_priority, None);
     assert!(jar.mixin_config_errors().is_empty());

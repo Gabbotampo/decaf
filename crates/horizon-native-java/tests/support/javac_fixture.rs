@@ -57,8 +57,8 @@ fn files_under(root: &Path) -> Vec<PathBuf> {
 
 impl Fixture {
     /// Compile `sources` (`(path, text)`, e.g. `("demo/Probe.java", ..)`) with
-    /// `javac --release 21` and pack the `demo/` classes as a Fabric jar with
-    /// `demo.Probe` as its `main` entrypoint.
+    /// `javac --release 21` and pack the `demo/` (and `demoprobe/`) classes as a
+    /// Fabric jar with `demo.Probe` as its `main` entrypoint.
     pub fn build(test: &str, sources: &[(&str, &str)]) -> Self {
         Self::build_jars(test, sources, &[], false)
     }
@@ -236,7 +236,15 @@ impl Fixture {
                 .as_bytes(),
         )
         .unwrap();
-        for class in files_under(&classes.join(packed)) {
+        // A Mixin fixture keeps only its mixins in the config's `demo` package (real
+        // Fabric refuses to load any other class there) and its probes in `demoprobe`:
+        // both ship.
+        let packed_roots = if packed.is_empty() {
+            vec![classes.clone()]
+        } else {
+            vec![classes.join(packed), classes.join(format!("{packed}probe"))]
+        };
+        for class in packed_roots.iter().flat_map(|root| files_under(root)) {
             let entry = class
                 .strip_prefix(&classes)
                 .unwrap()
