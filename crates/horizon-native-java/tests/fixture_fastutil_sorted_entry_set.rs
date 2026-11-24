@@ -71,6 +71,14 @@ fn fastutil_sorted_entry_set_leaves_the_rest_counted() {
     let iterator = format!(
         "{objects}Object2BooleanSortedMap$FastSortedEntrySet#iterator()L{objects}ObjectBidirectionalIterator;"
     );
+    let entry_equals = format!("{objects}Object2BooleanMap$Entry#equals(Ljava/lang/Object;)Z");
+    let entry_hash = format!("{objects}Object2BooleanMap$Entry#hashCode()I");
+    let object_equals = String::from("java/lang/Object#equals(Ljava/lang/Object;)Z");
+    let object_hash = String::from("java/lang/Object#hashCode()I");
+    let objects_hash = String::from("java/util/Objects#hashCode(Ljava/lang/Object;)I");
+    let if_acmp = String::from("java/lang/Object#if_acmp(Ljava/lang/Object;Ljava/lang/Object;)Z");
+    let map_put =
+        String::from("java/util/Map#put(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;");
     let tree = |class: &str| {
         format!("{objects}{class}#object2BooleanEntrySet()L{objects}ObjectSortedSet;")
     };
@@ -194,6 +202,120 @@ fn fastutil_sorted_entry_set_leaves_the_rest_counted() {
             "entryIdentityFastThenGeneric",
             "LINKED.entry-identity-fast-then-generic",
             vec!["java/util/Set#iterator()Ljava/util/Iterator;".into()],
+        ),
+        // An entry the iterator handed out compared or hashed against a fastutil `BasicEntry`
+        // (or any entry the host cannot prove equal as Java does), in either direction, as a
+        // key of a hash collection, or against an entry whose value fastutil's `equals` casts
+        // to `Boolean` and throws on: counted.
+        (
+            "entryEqualsBasic",
+            "LINKED.entry-equals-basic",
+            vec![entry_equals.clone()],
+        ),
+        (
+            "basicEqualsEntry",
+            "LINKED.basic-equals-entry",
+            vec![entry_equals.clone()],
+        ),
+        (
+            "entryEqualsBasicOtherValue",
+            "LINKED.entry-equals-basic-other-value",
+            vec![entry_equals.clone()],
+        ),
+        (
+            "entryHashCodeBasic",
+            "LINKED.entry-hashCode-basic",
+            vec![entry_hash.clone()],
+        ),
+        (
+            "entryListContains",
+            "LINKED.entry-list-contains-basic",
+            vec![object_equals.clone()],
+        ),
+        (
+            "basicListContains",
+            "LINKED.basic-list-contains-entry",
+            vec![object_equals.clone()],
+        ),
+        (
+            "entryHashSet",
+            "LINKED.entry-hashset-basic",
+            vec![object_hash.clone()],
+        ),
+        (
+            "basicHashSet",
+            "LINKED.basic-hashset-entry",
+            vec![object_hash.clone()],
+        ),
+        (
+            "entryHashMap",
+            "LINKED.entry-hashmap-basic",
+            vec![object_hash.clone()],
+        ),
+        (
+            "basicHashMap",
+            "LINKED.basic-hashmap-entry",
+            vec![object_hash.clone()],
+        ),
+        (
+            "entryIdentityFreshSet",
+            "LINKED.entry-identity-fresh-set",
+            vec![if_acmp.clone()],
+        ),
+        (
+            "entryIdentityFreshSetMap",
+            "LINKED.entry-identity-fresh-set-map",
+            vec![map_put.clone()],
+        ),
+        (
+            "objectEntryEqualsBasic",
+            "LINKED.object-entry-equals-basic",
+            vec![object_equals.clone()],
+        ),
+        (
+            "objectEntryHashCodeBasic",
+            "LINKED.object-entry-hashCode-basic",
+            vec![object_hash.clone()],
+        ),
+        (
+            "entryEqualsNonBooleanValue",
+            "LINKED.entry-equals-non-boolean-value",
+            vec![object_equals.clone()],
+        ),
+        (
+            "entryEqualsNullValue",
+            "LINKED.entry-equals-null-value",
+            vec![object_equals.clone()],
+        ),
+        (
+            "basicEqualsBasic",
+            "LINKED.basic-equals-basic",
+            vec![entry_equals.clone()],
+        ),
+        (
+            "objectBasicEqualsEntry",
+            "LINKED.object-basic-equals-entry",
+            vec![object_equals.clone()],
+        ),
+        (
+            "objectsEqualsBasicEntry",
+            "LINKED.objects-equals-basic-entry",
+            vec![object_equals.clone()],
+        ),
+        (
+            "objectsEqualsEntryBasic",
+            "LINKED.objects-equals-entry-basic",
+            vec![object_equals.clone()],
+        ),
+        (
+            "basicHashCode",
+            "LINKED.basic-hashCode",
+            vec![object_hash.clone()],
+        ),
+        (
+            "objectsHashCodeBasic",
+            "LINKED.objects-hashCode-basic",
+            vec![objects_hash.clone()],
         ),
         (
             "surrogateKeys",

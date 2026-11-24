@@ -1296,6 +1296,24 @@ fn entry_text(handle: &HostRef, nested: &mut dyn Nested) -> Result<Option<String
     Ok(Some(format!("{key}={value}")))
 }
 
+/// Whether a fastutil map's entry (`Object2BooleanLinkedOpenHashMap$MapEntry`), holding the value
+/// `own`, would throw comparing itself with an entry of an equal key and the value `other`: its
+/// `equals` casts `other.getValue()` to the box of its own value type (`Boolean`) once the keys
+/// are equal, a `ClassCastException` (a `NullPointerException` for `null`) where the host would
+/// answer `false`. A reference-valued map's entry casts nothing.
+pub(crate) fn fastutil_value_cast_fails(own: &Value, other: &Value) -> bool {
+    match (own, other) {
+        (Value::Boxed(own), Value::Boxed(theirs)) => {
+            std::mem::discriminant(own) != std::mem::discriminant(theirs)
+        }
+        (Value::Boxed(_), _) => true,
+        // A value this model cannot tell from another box kind (`Int`: an `Integer` or a
+        // `Boolean`): the cast holds only for another such value.
+        (Value::Int(_), other) => !matches!(other, Value::Int(_)),
+        _ => false,
+    }
+}
+
 /// `IdentityHashMap`'s entries compare and hash by identity (Java 25's
 /// `IdentityHashMap.EntryIterator.Entry`), every other entry class by `equals`/`hashCode`.
 const IDENTITY_ENTRY: &str = "java/util/IdentityHashMap$EntryIterator$Entry";
@@ -1358,7 +1376,14 @@ fn entry_equals(
                 });
             }
             Ok(match nested.equals(&key, &other_key)? {
-                Some(true) => nested.equals(&value, &other_value)?,
+                Some(true) => {
+                    if nested.is_fastutil_entry(&Value::Host(handle.clone()))
+                        && fastutil_value_cast_fails(&value, &other_value)
+                    {
+                        return Ok(None);
+                    }
+                    nested.equals(&value, &other_value)?
+                }
                 answer => answer,
             })
         }

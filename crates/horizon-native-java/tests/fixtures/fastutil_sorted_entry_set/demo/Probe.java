@@ -303,6 +303,54 @@ public class Probe {
             }
             return sb + "|" + m.size();
         }));
+        // Entries of one iteration are distinct objects (a new entry per next()), and an entry is
+        // equal to itself and to an equal entry of another class; hashed, it is key ^ value.
+        line("LINKED.entry-identity-consecutive", of(() -> {
+            Iterator<Object2BooleanMap.Entry<String>> it = linked().object2BooleanEntrySet().iterator();
+            Object a = it.next();
+            Object b = it.next();
+            return (a != b) + "|" + (a == a) + "|" + a.equals(a) + "|" + a.equals(b);
+        }));
+        // A second object2BooleanEntrySet() call makes new entries, equal to the first's.
+        line("LINKED.entry-equals-fresh-set", of(() -> {
+            Object2BooleanLinkedOpenHashMap<String> m = linked();
+            Object a = m.object2BooleanEntrySet().iterator().next();
+            Object b = m.object2BooleanEntrySet().iterator().next();
+            return a.equals(b) + "|" + (a.hashCode() == b.hashCode());
+        }));
+        line("LINKED.entry-hash-and-sets", of(() -> {
+            Iterator<Object2BooleanMap.Entry<String>> it = linked().object2BooleanEntrySet().iterator();
+            java.util.Set<Object> hashed = new java.util.HashSet<>();
+            Map<Object, Integer> identity = new java.util.IdentityHashMap<>();
+            Map<Object, String> byEntry = new java.util.HashMap<>();
+            Object first = null;
+            StringBuilder sb = new StringBuilder();
+            while (it.hasNext()) {
+                Object2BooleanMap.Entry<String> e = it.next();
+                first = first == null ? e : first;
+                hashed.add(e);
+                identity.put(e, 1);
+                byEntry.put(e, e.getKey());
+                sb.append(e.hashCode() == (e.getKey().hashCode() ^ (e.getBooleanValue() ? 1231 : 1237)))
+                        .append(',');
+            }
+            return sb + "" + hashed.size() + "|" + identity.size() + "|" + hashed.contains(first)
+                    + "|" + byEntry.get(first);
+        }));
+        line("LINKED.entry-equals-java-entries", of(() -> {
+            Object e = linked().object2BooleanEntrySet().iterator().next();
+            Object simple = new java.util.AbstractMap.SimpleEntry<>("banana", true);
+            Object mapEntry = Map.entry("banana", true);
+            Object other = Map.entry("banana", false);
+            Object otherKey = Map.entry("apple", true);
+            Object jarOtherKey = new JarEntry("apple", "x");
+            Object jar = new JarEntry("banana", true);
+            Object otherMap = linked().object2BooleanEntrySet().iterator().next();
+            return e.equals(jarOtherKey) + "|" + e.equals(jar) + "|" + jar.equals(e) + "|"
+                    + e.equals(otherMap) + "|" + otherMap.equals(e) + "|" + e.equals(simple) + "|" + simple.equals(e) + "|" + e.equals(mapEntry) + "|"
+                    + mapEntry.equals(e) + "|" + e.equals(other) + "|" + e.equals(otherKey) + "|"
+                    + e.equals(null) + "|" + e.equals("banana");
+        }));
         return out.toString();
     }
 
@@ -970,6 +1018,285 @@ public class Probe {
         return of(Probe::methodRefPutBody);
     }
 
+    // --- Entries compared with entries the host does not model (a fastutil BasicEntry, a
+    // --- java.util entry, a jar class): counted, never answered.
+
+    static Object2BooleanMap.Entry<String> firstEntry() {
+        return linked().object2BooleanEntrySet().iterator().next();
+    }
+
+    static Object2BooleanMap.Entry<String> basic() {
+        return new it.unimi.dsi.fastutil.objects.AbstractObject2BooleanMap.BasicEntry<>("banana", true);
+    }
+
+    /** A jar Map.Entry that keeps Object's equals and hashCode. */
+    static final class JarEntry implements Map.Entry<String, Object> {
+        final String key;
+        final Object value;
+
+        JarEntry(String key, Object value) {
+            this.key = key;
+            this.value = value;
+        }
+
+        public String getKey() {
+            return key;
+        }
+
+        public Object getValue() {
+            return value;
+        }
+
+        public Object setValue(Object v) {
+            throw new UnsupportedOperationException();
+        }
+    }
+
+    static String entryEqualsBasicBody() {
+        return "" + firstEntry().equals(basic());
+    }
+
+    /** Run on its own: the exception a counted call's neutral answer causes is caught as a row's is. */
+    public static String entryEqualsBasic() {
+        return of(Probe::entryEqualsBasicBody);
+    }
+
+    static String basicEqualsEntryBody() {
+        return "" + basic().equals(firstEntry());
+    }
+
+    /** Run on its own: the exception a counted call's neutral answer causes is caught as a row's is. */
+    public static String basicEqualsEntry() {
+        return of(Probe::basicEqualsEntryBody);
+    }
+
+    static String entryEqualsBasicOtherValueBody() {
+        return "" + firstEntry().equals(new it.unimi.dsi.fastutil.objects.AbstractObject2BooleanMap.BasicEntry<>("banana", false));
+    }
+
+    /** Run on its own: the exception a counted call's neutral answer causes is caught as a row's is. */
+    public static String entryEqualsBasicOtherValue() {
+        return of(Probe::entryEqualsBasicOtherValueBody);
+    }
+
+    static String entryHashCodeBasicBody() {
+        return "" + (firstEntry().hashCode() == basic().hashCode());
+    }
+
+    /** Run on its own: the exception a counted call's neutral answer causes is caught as a row's is. */
+    public static String entryHashCodeBasic() {
+        return of(Probe::entryHashCodeBasicBody);
+    }
+
+
+
+    static String entryListContainsBody() {
+        List<Object> list = new ArrayList<>();
+        list.add(basic());
+        return list.contains(firstEntry()) + "|" + list.indexOf(firstEntry());
+    }
+
+    /** Run on its own: the exception a counted call's neutral answer causes is caught as a row's is. */
+    public static String entryListContains() {
+        return of(Probe::entryListContainsBody);
+    }
+
+    static String basicListContainsBody() {
+        List<Object> list = new ArrayList<>();
+        list.add(firstEntry());
+        return list.contains(basic()) + "|" + list.indexOf(basic());
+    }
+
+    /** Run on its own: the exception a counted call's neutral answer causes is caught as a row's is. */
+    public static String basicListContains() {
+        return of(Probe::basicListContainsBody);
+    }
+
+    static String entryHashSetBody() {
+        java.util.Set<Object> set = new java.util.HashSet<>();
+        set.add(basic());
+        return "" + set.contains(firstEntry());
+    }
+
+    /** Run on its own: the exception a counted call's neutral answer causes is caught as a row's is. */
+    public static String entryHashSet() {
+        return of(Probe::entryHashSetBody);
+    }
+
+    static String basicHashSetBody() {
+        java.util.Set<Object> set = new java.util.HashSet<>();
+        set.add(firstEntry());
+        return "" + set.contains(basic());
+    }
+
+    /** Run on its own: the exception a counted call's neutral answer causes is caught as a row's is. */
+    public static String basicHashSet() {
+        return of(Probe::basicHashSetBody);
+    }
+
+    static String entryHashMapBody() {
+        Map<Object, String> map = new java.util.HashMap<>();
+        map.put(basic(), "found");
+        return "" + map.get(firstEntry());
+    }
+
+    /** Run on its own: the exception a counted call's neutral answer causes is caught as a row's is. */
+    public static String entryHashMap() {
+        return of(Probe::entryHashMapBody);
+    }
+
+    static String basicHashMapBody() {
+        Map<Object, String> map = new java.util.HashMap<>();
+        map.put(firstEntry(), "found");
+        return "" + map.get(basic());
+    }
+
+    /** Run on its own: the exception a counted call's neutral answer causes is caught as a row's is. */
+    public static String basicHashMap() {
+        return of(Probe::basicHashMapBody);
+    }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    static String entryEqualsNonBooleanValueBody() {
+        Object e = firstEntry();
+        return "" + e.equals(new JarEntry("banana", "x"));
+    }
+
+    /** Run on its own: the exception a counted call's neutral answer causes is caught as a row's is. */
+    public static String entryEqualsNonBooleanValue() {
+        return of(Probe::entryEqualsNonBooleanValueBody);
+    }
+
+    static String entryEqualsNullValueBody() {
+        Object e = firstEntry();
+        return "" + e.equals(new java.util.AbstractMap.SimpleEntry<>("banana", null));
+    }
+
+    /** Run on its own: the exception a counted call's neutral answer causes is caught as a row's is. */
+    public static String entryEqualsNullValue() {
+        return of(Probe::entryEqualsNullValueBody);
+    }
+
+    static String basicEqualsBasicBody() {
+        return "" + basic().equals(basic());
+    }
+
+    /** Run on its own: the exception a counted call's neutral answer causes is caught as a row's is. */
+    public static String basicEqualsBasic() {
+        return of(Probe::basicEqualsBasicBody);
+    }
+
+    static String objectBasicEqualsEntryBody() {
+        Object o = basic();
+        return "" + o.equals(firstEntry());
+    }
+
+    /** Run on its own: the exception a counted call's neutral answer causes is caught as a row's is. */
+    public static String objectBasicEqualsEntry() {
+        return of(Probe::objectBasicEqualsEntryBody);
+    }
+
+    static String objectsEqualsBasicEntryBody() {
+        return "" + java.util.Objects.equals(basic(), firstEntry());
+    }
+
+    /** Run on its own: the exception a counted call's neutral answer causes is caught as a row's is. */
+    public static String objectsEqualsBasicEntry() {
+        return of(Probe::objectsEqualsBasicEntryBody);
+    }
+
+    static String objectsEqualsEntryBasicBody() {
+        return "" + java.util.Objects.equals(firstEntry(), basic());
+    }
+
+    /** Run on its own: the exception a counted call's neutral answer causes is caught as a row's is. */
+    public static String objectsEqualsEntryBasic() {
+        return of(Probe::objectsEqualsEntryBasicBody);
+    }
+
+    static String basicHashCodeBody() {
+        Object o = basic();
+        return "" + o.hashCode();
+    }
+
+    /** Run on its own: the exception a counted call's neutral answer causes is caught as a row's is. */
+    public static String basicHashCode() {
+        return of(Probe::basicHashCodeBody);
+    }
+
+    static String objectsHashCodeBasicBody() {
+        return "" + java.util.Objects.hashCode(basic());
+    }
+
+    /** Run on its own: the exception a counted call's neutral answer causes is caught as a row's is. */
+    public static String objectsHashCodeBasic() {
+        return of(Probe::objectsHashCodeBasicBody);
+    }
+
+    /** The first entries of two object2BooleanEntrySet() calls are two objects, equal. */
+    static String entryIdentityFreshSetBody() {
+        Object2BooleanLinkedOpenHashMap<String> m = linked();
+        Object a = m.object2BooleanEntrySet().iterator().next();
+        Object b = m.object2BooleanEntrySet().iterator().next();
+        return "" + (a == b);
+    }
+
+    static String entryIdentityFreshSetMapBody() {
+        Object2BooleanLinkedOpenHashMap<String> m = linked();
+        Map<Object, Integer> identity = new java.util.IdentityHashMap<>();
+        identity.put(m.object2BooleanEntrySet().iterator().next(), 1);
+        identity.put(m.object2BooleanEntrySet().iterator().next(), 2);
+        return "" + identity.size();
+    }
+
+    /** Run on its own: the exception a counted call's neutral answer causes is caught as a row's is. */
+    public static String entryIdentityFreshSet() {
+        return of(Probe::entryIdentityFreshSetBody);
+    }
+
+    /** Run on its own: the exception a counted call's neutral answer causes is caught as a row's is. */
+    public static String entryIdentityFreshSetMap() {
+        return of(Probe::entryIdentityFreshSetMapBody);
+    }
+
+    static String objectEntryEqualsBasicBody() {
+        Object e = firstEntry();
+        return "" + e.equals(basic());
+    }
+
+    /** Run on its own: the exception a counted call's neutral answer causes is caught as a row's is. */
+    public static String objectEntryEqualsBasic() {
+        return of(Probe::objectEntryEqualsBasicBody);
+    }
+
+    static String objectEntryHashCodeBasicBody() {
+        Object e = firstEntry();
+        Object b = basic();
+        return "" + (e.hashCode() == b.hashCode());
+    }
+
+    /** Run on its own: the exception a counted call's neutral answer causes is caught as a row's is. */
+    public static String objectEntryHashCodeBasic() {
+        return of(Probe::objectEntryHashCodeBasicBody);
+    }
+
+
+
     public static String countedRows() {
         out = new StringBuilder();
         line("LINKED.fastIterator-order", fastIteratorOrder());
@@ -997,6 +1324,28 @@ public class Probe {
         line("LINKED.entry-identity-loop-twice", entryIdentityLoopTwice());
         line("LINKED.entry-identity-generic-then-fast", entryIdentityGenericThenFast());
         line("LINKED.entry-identity-fast-then-generic", entryIdentityFastThenGeneric());
+        line("LINKED.entry-equals-basic", entryEqualsBasic());
+        line("LINKED.basic-equals-entry", basicEqualsEntry());
+        line("LINKED.entry-equals-basic-other-value", entryEqualsBasicOtherValue());
+        line("LINKED.entry-hashCode-basic", entryHashCodeBasic());
+        line("LINKED.entry-list-contains-basic", entryListContains());
+        line("LINKED.basic-list-contains-entry", basicListContains());
+        line("LINKED.entry-hashset-basic", entryHashSet());
+        line("LINKED.basic-hashset-entry", basicHashSet());
+        line("LINKED.entry-hashmap-basic", entryHashMap());
+        line("LINKED.basic-hashmap-entry", basicHashMap());
+        line("LINKED.entry-identity-fresh-set", entryIdentityFreshSet());
+        line("LINKED.entry-identity-fresh-set-map", entryIdentityFreshSetMap());
+        line("LINKED.object-entry-equals-basic", objectEntryEqualsBasic());
+        line("LINKED.object-entry-hashCode-basic", objectEntryHashCodeBasic());
+        line("LINKED.entry-equals-non-boolean-value", entryEqualsNonBooleanValue());
+        line("LINKED.entry-equals-null-value", entryEqualsNullValue());
+        line("LINKED.basic-equals-basic", basicEqualsBasic());
+        line("LINKED.object-basic-equals-entry", objectBasicEqualsEntry());
+        line("LINKED.objects-equals-basic-entry", objectsEqualsBasicEntry());
+        line("LINKED.objects-equals-entry-basic", objectsEqualsEntryBasic());
+        line("LINKED.basic-hashCode", basicHashCode());
+        line("LINKED.objects-hashCode-basic", objectsHashCodeBasic());
         line("KEYS.surrogate-pair-merged", surrogateKeys());
         line("KEYS.fffd-and-surrogate", fffdAndSurrogateKeys());
         line("KEYS.surrogate-removed", surrogateRemove());

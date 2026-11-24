@@ -40,9 +40,15 @@ conditions, each of which the runtime checks and otherwise counts:
 Rows: `iterator()` order (including the empty-string key, a re-put of a present key and keys of
 any length and code point that are no lone surrogate), an entry set kept while the map does not
 change (one iterator, with `containsKey`/`size`/`getBoolean` in between) and a fresh entry set per
-use after a put, typed
-use through `getKey()` and `getBooleanValue()`, independent iterators, entries kept after the
-iteration, the bare `NoSuchElementException` past the end and on an empty map, the bare
+use after a put, typed use through `getKey()` and `getBooleanValue()`, independent iterators, entries kept after the
+iteration, the entries of one iteration being distinct objects (`LINKED.entry-identity-consecutive`:
+fastutil's `EntryIterator.next()` makes a new `MapEntry` per call; `==` and `equals`), entries
+`equals`/`hashCode` as Java's with a `java.util` entry or a jar's own `Map.Entry`
+(`LINKED.entry-equals-java-entries`, both directions, a different key or value, `null`, a
+`String`), and as keys of a `HashSet`, a `HashMap` and an `IdentityHashMap`
+(`LINKED.entry-hash-and-sets`: `hashCode() == key.hashCode() ^ (value ? 1231 : 1237)`),
+`LINKED.entry-equals-fresh-set` (entries of two `object2BooleanEntrySet()` calls: `equals`, same
+hash), the bare `NoSuchElementException` past the end and on an empty map, the bare
 `IllegalStateException` for a `remove` with nothing to remove, and `remove` in the middle, at the
 end and for every entry.
 
@@ -74,21 +80,29 @@ on a host of its own and checks it counts a call:
   boxes);
 - the tree maps (`Object2BooleanAVLTreeMap`, `Object2BooleanRBTreeMap`): their entry set is an
   unrelated `ObjectSortedSet` in natural key order.
+- an entry the iterator handed out compared or hashed against an entry the host does not model
+  (`LINKED.entry-equals-basic` and the rows after `entry-identity-fast-then-generic`). fastutil's
+  `BasicEntry` is equal to any entry holding the same key and value, and hashes as `key ^ value`
+  (`Boolean.hashCode`), where the host's object of an unknown class is identity-equal only. Counted,
+  whichever the type the program gives the receiver (`Object`, `Object2BooleanMap.Entry`) and
+  whichever side it is on: `entry.equals(basic)`, `basic.equals(entry)`, `Objects.equals` both
+  ways, `basic.hashCode()`, `List.contains`/`indexOf`, and an entry or a `BasicEntry` as a
+  `HashSet` element or a `HashMap` key against the other. A `BasicEntry` is counted for any
+  `equals`/`hashCode` (two of them too), since the host keeps no model of the class.
+- an entry compared with an entry whose value fastutil's `MapEntry.equals` casts and throws on
+  (verified in the 8.5.18 bytecode: once the keys are equal it casts `other.getValue()` to
+  `Boolean`, so a `String` value is a `ClassCastException` and `null` a `NullPointerException`;
+  `LINKED.entry-equals-non-boolean-value`, `LINKED.entry-equals-null-value`). The host would
+  answer `false`.
+- the identity of entries of two `object2BooleanEntrySet()` calls (`LINKED.entry-identity-fresh-set`,
+  `...-fresh-set-map`: `==` and an `IdentityHashMap`): fastutil makes a new `MapEntry` per
+  `next()`, the host keeps no identity between the two readings.
 
 Known and not fixed here (the same at the base commit, outside this change): the entry set typed
 as `Set`/`Collection`/`Iterable`/`ObjectSortedSet` goes through the host's generic path (its
 iteration, `size`, `isEmpty`, `stream`, `contains` read the host's copy, not the live view); the
 host's put through `Map.put(k, null)` stores `false` and `put`/`size`/`containsKey` merge lone
 surrogate keys.
-
-Known and not fixed, and reachable from this change: a fastutil `BasicEntry` is not `equals` to a
-host entry in either direction, and their `hashCode`s differ. The runtime answers `false` (or
-`-1`, `null`) where Java answers `true` (or the index, the value) for
-`new BasicEntry<>("banana", true)` against an entry an answered `iterator()` returned, through
-`equals` both ways, `List.contains`/`indexOf`, `HashSet.contains` and `HashMap.get`. The same wrong answers exist at the base commit (two
-`BasicEntry` objects are not `equals` there either), but a program that got its entries from this
-iterator was counted at the base and is answered now. No cheap fix: it needs the entry
-equality and hash of fastutil's entry classes modelled.
 
 Not run, not claimed: `fastIterator(entry)`, `forEachRemaining` on the iterator, the entry set's
 `size`/`contains`/`remove`, `iterator()` of any other fastutil class.

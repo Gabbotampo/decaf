@@ -30383,6 +30383,12 @@ impl<H: Host> Runtime<'_, H> {
             {
                 return self.host.unknown_operand_call(r).map(Some);
             }
+            // A fastutil entry object (`new BasicEntry<>(k, v)`) is equal to any entry with its
+            // key and value, not only to itself: counted, never a marker comparison.
+            if jar_object::object_class(receiver).is_some_and(object_methods::fastutil_entry_class)
+            {
+                return self.host.unknown_operand_call(r).map(Some);
+            }
             return Ok(Some(Value::Int(
                 (value_marker(receiver) == value_marker(other)) as i32,
             )));

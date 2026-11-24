@@ -23,6 +23,28 @@ LINKED.entry-identity-two-iterators	false
 LINKED.entry-identity-loop-twice	6
 LINKED.entry-identity-generic-then-fast	false
 LINKED.entry-identity-fast-then-generic	false
+LINKED.entry-equals-basic	true
+LINKED.basic-equals-entry	true
+LINKED.entry-equals-basic-other-value	false
+LINKED.entry-hashCode-basic	true
+LINKED.entry-list-contains-basic	true|0
+LINKED.basic-list-contains-entry	true|0
+LINKED.entry-hashset-basic	true
+LINKED.basic-hashset-entry	true
+LINKED.entry-hashmap-basic	found
+LINKED.basic-hashmap-entry	found
+LINKED.entry-identity-fresh-set	false
+LINKED.entry-identity-fresh-set-map	2
+LINKED.object-entry-equals-basic	true
+LINKED.object-entry-hashCode-basic	true
+LINKED.entry-equals-non-boolean-value	java.lang.ClassCastException: class java.lang.String cannot be cast to class java.lang.Boolean (java.lang.String and java.lang.Boolean are in module java.base of loader 'bootstrap')
+LINKED.entry-equals-null-value	java.lang.NullPointerException: Cannot invoke "java.lang.Boolean.booleanValue()" because the return value of "java.util.Map$Entry.getValue()" is null
+LINKED.basic-equals-basic	true
+LINKED.object-basic-equals-entry	true
+LINKED.objects-equals-basic-entry	true
+LINKED.objects-equals-entry-basic	true
+LINKED.basic-hashCode	-1396356182
+LINKED.objects-hashCode-basic	-1396356182
 KEYS.surrogate-pair-merged	2|1:55296=true;1:56320=false;
 KEYS.fffd-and-surrogate	2|1:65533=true;1:55296=false;
 KEYS.surrogate-removed	2|1:120=true;1:56320=true;
