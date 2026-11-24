@@ -102,8 +102,11 @@ FABRIC_SOURCES = {
         "@Retention(RetentionPolicy.RUNTIME) @Target(ElementType.METHOD) public @interface Inject { String method(); At at(); }"
     ),
     "demo/fabric/Target.java": "package demo.fabric; public class Target { public void tick() {} }",
-    "demo/fabric/FixtureMixin.java": (
-        "package demo.fabric; import org.spongepowered.asm.mixin.Mixin; "
+    # Real Fabric refuses to load any class in a Mixin config's package (sponge-mixin's
+    # `MixinProcessor` `packageMatch`, rethrown by Knot), so the mixin has a package of its
+    # own and the entrypoint, payload and target stay outside it.
+    "demo/fabric/mixin/FixtureMixin.java": (
+        "package demo.fabric.mixin; import demo.fabric.Target; import org.spongepowered.asm.mixin.Mixin; "
         "import org.spongepowered.asm.mixin.injection.*; @Mixin(Target.class) public class FixtureMixin { "
         "@Inject(method=\"tick\", at=@At(\"HEAD\")) private void head() {} }"
     ),
@@ -162,7 +165,7 @@ def build(output: Path) -> dict[str, dict[str, str]]:
         _jar(nested, nested_classes, {"fabric.mod.json": '{"schemaVersion":1,"id":"nested_fixture","version":"1.0","entrypoints":{"main":"demo.nested.Nested"}}'})
         _jar(output / "fabric-fixture.jar", fabric_classes, {
             "fabric.mod.json": '{"schemaVersion":1,"id":"native_fixture_fabric","version":"1.0.0","entrypoints":{"main":"demo.fabric.Mod"},"depends":{"minecraft":">=26.3","fabric-api":">=0.100"},"jars":[{"file":"META-INF/jars/nested.jar"}],"mixins":["native_fixture.mixins.json"]}',
-            "native_fixture.mixins.json": '{"required":true,"package":"demo.fabric","compatibilityLevel":"JAVA_8","mixins":["FixtureMixin"]}',
+            "native_fixture.mixins.json": '{"required":true,"package":"demo.fabric.mixin","compatibilityLevel":"JAVA_8","mixins":["FixtureMixin"]}',
             "META-INF/jars/nested.jar": nested.read_bytes(),
         })
         neo_classes = _compile(NEO_COMMON, work / "neo")

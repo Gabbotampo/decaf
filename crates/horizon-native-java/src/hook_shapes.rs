@@ -483,27 +483,37 @@ fn governing_config<'a>(
     })
 }
 
+/// The config gate for one game-hook / interface-injection Mixin plan.
+///
+/// A config that names an `IMixinConfigPlugin` decides each of its Mixins
+/// in the plugin's own code, so the plain gate refuses every plan it
+/// governs (`config-plugin`). The game-hook and runtime interface-mixin
+/// tiers ask the plugin instead: `plugins` holds one session per config,
+/// run once per jar/side the way Mixin runs a plugin (`mixin_plugins.rs`).
+/// The plan passes only when that session ran and the plugin answered
+/// `true` for this Mixin at this target; a refused session, a failed
+/// question or a `false` keeps `config-plugin`. A companion Mixin a
+/// plugin's `getMixins()` added is listed by no config, and passes as Mixin
+/// applies it: without asking.
+pub(crate) fn mixin_config_gate_with_plugins(
+    configs: &[MixinConfig],
+    config_sides: &BTreeMap<String, MixinSide>,
+    plugins: &ConfigPlugins,
+    mixin: &str,
+    target: &str,
+    side: MixinSide,
+) -> Result<(), MixinSkipReason> {
+    match mixin_config_gate(configs, config_sides, mixin, side) {
+        Err(MixinSkipReason::ConfigPlugin) => {}
+        Err(MixinSkipReason::NotInConfig) if plugins.is_companion(mixin) => return Ok(()),
+        other => return other,
+    }
+    let config = governing_config(configs, config_sides, mixin, side)
+        .ok_or(MixinSkipReason::ConfigPlugin)?;
+    plugins.decide(&config.path, mixin, target)
+}
+
 impl NativeJar {
-    /// The config gate for one game-hook plan.
-    ///
-    /// A config that names an `IMixinConfigPlugin` decides each of its Mixins
-    /// in the plugin's own code, so the plain gate refuses every plan it
-    /// governs (`config-plugin`). The game-hook tier asks the plugin instead:
-    /// `plugins` holds one session per config, run once per weave the way
-    /// Mixin runs a plugin (`mixin_plugins.rs`: a persistent instance,
-    /// `onLoad`, `getRefMapperConfig`, `shouldApplyMixin` for every listed
-    /// Mixin and target, `acceptTargets`, `getMixins`, then `preApply` and
-    /// `postApply` with stand-in nodes). The plan passes only when that
-    /// session ran and the plugin answered `true` for this Mixin at this
-    /// target; a refused session, a failed question or a `false` keeps
-    /// `config-plugin`. A companion Mixin a plugin's `getMixins()` added is
-    /// listed by no config, and passes as Mixin applies it: without asking.
-    ///
-    /// The plugin is asked without the pack's mod list: a plugin that applies
-    /// a compat Mixin only when another mod is loaded answers for this jar
-    /// alone, so a pack can lose a compat callback, never gain one the plugin
-    /// only allows alone (unless its answer is "apply when X is absent",
-    /// which this documents).
     pub(crate) fn game_hook_config_gate(
         &self,
         configs: &[MixinConfig],
@@ -513,14 +523,7 @@ impl NativeJar {
         target: &str,
         side: MixinSide,
     ) -> Result<(), MixinSkipReason> {
-        match mixin_config_gate(configs, config_sides, mixin, side) {
-            Err(MixinSkipReason::ConfigPlugin) => {}
-            Err(MixinSkipReason::NotInConfig) if plugins.is_companion(mixin) => return Ok(()),
-            other => return other,
-        }
-        let config = governing_config(configs, config_sides, mixin, side)
-            .ok_or(MixinSkipReason::ConfigPlugin)?;
-        plugins.decide(&config.path, mixin, target)
+        mixin_config_gate_with_plugins(configs, config_sides, plugins, mixin, target, side)
     }
 }
 

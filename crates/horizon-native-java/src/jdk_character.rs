@@ -68,6 +68,36 @@ pub(crate) fn is_whitespace(code_point: i32) -> bool {
     has(code_point, table::WHITESPACE)
 }
 
+/// The byte range of `text` with leading and trailing whitespace removed,
+/// where whitespace is exactly `Character.isWhitespace`: space separators
+/// except U+00A0, U+2007 and U+202F, plus U+0009-U+000D and U+001C-U+001F.
+///
+/// `start` is the first non-whitespace byte offset (`text.len()` when the text
+/// is all whitespace); `end` is one past the last non-whitespace byte offset
+/// (`0` when it is all whitespace). All-whitespace text therefore has
+/// `start == text.len()` and `end == 0`, so `start > end`: callers clamp the
+/// range before slicing (`strip` uses `end.max(start)`). `String.trim` keeps
+/// its own rule (code units `<= U+0020`) and is not this.
+pub(crate) fn strip_bounds(text: &str) -> (usize, usize) {
+    let mut start = 0;
+    for (byte, ch) in text.char_indices() {
+        if is_whitespace(ch as u32 as i32) {
+            start = byte + ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+    let mut end = text.len();
+    for (byte, ch) in text.char_indices().rev() {
+        if is_whitespace(ch as u32 as i32) {
+            end = byte;
+        } else {
+            break;
+        }
+    }
+    (start, end)
+}
+
 /// `Character.getType(codePoint)`.
 pub(crate) fn get_type(code_point: i32) -> i32 {
     i32::from(general_type(code_point))

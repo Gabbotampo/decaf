@@ -3,14 +3,14 @@
 //! One jar declares one mixin for each family (`HEAD`, cancellable `HEAD`,
 //! `RETURN`, `TAIL`, `INVOKE`, `FIELD`, `NEW`, `JUMP`, `@Overwrite`,
 //! `@ModifyArg`, `@ModifyVariable`).  Each family targets its own method of
-//! `demo/Target` and writes a marker with that method's argument, so a family
+//! `demoprobe/Target` and writes a marker with that method's argument, so a family
 //! that is applied, skipped or garbled cannot hide behind another one.
 //!
 //! The tests drive the same path the game's loader takes:
 //! `NativeJar::from_path`, `plan_load_time_weave`, `with_woven_classes`, then an
 //! ordinary `execute` of the jar's `main` entrypoint.  They then read
 //! `LoadTimeMixinWeave::woven`/`skipped` and the `Probe.mark` calls the run
-//! recorded at the host boundary (`demo/Probe` stays out of the jar).
+//! recorded at the host boundary (`demoprobe/Probe` stays out of the jar).
 //!
 //! ## Eleven applied families
 //!
@@ -344,8 +344,8 @@ public class CallbackInfoReturnable<T> extends CallbackInfo {
 "#,
     ),
     (
-        "demo/Probe.java",
-        r#"package demo;
+        "demoprobe/Probe.java",
+        r#"package demoprobe;
 public final class Probe {
     public static void mark(String marker, int value) {}
 }
@@ -364,12 +364,12 @@ const COMPILE_ONLY: &[&str] = &[
     "org/spongepowered/asm/mixin/injection/ModifyVariable.class",
     "org/spongepowered/asm/mixin/injection/callback/CallbackInfo.class",
     "org/spongepowered/asm/mixin/injection/callback/CallbackInfoReturnable.class",
-    "demo/Probe.class",
+    "demoprobe/Probe.class",
 ];
 
 /// `Main` runs every family's target in matrix order.  `begin`/`end` bracket
 /// the run so a call that never happens is still visible.
-const MAIN: &str = r#"package demo;
+const MAIN: &str = r#"package demoprobe;
 public final class Main {
     public void onInitialize() {
         Probe.mark("begin", 0);
@@ -392,7 +392,7 @@ public final class Main {
 
 /// One method per family.  Each writes its own target marker so the matrix can
 /// tell "not applied" from "applied to the wrong target".
-const TARGET: &str = r#"package demo;
+const TARGET: &str = r#"package demoprobe;
 public final class Target {
     public static int field = 5;
 
@@ -445,6 +445,8 @@ const MIXINS: &[(&str, &str)] = &[
     (
         "demo/HeadMixin.java",
         r#"package demo;
+import demoprobe.Probe;
+import demoprobe.Target;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
@@ -458,6 +460,8 @@ public abstract class HeadMixin {
     (
         "demo/CancellableMixin.java",
         r#"package demo;
+import demoprobe.Probe;
+import demoprobe.Target;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
@@ -475,6 +479,8 @@ public abstract class CancellableMixin {
     (
         "demo/ReturnMixin.java",
         r#"package demo;
+import demoprobe.Probe;
+import demoprobe.Target;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
@@ -488,6 +494,8 @@ public abstract class ReturnMixin {
     (
         "demo/TailMixin.java",
         r#"package demo;
+import demoprobe.Probe;
+import demoprobe.Target;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
@@ -501,6 +509,8 @@ public abstract class TailMixin {
     (
         "demo/InvokeMixin.java",
         r#"package demo;
+import demoprobe.Probe;
+import demoprobe.Target;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
@@ -508,7 +518,7 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 @Mixin(Target.class)
 public abstract class InvokeMixin {
     @Inject(method = "invoked(I)V",
-            at = @At(value = "INVOKE", target = "Ldemo/Probe;mark(Ljava/lang/String;I)V"))
+            at = @At(value = "INVOKE", target = "Ldemoprobe/Probe;mark(Ljava/lang/String;I)V"))
     private static void onInvoke(int value, CallbackInfo info) {
         Probe.mark("invoke-callback", value);
     }
@@ -518,13 +528,15 @@ public abstract class InvokeMixin {
     (
         "demo/FieldMixin.java",
         r#"package demo;
+import demoprobe.Probe;
+import demoprobe.Target;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
 @Mixin(Target.class)
 public abstract class FieldMixin {
     @Inject(method = "fielded(I)V",
-            at = @At(value = "FIELD", target = "Ldemo/Target;field:I"))
+            at = @At(value = "FIELD", target = "Ldemoprobe/Target;field:I"))
     private static void onField(int value) { Probe.mark("field-callback", value); }
 }
 "#,
@@ -532,6 +544,8 @@ public abstract class FieldMixin {
     (
         "demo/NewMixin.java",
         r#"package demo;
+import demoprobe.Probe;
+import demoprobe.Target;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
@@ -546,6 +560,8 @@ public abstract class NewMixin {
     (
         "demo/JumpMixin.java",
         r#"package demo;
+import demoprobe.Probe;
+import demoprobe.Target;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
@@ -559,6 +575,8 @@ public abstract class JumpMixin {
     (
         "demo/OverwriteMixin.java",
         r#"package demo;
+import demoprobe.Probe;
+import demoprobe.Target;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Overwrite;
 @Mixin(Target.class)
@@ -571,13 +589,15 @@ public abstract class OverwriteMixin {
     (
         "demo/ModifyArgMixin.java",
         r#"package demo;
+import demoprobe.Probe;
+import demoprobe.Target;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.ModifyArg;
 @Mixin(Target.class)
 public abstract class ModifyArgMixin {
     @ModifyArg(method = "arg(I)V",
-            at = @At(value = "INVOKE", target = "Ldemo/Probe;mark(Ljava/lang/String;I)V"),
+            at = @At(value = "INVOKE", target = "Ldemoprobe/Probe;mark(Ljava/lang/String;I)V"),
             index = 1)
     private static int modifyArg(int value) {
         Probe.mark("modifyarg-callback", value);
@@ -589,6 +609,8 @@ public abstract class ModifyArgMixin {
     (
         "demo/ModifyVariableMixin.java",
         r#"package demo;
+import demoprobe.Probe;
+import demoprobe.Target;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.ModifyVariable;
@@ -628,7 +650,10 @@ impl Fixture {
             fs::write(&path, body).unwrap();
             paths.push(path);
         }
-        for (relative, body) in [("demo/Main.java", MAIN), ("demo/Target.java", TARGET)] {
+        for (relative, body) in [
+            ("demoprobe/Main.java", MAIN),
+            ("demoprobe/Target.java", TARGET),
+        ] {
             let path = src.join(relative);
             fs::create_dir_all(path.parent().unwrap()).unwrap();
             fs::write(&path, body).unwrap();
@@ -650,7 +675,7 @@ impl Fixture {
         let mut zip = zip::ZipWriter::new(fs::File::create(&jar_path).unwrap());
         zip.start_file("fabric.mod.json", options).unwrap();
         zip.write_all(
-            br#"{"id":"mixin-family-matrix","version":"1.0","entrypoints":{"main":["demo.Main"]},"mixins":["demo.mixins.json"]}"#,
+            br#"{"id":"mixin-family-matrix","version":"1.0","entrypoints":{"main":["demoprobe.Main"]},"mixins":["demo.mixins.json"]}"#,
         )
         .unwrap();
         zip.start_file("demo.mixins.json", options).unwrap();
@@ -713,7 +738,7 @@ struct MatrixReport {
 fn probe_marks(host: &StdHost) -> Vec<(String, i32)> {
     host.invocations()
         .iter()
-        .filter(|invocation| invocation.method.owner == "demo/Probe")
+        .filter(|invocation| invocation.method.owner == "demoprobe/Probe")
         .map(|invocation| match invocation.args.as_slice() {
             [Value::Ref(Some(marker)), Value::Int(value)] => (marker.clone(), *value),
             other => panic!("unexpected Probe.mark arguments: {other:?}"),
@@ -726,7 +751,8 @@ fn run(jar: &NativeJar, weave: Option<&LoadTimeMixinWeave>) -> Vec<(String, i32)
     if let Some(weave) = weave {
         host = host.with_mixin_bridge_instances(&weave.classes).unwrap();
     }
-    jar.execute("demo.Main", None, "main", &mut host).unwrap();
+    jar.execute("demoprobe.Main", None, "main", &mut host)
+        .unwrap();
     probe_marks(&host)
 }
 

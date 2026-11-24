@@ -323,8 +323,13 @@ impl<H: Host> Runtime<'_, H> {
         {
             return self.host.unknown_operand_call(&r);
         }
-        if let Some(body) = self.jvm_selected_jar_body(&r, opcode, Some(receiver))? {
-            return self.invoke(&body, name, descriptor, Some(receiver.clone()), args);
+        match self.jvm_dispatch_or_count(&r, opcode, Some(receiver))? {
+            Some(crate::jvm_dispatch::Dispatched::Body(body)) => {
+                return self.invoke(&body, name, descriptor, Some(receiver.clone()), args);
+            }
+            // A selection an unreadable interface decides (#627): counted.
+            Some(crate::jvm_dispatch::Dispatched::Counted(value)) => return Ok(value),
+            None => {}
         }
         if let Some(value) = self.invoke_screen_or_menu_method(&r, opcode, receiver, args)? {
             return Ok(value);

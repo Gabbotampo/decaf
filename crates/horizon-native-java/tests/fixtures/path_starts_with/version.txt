@@ -1,0 +1,5 @@
+openjdk version "25.0.5.1" 2026-11-17
+OpenJDK Runtime Environment (build 25.0.5.1)
+OpenJDK 64-Bit Server VM (build 25.0.5.1, mixed mode, sharing)
+Linux 7.2.15-arch1-1
+java25.txt sha256: c50b1f9fbdcb9391ee52e299b1338605de3ee2ddaa4a0ded159ce97c76c7ae05

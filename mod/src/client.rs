@@ -199,6 +199,18 @@ impl State {
         self.world_loaded
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_first_jar_mut<T>(
+        &mut self,
+        f: impl FnOnce(&NativeJar, &mut StdHost) -> T,
+    ) -> T {
+        let first = self
+            .jars
+            .first_mut()
+            .expect("at least one client jar loaded");
+        f(&first.jar, &mut first.host)
+    }
+
     /// A resident jar and its host, for tests that set up state a client callback then reads.
     #[cfg(test)]
     pub(crate) fn resident(&mut self, index: usize) -> (&NativeJar, &mut StdHost) {
@@ -221,7 +233,23 @@ impl State {
 
     pub(crate) fn level_unloaded(&mut self) {
         self.world_loaded = false;
+        for jar in &mut self.jars {
+            jar.host.forget_all_game_objects();
+        }
         self.forget_client_sound_streams();
+    }
+
+    pub(crate) fn player_logged_out(&mut self) {
+        for jar in &mut self.jars {
+            jar.host.forget_all_game_objects();
+        }
+    }
+
+    pub(crate) fn player_cloned(&mut self) {
+        for jar in &mut self.jars {
+            jar.host
+                .forget_game_object_prefix(runtime::client_surface::PLAYER);
+        }
     }
 
     /// A client level comes with a fresh `random` and `soundSeedGenerator`: no stream position

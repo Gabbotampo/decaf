@@ -1,0 +1,1057 @@
+[] [] str=true path=true
+[] [/] str=false path=false
+[] [a] str=false path=false
+[] [a/] str=false path=false
+[] [a/b] str=false path=false
+[] [a/b/c] str=false path=false
+[] [/a] str=false path=false
+[] [/a/b] str=false path=false
+[] [/a/b/] str=false path=false
+[] [//a//b] str=false path=false
+[] [.] str=false path=false
+[] [..] str=false path=false
+[] [../a] str=false path=false
+[] [a/..] str=false path=false
+[] [./a] str=false path=false
+[] [a/./b] str=false path=false
+[] [../..] str=false path=false
+[] [...] str=false path=false
+[] [..a] str=false path=false
+[] [a..] str=false path=false
+[] [/..] str=false path=false
+[] [/../a] str=false path=false
+[] [a b] str=false path=false
+[] [ ] str=false path=false
+[] [a/ ] str=false path=false
+[] [ab] str=false path=false
+[] [abc] str=false path=false
+[] [a/bc] str=false path=false
+[] [b] str=false path=false
+[] [abc/d] str=false path=false
+[] [a//b] str=false path=false
+[] [/a/b/c] str=false path=false
+[/] [] str=false path=false
+[/] [/] str=true path=true
+[/] [a] str=false path=false
+[/] [a/] str=false path=false
+[/] [a/b] str=false path=false
+[/] [a/b/c] str=false path=false
+[/] [/a] str=false path=false
+[/] [/a/b] str=false path=false
+[/] [/a/b/] str=false path=false
+[/] [//a//b] str=false path=false
+[/] [.] str=false path=false
+[/] [..] str=false path=false
+[/] [../a] str=false path=false
+[/] [a/..] str=false path=false
+[/] [./a] str=false path=false
+[/] [a/./b] str=false path=false
+[/] [../..] str=false path=false
+[/] [...] str=false path=false
+[/] [..a] str=false path=false
+[/] [a..] str=false path=false
+[/] [/..] str=false path=false
+[/] [/../a] str=false path=false
+[/] [a b] str=false path=false
+[/] [ ] str=false path=false
+[/] [a/ ] str=false path=false
+[/] [ab] str=false path=false
+[/] [abc] str=false path=false
+[/] [a/bc] str=false path=false
+[/] [b] str=false path=false
+[/] [abc/d] str=false path=false
+[/] [a//b] str=false path=false
+[/] [/a/b/c] str=false path=false
+[a] [] str=false path=false
+[a] [/] str=false path=false
+[a] [a] str=true path=true
+[a] [a/] str=true path=true
+[a] [a/b] str=false path=false
+[a] [a/b/c] str=false path=false
+[a] [/a] str=false path=false
+[a] [/a/b] str=false path=false
+[a] [/a/b/] str=false path=false
+[a] [//a//b] str=false path=false
+[a] [.] str=false path=false
+[a] [..] str=false path=false
+[a] [../a] str=false path=false
+[a] [a/..] str=false path=false
+[a] [./a] str=false path=false
+[a] [a/./b] str=false path=false
+[a] [../..] str=false path=false
+[a] [...] str=false path=false
+[a] [..a] str=false path=false
+[a] [a..] str=false path=false
+[a] [/..] str=false path=false
+[a] [/../a] str=false path=false
+[a] [a b] str=false path=false
+[a] [ ] str=false path=false
+[a] [a/ ] str=false path=false
+[a] [ab] str=false path=false
+[a] [abc] str=false path=false
+[a] [a/bc] str=false path=false
+[a] [b] str=false path=false
+[a] [abc/d] str=false path=false
+[a] [a//b] str=false path=false
+[a] [/a/b/c] str=false path=false
+[a/] [] str=false path=false
+[a/] [/] str=false path=false
+[a/] [a] str=true path=true
+[a/] [a/] str=true path=true
+[a/] [a/b] str=false path=false
+[a/] [a/b/c] str=false path=false
+[a/] [/a] str=false path=false
+[a/] [/a/b] str=false path=false
+[a/] [/a/b/] str=false path=false
+[a/] [//a//b] str=false path=false
+[a/] [.] str=false path=false
+[a/] [..] str=false path=false
+[a/] [../a] str=false path=false
+[a/] [a/..] str=false path=false
+[a/] [./a] str=false path=false
+[a/] [a/./b] str=false path=false
+[a/] [../..] str=false path=false
+[a/] [...] str=false path=false
+[a/] [..a] str=false path=false
+[a/] [a..] str=false path=false
+[a/] [/..] str=false path=false
+[a/] [/../a] str=false path=false
+[a/] [a b] str=false path=false
+[a/] [ ] str=false path=false
+[a/] [a/ ] str=false path=false
+[a/] [ab] str=false path=false
+[a/] [abc] str=false path=false
+[a/] [a/bc] str=false path=false
+[a/] [b] str=false path=false
+[a/] [abc/d] str=false path=false
+[a/] [a//b] str=false path=false
+[a/] [/a/b/c] str=false path=false
+[a/b] [] str=false path=false
+[a/b] [/] str=false path=false
+[a/b] [a] str=true path=true
+[a/b] [a/] str=true path=true
+[a/b] [a/b] str=true path=true
+[a/b] [a/b/c] str=false path=false
+[a/b] [/a] str=false path=false
+[a/b] [/a/b] str=false path=false
+[a/b] [/a/b/] str=false path=false
+[a/b] [//a//b] str=false path=false
+[a/b] [.] str=false path=false
+[a/b] [..] str=false path=false
+[a/b] [../a] str=false path=false
+[a/b] [a/..] str=false path=false
+[a/b] [./a] str=false path=false
+[a/b] [a/./b] str=false path=false
+[a/b] [../..] str=false path=false
+[a/b] [...] str=false path=false
+[a/b] [..a] str=false path=false
+[a/b] [a..] str=false path=false
+[a/b] [/..] str=false path=false
+[a/b] [/../a] str=false path=false
+[a/b] [a b] str=false path=false
+[a/b] [ ] str=false path=false
+[a/b] [a/ ] str=false path=false
+[a/b] [ab] str=false path=false
+[a/b] [abc] str=false path=false
+[a/b] [a/bc] str=false path=false
+[a/b] [b] str=false path=false
+[a/b] [abc/d] str=false path=false
+[a/b] [a//b] str=true path=true
+[a/b] [/a/b/c] str=false path=false
+[a/b/c] [] str=false path=false
+[a/b/c] [/] str=false path=false
+[a/b/c] [a] str=true path=true
+[a/b/c] [a/] str=true path=true
+[a/b/c] [a/b] str=true path=true
+[a/b/c] [a/b/c] str=true path=true
+[a/b/c] [/a] str=false path=false
+[a/b/c] [/a/b] str=false path=false
+[a/b/c] [/a/b/] str=false path=false
+[a/b/c] [//a//b] str=false path=false
+[a/b/c] [.] str=false path=false
+[a/b/c] [..] str=false path=false
+[a/b/c] [../a] str=false path=false
+[a/b/c] [a/..] str=false path=false
+[a/b/c] [./a] str=false path=false
+[a/b/c] [a/./b] str=false path=false
+[a/b/c] [../..] str=false path=false
+[a/b/c] [...] str=false path=false
+[a/b/c] [..a] str=false path=false
+[a/b/c] [a..] str=false path=false
+[a/b/c] [/..] str=false path=false
+[a/b/c] [/../a] str=false path=false
+[a/b/c] [a b] str=false path=false
+[a/b/c] [ ] str=false path=false
+[a/b/c] [a/ ] str=false path=false
+[a/b/c] [ab] str=false path=false
+[a/b/c] [abc] str=false path=false
+[a/b/c] [a/bc] str=false path=false
+[a/b/c] [b] str=false path=false
+[a/b/c] [abc/d] str=false path=false
+[a/b/c] [a//b] str=true path=true
+[a/b/c] [/a/b/c] str=false path=false
+[/a] [] str=false path=false
+[/a] [/] str=true path=true
+[/a] [a] str=false path=false
+[/a] [a/] str=false path=false
+[/a] [a/b] str=false path=false
+[/a] [a/b/c] str=false path=false
+[/a] [/a] str=true path=true
+[/a] [/a/b] str=false path=false
+[/a] [/a/b/] str=false path=false
+[/a] [//a//b] str=false path=false
+[/a] [.] str=false path=false
+[/a] [..] str=false path=false
+[/a] [../a] str=false path=false
+[/a] [a/..] str=false path=false
+[/a] [./a] str=false path=false
+[/a] [a/./b] str=false path=false
+[/a] [../..] str=false path=false
+[/a] [...] str=false path=false
+[/a] [..a] str=false path=false
+[/a] [a..] str=false path=false
+[/a] [/..] str=false path=false
+[/a] [/../a] str=false path=false
+[/a] [a b] str=false path=false
+[/a] [ ] str=false path=false
+[/a] [a/ ] str=false path=false
+[/a] [ab] str=false path=false
+[/a] [abc] str=false path=false
+[/a] [a/bc] str=false path=false
+[/a] [b] str=false path=false
+[/a] [abc/d] str=false path=false
+[/a] [a//b] str=false path=false
+[/a] [/a/b/c] str=false path=false
+[/a/b] [] str=false path=false
+[/a/b] [/] str=true path=true
+[/a/b] [a] str=false path=false
+[/a/b] [a/] str=false path=false
+[/a/b] [a/b] str=false path=false
+[/a/b] [a/b/c] str=false path=false
+[/a/b] [/a] str=true path=true
+[/a/b] [/a/b] str=true path=true
+[/a/b] [/a/b/] str=true path=true
+[/a/b] [//a//b] str=true path=true
+[/a/b] [.] str=false path=false
+[/a/b] [..] str=false path=false
+[/a/b] [../a] str=false path=false
+[/a/b] [a/..] str=false path=false
+[/a/b] [./a] str=false path=false
+[/a/b] [a/./b] str=false path=false
+[/a/b] [../..] str=false path=false
+[/a/b] [...] str=false path=false
+[/a/b] [..a] str=false path=false
+[/a/b] [a..] str=false path=false
+[/a/b] [/..] str=false path=false
+[/a/b] [/../a] str=false path=false
+[/a/b] [a b] str=false path=false
+[/a/b] [ ] str=false path=false
+[/a/b] [a/ ] str=false path=false
+[/a/b] [ab] str=false path=false
+[/a/b] [abc] str=false path=false
+[/a/b] [a/bc] str=false path=false
+[/a/b] [b] str=false path=false
+[/a/b] [abc/d] str=false path=false
+[/a/b] [a//b] str=false path=false
+[/a/b] [/a/b/c] str=false path=false
+[/a/b/] [] str=false path=false
+[/a/b/] [/] str=true path=true
+[/a/b/] [a] str=false path=false
+[/a/b/] [a/] str=false path=false
+[/a/b/] [a/b] str=false path=false
+[/a/b/] [a/b/c] str=false path=false
+[/a/b/] [/a] str=true path=true
+[/a/b/] [/a/b] str=true path=true
+[/a/b/] [/a/b/] str=true path=true
+[/a/b/] [//a//b] str=true path=true
+[/a/b/] [.] str=false path=false
+[/a/b/] [..] str=false path=false
+[/a/b/] [../a] str=false path=false
+[/a/b/] [a/..] str=false path=false
+[/a/b/] [./a] str=false path=false
+[/a/b/] [a/./b] str=false path=false
+[/a/b/] [../..] str=false path=false
+[/a/b/] [...] str=false path=false
+[/a/b/] [..a] str=false path=false
+[/a/b/] [a..] str=false path=false
+[/a/b/] [/..] str=false path=false
+[/a/b/] [/../a] str=false path=false
+[/a/b/] [a b] str=false path=false
+[/a/b/] [ ] str=false path=false
+[/a/b/] [a/ ] str=false path=false
+[/a/b/] [ab] str=false path=false
+[/a/b/] [abc] str=false path=false
+[/a/b/] [a/bc] str=false path=false
+[/a/b/] [b] str=false path=false
+[/a/b/] [abc/d] str=false path=false
+[/a/b/] [a//b] str=false path=false
+[/a/b/] [/a/b/c] str=false path=false
+[//a//b] [] str=false path=false
+[//a//b] [/] str=true path=true
+[//a//b] [a] str=false path=false
+[//a//b] [a/] str=false path=false
+[//a//b] [a/b] str=false path=false
+[//a//b] [a/b/c] str=false path=false
+[//a//b] [/a] str=true path=true
+[//a//b] [/a/b] str=true path=true
+[//a//b] [/a/b/] str=true path=true
+[//a//b] [//a//b] str=true path=true
+[//a//b] [.] str=false path=false
+[//a//b] [..] str=false path=false
+[//a//b] [../a] str=false path=false
+[//a//b] [a/..] str=false path=false
+[//a//b] [./a] str=false path=false
+[//a//b] [a/./b] str=false path=false
+[//a//b] [../..] str=false path=false
+[//a//b] [...] str=false path=false
+[//a//b] [..a] str=false path=false
+[//a//b] [a..] str=false path=false
+[//a//b] [/..] str=false path=false
+[//a//b] [/../a] str=false path=false
+[//a//b] [a b] str=false path=false
+[//a//b] [ ] str=false path=false
+[//a//b] [a/ ] str=false path=false
+[//a//b] [ab] str=false path=false
+[//a//b] [abc] str=false path=false
+[//a//b] [a/bc] str=false path=false
+[//a//b] [b] str=false path=false
+[//a//b] [abc/d] str=false path=false
+[//a//b] [a//b] str=false path=false
+[//a//b] [/a/b/c] str=false path=false
+[.] [] str=false path=false
+[.] [/] str=false path=false
+[.] [a] str=false path=false
+[.] [a/] str=false path=false
+[.] [a/b] str=false path=false
+[.] [a/b/c] str=false path=false
+[.] [/a] str=false path=false
+[.] [/a/b] str=false path=false
+[.] [/a/b/] str=false path=false
+[.] [//a//b] str=false path=false
+[.] [.] str=true path=true
+[.] [..] str=false path=false
+[.] [../a] str=false path=false
+[.] [a/..] str=false path=false
+[.] [./a] str=false path=false
+[.] [a/./b] str=false path=false
+[.] [../..] str=false path=false
+[.] [...] str=false path=false
+[.] [..a] str=false path=false
+[.] [a..] str=false path=false
+[.] [/..] str=false path=false
+[.] [/../a] str=false path=false
+[.] [a b] str=false path=false
+[.] [ ] str=false path=false
+[.] [a/ ] str=false path=false
+[.] [ab] str=false path=false
+[.] [abc] str=false path=false
+[.] [a/bc] str=false path=false
+[.] [b] str=false path=false
+[.] [abc/d] str=false path=false
+[.] [a//b] str=false path=false
+[.] [/a/b/c] str=false path=false
+[..] [] str=false path=false
+[..] [/] str=false path=false
+[..] [a] str=false path=false
+[..] [a/] str=false path=false
+[..] [a/b] str=false path=false
+[..] [a/b/c] str=false path=false
+[..] [/a] str=false path=false
+[..] [/a/b] str=false path=false
+[..] [/a/b/] str=false path=false
+[..] [//a//b] str=false path=false
+[..] [.] str=false path=false
+[..] [..] str=true path=true
+[..] [../a] str=false path=false
+[..] [a/..] str=false path=false
+[..] [./a] str=false path=false
+[..] [a/./b] str=false path=false
+[..] [../..] str=false path=false
+[..] [...] str=false path=false
+[..] [..a] str=false path=false
+[..] [a..] str=false path=false
+[..] [/..] str=false path=false
+[..] [/../a] str=false path=false
+[..] [a b] str=false path=false
+[..] [ ] str=false path=false
+[..] [a/ ] str=false path=false
+[..] [ab] str=false path=false
+[..] [abc] str=false path=false
+[..] [a/bc] str=false path=false
+[..] [b] str=false path=false
+[..] [abc/d] str=false path=false
+[..] [a//b] str=false path=false
+[..] [/a/b/c] str=false path=false
+[../a] [] str=false path=false
+[../a] [/] str=false path=false
+[../a] [a] str=false path=false
+[../a] [a/] str=false path=false
+[../a] [a/b] str=false path=false
+[../a] [a/b/c] str=false path=false
+[../a] [/a] str=false path=false
+[../a] [/a/b] str=false path=false
+[../a] [/a/b/] str=false path=false
+[../a] [//a//b] str=false path=false
+[../a] [.] str=false path=false
+[../a] [..] str=true path=true
+[../a] [../a] str=true path=true
+[../a] [a/..] str=false path=false
+[../a] [./a] str=false path=false
+[../a] [a/./b] str=false path=false
+[../a] [../..] str=false path=false
+[../a] [...] str=false path=false
+[../a] [..a] str=false path=false
+[../a] [a..] str=false path=false
+[../a] [/..] str=false path=false
+[../a] [/../a] str=false path=false
+[../a] [a b] str=false path=false
+[../a] [ ] str=false path=false
+[../a] [a/ ] str=false path=false
+[../a] [ab] str=false path=false
+[../a] [abc] str=false path=false
+[../a] [a/bc] str=false path=false
+[../a] [b] str=false path=false
+[../a] [abc/d] str=false path=false
+[../a] [a//b] str=false path=false
+[../a] [/a/b/c] str=false path=false
+[a/..] [] str=false path=false
+[a/..] [/] str=false path=false
+[a/..] [a] str=true path=true
+[a/..] [a/] str=true path=true
+[a/..] [a/b] str=false path=false
+[a/..] [a/b/c] str=false path=false
+[a/..] [/a] str=false path=false
+[a/..] [/a/b] str=false path=false
+[a/..] [/a/b/] str=false path=false
+[a/..] [//a//b] str=false path=false
+[a/..] [.] str=false path=false
+[a/..] [..] str=false path=false
+[a/..] [../a] str=false path=false
+[a/..] [a/..] str=true path=true
+[a/..] [./a] str=false path=false
+[a/..] [a/./b] str=false path=false
+[a/..] [../..] str=false path=false
+[a/..] [...] str=false path=false
+[a/..] [..a] str=false path=false
+[a/..] [a..] str=false path=false
+[a/..] [/..] str=false path=false
+[a/..] [/../a] str=false path=false
+[a/..] [a b] str=false path=false
+[a/..] [ ] str=false path=false
+[a/..] [a/ ] str=false path=false
+[a/..] [ab] str=false path=false
+[a/..] [abc] str=false path=false
+[a/..] [a/bc] str=false path=false
+[a/..] [b] str=false path=false
+[a/..] [abc/d] str=false path=false
+[a/..] [a//b] str=false path=false
+[a/..] [/a/b/c] str=false path=false
+[./a] [] str=false path=false
+[./a] [/] str=false path=false
+[./a] [a] str=false path=false
+[./a] [a/] str=false path=false
+[./a] [a/b] str=false path=false
+[./a] [a/b/c] str=false path=false
+[./a] [/a] str=false path=false
+[./a] [/a/b] str=false path=false
+[./a] [/a/b/] str=false path=false
+[./a] [//a//b] str=false path=false
+[./a] [.] str=true path=true
+[./a] [..] str=false path=false
+[./a] [../a] str=false path=false
+[./a] [a/..] str=false path=false
+[./a] [./a] str=true path=true
+[./a] [a/./b] str=false path=false
+[./a] [../..] str=false path=false
+[./a] [...] str=false path=false
+[./a] [..a] str=false path=false
+[./a] [a..] str=false path=false
+[./a] [/..] str=false path=false
+[./a] [/../a] str=false path=false
+[./a] [a b] str=false path=false
+[./a] [ ] str=false path=false
+[./a] [a/ ] str=false path=false
+[./a] [ab] str=false path=false
+[./a] [abc] str=false path=false
+[./a] [a/bc] str=false path=false
+[./a] [b] str=false path=false
+[./a] [abc/d] str=false path=false
+[./a] [a//b] str=false path=false
+[./a] [/a/b/c] str=false path=false
+[a/./b] [] str=false path=false
+[a/./b] [/] str=false path=false
+[a/./b] [a] str=true path=true
+[a/./b] [a/] str=true path=true
+[a/./b] [a/b] str=false path=false
+[a/./b] [a/b/c] str=false path=false
+[a/./b] [/a] str=false path=false
+[a/./b] [/a/b] str=false path=false
+[a/./b] [/a/b/] str=false path=false
+[a/./b] [//a//b] str=false path=false
+[a/./b] [.] str=false path=false
+[a/./b] [..] str=false path=false
+[a/./b] [../a] str=false path=false
+[a/./b] [a/..] str=false path=false
+[a/./b] [./a] str=false path=false
+[a/./b] [a/./b] str=true path=true
+[a/./b] [../..] str=false path=false
+[a/./b] [...] str=false path=false
+[a/./b] [..a] str=false path=false
+[a/./b] [a..] str=false path=false
+[a/./b] [/..] str=false path=false
+[a/./b] [/../a] str=false path=false
+[a/./b] [a b] str=false path=false
+[a/./b] [ ] str=false path=false
+[a/./b] [a/ ] str=false path=false
+[a/./b] [ab] str=false path=false
+[a/./b] [abc] str=false path=false
+[a/./b] [a/bc] str=false path=false
+[a/./b] [b] str=false path=false
+[a/./b] [abc/d] str=false path=false
+[a/./b] [a//b] str=false path=false
+[a/./b] [/a/b/c] str=false path=false
+[../..] [] str=false path=false
+[../..] [/] str=false path=false
+[../..] [a] str=false path=false
+[../..] [a/] str=false path=false
+[../..] [a/b] str=false path=false
+[../..] [a/b/c] str=false path=false
+[../..] [/a] str=false path=false
+[../..] [/a/b] str=false path=false
+[../..] [/a/b/] str=false path=false
+[../..] [//a//b] str=false path=false
+[../..] [.] str=false path=false
+[../..] [..] str=true path=true
+[../..] [../a] str=false path=false
+[../..] [a/..] str=false path=false
+[../..] [./a] str=false path=false
+[../..] [a/./b] str=false path=false
+[../..] [../..] str=true path=true
+[../..] [...] str=false path=false
+[../..] [..a] str=false path=false
+[../..] [a..] str=false path=false
+[../..] [/..] str=false path=false
+[../..] [/../a] str=false path=false
+[../..] [a b] str=false path=false
+[../..] [ ] str=false path=false
+[../..] [a/ ] str=false path=false
+[../..] [ab] str=false path=false
+[../..] [abc] str=false path=false
+[../..] [a/bc] str=false path=false
+[../..] [b] str=false path=false
+[../..] [abc/d] str=false path=false
+[../..] [a//b] str=false path=false
+[../..] [/a/b/c] str=false path=false
+[...] [] str=false path=false
+[...] [/] str=false path=false
+[...] [a] str=false path=false
+[...] [a/] str=false path=false
+[...] [a/b] str=false path=false
+[...] [a/b/c] str=false path=false
+[...] [/a] str=false path=false
+[...] [/a/b] str=false path=false
+[...] [/a/b/] str=false path=false
+[...] [//a//b] str=false path=false
+[...] [.] str=false path=false
+[...] [..] str=false path=false
+[...] [../a] str=false path=false
+[...] [a/..] str=false path=false
+[...] [./a] str=false path=false
+[...] [a/./b] str=false path=false
+[...] [../..] str=false path=false
+[...] [...] str=true path=true
+[...] [..a] str=false path=false
+[...] [a..] str=false path=false
+[...] [/..] str=false path=false
+[...] [/../a] str=false path=false
+[...] [a b] str=false path=false
+[...] [ ] str=false path=false
+[...] [a/ ] str=false path=false
+[...] [ab] str=false path=false
+[...] [abc] str=false path=false
+[...] [a/bc] str=false path=false
+[...] [b] str=false path=false
+[...] [abc/d] str=false path=false
+[...] [a//b] str=false path=false
+[...] [/a/b/c] str=false path=false
+[..a] [] str=false path=false
+[..a] [/] str=false path=false
+[..a] [a] str=false path=false
+[..a] [a/] str=false path=false
+[..a] [a/b] str=false path=false
+[..a] [a/b/c] str=false path=false
+[..a] [/a] str=false path=false
+[..a] [/a/b] str=false path=false
+[..a] [/a/b/] str=false path=false
+[..a] [//a//b] str=false path=false
+[..a] [.] str=false path=false
+[..a] [..] str=false path=false
+[..a] [../a] str=false path=false
+[..a] [a/..] str=false path=false
+[..a] [./a] str=false path=false
+[..a] [a/./b] str=false path=false
+[..a] [../..] str=false path=false
+[..a] [...] str=false path=false
+[..a] [..a] str=true path=true
+[..a] [a..] str=false path=false
+[..a] [/..] str=false path=false
+[..a] [/../a] str=false path=false
+[..a] [a b] str=false path=false
+[..a] [ ] str=false path=false
+[..a] [a/ ] str=false path=false
+[..a] [ab] str=false path=false
+[..a] [abc] str=false path=false
+[..a] [a/bc] str=false path=false
+[..a] [b] str=false path=false
+[..a] [abc/d] str=false path=false
+[..a] [a//b] str=false path=false
+[..a] [/a/b/c] str=false path=false
+[a..] [] str=false path=false
+[a..] [/] str=false path=false
+[a..] [a] str=false path=false
+[a..] [a/] str=false path=false
+[a..] [a/b] str=false path=false
+[a..] [a/b/c] str=false path=false
+[a..] [/a] str=false path=false
+[a..] [/a/b] str=false path=false
+[a..] [/a/b/] str=false path=false
+[a..] [//a//b] str=false path=false
+[a..] [.] str=false path=false
+[a..] [..] str=false path=false
+[a..] [../a] str=false path=false
+[a..] [a/..] str=false path=false
+[a..] [./a] str=false path=false
+[a..] [a/./b] str=false path=false
+[a..] [../..] str=false path=false
+[a..] [...] str=false path=false
+[a..] [..a] str=false path=false
+[a..] [a..] str=true path=true
+[a..] [/..] str=false path=false
+[a..] [/../a] str=false path=false
+[a..] [a b] str=false path=false
+[a..] [ ] str=false path=false
+[a..] [a/ ] str=false path=false
+[a..] [ab] str=false path=false
+[a..] [abc] str=false path=false
+[a..] [a/bc] str=false path=false
+[a..] [b] str=false path=false
+[a..] [abc/d] str=false path=false
+[a..] [a//b] str=false path=false
+[a..] [/a/b/c] str=false path=false
+[/..] [] str=false path=false
+[/..] [/] str=true path=true
+[/..] [a] str=false path=false
+[/..] [a/] str=false path=false
+[/..] [a/b] str=false path=false
+[/..] [a/b/c] str=false path=false
+[/..] [/a] str=false path=false
+[/..] [/a/b] str=false path=false
+[/..] [/a/b/] str=false path=false
+[/..] [//a//b] str=false path=false
+[/..] [.] str=false path=false
+[/..] [..] str=false path=false
+[/..] [../a] str=false path=false
+[/..] [a/..] str=false path=false
+[/..] [./a] str=false path=false
+[/..] [a/./b] str=false path=false
+[/..] [../..] str=false path=false
+[/..] [...] str=false path=false
+[/..] [..a] str=false path=false
+[/..] [a..] str=false path=false
+[/..] [/..] str=true path=true
+[/..] [/../a] str=false path=false
+[/..] [a b] str=false path=false
+[/..] [ ] str=false path=false
+[/..] [a/ ] str=false path=false
+[/..] [ab] str=false path=false
+[/..] [abc] str=false path=false
+[/..] [a/bc] str=false path=false
+[/..] [b] str=false path=false
+[/..] [abc/d] str=false path=false
+[/..] [a//b] str=false path=false
+[/..] [/a/b/c] str=false path=false
+[/../a] [] str=false path=false
+[/../a] [/] str=true path=true
+[/../a] [a] str=false path=false
+[/../a] [a/] str=false path=false
+[/../a] [a/b] str=false path=false
+[/../a] [a/b/c] str=false path=false
+[/../a] [/a] str=false path=false
+[/../a] [/a/b] str=false path=false
+[/../a] [/a/b/] str=false path=false
+[/../a] [//a//b] str=false path=false
+[/../a] [.] str=false path=false
+[/../a] [..] str=false path=false
+[/../a] [../a] str=false path=false
+[/../a] [a/..] str=false path=false
+[/../a] [./a] str=false path=false
+[/../a] [a/./b] str=false path=false
+[/../a] [../..] str=false path=false
+[/../a] [...] str=false path=false
+[/../a] [..a] str=false path=false
+[/../a] [a..] str=false path=false
+[/../a] [/..] str=true path=true
+[/../a] [/../a] str=true path=true
+[/../a] [a b] str=false path=false
+[/../a] [ ] str=false path=false
+[/../a] [a/ ] str=false path=false
+[/../a] [ab] str=false path=false
+[/../a] [abc] str=false path=false
+[/../a] [a/bc] str=false path=false
+[/../a] [b] str=false path=false
+[/../a] [abc/d] str=false path=false
+[/../a] [a//b] str=false path=false
+[/../a] [/a/b/c] str=false path=false
+[a b] [] str=false path=false
+[a b] [/] str=false path=false
+[a b] [a] str=false path=false
+[a b] [a/] str=false path=false
+[a b] [a/b] str=false path=false
+[a b] [a/b/c] str=false path=false
+[a b] [/a] str=false path=false
+[a b] [/a/b] str=false path=false
+[a b] [/a/b/] str=false path=false
+[a b] [//a//b] str=false path=false
+[a b] [.] str=false path=false
+[a b] [..] str=false path=false
+[a b] [../a] str=false path=false
+[a b] [a/..] str=false path=false
+[a b] [./a] str=false path=false
+[a b] [a/./b] str=false path=false
+[a b] [../..] str=false path=false
+[a b] [...] str=false path=false
+[a b] [..a] str=false path=false
+[a b] [a..] str=false path=false
+[a b] [/..] str=false path=false
+[a b] [/../a] str=false path=false
+[a b] [a b] str=true path=true
+[a b] [ ] str=false path=false
+[a b] [a/ ] str=false path=false
+[a b] [ab] str=false path=false
+[a b] [abc] str=false path=false
+[a b] [a/bc] str=false path=false
+[a b] [b] str=false path=false
+[a b] [abc/d] str=false path=false
+[a b] [a//b] str=false path=false
+[a b] [/a/b/c] str=false path=false
+[ ] [] str=false path=false
+[ ] [/] str=false path=false
+[ ] [a] str=false path=false
+[ ] [a/] str=false path=false
+[ ] [a/b] str=false path=false
+[ ] [a/b/c] str=false path=false
+[ ] [/a] str=false path=false
+[ ] [/a/b] str=false path=false
+[ ] [/a/b/] str=false path=false
+[ ] [//a//b] str=false path=false
+[ ] [.] str=false path=false
+[ ] [..] str=false path=false
+[ ] [../a] str=false path=false
+[ ] [a/..] str=false path=false
+[ ] [./a] str=false path=false
+[ ] [a/./b] str=false path=false
+[ ] [../..] str=false path=false
+[ ] [...] str=false path=false
+[ ] [..a] str=false path=false
+[ ] [a..] str=false path=false
+[ ] [/..] str=false path=false
+[ ] [/../a] str=false path=false
+[ ] [a b] str=false path=false
+[ ] [ ] str=true path=true
+[ ] [a/ ] str=false path=false
+[ ] [ab] str=false path=false
+[ ] [abc] str=false path=false
+[ ] [a/bc] str=false path=false
+[ ] [b] str=false path=false
+[ ] [abc/d] str=false path=false
+[ ] [a//b] str=false path=false
+[ ] [/a/b/c] str=false path=false
+[a/ ] [] str=false path=false
+[a/ ] [/] str=false path=false
+[a/ ] [a] str=true path=true
+[a/ ] [a/] str=true path=true
+[a/ ] [a/b] str=false path=false
+[a/ ] [a/b/c] str=false path=false
+[a/ ] [/a] str=false path=false
+[a/ ] [/a/b] str=false path=false
+[a/ ] [/a/b/] str=false path=false
+[a/ ] [//a//b] str=false path=false
+[a/ ] [.] str=false path=false
+[a/ ] [..] str=false path=false
+[a/ ] [../a] str=false path=false
+[a/ ] [a/..] str=false path=false
+[a/ ] [./a] str=false path=false
+[a/ ] [a/./b] str=false path=false
+[a/ ] [../..] str=false path=false
+[a/ ] [...] str=false path=false
+[a/ ] [..a] str=false path=false
+[a/ ] [a..] str=false path=false
+[a/ ] [/..] str=false path=false
+[a/ ] [/../a] str=false path=false
+[a/ ] [a b] str=false path=false
+[a/ ] [ ] str=false path=false
+[a/ ] [a/ ] str=true path=true
+[a/ ] [ab] str=false path=false
+[a/ ] [abc] str=false path=false
+[a/ ] [a/bc] str=false path=false
+[a/ ] [b] str=false path=false
+[a/ ] [abc/d] str=false path=false
+[a/ ] [a//b] str=false path=false
+[a/ ] [/a/b/c] str=false path=false
+[ab] [] str=false path=false
+[ab] [/] str=false path=false
+[ab] [a] str=false path=false
+[ab] [a/] str=false path=false
+[ab] [a/b] str=false path=false
+[ab] [a/b/c] str=false path=false
+[ab] [/a] str=false path=false
+[ab] [/a/b] str=false path=false
+[ab] [/a/b/] str=false path=false
+[ab] [//a//b] str=false path=false
+[ab] [.] str=false path=false
+[ab] [..] str=false path=false
+[ab] [../a] str=false path=false
+[ab] [a/..] str=false path=false
+[ab] [./a] str=false path=false
+[ab] [a/./b] str=false path=false
+[ab] [../..] str=false path=false
+[ab] [...] str=false path=false
+[ab] [..a] str=false path=false
+[ab] [a..] str=false path=false
+[ab] [/..] str=false path=false
+[ab] [/../a] str=false path=false
+[ab] [a b] str=false path=false
+[ab] [ ] str=false path=false
+[ab] [a/ ] str=false path=false
+[ab] [ab] str=true path=true
+[ab] [abc] str=false path=false
+[ab] [a/bc] str=false path=false
+[ab] [b] str=false path=false
+[ab] [abc/d] str=false path=false
+[ab] [a//b] str=false path=false
+[ab] [/a/b/c] str=false path=false
+[abc] [] str=false path=false
+[abc] [/] str=false path=false
+[abc] [a] str=false path=false
+[abc] [a/] str=false path=false
+[abc] [a/b] str=false path=false
+[abc] [a/b/c] str=false path=false
+[abc] [/a] str=false path=false
+[abc] [/a/b] str=false path=false
+[abc] [/a/b/] str=false path=false
+[abc] [//a//b] str=false path=false
+[abc] [.] str=false path=false
+[abc] [..] str=false path=false
+[abc] [../a] str=false path=false
+[abc] [a/..] str=false path=false
+[abc] [./a] str=false path=false
+[abc] [a/./b] str=false path=false
+[abc] [../..] str=false path=false
+[abc] [...] str=false path=false
+[abc] [..a] str=false path=false
+[abc] [a..] str=false path=false
+[abc] [/..] str=false path=false
+[abc] [/../a] str=false path=false
+[abc] [a b] str=false path=false
+[abc] [ ] str=false path=false
+[abc] [a/ ] str=false path=false
+[abc] [ab] str=false path=false
+[abc] [abc] str=true path=true
+[abc] [a/bc] str=false path=false
+[abc] [b] str=false path=false
+[abc] [abc/d] str=false path=false
+[abc] [a//b] str=false path=false
+[abc] [/a/b/c] str=false path=false
+[a/bc] [] str=false path=false
+[a/bc] [/] str=false path=false
+[a/bc] [a] str=true path=true
+[a/bc] [a/] str=true path=true
+[a/bc] [a/b] str=false path=false
+[a/bc] [a/b/c] str=false path=false
+[a/bc] [/a] str=false path=false
+[a/bc] [/a/b] str=false path=false
+[a/bc] [/a/b/] str=false path=false
+[a/bc] [//a//b] str=false path=false
+[a/bc] [.] str=false path=false
+[a/bc] [..] str=false path=false
+[a/bc] [../a] str=false path=false
+[a/bc] [a/..] str=false path=false
+[a/bc] [./a] str=false path=false
+[a/bc] [a/./b] str=false path=false
+[a/bc] [../..] str=false path=false
+[a/bc] [...] str=false path=false
+[a/bc] [..a] str=false path=false
+[a/bc] [a..] str=false path=false
+[a/bc] [/..] str=false path=false
+[a/bc] [/../a] str=false path=false
+[a/bc] [a b] str=false path=false
+[a/bc] [ ] str=false path=false
+[a/bc] [a/ ] str=false path=false
+[a/bc] [ab] str=false path=false
+[a/bc] [abc] str=false path=false
+[a/bc] [a/bc] str=true path=true
+[a/bc] [b] str=false path=false
+[a/bc] [abc/d] str=false path=false
+[a/bc] [a//b] str=false path=false
+[a/bc] [/a/b/c] str=false path=false
+[b] [] str=false path=false
+[b] [/] str=false path=false
+[b] [a] str=false path=false
+[b] [a/] str=false path=false
+[b] [a/b] str=false path=false
+[b] [a/b/c] str=false path=false
+[b] [/a] str=false path=false
+[b] [/a/b] str=false path=false
+[b] [/a/b/] str=false path=false
+[b] [//a//b] str=false path=false
+[b] [.] str=false path=false
+[b] [..] str=false path=false
+[b] [../a] str=false path=false
+[b] [a/..] str=false path=false
+[b] [./a] str=false path=false
+[b] [a/./b] str=false path=false
+[b] [../..] str=false path=false
+[b] [...] str=false path=false
+[b] [..a] str=false path=false
+[b] [a..] str=false path=false
+[b] [/..] str=false path=false
+[b] [/../a] str=false path=false
+[b] [a b] str=false path=false
+[b] [ ] str=false path=false
+[b] [a/ ] str=false path=false
+[b] [ab] str=false path=false
+[b] [abc] str=false path=false
+[b] [a/bc] str=false path=false
+[b] [b] str=true path=true
+[b] [abc/d] str=false path=false
+[b] [a//b] str=false path=false
+[b] [/a/b/c] str=false path=false
+[abc/d] [] str=false path=false
+[abc/d] [/] str=false path=false
+[abc/d] [a] str=false path=false
+[abc/d] [a/] str=false path=false
+[abc/d] [a/b] str=false path=false
+[abc/d] [a/b/c] str=false path=false
+[abc/d] [/a] str=false path=false
+[abc/d] [/a/b] str=false path=false
+[abc/d] [/a/b/] str=false path=false
+[abc/d] [//a//b] str=false path=false
+[abc/d] [.] str=false path=false
+[abc/d] [..] str=false path=false
+[abc/d] [../a] str=false path=false
+[abc/d] [a/..] str=false path=false
+[abc/d] [./a] str=false path=false
+[abc/d] [a/./b] str=false path=false
+[abc/d] [../..] str=false path=false
+[abc/d] [...] str=false path=false
+[abc/d] [..a] str=false path=false
+[abc/d] [a..] str=false path=false
+[abc/d] [/..] str=false path=false
+[abc/d] [/../a] str=false path=false
+[abc/d] [a b] str=false path=false
+[abc/d] [ ] str=false path=false
+[abc/d] [a/ ] str=false path=false
+[abc/d] [ab] str=false path=false
+[abc/d] [abc] str=true path=true
+[abc/d] [a/bc] str=false path=false
+[abc/d] [b] str=false path=false
+[abc/d] [abc/d] str=true path=true
+[abc/d] [a//b] str=false path=false
+[abc/d] [/a/b/c] str=false path=false
+[a//b] [] str=false path=false
+[a//b] [/] str=false path=false
+[a//b] [a] str=true path=true
+[a//b] [a/] str=true path=true
+[a//b] [a/b] str=true path=true
+[a//b] [a/b/c] str=false path=false
+[a//b] [/a] str=false path=false
+[a//b] [/a/b] str=false path=false
+[a//b] [/a/b/] str=false path=false
+[a//b] [//a//b] str=false path=false
+[a//b] [.] str=false path=false
+[a//b] [..] str=false path=false
+[a//b] [../a] str=false path=false
+[a//b] [a/..] str=false path=false
+[a//b] [./a] str=false path=false
+[a//b] [a/./b] str=false path=false
+[a//b] [../..] str=false path=false
+[a//b] [...] str=false path=false
+[a//b] [..a] str=false path=false
+[a//b] [a..] str=false path=false
+[a//b] [/..] str=false path=false
+[a//b] [/../a] str=false path=false
+[a//b] [a b] str=false path=false
+[a//b] [ ] str=false path=false
+[a//b] [a/ ] str=false path=false
+[a//b] [ab] str=false path=false
+[a//b] [abc] str=false path=false
+[a//b] [a/bc] str=false path=false
+[a//b] [b] str=false path=false
+[a//b] [abc/d] str=false path=false
+[a//b] [a//b] str=true path=true
+[a//b] [/a/b/c] str=false path=false
+[/a/b/c] [] str=false path=false
+[/a/b/c] [/] str=true path=true
+[/a/b/c] [a] str=false path=false
+[/a/b/c] [a/] str=false path=false
+[/a/b/c] [a/b] str=false path=false
+[/a/b/c] [a/b/c] str=false path=false
+[/a/b/c] [/a] str=true path=true
+[/a/b/c] [/a/b] str=true path=true
+[/a/b/c] [/a/b/] str=true path=true
+[/a/b/c] [//a//b] str=true path=true
+[/a/b/c] [.] str=false path=false
+[/a/b/c] [..] str=false path=false
+[/a/b/c] [../a] str=false path=false
+[/a/b/c] [a/..] str=false path=false
+[/a/b/c] [./a] str=false path=false
+[/a/b/c] [a/./b] str=false path=false
+[/a/b/c] [../..] str=false path=false
+[/a/b/c] [...] str=false path=false
+[/a/b/c] [..a] str=false path=false
+[/a/b/c] [a..] str=false path=false
+[/a/b/c] [/..] str=false path=false
+[/a/b/c] [/../a] str=false path=false
+[/a/b/c] [a b] str=false path=false
+[/a/b/c] [ ] str=false path=false
+[/a/b/c] [a/ ] str=false path=false
+[/a/b/c] [ab] str=false path=false
+[/a/b/c] [abc] str=false path=false
+[/a/b/c] [a/bc] str=false path=false
+[/a/b/c] [b] str=false path=false
+[/a/b/c] [abc/d] str=false path=false
+[/a/b/c] [a//b] str=false path=false
+[/a/b/c] [/a/b/c] str=true path=true
+normalize [] -> [] dots=false dotsPath=false
+normalize [/] -> [/] dots=false dotsPath=false
+normalize [a] -> [a] dots=false dotsPath=false
+normalize [a/] -> [a] dots=false dotsPath=false
+normalize [a/b] -> [a/b] dots=false dotsPath=false
+normalize [a/b/c] -> [a/b/c] dots=false dotsPath=false
+normalize [/a] -> [/a] dots=false dotsPath=false
+normalize [/a/b] -> [/a/b] dots=false dotsPath=false
+normalize [/a/b/] -> [/a/b] dots=false dotsPath=false
+normalize [//a//b] -> [/a/b] dots=false dotsPath=false
+normalize [.] -> [] dots=false dotsPath=false
+normalize [..] -> [..] dots=true dotsPath=true
+normalize [../a] -> [../a] dots=true dotsPath=true
+normalize [a/..] -> [] dots=false dotsPath=false
+normalize [./a] -> [a] dots=false dotsPath=false
+normalize [a/./b] -> [a/b] dots=false dotsPath=false
+normalize [../..] -> [../..] dots=true dotsPath=true
+normalize [...] -> [...] dots=false dotsPath=false
+normalize [..a] -> [..a] dots=false dotsPath=false
+normalize [a..] -> [a..] dots=false dotsPath=false
+normalize [/..] -> [/] dots=false dotsPath=false
+normalize [/../a] -> [/a] dots=false dotsPath=false
+normalize [a b] -> [a b] dots=false dotsPath=false
+normalize [ ] -> [ ] dots=false dotsPath=false
+normalize [a/ ] -> [a/ ] dots=false dotsPath=false
+normalize [ab] -> [ab] dots=false dotsPath=false
+normalize [abc] -> [abc] dots=false dotsPath=false
+normalize [a/bc] -> [a/bc] dots=false dotsPath=false
+normalize [b] -> [b] dots=false dotsPath=false
+normalize [abc/d] -> [abc/d] dots=false dotsPath=false
+normalize [a//b] -> [a/b] dots=false dotsPath=false
+normalize [/a/b/c] -> [/a/b/c] dots=false dotsPath=false
+joined.str=true resolved=true parent=true

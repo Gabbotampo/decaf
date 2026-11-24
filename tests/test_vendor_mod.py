@@ -74,6 +74,107 @@ class VendorModTests(unittest.TestCase):
         self.assertEqual(same.returncode, 0, same.stderr)
         self.assertIn("vendored file(s) match", same.stdout)
 
+    def test_only_mod_is_vendored_unless_another_mod_is_named(self):
+        # `mod-horizon/` (the official-Horizon build) is never committed with its copy: the default
+        # run and check touch `mod/` only, and `--mod mod-horizon` writes and checks that folder.
+        with tempfile.TemporaryDirectory() as scratch:
+            tree = copy_tree(Path(scratch) / "tree")
+            (tree / "mod-horizon").mkdir()
+            self.assertEqual(check(tree, "--check")[0], 0, "the default check ignores mod-horizon/")
+            subprocess.run([sys.executable, str(VENDOR), "--repo", str(tree)], check=True,
+                           capture_output=True, timeout=120)
+            self.assertFalse((tree / "mod-horizon" / "src" / "runtime").exists())
+            self.assertEqual(check(tree, "--check", "--mod", "mod-horizon")[0], 1, "not generated yet")
+            subprocess.run([sys.executable, str(VENDOR), "--mod", "mod-horizon", "--repo", str(tree)],
+                           check=True, capture_output=True, timeout=120)
+            self.assertEqual(check(tree, "--check", "--mod", "mod-horizon")[0], 0)
+            self.assertEqual(
+                (tree / "mod-horizon" / "src" / "runtime" / "mod.rs").read_bytes(),
+                (tree / "mod" / "src" / "runtime" / "mod.rs").read_bytes(),
+            )
+            edited = tree / "mod-horizon" / "src" / "runtime" / "brigadier.rs"
+            edited.write_bytes(edited.read_bytes() + b"\n")
+            self.assertEqual(check(tree, "--check")[0], 0, "an edit there never fails the default check")
+            code, stderr = check(tree, "--check", "--mod", "mod-horizon")
+            self.assertEqual(code, 1)
+            self.assertIn("mod-horizon/src/runtime/brigadier.rs", stderr)
+            self.assertNotEqual(check(tree, "--mod", "no-such-mod")[0], 0)
+
+    def test_without_mod_the_output_and_a_missing_mod_folder_are_unchanged(self):
+        # Scripts and agents match on these lines, so `--mod` must not change the default run.
+        with tempfile.TemporaryDirectory() as scratch:
+            tree = copy_tree(Path(scratch) / "tree")
+            run = lambda *flags: subprocess.run(
+                [sys.executable, str(VENDOR), *flags, "--repo", str(tree)],
+                text=True, capture_output=True, timeout=120, check=False,
+            )
+            self.assertRegex(run("--check").stdout,
+                             r"^\d+ vendored file\(s\) match crates/horizon-native-java/src\n$")
+            self.assertRegex(run().stdout, r"^vendored \d+ file\(s\) into mod/src/runtime\n$")
+            # No `mod/` at all: the check reports every file missing, and a write creates it.
+            shutil.rmtree(tree / "mod")
+            missing = run("--check")
+            self.assertEqual(missing.returncode, 1)
+            self.assertIn("drift: mod/src/runtime/mod.rs: missing", missing.stderr)
+            self.assertIn("run python3 tools/vendor.py and commit mod/src/runtime", missing.stderr)
+            self.assertEqual(run().returncode, 0)
+            self.assertTrue((tree / "mod" / "src" / "runtime" / "mod.rs").is_file())
+
+    def test_a_horizon_package_gets_the_same_embedded_data_as_rust(self):
+        # The official Horizon's native package accepts only `.rs` and `.toml` under `src/` as a
+        # Sunrise one does, so every mod folder gets the same bytes: each other embedded file as
+        # `<name>.rs` holding its exact text, byte for byte what `mod/` carries. A folder with
+        # `horizon-mod.toml` and one without it are vendored alike.
+        with tempfile.TemporaryDirectory() as scratch:
+            tree = copy_tree(Path(scratch) / "tree")
+            (tree / "mod-horizon").mkdir()
+            (tree / "mod-horizon" / "horizon-mod.toml").write_text('id = "horizon_java"\n')
+            (tree / "plain").mkdir()
+            for folder in ("mod-horizon", "plain"):
+                subprocess.run([sys.executable, str(VENDOR), "--mod", folder, "--repo", str(tree)],
+                               check=True, capture_output=True, timeout=120)
+            reference = tree / "mod" / "src" / "runtime"
+            expected = {
+                path.relative_to(reference).as_posix(): path.read_bytes()
+                for path in reference.rglob("*") if path.is_file()
+            }
+            for folder in ("mod-horizon", "plain"):
+                runtime = tree / folder / "src" / "runtime"
+                found = {
+                    path.relative_to(runtime).as_posix(): path.read_bytes()
+                    for path in runtime.rglob("*") if path.is_file()
+                }
+                self.assertEqual(found, expected, folder)
+                self.assertEqual({Path(name).suffix for name in found}, {".rs", ".toml"}, folder)
+            runtime = tree / "mod-horizon" / "src" / "runtime"
+            self.assertTrue((runtime / "vanilla_item_ids_java25.txt.rs").is_file())
+            self.assertFalse((runtime / "vanilla_item_ids_java25.txt").exists())
+            self.assertEqual(check(tree, "--check", "--mod", "mod-horizon")[0], 0)
+            self.assertEqual(check(tree, "--check")[0], 0)
+            (runtime / "vanilla_item_ids_java25.txt.rs").write_text("pub(crate) const VENDORED_DATA: &str = \"\";\n")
+            code, stderr = check(tree, "--check", "--mod", "mod-horizon")
+            self.assertEqual(code, 1)
+            self.assertIn("vanilla_item_ids_java25.txt.rs: differs from what "
+                          "crates/horizon-native-java/src/vanilla_item_ids_java25.txt vendors to", stderr)
+
+    def test_a_mod_folder_outside_the_tree_is_refused(self):
+        # The write step deletes stale files under the folder's `src/runtime/`, so `--mod` never
+        # reaches outside the tree: not by `..`, an absolute path, the root itself or a symlink.
+        with tempfile.TemporaryDirectory() as scratch:
+            tree = copy_tree(Path(scratch) / "tree")
+            outside = Path(scratch) / "escape"
+            (outside / "src" / "runtime").mkdir(parents=True)
+            kept = outside / "src" / "runtime" / "kept.rs"
+            kept.write_text("// not the tree's\n")
+            (tree / "link").symlink_to(outside, target_is_directory=True)
+            for folder in ("../escape", str(outside), ".", "link"):
+                for flags in ((), ("--check",)):
+                    code, stderr = check(tree, *flags, "--mod", folder)
+                    self.assertEqual(code, 2, (folder, flags, stderr))
+                    self.assertIn("not a folder inside", stderr)
+            self.assertTrue(kept.is_file())
+            self.assertEqual(sorted(p.name for p in (outside / "src" / "runtime").iterdir()), ["kept.rs"])
+
     def test_one_edited_byte_fails_the_check(self):
         with tempfile.TemporaryDirectory() as scratch:
             tree = copy_tree(Path(scratch) / "tree")

@@ -6,7 +6,7 @@
 //! profile (`facade_server.rs`, `game_hooks.rs`). This fixture compiles a
 //! `PlayerList#placeNewPlayer` Mixin that asks each of them, fires the
 //! `player_logged_in` point with a [`ServerFacts`] snapshot, and checks the
-//! answers the callback saw (through the compile-only `demo/HookSink`, whose
+//! answers the callback saw (through the compile-only `demoprobe/HookSink`, whose
 //! calls the host records) against the facts, written out here by hand.
 //!
 //! The scratch jar lives under `.local/` (never the system temp directory).
@@ -66,8 +66,8 @@ const COMPILE_ONLY: &[(&str, &str)] = &[
         "package org.spongepowered.asm.mixin.injection.callback;\npublic class CallbackInfo { public void cancel() {} }\n",
     ),
     (
-        "demo/HookSink.java",
-        "package demo;\npublic final class HookSink { public static void mark(String what) {} }\n",
+        "demoprobe/HookSink.java",
+        "package demoprobe;\npublic final class HookSink { public static void mark(String what) {} }\n",
     ),
     (
         "net/minecraft/resources/Identifier.java",
@@ -167,6 +167,7 @@ const COMPILE_ONLY: &[(&str, &str)] = &[
 /// marking each answer. The last line reaches a registry the facts do not
 /// list, which must refuse.
 const LOGIN_MIXIN: &str = r#"package demo;
+import demoprobe.HookSink;
 import net.fabricmc.fabric.api.networking.v1.ServerPlayNetworking;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.core.registries.Registries;
@@ -185,9 +186,10 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
 @Mixin(PlayerList.class)
 public class LoginMixin {
-    static final CustomPacketPayload.Type<?> SYNC =
+    // `private`: sponge-mixin 0.17.5 rejects a mixin with a non-private static field.
+    private static final CustomPacketPayload.Type<?> SYNC =
         new CustomPacketPayload.Type<>(Identifier.fromNamespaceAndPath("demo", "sync"));
-    static final CustomPacketPayload.Type<?> OTHER =
+    private static final CustomPacketPayload.Type<?> OTHER =
         new CustomPacketPayload.Type<>(Identifier.fromNamespaceAndPath("demo", "other"));
 
     @Inject(method = "placeNewPlayer", at = @At("TAIL"))
@@ -278,7 +280,7 @@ impl Drop for Fixture {
 fn marks(host: &StdHost) -> Vec<String> {
     host.invocations()
         .iter()
-        .filter(|call| call.method.owner == "demo/HookSink" && call.method.name == "mark")
+        .filter(|call| call.method.owner == "demoprobe/HookSink" && call.method.name == "mark")
         .filter_map(|call| match call.args.first() {
             Some(Value::Ref(Some(text))) => Some(text.clone()),
             _ => None,

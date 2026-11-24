@@ -5,7 +5,7 @@
 //! `execute`. No JVM and no `--weave` jar is involved, so a callback that runs
 //! here ran from the rewritten bytecode of its target.
 //!
-//! `demo/Probe` exists only at compile time: leaving it out of the jar makes
+//! `demoprobe/Probe` exists only at compile time: leaving it out of the jar makes
 //! every `Probe.mark` call cross the host boundary, where `StdHost` records the
 //! order and the arguments.
 
@@ -93,7 +93,7 @@ public class CallbackInfoReturnable<T> extends CallbackInfo {
 }
 "#;
 
-const PROBE: &str = r#"package demo;
+const PROBE: &str = r#"package demoprobe;
 public final class Probe {
     public static void mark(String marker, int value) {}
 }
@@ -107,10 +107,10 @@ const COMPILE_ONLY: &[&str] = &[
     "org/spongepowered/asm/mixin/injection/Inject.class",
     "org/spongepowered/asm/mixin/injection/callback/CallbackInfo.class",
     "org/spongepowered/asm/mixin/injection/callback/CallbackInfoReturnable.class",
-    "demo/Probe.class",
+    "demoprobe/Probe.class",
 ];
 
-/// A fixture mod: `demo.Main` is its `main` entrypoint, `configs` are declared
+/// A fixture mod: `demoprobe.Main` is its `main` entrypoint, `configs` are declared
 /// by `fabric.mod.json` and shipped at the jar root.
 struct Fixture {
     root: PathBuf,
@@ -145,7 +145,7 @@ impl Fixture {
                 "org/spongepowered/asm/mixin/injection/callback/CallbackInfoReturnable.java",
                 CALLBACK_INFO_RETURNABLE,
             ),
-            ("demo/Probe.java", PROBE),
+            ("demoprobe/Probe.java", PROBE),
         ];
         let mut paths = Vec::new();
         for (relative, body) in shared.iter().chain(sources) {
@@ -170,7 +170,7 @@ impl Fixture {
             .collect::<Vec<_>>()
             .join(",");
         let metadata = format!(
-            r#"{{"id":"woven-{name}","version":"1.0","entrypoints":{{"main":["demo.Main"]}},"mixins":[{declared}]}}"#
+            r#"{{"id":"woven-{name}","version":"1.0","entrypoints":{{"main":["demoprobe.Main"]}},"mixins":[{declared}]}}"#
         );
         let jar = root.join(format!("{name}.jar"));
         let options = SimpleFileOptions::default();
@@ -211,7 +211,8 @@ impl Drop for Fixture {
 /// Run the jar's `main` entrypoint and return the `Probe.mark` calls in order.
 fn run_main(jar: &NativeJar) -> Vec<(String, i32)> {
     let mut host = jar.seed_host(StdHost::new());
-    jar.execute("demo.Main", None, "main", &mut host).unwrap();
+    jar.execute("demoprobe.Main", None, "main", &mut host)
+        .unwrap();
     probe_marks(&host)
 }
 
@@ -225,7 +226,8 @@ fn run_woven_main(
         .seed_host(StdHost::new())
         .with_mixin_bridge_instances(&weave.classes)
         .unwrap();
-    jar.execute("demo.Main", None, "main", &mut host).unwrap();
+    jar.execute("demoprobe.Main", None, "main", &mut host)
+        .unwrap();
     probe_marks(&host)
 }
 
@@ -233,7 +235,7 @@ fn run_woven_main(
 fn probe_marks(host: &StdHost) -> Vec<(String, i32)> {
     host.invocations()
         .iter()
-        .filter(|invocation| invocation.method.owner == "demo/Probe")
+        .filter(|invocation| invocation.method.owner == "demoprobe/Probe")
         .map(|invocation| match invocation.args.as_slice() {
             [Value::Ref(Some(marker)), Value::Int(value)] => (marker.clone(), *value),
             other => panic!("unexpected Probe.mark arguments: {other:?}"),
@@ -255,7 +257,7 @@ fn woven(jar: NativeJar, side: MixinSide) -> (NativeJar, horizon_native_java::Lo
     (jar, weave)
 }
 
-const MAIN_RUNS_TARGET: &str = r#"package demo;
+const MAIN_RUNS_TARGET: &str = r#"package demoprobe;
 public final class Main {
     public void onInitialize() {
         Target.run();
@@ -264,7 +266,7 @@ public final class Main {
 }
 "#;
 
-const COUNTER: &str = r#"package demo;
+const COUNTER: &str = r#"package demoprobe;
 public final class Counter {
     public static int value;
 }
@@ -276,11 +278,11 @@ fn a_woven_head_callback_runs_when_its_target_runs() {
         "counter",
         "RUNTIME",
         &[
-            ("demo/Main.java", MAIN_RUNS_TARGET),
-            ("demo/Counter.java", COUNTER),
+            ("demoprobe/Main.java", MAIN_RUNS_TARGET),
+            ("demoprobe/Counter.java", COUNTER),
             (
-                "demo/Target.java",
-                r#"package demo;
+                "demoprobe/Target.java",
+                r#"package demoprobe;
 public final class Target {
     public static void run() { Probe.mark("target", Counter.value); }
 }
@@ -289,6 +291,9 @@ public final class Target {
             (
                 "demo/TargetMixin.java",
                 r#"package demo;
+import demoprobe.Counter;
+import demoprobe.Probe;
+import demoprobe.Target;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
@@ -344,11 +349,11 @@ fn an_instance_callback_is_woven_through_its_bridge_and_runs() {
         "instance",
         "RUNTIME",
         &[
-            ("demo/Main.java", MAIN_RUNS_TARGET),
-            ("demo/Counter.java", COUNTER),
+            ("demoprobe/Main.java", MAIN_RUNS_TARGET),
+            ("demoprobe/Counter.java", COUNTER),
             (
-                "demo/Target.java",
-                r#"package demo;
+                "demoprobe/Target.java",
+                r#"package demoprobe;
 public final class Target {
     public static void run() { Probe.mark("target", Counter.value); }
 }
@@ -357,6 +362,9 @@ public final class Target {
             (
                 "demo/InstanceMixin.java",
                 r#"package demo;
+import demoprobe.Counter;
+import demoprobe.Probe;
+import demoprobe.Target;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
@@ -416,11 +424,11 @@ fn head_callbacks_run_in_mixin_apply_order() {
         "order",
         "RUNTIME",
         &[
-            ("demo/Main.java", MAIN_RUNS_TARGET),
-            ("demo/Counter.java", COUNTER),
+            ("demoprobe/Main.java", MAIN_RUNS_TARGET),
+            ("demoprobe/Counter.java", COUNTER),
             (
-                "demo/Target.java",
-                r#"package demo;
+                "demoprobe/Target.java",
+                r#"package demoprobe;
 public final class Target {
     public static void run() { Probe.mark("target", 0); }
 }
@@ -429,6 +437,8 @@ public final class Target {
             (
                 "demo/ZetaMixin.java",
                 r#"package demo;
+import demoprobe.Probe;
+import demoprobe.Target;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
@@ -444,6 +454,8 @@ public abstract class ZetaMixin {
             (
                 "demo/AlphaMixin.java",
                 r#"package demo;
+import demoprobe.Probe;
+import demoprobe.Target;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
@@ -457,6 +469,8 @@ public abstract class AlphaMixin {
             (
                 "demo/EarlyMixin.java",
                 r#"package demo;
+import demoprobe.Probe;
+import demoprobe.Target;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
@@ -510,8 +524,8 @@ fn a_mixed_jar_weaves_one_target_and_reports_the_other() {
         "RUNTIME",
         &[
             (
-                "demo/Main.java",
-                r#"package demo;
+                "demoprobe/Main.java",
+                r#"package demoprobe;
 public final class Main {
     public void onInitialize() {
         Target.run();
@@ -521,16 +535,16 @@ public final class Main {
 "#,
             ),
             (
-                "demo/Target.java",
-                r#"package demo;
+                "demoprobe/Target.java",
+                r#"package demoprobe;
 public final class Target {
     public static void run() { Probe.mark("target", 0); }
 }
 "#,
             ),
             (
-                "demo/Other.java",
-                r#"package demo;
+                "demoprobe/Other.java",
+                r#"package demoprobe;
 public final class Other {
     public static void run() { Probe.mark("other", 0); }
 }
@@ -539,6 +553,8 @@ public final class Other {
             (
                 "demo/PlainMixin.java",
                 r#"package demo;
+import demoprobe.Probe;
+import demoprobe.Target;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
@@ -552,6 +568,7 @@ public abstract class PlainMixin {
             (
                 "demo/CancelMixin.java",
                 r#"package demo;
+import demoprobe.Other;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
@@ -584,8 +601,8 @@ public abstract class CancelMixin {
     // and the woven `if (isCancelled()) return` took the early answer.
     assert_eq!(run_main(&jar), marks(&[("woven", 0), ("target", 0)]));
     assert_eq!(weave.classes.classes.len(), 2);
-    assert!(weave.classes.classes.contains_key("demo/Target"));
-    assert!(weave.classes.classes.contains_key("demo/Other"));
+    assert!(weave.classes.classes.contains_key("demoprobe/Target"));
+    assert!(weave.classes.classes.contains_key("demoprobe/Other"));
     assert!(
         weave
             .classes
@@ -594,7 +611,7 @@ public abstract class CancelMixin {
     );
 }
 
-const REASONS_MAIN: &str = r#"package demo;
+const REASONS_MAIN: &str = r#"package demoprobe;
 public final class Main {
     public void onInitialize() {
         Target.good();
@@ -603,7 +620,7 @@ public final class Main {
 }
 "#;
 
-const REASONS_TARGET: &str = r#"package demo;
+const REASONS_TARGET: &str = r#"package demoprobe;
 public final class Target {
     public Target() {}
     public static void good() { Probe.mark("good-target", 0); }
@@ -618,6 +635,8 @@ public final class Target {
 "#;
 
 const REASONS_MIXIN: &str = r#"package demo;
+import demoprobe.Probe;
+import demoprobe.Target;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
@@ -673,15 +692,15 @@ fn skip_labels(weave: &horizon_native_java::LoadTimeMixinWeave) -> BTreeMap<&'st
 #[test]
 fn every_shape_outside_the_subset_is_skipped_with_its_reason() {
     let outside = single_inject("OutsideMixin", "Lnet/minecraft/Elsewhere;", "tick()V");
-    let client = single_inject("ClientMixin", "Ldemo/Target;", "sided()V");
-    let unlisted = single_inject("UnlistedMixin", "Ldemo/Target;", "sided()V");
-    let plugged = single_inject("PluggedMixin", "Ldemo/Target;", "sided()V");
+    let client = single_inject("ClientMixin", "Ldemoprobe/Target;", "sided()V");
+    let unlisted = single_inject("UnlistedMixin", "Ldemoprobe/Target;", "sided()V");
+    let plugged = single_inject("PluggedMixin", "Ldemoprobe/Target;", "sided()V");
     let fixture = Fixture::build(
         "reasons",
         "RUNTIME",
         &[
-            ("demo/Main.java", REASONS_MAIN),
-            ("demo/Target.java", REASONS_TARGET),
+            ("demoprobe/Main.java", REASONS_MAIN),
+            ("demoprobe/Target.java", REASONS_TARGET),
             ("demo/ReasonsMixin.java", REASONS_MIXIN),
             ("demo/OutsideMixin.java", &outside),
             ("demo/ClientMixin.java", &client),
@@ -690,6 +709,7 @@ fn every_shape_outside_the_subset_is_skipped_with_its_reason() {
             (
                 "demo/MemberMixin.java",
                 r#"package demo;
+import demoprobe.Target;
 import org.spongepowered.asm.mixin.Mixin;
 @Mixin(Target.class)
 public abstract class MemberMixin {
@@ -698,8 +718,8 @@ public abstract class MemberMixin {
 "#,
             ),
             (
-                "demo/Listed.java",
-                "package demo;\npublic final class Listed {}\n",
+                "demoprobe/Listed.java",
+                "package demoprobe;\npublic final class Listed {}\n",
             ),
         ],
         &[
@@ -802,11 +822,11 @@ fn a_class_retention_mixin_is_discovered_and_woven() {
         "retention",
         "CLASS",
         &[
-            ("demo/Main.java", MAIN_RUNS_TARGET),
-            ("demo/Counter.java", COUNTER),
+            ("demoprobe/Main.java", MAIN_RUNS_TARGET),
+            ("demoprobe/Counter.java", COUNTER),
             (
-                "demo/Target.java",
-                r#"package demo;
+                "demoprobe/Target.java",
+                r#"package demoprobe;
 public final class Target {
     public static void run() { Probe.mark("target", 0); }
 }
@@ -815,6 +835,8 @@ public final class Target {
             (
                 "demo/RealMixin.java",
                 r#"package demo;
+import demoprobe.Probe;
+import demoprobe.Target;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
@@ -882,11 +904,11 @@ fn a_woven_cancellable_head_that_does_not_cancel_runs_the_body() {
         "cancellable-keeps",
         "RUNTIME",
         &[
-            ("demo/Main.java", MAIN_RUNS_TARGET),
-            ("demo/Counter.java", COUNTER),
+            ("demoprobe/Main.java", MAIN_RUNS_TARGET),
+            ("demoprobe/Counter.java", COUNTER),
             (
-                "demo/Target.java",
-                r#"package demo;
+                "demoprobe/Target.java",
+                r#"package demoprobe;
 public final class Target {
     public static void run() { Counter.value++; Probe.mark("target", Counter.value); }
 }
@@ -895,6 +917,9 @@ public final class Target {
             (
                 "demo/KeepMixin.java",
                 r#"package demo;
+import demoprobe.Counter;
+import demoprobe.Probe;
+import demoprobe.Target;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
@@ -932,11 +957,11 @@ fn a_woven_cancellable_head_that_cancels_skips_the_body() {
         "cancellable-cancels",
         "RUNTIME",
         &[
-            ("demo/Main.java", MAIN_RUNS_TARGET),
-            ("demo/Counter.java", COUNTER),
+            ("demoprobe/Main.java", MAIN_RUNS_TARGET),
+            ("demoprobe/Counter.java", COUNTER),
             (
-                "demo/Target.java",
-                r#"package demo;
+                "demoprobe/Target.java",
+                r#"package demoprobe;
 public final class Target {
     public static void run() { Counter.value += 5; Probe.mark("target", Counter.value); }
 }
@@ -945,6 +970,8 @@ public final class Target {
             (
                 "demo/CancelMixin.java",
                 r#"package demo;
+import demoprobe.Probe;
+import demoprobe.Target;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
@@ -981,8 +1008,8 @@ fn a_woven_cancellable_head_survives_a_hot_loop() {
         "RUNTIME",
         &[
             (
-                "demo/Main.java",
-                r#"package demo;
+                "demoprobe/Main.java",
+                r#"package demoprobe;
 public final class Main {
     public void onInitialize() {
         for (int i = 0; i < 100; i++) {
@@ -993,10 +1020,10 @@ public final class Main {
 }
 "#,
             ),
-            ("demo/Counter.java", COUNTER),
+            ("demoprobe/Counter.java", COUNTER),
             (
-                "demo/Target.java",
-                r#"package demo;
+                "demoprobe/Target.java",
+                r#"package demoprobe;
 public final class Target {
     public static void run() { Counter.value -= 1000; Probe.mark("target", Counter.value); }
 }
@@ -1005,6 +1032,8 @@ public final class Target {
             (
                 "demo/CancelMixin.java",
                 r#"package demo;
+import demoprobe.Counter;
+import demoprobe.Target;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
@@ -1039,8 +1068,8 @@ fn a_cancellable_head_on_a_non_void_target_stays_out() {
         "RUNTIME",
         &[
             (
-                "demo/Main.java",
-                r#"package demo;
+                "demoprobe/Main.java",
+                r#"package demoprobe;
 public final class Main {
     public void onInitialize() {
         Probe.mark("after", Target.number());
@@ -1049,8 +1078,8 @@ public final class Main {
 "#,
             ),
             (
-                "demo/Target.java",
-                r#"package demo;
+                "demoprobe/Target.java",
+                r#"package demoprobe;
 public final class Target {
     public static int number() { Probe.mark("target", 0); return 7; }
 }
@@ -1059,6 +1088,7 @@ public final class Target {
             (
                 "demo/ValueMixin.java",
                 r#"package demo;
+import demoprobe.Target;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
@@ -1096,8 +1126,8 @@ fn a_woven_return_callback_runs_after_the_body() {
         "RUNTIME",
         &[
             (
-                "demo/Main.java",
-                r#"package demo;
+                "demoprobe/Main.java",
+                r#"package demoprobe;
 public final class Main {
     public void onInitialize() {
         Target.run();
@@ -1108,10 +1138,10 @@ public final class Main {
 }
 "#,
             ),
-            ("demo/Counter.java", COUNTER),
+            ("demoprobe/Counter.java", COUNTER),
             (
-                "demo/Target.java",
-                r#"package demo;
+                "demoprobe/Target.java",
+                r#"package demoprobe;
 public final class Target {
     public static void run() { Probe.mark("target", Counter.value); }
     public static void branchy() { if (Counter.value > 0) { return; } Counter.value++; }
@@ -1121,6 +1151,9 @@ public final class Target {
             (
                 "demo/ReturnMixin.java",
                 r#"package demo;
+import demoprobe.Counter;
+import demoprobe.Probe;
+import demoprobe.Target;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
@@ -1172,8 +1205,8 @@ fn a_woven_return_callback_can_take_a_callback_info() {
         "RUNTIME",
         &[
             (
-                "demo/Main.java",
-                r#"package demo;
+                "demoprobe/Main.java",
+                r#"package demoprobe;
 public final class Main {
     public void onInitialize() {
         Target.run();
@@ -1182,8 +1215,8 @@ public final class Main {
 "#,
             ),
             (
-                "demo/Target.java",
-                r#"package demo;
+                "demoprobe/Target.java",
+                r#"package demoprobe;
 public final class Target {
     public static void run() { Probe.mark("target", 0); }
 }
@@ -1192,6 +1225,8 @@ public final class Target {
             (
                 "demo/InfoMixin.java",
                 r#"package demo;
+import demoprobe.Probe;
+import demoprobe.Target;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
@@ -1226,8 +1261,8 @@ fn a_woven_return_can_replace_a_value_targets_result() {
         "RUNTIME",
         &[
             (
-                "demo/Main.java",
-                r#"package demo;
+                "demoprobe/Main.java",
+                r#"package demoprobe;
 public final class Main {
     public void onInitialize() {
         Probe.mark("after", Target.number());
@@ -1236,8 +1271,8 @@ public final class Main {
 "#,
             ),
             (
-                "demo/Target.java",
-                r#"package demo;
+                "demoprobe/Target.java",
+                r#"package demoprobe;
 public final class Target {
     public static int number() { Probe.mark("target", 0); return 3; }
 }
@@ -1246,6 +1281,8 @@ public final class Target {
             (
                 "demo/ValueMixin.java",
                 r#"package demo;
+import demoprobe.Probe;
+import demoprobe.Target;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
@@ -1291,8 +1328,8 @@ fn a_woven_return_keeps_the_targets_value_when_it_sets_none() {
         "RUNTIME",
         &[
             (
-                "demo/Main.java",
-                r#"package demo;
+                "demoprobe/Main.java",
+                r#"package demoprobe;
 public final class Main {
     public void onInitialize() {
         Probe.mark("after", Target.number());
@@ -1301,8 +1338,8 @@ public final class Main {
 "#,
             ),
             (
-                "demo/Target.java",
-                r#"package demo;
+                "demoprobe/Target.java",
+                r#"package demoprobe;
 public final class Target {
     public static int number() { Probe.mark("target", 0); return 3; }
 }
@@ -1311,6 +1348,8 @@ public final class Target {
             (
                 "demo/ValueMixin.java",
                 r#"package demo;
+import demoprobe.Probe;
+import demoprobe.Target;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
