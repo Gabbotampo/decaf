@@ -357,7 +357,7 @@ fn to_nanos(unit: Option<&Value>, amount: i64) -> Result<Option<i64>, NativeErro
     ))
 }
 
-fn illegal_argument(message: &str) -> NativeError {
+pub(super) fn illegal_argument(message: &str) -> NativeError {
     NativeError::UncaughtException {
         class: "java/lang/IllegalArgumentException".into(),
         message: Some(message.into()),
@@ -365,7 +365,7 @@ fn illegal_argument(message: &str) -> NativeError {
     }
 }
 
-fn null_pointer(message: &str) -> NativeError {
+pub(super) fn null_pointer(message: &str) -> NativeError {
     NativeError::UncaughtException {
         class: "java/lang/NullPointerException".into(),
         message: Some(message.into()),

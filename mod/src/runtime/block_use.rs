@@ -301,6 +301,12 @@ pub struct BlockUseOutcome {
     pub raw_result: Value,
     /// Menus closed and opened through `ServerPlayer.openMenu(MenuProvider)`, in order.
     pub menu_effects: Vec<MenuEffect>,
+    /// What the opened menus' `initMenu` (and anything else of `live_menu.rs`) recorded: the
+    /// initial contents and listener effects, when the embedder gave the player's facts
+    /// ([`StdHost::set_player_menu_facts`]).
+    pub live_effects: Vec<crate::runtime::live_menu::LiveMenuEffect>,
+    /// The player's inventory after the use, when the facts gave it.
+    pub inventory: Option<Vec<Value>>,
     /// Unmodelled host calls recorded during this block-use invocation.
     pub unknown_host_calls: BTreeMap<String, usize>,
     /// Total count of unmodelled host calls during this block-use invocation.
@@ -363,6 +369,10 @@ pub(crate) struct ActiveBlockUse {
     /// snapshot at the start, then what this call's closes and opens made it.
     pub(crate) container: PlayerContainer,
     pub(crate) menu_effects: Vec<MenuEffect>,
+    /// What the embedder told Decaf of the player for this call (`live_menu.rs`).
+    pub(crate) facts: Option<crate::runtime::live_menu::MenuPlayerFacts>,
+    /// The live-menu effects this call recorded, in order.
+    pub(crate) live_effects: Vec<crate::runtime::live_menu::LiveMenuEffect>,
 }
 
 /// One `ServerPlayer` object's menu state, as Decaf models it (#629 review P1 1 and 2).
@@ -383,6 +393,9 @@ pub(crate) struct PlayerMenus {
     /// The Java menu Decaf opened that is still the object's `containerMenu`. Its Java values
     /// are retained on the host while it is held, and released when it is dropped.
     pub(crate) open: Option<OpenMenuEffect>,
+    /// The `Inventory` object `open`'s player slots read (the one its open built), retained
+    /// with it: the live-menu calls refill it from the embedder's facts.
+    pub(crate) inventory: Option<Value>,
     /// `closeContainer` sent the client `open`'s close packet, so no window shows it, but its
     /// `doCloseContainer` hasn't reached `containerMenu = inventoryMenu` (it is running, or its
     /// `removed` threw): vanilla still has it installed, and its next `openMenu` closes it
@@ -401,6 +414,9 @@ pub(crate) struct BlockUseHostState {
     /// (and so at most one held menu) per player: a newer object's entry replaces an older's.
     pub(crate) players: BTreeMap<u128, PlayerMenus>,
     pub(crate) next_id: u64,
+    /// What the embedder told Decaf of each player for their next block use
+    /// ([`StdHost::set_player_menu_facts`]).
+    pub(crate) facts: BTreeMap<u128, crate::runtime::live_menu::MenuPlayerFacts>,
 }
 
 impl BlockUseHostState {
@@ -411,7 +427,11 @@ impl BlockUseHostState {
     }
 
     /// The entry of the `ServerPlayer` object `incarnation` of `uuid`, if Decaf has one.
-    fn player(&self, uuid: u128, incarnation: Option<(u32, u32)>) -> Option<&PlayerMenus> {
+    pub(crate) fn player(
+        &self,
+        uuid: u128,
+        incarnation: Option<(u32, u32)>,
+    ) -> Option<&PlayerMenus> {
         let incarnation = incarnation?;
         self.players
             .get(&uuid)
@@ -1524,6 +1544,21 @@ fn active_level_call(
                 Ok(game_object::server_value("game/server".into()))
             }
         }
+        // `ServerLevel.recipeAccess()`: the server's one `RecipeManager` (`recipe_models.rs`).
+        (
+            "recipeAccess",
+            "()Lnet/minecraft/world/item/crafting/RecipeManager;"
+            | "()Lnet/minecraft/world/item/crafting/RecipeAccess;",
+        ) if active.side == BlockUseSide::Server
+            && matches!(
+                r.owner.as_str(),
+                "net/minecraft/server/level/ServerLevel" | "net/minecraft/world/level/Level"
+            ) =>
+        {
+            Ok(game_object::server_value(
+                crate::runtime::recipe_models::RECIPE_MANAGER_KEY.into(),
+            ))
+        }
         _ => host.unknown_host_call(r),
     }
 }
@@ -1900,10 +1935,15 @@ fn invoke_player_open_menu<H: Host>(
     // `sendAllDataToRemote`). Both read the menu's slots, containers and data slots through
     // methods a mod's menu can override, and send what they read to the client. Nothing runs
     // them for a Java menu yet (the live-menu bridge will), so the call is counted.
-    runtime.host.unknown_operand_call(&server_player_method(
-        "initMenu",
-        "(Lnet/minecraft/world/inventory/AbstractContainerMenu;)V",
-    ))?;
+    // When the embedder described the player's inventory (`MenuPlayerFacts`), Decaf models the
+    // player's listener and synchronizer (`live_menu.rs`) and runs both exactly; otherwise the
+    // reads of the player's slots would be guesses, so `initMenu` stays counted.
+    if !crate::runtime::live_menu::run_init_menu(runtime, &menu)? {
+        runtime.host.unknown_operand_call(&server_player_method(
+            "initMenu",
+            "(Lnet/minecraft/world/inventory/AbstractContainerMenu;)V",
+        ))?;
+    }
 
     // Resolve access_pos: first from ItemCombinerMenu.access (exact, honoring NULL),
     // otherwise from any ContainerLevelAccess instance field stored on a custom menu subclass.
@@ -2042,7 +2082,7 @@ fn open_menu_close_current<H: Host>(
 /// ([`MenuEffect::Closed`]), so its window is gone from here on, then offset 22 runs
 /// `doCloseContainer` ([`run_do_close_container`]) with the menu still installed.
 #[inline(never)]
-fn run_close_container<H: Host>(
+pub(crate) fn run_close_container<H: Host>(
     runtime: &mut Runtime<'_, H>,
     player: &Value,
 ) -> Result<(), NativeError> {
@@ -2076,7 +2116,7 @@ fn run_close_container<H: Host>(
 ///   other than the one closing (a nested open's) is discarded without any close
 ///   ([`MenuEffect::Orphaned`]).
 #[inline(never)]
-fn run_do_close_container<H: Host>(
+pub(crate) fn run_do_close_container<H: Host>(
     runtime: &mut Runtime<'_, H>,
     player: &Value,
 ) -> Result<(), NativeError> {
@@ -2213,6 +2253,7 @@ impl StdHost {
                 incarnation: (session, life),
                 counter: Some(0),
                 open: None,
+                inventory: None,
                 close_sent: false,
             },
         );
@@ -2254,11 +2295,17 @@ impl StdHost {
         entry.counter = None;
         let held = entry.open.take_if(|open| open.container_id == container_id);
         let dropped = held.is_some();
-        if dropped {
+        let inventory = if dropped {
             entry.close_sent = false;
-        }
+            entry.inventory.take()
+        } else {
+            None
+        };
         if let Some(record) = held {
             self.release_menu_values(&record);
+        }
+        if let Some(inventory) = inventory {
+            self.release(&inventory);
         }
         dropped
     }
@@ -2266,19 +2313,24 @@ impl StdHost {
     /// Drop every player's menu state: a new server, whose players are new objects.
     pub fn reset_player_menus(&mut self) {
         let players = std::mem::take(&mut self.block_use.players);
-        for record in players.into_values().filter_map(|entry| entry.open) {
-            self.release_menu_values(&record);
+        for entry in players.into_values() {
+            if let Some(record) = entry.open {
+                self.release_menu_values(&record);
+            }
+            if let Some(inventory) = entry.inventory {
+                self.release(&inventory);
+            }
         }
     }
 
     fn forget_player_menus(&mut self, uuid: u128) {
-        if let Some(record) = self
-            .block_use
-            .players
-            .remove(&uuid)
-            .and_then(|entry| entry.open)
-        {
-            self.release_menu_values(&record);
+        if let Some(entry) = self.block_use.players.remove(&uuid) {
+            if let Some(record) = entry.open {
+                self.release_menu_values(&record);
+            }
+            if let Some(inventory) = entry.inventory {
+                self.release(&inventory);
+            }
         }
     }
 
@@ -2300,6 +2352,7 @@ impl StdHost {
             return;
         };
         let uuid = active.player_data.uuid;
+        let inventory = active.player_inventory.clone();
         let Some(incarnation) = active.player_data.incarnation else {
             return;
         };
@@ -2317,15 +2370,21 @@ impl StdHost {
             // Decaf was not told this object was created, so it can't know the counter.
             counter: None,
             open: None,
+            inventory: None,
             close_sent: false,
         });
         let replaced = entry.open.replace(effect.clone());
+        let replaced_inventory = entry.inventory.replace(inventory.clone());
         entry.close_sent = false;
         for value in effect.values() {
             self.retain(value);
         }
+        self.retain(&inventory);
         if let Some(record) = replaced {
             self.release_menu_values(&record);
+        }
+        if let Some(old) = replaced_inventory {
+            self.release(&old);
         }
     }
 
@@ -2340,8 +2399,12 @@ impl StdHost {
             return;
         };
         entry.close_sent = false;
+        let inventory = entry.inventory.take();
         if let Some(record) = entry.open.take() {
             self.release_menu_values(&record);
+        }
+        if let Some(inventory) = inventory {
+            self.release(&inventory);
         }
     }
 
@@ -2401,7 +2464,7 @@ enum BlockUseKind {
 
 /// The `ServerPlayer` handle a player's data names, keyed as the server's game objects key a
 /// player (`GameObject::marker`): by UUID, object (session and life) and entity id.
-fn server_player_value(player: &BlockUsePlayerData) -> Value {
+pub(crate) fn server_player_value(player: &BlockUsePlayerData) -> Value {
     let uuid = player.uuid;
     let key = match (player.incarnation, player.entity_id) {
         (Some((session, life)), Some(id)) => {
@@ -2414,7 +2477,7 @@ fn server_player_value(player: &BlockUsePlayerData) -> Value {
 }
 
 /// How many unmodelled host calls `host` made since `before`, by method.
-fn unknown_calls_since(
+pub(crate) fn unknown_calls_since(
     host: &StdHost,
     before: &BTreeMap<String, usize>,
 ) -> (BTreeMap<String, usize>, usize) {
@@ -2531,6 +2594,8 @@ impl NativeJar {
             player_inventory: player_inventory.clone(),
             container: PlayerContainer::Inventory,
             menu_effects: Vec::new(),
+            facts: None,
+            live_effects: Vec::new(),
         });
         host.mark_close_sent();
         let roots = vec![level, player_value.clone(), player_inventory, menu];
@@ -2585,6 +2650,14 @@ impl NativeJar {
             &mut host.next_menu_object,
             player.clone(),
         );
+        // What the embedder said of the player's inventory and abilities (server side only:
+        // the client's `LocalPlayer` inventory is the client frame's).
+        let facts = (context.side == BlockUseSide::Server)
+            .then(|| host.block_use.facts.get(&context.player.uuid).cloned())
+            .flatten();
+        if let Some(facts) = &facts {
+            crate::runtime::live_menu::fill_inventory(host, &player_inventory, facts);
+        }
         let pos = block_pos_value(context.pos);
         let hit = host.block_use.alloc_block_hit(context.hit.clone());
         let hand = Value::Ref(Some(format!("{HAND_ENUM_PREFIX}{}", context.hand)));
@@ -2606,6 +2679,8 @@ impl NativeJar {
             player_inventory: player_inventory.clone(),
             container: context.player.container,
             menu_effects: Vec::new(),
+            facts: facts.clone(),
+            live_effects: Vec::new(),
         });
 
         let roots = vec![
@@ -2657,9 +2732,12 @@ impl NativeJar {
 
         // A hook that threw (or ran out of budget) still did what it did before that: a close
         // packet vanilla sent stays sent, so its effects are kept with the failure.
-        let menu_effects = finished_active
-            .map(|active| active.menu_effects)
+        let (menu_effects, live_effects) = finished_active
+            .map(|active| (active.menu_effects, active.live_effects))
             .unwrap_or_default();
+        let inventory = facts
+            .as_ref()
+            .and_then(|facts| crate::runtime::live_menu::inventory_out(host, &player_inventory, facts));
         let (raw_result, failure) = match call_result {
             Ok(value) => (value, None),
             Err(error) => (Value::Void, Some(error.to_string())),
@@ -2676,6 +2754,8 @@ impl NativeJar {
             result,
             raw_result,
             menu_effects,
+            live_effects,
+            inventory,
             unknown_host_calls,
             unknown_host_call_count,
             failure,

@@ -36,6 +36,12 @@ made, so the mod never drifts from ``crates/horizon-native-java``:
 
 The vendored files are committed: a clean clone builds the mod without running this tool.
 
+``--mod <folder>`` writes or checks another mod folder of the tree instead of ``mod/``. It exists for
+``mod-horizon/`` (the build on the official Horizon's ``horizon-mod-api``), whose copy is not
+committed: its CI job and a local build generate it first (docs/mod-horizon.md). The bytes are the
+same in every mod folder, the data-file forms above included (the official Horizon's package rules
+accept only ``.rs`` and ``.toml`` files under ``src/`` too), so only the destination differs.
+
 There is one check, ``--check``: it regenerates the copy in memory from
 ``crates/horizon-native-java/src`` **as it is now** and compares it byte for byte with the committed
 ``mod/src/runtime/``. Every file must match, none may be missing, and nothing else may sit in the
@@ -248,9 +254,9 @@ def rewrite_includes(text: bytes, included: list[tuple[str, PurePosixPath]]) -> 
     return INCLUDE_LITERAL.sub(replace, text)
 
 
-def vendored_files_on_disk(root: Path) -> set[str]:
-    """Every file under `mod/src/runtime/`: sources and the data files they embed."""
-    target = root / VENDOR
+def vendored_files_on_disk(root: Path, vendor: Path = VENDOR) -> set[str]:
+    """Every file under `mod/src/runtime/` (or `vendor`): sources and the data files they embed."""
+    target = root / vendor
     if not target.is_dir():
         return set()
     return {path.relative_to(target).as_posix() for path in target.rglob("*") if path.is_file()}
@@ -312,7 +318,7 @@ def expected(root: Path) -> dict[str, tuple[bytes, bytes]]:
     return files
 
 
-def drift(root: Path) -> list[str]:
+def drift(root: Path, vendor: Path = VENDOR) -> list[str]:
     """Every difference between the committed copy and what the runtime source vendors to now.
 
     Byte for byte, file by file: a hand edit to `mod/src/runtime/`, a runtime change nobody
@@ -320,32 +326,35 @@ def drift(root: Path) -> list[str]:
     """
     problems = []
     files = expected(root)
-    target = root / VENDOR
+    target = root / vendor
     for name, (_, vendored_bytes) in sorted(files.items()):
         path = target / name
         source = RUNTIME_SRC / ("lib.rs" if name == "mod.rs" else name)
+        if PurePosixPath(name.removesuffix(".rs")).suffix not in {"", ".rs"}:
+            # A data file vendored as Rust (`<name>.rs`) comes from `<name>`.
+            source = RUNTIME_SRC / name.removesuffix(".rs")
         if not path.is_file():
-            problems.append(f"{VENDOR / name}: missing (vendored from {source})")
+            problems.append(f"{vendor / name}: missing (vendored from {source})")
         elif path.read_bytes() != vendored_bytes:
             problems.append(
-                f"{VENDOR / name}: differs from what {source} vendors to "
+                f"{vendor / name}: differs from what {source} vendors to "
                 "(edited by hand, or the runtime changed and was not re-vendored)"
             )
-    for name in sorted(vendored_files_on_disk(root) - set(files)):
-        problems.append(f"{VENDOR / name}: vendored file has no source in {RUNTIME_SRC}")
+    for name in sorted(vendored_files_on_disk(root, vendor) - set(files)):
+        problems.append(f"{vendor / name}: vendored file has no source in {RUNTIME_SRC}")
     return problems
 
 
-def write(root: Path) -> None:
+def write(root: Path, vendor: Path = VENDOR) -> None:
     files = expected(root)
-    target = root / VENDOR
+    target = root / vendor
     target.mkdir(parents=True, exist_ok=True)
     for name, (_, vendored_bytes) in sorted(files.items()):
         destination = target / name
         destination.parent.mkdir(parents=True, exist_ok=True)
         destination.write_bytes(vendored_bytes)
     # A file whose source is gone (or that no source embeds any more) stops being part of the mod.
-    for name in vendored_files_on_disk(root) - set(files):
+    for name in vendored_files_on_disk(root, vendor) - set(files):
         (target / name).unlink()
 
 
@@ -357,23 +366,45 @@ def main(argv: list[str]) -> int:
         help="fail unless mod/src/runtime is exactly what the runtime source vendors to now",
     )
     parser.add_argument("--repo", type=Path, default=None, help="the tree to vendor (default: this one)")
+    parser.add_argument(
+        "--mod",
+        type=Path,
+        default=None,
+        help="vendor into or check this mod folder of the tree instead of mod/ (e.g. mod-horizon); "
+        "its copy is generated, never committed",
+    )
     args = parser.parse_args(argv)
     root = (args.repo or repo_root()).resolve()
+    vendor = VENDOR
+    if args.mod is not None:
+        # The write step deletes stale files under the folder's `src/runtime/`, so the folder must
+        # be inside the tree once `..`, an absolute path and symbolic links are resolved.
+        folder = (root / args.mod).resolve()
+        if folder == root or not folder.is_relative_to(root):
+            parser.error(f"--mod {args.mod}: not a folder inside {root}")
+        if not folder.is_dir():
+            parser.error(f"--mod {args.mod}: no such mod folder in {root}")
+        vendor = folder.relative_to(root) / "src" / "runtime"
     if args.check:
-        problems = drift(root)
+        problems = drift(root, vendor)
         for problem in problems:
             print(f"drift: {problem}", file=sys.stderr)
         if problems:
+            hint = (
+                "run python3 tools/vendor.py and commit mod/src/runtime"
+                if args.mod is None
+                else f"run python3 tools/vendor.py --mod {args.mod}"
+            )
             print(
-                f"{len(problems)} vendored file(s) are not what tools/vendor.py produces; "
-                "run python3 tools/vendor.py and commit mod/src/runtime",
+                f"{len(problems)} vendored file(s) are not what tools/vendor.py produces; {hint}",
                 file=sys.stderr,
             )
             return 1
-        print(f"{len(expected(root))} vendored file(s) match {RUNTIME_SRC}")
+        where = "" if args.mod is None else f" in {vendor}"
+        print(f"{len(expected(root))} vendored file(s) match {RUNTIME_SRC}{where}")
         return 0
-    write(root)
-    print(f"vendored {len(expected(root))} file(s) into {VENDOR}")
+    write(root, vendor)
+    print(f"vendored {len(expected(root))} file(s) into {vendor}")
     return 0
 
 if __name__ == "__main__":

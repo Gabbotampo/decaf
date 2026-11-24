@@ -26,9 +26,14 @@ fn rows_match_java() {
     assert_eq!(h.unknown_host_calls(), Vec::<(String, usize)>::new());
 }
 #[test]
-fn encode_counted() {
+fn encode_not_counted() {
+    // `apply` with a jar-supplied operation now runs `operation.apply(this)`
+    // through the interpreter. The lambda body calls `StreamCodec.map`, which
+    // is modelled, so nothing inside is counted and `apply` itself answers
+    // exactly. The oracle (Java 25) confirms the operation runs once with the
+    // receiver and returns its result unchanged; nothing is counted.
     let f = fixture();
     let mut h = f.jar.seed_host(StdHost::new());
     f.text_on(&mut h, "counted");
-    assert_eq!(h.unknown_host_calls(),vec![("net/minecraft/network/codec/StreamCodec#apply(Lnet/minecraft/network/codec/StreamCodec$CodecOperation;)Lnet/minecraft/network/codec/StreamCodec;".into(),1)]);
+    assert_eq!(h.unknown_host_calls(), Vec::<(String, usize)>::new());
 }

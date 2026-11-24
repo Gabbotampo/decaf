@@ -32,7 +32,7 @@
 
 use super::*;
 
-fn thrown(class: &str, message: Option<String>) -> NativeError {
+pub(super) fn thrown(class: &str, message: Option<String>) -> NativeError {
     NativeError::UncaughtException {
         class: class.into(),
         message,
@@ -45,7 +45,7 @@ const PRIMITIVES: &[&str] = &[
 ];
 
 /// How HotSpot names an array kind in its messages: `char`, or `object array`.
-fn kind_name(component: &str) -> &str {
+pub(super) fn kind_name(component: &str) -> &str {
     if PRIMITIVES.contains(&component) {
         component
     } else {
