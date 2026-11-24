@@ -150,6 +150,16 @@ public final class Probe {
         row(b, "and 1", digits.and(letters).test("1"));
         row(b, "or x", digits.or(letters).test("x"));
         row(b, "or ?", digits.or(letters).test("?"));
+        // The other operations that take a Predicate: terminals of a stream, an Optional.
+        b.append("stream count = ").append(Stream.of("a1", "b", "c2").filter(digits).count()).append('\n');
+        row(b, "anyMatch", Stream.of("a", "b1").anyMatch(digits));
+        row(b, "anyMatch none", Stream.of("a", "b").anyMatch(digits));
+        row(b, "allMatch", Stream.of("a1", "b2").allMatch(digits));
+        row(b, "allMatch not", Stream.of("a1", "b").allMatch(digits));
+        row(b, "noneMatch", Stream.of("a", "b").noneMatch(digits));
+        row(b, "noneMatch not", Stream.of("a", "b1").noneMatch(digits));
+        row(b, "optional filter kept", java.util.Optional.of("a1").filter(digits).isPresent());
+        row(b, "optional filter dropped", java.util.Optional.of("a").filter(digits).isPresent());
         return b.toString();
     }
 
@@ -265,6 +275,77 @@ public final class Probe {
     };
 
     /**
+     * `test` called by a JDK operation (`removeIf`, `Stream.filter` ended by `collect`/`count`,
+     * `anyMatch`, `allMatch`, `noneMatch`, `Optional.filter`, `Predicate.negate`) on an element
+     * the runtime cannot answer: a non-String (the JDK throws ClassCastException) or a String
+     * with a supplementary character (the engine refuses it). The runtime counts the call and
+     * the enclosing operation stops there, never a definite `removeIf`/count/match result. A row
+     * prints what the JDK does. Each row runs on a fresh host in the test.
+     */
+    @SuppressWarnings({"unchecked", "rawtypes"})
+    public static String enclosing(String which) {
+        Predicate matchA = Pattern.compile("a").asPredicate();
+        Predicate matchNone = Pattern.compile("^zzz").asPredicate();
+        // U+1F600 followed by `a`: a supplementary character in the input.
+        String face = "\uD83D\uDE00a";
+        String out;
+        try {
+            switch (which) {
+                case "removeIf-array-list-object" -> {
+                    List<Object> list = new ArrayList<>(Arrays.asList("a", new Object(), "ba"));
+                    out = list.removeIf(matchA) + " " + list.size();
+                }
+                case "removeIf-linked-list-object" -> {
+                    List<Object> list = new LinkedList<>(Arrays.asList("a", new Object(), "ba"));
+                    out = list.removeIf(matchA) + " " + list.size();
+                }
+                case "removeIf-hash-set-object" -> {
+                    java.util.Set<Object> set = new HashSet<>(Arrays.asList(new Object()));
+                    out = set.removeIf(matchNone) + " " + set.size();
+                }
+                case "removeIf-supplementary" -> {
+                    List<String> list = new ArrayList<>(Arrays.asList("b", face, "a"));
+                    out = list.removeIf(matchA) + " " + list.size();
+                }
+                case "filter-collect-object" ->
+                    out = String.valueOf(Stream.<Object>of("a", new Object()).filter(matchA).collect(Collectors.toList()));
+                case "filter-count-object" ->
+                    out = String.valueOf(Stream.<Object>of(new Object()).filter(matchNone).count());
+                case "filter-collect-supplementary" ->
+                    out = String.valueOf(Stream.of("a", face).filter(matchA).collect(Collectors.toList()));
+                case "filter-count-supplementary" ->
+                    out = String.valueOf(Stream.of("b", face).filter(matchA).count());
+                case "anyMatch-supplementary" -> out = String.valueOf(Stream.of("b", face).anyMatch(matchA));
+                case "allMatch-object" ->
+                    out = String.valueOf(Stream.<Object>of(new Object()).allMatch(matchA));
+                case "allMatch-supplementary" -> out = String.valueOf(Stream.of("a", face).allMatch(matchA));
+                case "noneMatch-object" ->
+                    out = String.valueOf(Stream.<Object>of(new Object()).noneMatch(matchNone));
+                case "noneMatch-supplementary" -> out = String.valueOf(Stream.of("b", face).noneMatch(matchA));
+                case "negate-removeIf-object" -> {
+                    List<Object> list = new ArrayList<>(Arrays.asList(new Object()));
+                    out = list.removeIf(matchA.negate()) + " " + list.size();
+                }
+                case "optional-filter-object" ->
+                    out = String.valueOf(java.util.Optional.<Object>of(new Object()).filter(matchA).isPresent());
+                default -> out = "unknown row " + which;
+            }
+        } catch (ClassCastException e) {
+            out = "ClassCastException";
+        }
+        return which + " = " + out + "\n";
+    }
+
+    static final String[] ENCLOSING_ROWS = {
+        "removeIf-array-list-object", "removeIf-linked-list-object", "removeIf-hash-set-object",
+        "removeIf-supplementary", "filter-collect-object", "filter-count-object",
+        "filter-collect-supplementary", "filter-count-supplementary",
+        "anyMatch-supplementary", "allMatch-object", "allMatch-supplementary",
+        "noneMatch-object", "noneMatch-supplementary", "negate-removeIf-object",
+        "optional-filter-object",
+    };
+
+    /**
      * Reflection on the predicate: its class is a hidden lambda class, not the interface. Only
      * stable facts are printed (the class name has an address in it). Counted by the runtime.
      */
@@ -335,6 +416,9 @@ public final class Probe {
             System.out.print(nonString());
             for (String row : OBJECT_ARGUMENT_ROWS) {
                 System.out.print(objectArgument(row));
+            }
+            for (String row : ENCLOSING_ROWS) {
+                System.out.print(enclosing(row));
             }
             for (String row : REFLECTION_ROWS) {
                 System.out.print(reflection(row));

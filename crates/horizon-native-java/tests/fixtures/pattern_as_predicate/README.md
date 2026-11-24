@@ -22,7 +22,7 @@ No jar is involved: the probe only uses JDK classes.
 
 Answered, with the oracle rows: `Pattern.compile(String).asPredicate()` and `test` on a
 `String` (`matcher(s).find()` on a fresh matcher), including the Predicate handed to
-`Stream.filter`, `List.removeIf` and `negate`/`and`/`or`, and a jar's own lambda,
+`Stream.filter`, `List.removeIf` and `negate`/`and`/`or`, the `anyMatch`, `allMatch`, `noneMatch` and `count` of a stream and `Optional.filter`, and a jar's own lambda,
 method reference, anonymous and named `Predicate` going through the same call site.
 Counted, never guessed: `Pattern.compile(String, int)` (flags), a `test` on `null`, a
 `StringBuilder` or any non-`String` (a jar object, `new Object()`, a collection, a `File`, a
@@ -34,3 +34,9 @@ the one interface `Predicate`; `instanceof` is answered on that, with oracle row
 `asPredicate()` on a pattern the engine does not compile (a pattern the JDK rejects with
 `PatternSyntaxException`, or one outside the engine's subset: the two are not told apart), or on
 `Pattern.compile(null)` (a `NullPointerException` on the JDK).
+
+The count belongs to the enclosing JDK operation too. When `test` is one of the counted calls
+above and a `removeIf`, a stream's `filter` (ended by `collect` or `count`), `anyMatch`,
+`allMatch` or `noneMatch`, `Optional.filter` or a `negate`/`and`/`or` runs it, that operation stops at
+the count (`jdk_call::ABANDONED`): nothing is removed, kept, counted or answered from the host's
+neutral `false`. The `enclosing` rows of `java25_counted.txt` print what the JDK does for each.

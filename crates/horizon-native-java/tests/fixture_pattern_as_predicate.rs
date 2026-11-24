@@ -17,6 +17,7 @@ use horizon_native_java::StdHost;
 use javac_fixture::Fixture;
 
 const PROBE: &str = include_str!("fixtures/pattern_as_predicate/demo/Probe.java");
+const ABANDONED: &str = "JDK body stopped at a counted host answer";
 const ORACLE: &str = include_str!("fixtures/pattern_as_predicate/java25.txt");
 
 /// Every oracle row, answered with no unknown host call.
@@ -62,12 +63,21 @@ fn a_pattern_with_flags_is_counted() {
 
 /// A supplementary character in the input: the engine refuses it, so `test` is
 /// counted (the JDK prints `true`, `false`, and `removeIf` removes both elements),
-/// never answered as UTF-16 units, also when `removeIf` runs the predicate.
+/// never answered as UTF-16 units; `removeIf` stops at it rather than remove from a neutral `false`.
 #[test]
 fn a_supplementary_input_is_counted() {
     let fixture = Fixture::build("pattern-as-predicate-sup", &[("demo/Probe.java", PROBE)]);
     let mut host = fixture.jar.seed_host(StdHost::new());
-    let outcome = fixture.text_on(&mut host, "supplementary");
+    let outcome = fixture.jar.invoke_method_with_args(
+        "demo/Probe",
+        "supplementary",
+        "()Ljava/lang/String;",
+        None,
+        &[],
+        &mut host,
+    );
+    // Two direct `test` calls, then `removeIf`'s test of the first element, which stops it
+    // (`removeIf left` is never printed as a definite size).
     assert_eq!(
         host.unknown_host_calls(),
         [(
@@ -76,6 +86,10 @@ fn a_supplementary_input_is_counted() {
         )],
         "answered {outcome:?}"
     );
+    let error = outcome
+        .expect_err("removeIf answered a supplementary input")
+        .to_string();
+    assert!(error.contains(ABANDONED), "{error}");
 }
 
 /// `test` on a `StringBuilder`, `null` or an `Integer`: the JDK throws
@@ -180,6 +194,82 @@ fn a_test_argument_that_is_an_object_is_counted() {
             "file = ClassCastException",
             "removeIf-object = ClassCastException",
             "string-key-text = true",
+        ]
+    );
+}
+
+/// `test` run by a JDK operation on an element the runtime cannot answer (a non-`String`, or a
+/// `String` with a supplementary character): the count belongs to the enclosing operation too.
+/// `removeIf` removes nothing from a list the JDK throws out of, a stream's `filter` (ended by
+/// `collect` or `count`), `anyMatch`, `allMatch` and `noneMatch` give no answer, and neither do
+/// `Optional.filter` and a `negate`d predicate. The call is counted and the run stops there
+/// (`jdk_call::ABANDONED`); it never ends in a definite `removeIf` result, list, count or
+/// match that the JDK did not print.
+#[test]
+fn an_unanswered_test_stops_the_enclosing_operation() {
+    let fixture = Fixture::build(
+        "pattern-as-predicate-enclosing",
+        &[("demo/Probe.java", PROBE)],
+    );
+    let rows = [
+        "removeIf-array-list-object",
+        "removeIf-linked-list-object",
+        "removeIf-hash-set-object",
+        "removeIf-supplementary",
+        "filter-collect-object",
+        "filter-count-object",
+        "filter-collect-supplementary",
+        "filter-count-supplementary",
+        "anyMatch-supplementary",
+        "allMatch-object",
+        "allMatch-supplementary",
+        "noneMatch-object",
+        "noneMatch-supplementary",
+        "negate-removeIf-object",
+        "optional-filter-object",
+    ];
+    for row in rows {
+        let (outcome, unknown) = row_on_fresh_host(&fixture, "enclosing", row);
+        assert!(
+            unknown
+                .iter()
+                .any(|(call, _)| call == "java/util/function/Predicate#test(Ljava/lang/Object;)Z"),
+            "{row}: answered {outcome}, counted {unknown:?}"
+        );
+        assert!(
+            outcome.starts_with("error: ") && outcome.contains(ABANDONED),
+            "{row}: the enclosing operation answered {outcome}"
+        );
+    }
+    for row in [
+        "removeIf-object",
+        "filter-object",
+        "filter-object-nomatch",
+        "anyMatch-object",
+    ] {
+        let (outcome, _) = row_on_fresh_host(&fixture, "objectArgument", row);
+        assert!(
+            outcome.starts_with("error: ") && outcome.contains(ABANDONED),
+            "{row}: the enclosing operation answered {outcome}"
+        );
+    }
+    // What the JDK does for them: throws, or (a supplementary character) answers.
+    assert_eq!(
+        oracle_rows(&[
+            "removeIf-array-list-object",
+            "filter-collect-object",
+            "allMatch-object",
+            "removeIf-supplementary",
+            "filter-count-supplementary",
+            "noneMatch-supplementary",
+        ]),
+        [
+            "removeIf-array-list-object = ClassCastException",
+            "filter-collect-object = ClassCastException",
+            "allMatch-object = ClassCastException",
+            "removeIf-supplementary = true 1",
+            "filter-count-supplementary = 1",
+            "noneMatch-supplementary = false",
         ]
     );
 }
