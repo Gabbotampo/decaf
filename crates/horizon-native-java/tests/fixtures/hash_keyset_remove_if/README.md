@@ -17,3 +17,9 @@ $J/java -cp out demo.Probe > java25.txt
 
 Found by `fabric-carpet-26.3+v260915.jar` (MIT): `Translations.updateLanguage` calls
 `Map.keySet().removeIf(...)` on a `HashMap<String, String>` (bytecode `287..298`).
+
+Not in the oracle: a `Predicate.test` the run cannot answer (its body reaches a counted call such as
+`Thread.holdsLock`, whose result is the host's neutral `false`). `removeIf` is then counted as a whole
+and the walk stops at that test (no later key is tested); removals made before it were exact and stay.
+The rows of `counted_predicate_tests_count_the_remove_if` in `tests/fixture_hash_keyset_remove_if.rs`
+are the run's state at that stop, not Java's, and assert the counted `removeIf`.

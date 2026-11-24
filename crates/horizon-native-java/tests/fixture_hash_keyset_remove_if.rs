@@ -82,3 +82,94 @@ fn counted_key_sets_stay_counted() {
         );
     }
 }
+
+/// A `Predicate.test` the run cannot answer (its body calls `Thread.holdsLock`, which the host
+/// counts and answers `false`) is not "false": Java may have removed that key and the later ones.
+/// The whole `removeIf` is counted and the walk stops at the test: no later key is tested
+/// (`calls`), and what was removed before it stays removed (each of those tests was exact), so
+/// the rows below are the run's state at the stop, not Java's: Java would run on. The map is
+/// unknown to the run after a counted `removeIf`.
+const COUNTED_TESTS: &str = r#"package demo;
+import java.util.*;
+public class Probe {
+  /// `holdsLock` is counted at the first key; the predicate is `true` for every key in Java.
+  public static String firstTest() {
+    Map<String, Integer> m = new HashMap<>();
+    m.put("k0", 0); m.put("k1", 1); m.put("k2", 2);
+    int[] calls = {0};
+    boolean r = m.keySet().removeIf(k -> { calls[0]++; return Thread.holdsLock(k) || true; });
+    return r + "|" + m + "|" + calls[0];
+  }
+  /// `k0` is selected exactly (removed), then `k1`'s test is counted: `k2` is never tested.
+  public static String afterRemoval() {
+    Map<String, Integer> m = new HashMap<>();
+    m.put("k0", 0); m.put("k1", 1); m.put("k2", 2);
+    int[] calls = {0};
+    boolean r = m.keySet().removeIf(k -> {
+      calls[0]++;
+      return k.equals("k0") || Thread.holdsLock(k) || true;
+    });
+    return r + "|" + m + "|" + calls[0];
+  }
+  public static String linkedMap() {
+    Map<String, Integer> m = new LinkedHashMap<>();
+    m.put("k0", 0); m.put("k1", 1); m.put("k2", 2);
+    int[] calls = {0};
+    boolean r = m.keySet().removeIf(k -> {
+      calls[0]++;
+      return k.equals("k0") || Thread.holdsLock(k) || true;
+    });
+    return r + "|" + m + "|" + calls[0];
+  }
+  public static String hashSet() {
+    Set<String> s = new HashSet<>();
+    s.add("k0"); s.add("k1"); s.add("k2");
+    int[] calls = {0};
+    boolean r = s.removeIf(k -> {
+      calls[0]++;
+      return k.equals("k0") || Thread.holdsLock(k) || true;
+    });
+    return r + "|" + s + "|" + calls[0];
+  }
+  /// A predicate that never reaches a counted call is still exact.
+  public static String answered() {
+    Map<String, Integer> m = new HashMap<>();
+    m.put("k0", 0); m.put("k1", 1); m.put("k2", 2);
+    int[] calls = {0};
+    boolean r = m.keySet().removeIf(k -> { calls[0]++; return k.equals("k1") || (calls[0] > 100 && Thread.holdsLock(k)); });
+    return r + "|" + m + "|" + calls[0];
+  }
+}
+"#;
+
+#[test]
+fn counted_predicate_tests_count_the_remove_if() {
+    let fixture = Fixture::build(
+        "hash-keyset-remove-if-counted-tests",
+        &[("demo/Probe.java", COUNTED_TESTS)],
+    );
+    let owner = "java/util/Set#removeIf(Ljava/util/function/Predicate;)Z";
+    let set = "java/util/Collection#removeIf(Ljava/util/function/Predicate;)Z";
+    let cases = [
+        ("firstTest", "false|{k0=0, k1=1, k2=2}|1", Some(owner)),
+        ("afterRemoval", "true|{k1=1, k2=2}|2", Some(owner)),
+        ("linkedMap", "true|{k1=1, k2=2}|2", Some(owner)),
+        ("hashSet", "true|[k1, k2]|2", Some(set)),
+        ("answered", "true|{k0=0, k2=2}|3", None),
+    ];
+    for (method, rows, counted_removal) in cases {
+        let mut host = fixture.jar.seed_host(StdHost::new());
+        assert_eq!(fixture.text_on(&mut host, method), rows, "{method}");
+        let counted = host.unknown_host_calls();
+        let holds = counted
+            .iter()
+            .any(|(call, n)| call.starts_with("java/lang/Thread#holdsLock") && *n == 1);
+        match counted_removal {
+            Some(removal) => assert!(
+                holds && counted.iter().any(|(call, n)| call == removal && *n == 1),
+                "{method}: {counted:?}"
+            ),
+            None => assert!(counted.is_empty(), "{method}: {counted:?}"),
+        }
+    }
+}

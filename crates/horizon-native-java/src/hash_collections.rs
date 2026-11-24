@@ -1745,7 +1745,17 @@ impl<H: Host> Runtime<'_, H> {
                     }
                 }
             }
-            if !self.predicate_holds(predicate, element)? {
+            // A test the run cannot answer (a predicate it cannot run, or one whose body
+            // reached a counted call) is not "false": Java may have removed this key and
+            // every later one it selects. The whole `removeIf` is counted and the walk stops
+            // here. What the walk did before (each earlier test answered exactly, each
+            // removal done) is what Java did too; nothing past this key is modelled, so
+            // the map's state from here on is unknown to the run.
+            let Some(selected) = self.remove_if_test(predicate, element)? else {
+                self.host.unknown_operand_call(counted)?;
+                return Ok(Value::Int(i32::from(removed)));
+            };
+            if !selected {
                 continue;
             }
             // `each.remove()`: the check, then the re-walk.
@@ -1805,6 +1815,41 @@ impl<H: Host> Runtime<'_, H> {
             removed = true;
         }
         Ok(Value::Int(i32::from(removed)))
+    }
+
+    /// `Predicate.test(element)` for `hash_remove_if`, `None` when the run has no answer:
+    /// the predicate is not something it can run (a host handle, a lambda it cannot reach),
+    /// or running it counted a call (its result is then the host's neutral value, not
+    /// what the JDK computed). `collection_callback.rs`'s `predicate_holds` reads both as
+    /// `false`, which for `removeIf` would keep a key Java may have removed.
+    fn remove_if_test(
+        &mut self,
+        predicate: &Value,
+        element: &Value,
+    ) -> Result<Option<bool>, NativeError> {
+        let counted = self.host.counted_unknown_calls();
+        let arguments = std::slice::from_ref(element);
+        let mut answer = self.invoke_callback(predicate, arguments)?;
+        if answer.is_none() {
+            let call = MethodRef {
+                owner: "java/util/function/Predicate".into(),
+                name: "test".into(),
+                descriptor: "(Ljava/lang/Object;)Z".into(),
+            };
+            if let Some((owner, true)) = self.dispatch_owner(&call, 0xb9, Some(predicate)) {
+                answer = Some(self.invoke(
+                    &owner,
+                    &call.name,
+                    &call.descriptor,
+                    Some(predicate.clone()),
+                    arguments,
+                )?);
+            }
+        }
+        if self.host.counted_unknown_calls() > counted {
+            return Ok(None);
+        }
+        Ok(answer.map(|answer| matches!(answer, Value::Int(flag) if flag != 0)))
     }
 
     /// `HashMap.forEach`/`HashSet.forEach` (and the linked ones): every
