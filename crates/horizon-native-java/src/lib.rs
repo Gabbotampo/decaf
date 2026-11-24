@@ -29766,44 +29766,10 @@ impl<H: Host> Runtime<'_, H> {
             }
             ("copyOf", _) | ("copyOfRange", _) => {
                 let source = self.array(StdHost::argument(r, args, 0)?)?.into_owned();
-                let (start, end) = if r.name == "copyOf" {
-                    let length = expect_int(r, StdHost::argument(r, args, 1)?)?;
-                    let length = usize::try_from(length).map_err(|_| {
-                        NativeError::Metadata("Arrays.copyOf length is negative".into())
-                    })?;
-                    (0, length)
-                } else {
-                    let from = expect_int(r, StdHost::argument(r, args, 1)?)?;
-                    let to = expect_int(r, StdHost::argument(r, args, 2)?)?;
-                    let from = usize::try_from(from).map_err(|_| {
-                        NativeError::Metadata("Arrays.copyOfRange start is negative".into())
-                    })?;
-                    let to = usize::try_from(to).map_err(|_| {
-                        NativeError::Metadata("Arrays.copyOfRange end is negative".into())
-                    })?;
-                    (from, to.max(from))
-                };
-                let element = return_desc(&r.descriptor)
-                    .trim_start_matches('[')
-                    .to_owned();
-                let copy_len = end.saturating_sub(start);
-                if copy_len > MAX_ARRAY_ELEMENTS {
-                    return Err(array_bound_error(copy_len as u128));
-                }
-                let mut values = Vec::new();
-                values
-                    .try_reserve_exact(copy_len)
-                    .map_err(|_| array_bound_error(copy_len as u128))?;
-                for index in start..end {
-                    values.push(
-                        source
-                            .get(index)
-                            .cloned()
-                            .unwrap_or_else(|| Value::default_for(&element)),
-                    );
-                }
                 // The copy is an array of the original's class, or of the
-                // `Class<? extends T[]> newType` the last argument names.
+                // `Class<? extends T[]> newType` the last argument names. One that is
+                // not known stays counted, before any argument check: Java reads
+                // `newType` before it allocates, so its errors may come first.
                 let class = if r.descriptor.contains("Ljava/lang/Class;") {
                     match args.last().and_then(host_class::class_name) {
                         Some(class) if class.starts_with('[') => class.replace('.', "/"),
@@ -29815,6 +29781,65 @@ impl<H: Host> Runtime<'_, H> {
                         None => return Ok(None),
                     }
                 };
+                let (from, length) = if r.name == "copyOf" {
+                    let length = expect_int(r, StdHost::argument(r, args, 1)?)?;
+                    (0, array_length(length)?)
+                } else {
+                    let from = expect_int(r, StdHost::argument(r, args, 1)?)?;
+                    let to = expect_int(r, StdHost::argument(r, args, 2)?)?;
+                    // `int newLength = to - from` wraps: `(-5, Integer.MAX_VALUE)` is
+                    // `from > to` to the JDK too.
+                    let Ok(length) = usize::try_from(to.wrapping_sub(from)) else {
+                        return Err(array_copy::thrown(
+                            "java/lang/IllegalArgumentException",
+                            Some(format!("{from} > {to}")),
+                        ));
+                    };
+                    (from, length)
+                };
+                // The copy is allocated before `System.arraycopy` checks `from`.
+                if length > MAX_ARRAY_ELEMENTS {
+                    return Err(array_bound_error(length as u128));
+                }
+                if from < 0 {
+                    let kind = value_class::array_component(StdHost::argument(r, args, 0)?)
+                        .map_or_else(
+                            || "object array".to_owned(),
+                            |component| array_copy::kind_name(&component).to_owned(),
+                        );
+                    return Err(array_copy::thrown(
+                        "java/lang/ArrayIndexOutOfBoundsException",
+                        Some(format!(
+                            "arraycopy: source index {from} out of bounds for {kind}[{}]",
+                            source.len()
+                        )),
+                    ));
+                }
+                let start = from as usize;
+                if start > source.len() {
+                    return Err(array_copy::thrown(
+                        "java/lang/ArrayIndexOutOfBoundsException",
+                        Some(format!(
+                            "arraycopy: length {} is negative",
+                            source.len() as i64 - start as i64
+                        )),
+                    ));
+                }
+                let element = return_desc(&r.descriptor)
+                    .trim_start_matches('[')
+                    .to_owned();
+                let mut values = Vec::new();
+                values
+                    .try_reserve_exact(length)
+                    .map_err(|_| array_bound_error(length as u128))?;
+                for index in start..start + length {
+                    values.push(
+                        source
+                            .get(index)
+                            .cloned()
+                            .unwrap_or_else(|| Value::default_for(&element)),
+                    );
+                }
                 // A `newType` the original's component is not a subtype of:
                 // `System.arraycopy` checks each element (`array_store.rs`).
                 if let (Some(source), Some(component)) = (
