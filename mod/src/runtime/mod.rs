@@ -189,6 +189,7 @@ mod jdk_character;
 mod jdk_character_table;
 mod jdk_closure;
 mod jdk_float_text;
+mod jdk_interface_methods;
 mod jdk_locale_thread;
 mod jdk_model;
 mod jdk_new_set_from_map;
@@ -35341,7 +35342,8 @@ impl<H: Host> Runtime<'_, H> {
                     jvm_dispatch::jdk_superclass_declares(&current, name, descriptor)
                         == Some(false);
                 if host_cannot_declare
-                    && let Some(owner) = self.inherited_default_owner(&chain, name, descriptor)
+                    && let Some(owner) =
+                        self.inherited_default_owner(&chain, &current, name, descriptor)
                 {
                     return Some((owner, true));
                 }
@@ -35364,17 +35366,21 @@ impl<H: Host> Runtime<'_, H> {
     /// at `java/lang/Object` and the host answered a neutral `null` for a body
     /// the jar ships. The default is the maximally specific one (JVMS
     /// §5.4.3.3, `jvm_dispatch.rs`), so a sub-interface's override beats the
-    /// default it overrides wherever either is declared.
+    /// default it overrides wherever either is declared. `left_at` is the JDK
+    /// superclass the chain leaves the jar at, whose interfaces take part too
+    /// (#627).
     fn inherited_default_owner(
         &self,
         chain: &[String],
+        left_at: &str,
         name: &str,
         descriptor: &str,
     ) -> Option<String> {
         // JVMS §5.4.3.3's maximally specific default (`jvm_dispatch.rs`); a
-        // conflict or an abstract-only set selects nothing here.
-        match self.maximally_specific_default(chain, name, descriptor) {
-            jvm_dispatch::DefaultSelection::Selected(owner) => Some(owner),
+        // JDK default, a conflict, an abstract-only set or an outcome an
+        // unknown interface could change selects no jar body here.
+        match self.maximally_specific_default(chain, Some(left_at), name, descriptor) {
+            jvm_dispatch::DefaultSelection::Jar(owner) => Some(owner),
             _ => None,
         }
     }
@@ -39729,27 +39735,32 @@ impl<H: Host> Runtime<'_, H> {
                         dispatched = Some(invoke_or_catch!(at, value));
                     }
                     if dispatched.is_none()
-                        && let Some(owner) = invoke_or_catch!(
+                        && let Some(selected) = invoke_or_catch!(
                             at,
-                            self.jvm_selected_jar_body(&r, op, receiver.as_ref())
+                            self.jvm_dispatch_or_count(&r, op, receiver.as_ref())
                         )
                     {
-                        dispatched = Some({
+                        dispatched = Some(match selected {
+                            // A selection an unreadable interface decides
+                            // (`jvm_dispatch.rs`, #627): counted.
+                            jvm_dispatch::Dispatched::Counted(value) => value,
                             // The receiver's own body, before any host model
                             // (`jvm_dispatch.rs`).
-                            jar_body = true;
-                            // A clone: later arms are statements the borrow checker sees
-                            // reaching `receiver`, though `dispatched` keeps them from running.
-                            invoke_or_catch!(
-                                at,
-                                self.invoke(
-                                    &owner,
-                                    &r.name,
-                                    &r.descriptor,
-                                    receiver.clone(),
-                                    &args
+                            jvm_dispatch::Dispatched::Body(owner) => {
+                                jar_body = true;
+                                // A clone: later arms are statements the borrow checker sees
+                                // reaching `receiver`, though `dispatched` keeps them from running.
+                                invoke_or_catch!(
+                                    at,
+                                    self.invoke(
+                                        &owner,
+                                        &r.name,
+                                        &r.descriptor,
+                                        receiver.clone(),
+                                        &args
+                                    )
                                 )
-                            )
+                            }
                         });
                     }
                     if dispatched.is_none()
@@ -59613,6 +59624,8 @@ mod vendored_game_rules_oracle_tsv;
 mod vendored_generated_nested_real_java25_txt;
 #[path = "jarjar_version_java25.txt.rs"]
 mod vendored_jarjar_version_java25_txt;
+#[path = "jdk_interface_methods_25.tsv.rs"]
+mod vendored_jdk_interface_methods_25_tsv;
 #[path = "jdk_text_oracle.json.rs"]
 mod vendored_jdk_text_oracle_json;
 #[path = "live_menu_item_hooks_java25.txt.rs"]
