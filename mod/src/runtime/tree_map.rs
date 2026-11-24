@@ -432,6 +432,20 @@ fn thrown(class: &str) -> NativeError {
     }
 }
 
+/// `((Comparable) k1).compareTo(k2)` with `k1` null: the JDK 25 detailed
+/// `NullPointerException` message from `TreeMap.compare` / `TreeSet`'s
+/// backing `TreeMap`.
+fn tree_null_compare_error() -> NativeError {
+    NativeError::UncaughtException {
+        class: "java/lang/NullPointerException".into(),
+        message: Some(
+            "Cannot invoke \"java.lang.Comparable.compareTo(Object)\" because \"k1\" is null"
+                .into(),
+        ),
+        frame: None,
+    }
+}
+
 /// The views a tree map hands out, which this module does not model.
 fn navigable_view(name: &str) -> bool {
     matches!(
@@ -468,6 +482,12 @@ impl<H: Host> Runtime<'_, H> {
         a: &Value,
         b: &Value,
     ) -> Result<i32, NativeError> {
+        // `addEntryToEmptyMap` / a nearest-key walk compares the null key
+        // with itself: `((Comparable) null).compareTo(...)` throws the JDK's
+        // detailed message about the receiver being null.
+        if comparator.is_none() && *a == Value::Ref(None) {
+            return Err(tree_null_compare_error());
+        }
         self.ordered_compare(comparator, a, b)
     }
 
@@ -684,6 +704,18 @@ impl<H: Host> Runtime<'_, H> {
             return Ok(None);
         };
         if navigable_view(&r.name) {
+            // `headMap(null)` / `tailMap(null)` / `headSet(null)` /
+            // `tailSet(null)` with natural order compare the null bound with
+            // itself and throw before the view exists.
+            if matches!(
+                r.name.as_str(),
+                "headMap" | "tailMap" | "headSet" | "tailSet"
+            ) && args.len() == 1
+                && args[0] == Value::Ref(None)
+                && self.host.collection_comparator(&marker).is_none()
+            {
+                return Err(tree_null_compare_error());
+            }
             return self.host.unknown_operand_call(r).map(|_| None);
         }
         if let Some(callback) = TreeCallback::of(map, r) {
@@ -783,6 +815,15 @@ impl<H: Host> Runtime<'_, H> {
                 } else {
                     default.clone()
                 }
+            }
+            // `Map.remove(key, value)` reads `get(key)` first and `replace(key,
+            // old, new)` calls `getEntry(key)`: a null key is the same
+            // `requireNonNull` failure as `get(null)`. Other keys stay with
+            // the rest of the dispatch.
+            (true, "remove", [key, _]) | (true, "replace", [key, _, _])
+                if comparator.is_none() && *key == Value::Ref(None) =>
+            {
+                return Err(thrown("java/lang/NullPointerException"));
             }
             (_, "remove", [key]) if r.descriptor.ends_with(")Ljava/lang/Object;") || !map => {
                 match self.tree_get(tree, comparator, key)? {
@@ -891,9 +932,6 @@ impl<H: Host> Runtime<'_, H> {
                     "higherKey" | "higherEntry" | "higher" => Nearest::Higher,
                     _ => Nearest::Lower,
                 };
-                if comparator.is_none() && *key == Value::Ref(None) {
-                    return Err(thrown("java/lang/NullPointerException"));
-                }
                 let node = self.tree_nearest(tree, comparator, key, nearest)?;
                 let found = key_of(tree, node);
                 if matches!(

@@ -9,6 +9,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::runtime::callback_marker;
 use crate::runtime::host_ref::{
     ClassHierarchy, ClassSide, HostKind, HostRef, Methods, exact_class_rules_out,
 };
@@ -256,6 +257,52 @@ fn apply_codec_operation(op: &Value, element_codec: &Value) -> Option<Value> {
     }
 }
 
+/// Run a jar-supplied `CodecOperation` (`op.apply(receiver)`) and return its
+/// result unchanged, as vanilla's `operation.apply(this)` does. The operation
+/// is a callback (a lambda or method reference) run by the runtime's own
+/// callback dispatch, which passes the captures and then the receiver in the
+/// JVM's order and handles static, instance and constructor references alike.
+/// A modelled static target (`ByteBufCodecs::optional`) is answered by this
+/// module's own model first. `None` when the operation is not a callback, so
+/// the caller keeps `apply` counted.
+///
+/// A counted unknown inside the operation still counts `apply`: if any inner
+/// call was counted, the result is refused and `apply` stays counted, so there
+/// is no silent answer.
+fn apply_jar_operation<H: Host>(
+    runtime: &mut Runtime<'_, H>,
+    op: &Value,
+    receiver: &Value,
+) -> Result<Option<Value>, NativeError> {
+    let Value::Host(handle) = op else {
+        return Ok(None);
+    };
+    if handle.kind() != HostKind::Callback {
+        return Ok(None);
+    }
+    let Some(callback) = callback_marker::lambda_of(op) else {
+        return Ok(None);
+    };
+    if callback.ref_kind == Some(6) {
+        let mut values = callback.captures.clone();
+        values.push(receiver.clone());
+        if let Some(value) = static_call(&callback.target, &values) {
+            return Ok(Some(value));
+        }
+    }
+    let before = runtime.host.counted_unknown_calls();
+    match runtime.invoke_callback(op, std::slice::from_ref(receiver)) {
+        Ok(value) if runtime.host.counted_unknown_calls() == before => Ok(value),
+        Ok(_) => Ok(None),
+        Err(NativeError::UncaughtException { .. })
+            if runtime.host.counted_unknown_calls() != before =>
+        {
+            Ok(None)
+        }
+        Err(err) => Err(err),
+    }
+}
+
 /// A fresh implementation object retaining every constructor argument in
 /// declaration order. The serial keeps repeated construction distinct even
 /// when the same components are supplied.
@@ -446,9 +493,48 @@ pub(crate) fn runtime_instance_call<H: Host>(
     args: &[Value],
 ) -> Option<Result<Value, NativeError>> {
     let receiver = receiver?;
-    if !is_stream_codec(receiver)
-        || class_of_value(receiver).as_deref() != Some("net/minecraft/network/codec/StreamCodec$3")
+    if !is_stream_codec(receiver) {
+        return None;
+    }
+    // `StreamCodec.apply(CodecOperation)`: a modelled `CodecOperation` handle
+    // (list, collection, fixed-list or fixed-collection) is answered exactly;
+    // otherwise the operation is a jar-supplied callable (a lambda or method
+    // reference) and vanilla runs `operation.apply(this)` once, with the
+    // receiver's identity, returning its result unchanged. The jar callable is
+    // invoked through the interpreter with the receiver as the argument.
+    if r.owner == STREAM_CODEC
+        && r.name == "apply"
+        && r.descriptor
+            == "(Lnet/minecraft/network/codec/StreamCodec$CodecOperation;)Lnet/minecraft/network/codec/StreamCodec;"
+        && let [op] = args
     {
+        // `apply(null)` throws the game's helpful NPE.
+        if matches!(op, Value::Ref(None)) {
+            return Some(Err(NativeError::UncaughtException {
+                class: "java/lang/NullPointerException".into(),
+                message: Some(
+                    "Cannot invoke \"net.minecraft.network.codec.StreamCodec$CodecOperation.apply(net.minecraft.network.codec.StreamCodec)\" because \"operation\" is null".into(),
+                ),
+                frame: None,
+            }));
+        }
+        // A modelled `CodecOperation` handle (list, collection, fixed-list or
+        // fixed-collection) is answered exactly.
+        if let Some(value) = apply_codec_operation(op, receiver) {
+            return Some(Ok(value));
+        }
+        // Otherwise the operation is a jar-supplied callable (a lambda or method
+        // reference). Vanilla runs `operation.apply(this)` once, with the
+        // receiver's identity, returning its result unchanged. The jar callable
+        // is invoked through the interpreter with the receiver as the argument.
+        return match apply_jar_operation(runtime, op, receiver) {
+            Ok(Some(value)) => Some(Ok(value)),
+            Ok(None) => None,
+            Err(error) => Some(Err(error)),
+        };
+    }
+    // Everything below is `StreamCodec$3` (`StreamCodec.unit`) only.
+    if class_of_value(receiver).as_deref() != Some("net/minecraft/network/codec/StreamCodec$3") {
         return None;
     }
     let expected = match receiver {
