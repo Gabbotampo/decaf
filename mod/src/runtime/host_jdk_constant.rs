@@ -238,30 +238,76 @@ pub(crate) fn pattern(text: &str) -> Value {
 
 static NEXT_MATCHER: AtomicU64 = AtomicU64::new(0);
 
+/// The serial the next `matcher` call takes: every matcher made so far has a smaller one.
+pub(crate) fn next_matcher_serial() -> u64 {
+    NEXT_MATCHER.load(Ordering::Relaxed)
+}
+
 /// `pattern.matcher(input)`: a new `Matcher` object per call, holding the pattern
-/// text and the input. Only `matches()` is answered (`jdk_model.rs`); every other
-/// `Matcher` method is counted.
-pub(crate) fn matcher(pattern: &str, input: &str) -> Value {
+/// text and the input. `fixed` says the input is a `String`, which never changes;
+/// a `StringBuilder`'s text is copied, so a later append would show in Java's
+/// matcher but not here. The calls it answers, and its search state, are
+/// `regex_matcher.rs`'s; every other `Matcher` method is counted.
+pub(crate) fn matcher(pattern: &str, input: &str, fixed: bool) -> Value {
     Value::Host(HostRef::of_values(
         HostKind::RegexMatcher,
         &[
             Value::Long(NEXT_MATCHER.fetch_add(1, Ordering::Relaxed) as i64),
             Value::Ref(Some(pattern.to_owned())),
             Value::Ref(Some(input.to_owned())),
+            Value::Int(i32::from(fixed)),
         ],
     ))
 }
 
-/// The pattern text and input of a `Matcher` handle.
-pub(crate) fn matcher_parts(value: &Value) -> Option<(String, String)> {
+/// What a `Matcher` handle holds (see [`matcher`]).
+pub(crate) struct MatcherParts {
+    pub(crate) serial: u64,
+    pub(crate) pattern: String,
+    pub(crate) input: String,
+    pub(crate) fixed: bool,
+}
+
+/// A matcher's serial and whether its input is fixed, without copying the
+/// pattern and the input: what every call on a matcher needs, however long
+/// its text.
+pub(crate) fn matcher_identity(value: &Value) -> Option<(u64, bool)> {
     let Value::Host(handle) = value else {
         return None;
     };
     if handle.kind() != HostKind::RegexMatcher {
         return None;
     }
-    match <[Value; 3]>::try_from(handle.values()?) {
-        Ok([_, Value::Ref(Some(pattern)), Value::Ref(Some(input))]) => Some((pattern, input)),
+    match handle.held() {
+        [Value::Long(serial), _, _, Value::Int(fixed)] => Some((*serial as u64, *fixed != 0)),
+        // A handle rebuilt from its key holds nothing: read it back.
+        [] => matcher_parts(value).map(|parts| (parts.serial, parts.fixed)),
+        _ => None,
+    }
+}
+
+/// The parts of a `Matcher` handle.
+pub(crate) fn matcher_parts(value: &Value) -> Option<MatcherParts> {
+    let Value::Host(handle) = value else {
+        return None;
+    };
+    if handle.kind() != HostKind::RegexMatcher {
+        return None;
+    }
+    match <[Value; 4]>::try_from(handle.values()?) {
+        Ok(
+            [
+                Value::Long(serial),
+                Value::Ref(Some(pattern)),
+                Value::Ref(Some(input)),
+                Value::Int(fixed),
+            ],
+        ) => Some(MatcherParts {
+            serial: serial as u64,
+            pattern,
+            input,
+            fixed: fixed != 0,
+        }),
         _ => None,
     }
 }
@@ -379,7 +425,7 @@ pub(crate) const LOCALE_METHODS: Methods =
     };
 
 /// A `Matcher`'s `toString` reports its region and last match, which the model
-/// does not keep, and its hash is an identity hash: both are counted.
+/// keeps only as a search position, and its hash is an identity hash: both are counted.
 pub(crate) const MATCHER_METHODS: Methods = Methods {
     to_string: |_, _| Ok(None),
     hash_code: |_, _| Ok(None),
