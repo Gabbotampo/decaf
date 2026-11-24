@@ -259,7 +259,7 @@ mod tests {
         assert_eq!(&encode(&mime, &[0; 58])[76..78], b"\r\n");
         assert_eq!(encoded_len(&mime, 0), 0);
         let short = config(false, true, 8, b"<>");
-        assert_eq!(encode(&short, &[0; 7]), b"AAAAAAAA<>AAA=".as_slice());
+        assert_eq!(encode(&short, &[0; 7]), b"AAAAAAAA<>AA==".as_slice());
     }
 
     #[test]
