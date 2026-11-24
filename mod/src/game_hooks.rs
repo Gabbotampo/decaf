@@ -206,7 +206,8 @@ pub(crate) struct Tally {
     pub unlisted: usize,
     /// Game-class `@Inject` plans a hook point refused when they registered (a cancellable
     /// callback at a listen-only point, an anchor the point has no call site for): they never
-    /// run.
+    /// run. Also each target of a rejected mixin (`InvalidMixinException`) in a `required`
+    /// config: real Fabric fails that class's load, which this run does not do.
     pub refused: usize,
     /// Failure reasons, first line, with counts (at most 16 kept).
     pub failures: BTreeMap<String, usize>,
@@ -240,6 +241,7 @@ pub(crate) fn register(
             matches!(
                 plan.reason,
                 crate::runtime::MixinSkipReason::GameHookMismatch(_)
+                    | crate::runtime::MixinSkipReason::RequiredMixinFailed(_)
             ) || matches!(plan.reason, crate::runtime::MixinSkipReason::Unresolved)
                 && crate::runtime::every_game_hook_site().any(|site| {
                     site.target_owner == plan.target.owner
@@ -297,7 +299,11 @@ pub(crate) fn attack_target(state: &State, id: i32, kind: &str) -> Option<GameOb
         let listed = state.players.iter().find(|p| p.entity_id == Some(id))?;
         return player_of(listed, 0);
     }
-    Some(GameObject::entity(id, kind, false))
+    let mut entity = GameObject::entity(id, kind, false);
+    if let Some(incarnation) = state.entity_incarnation(id) {
+        entity = entity.with_entity_incarnation(incarnation);
+    }
+    Some(entity)
 }
 
 /// Count a firing of `site` that was not run because a player it hands over is not listed
@@ -336,6 +342,18 @@ pub(crate) fn forget(state: &mut State, object: &GameObject) {
     let marker = object.marker();
     for loaded in &mut state.jars {
         loaded.hook_state.forget_object(&marker);
+        loaded.host.forget_game_object(&marker);
+    }
+}
+
+/// Drop what every jar kept on a non-player entity `id` (both bare `game/entity/<id>` and
+/// any incarnated `game/entity/<id>/<inc>` marker) when it leaves a level or its join is
+/// cancelled, so a later entity reusing `id` starts with fresh Mixin fields.
+pub(crate) fn forget_entity(state: &mut State, id: i32) {
+    let prefix = format!("game/entity/{id}");
+    for loaded in &mut state.jars {
+        loaded.hook_state.forget_object_prefix(&prefix);
+        loaded.host.forget_game_object_prefix(&prefix);
     }
 }
 
@@ -477,8 +495,10 @@ pub(crate) fn fire_with_host(
 /// mobs and connections are gone, and the next world's are new Java objects (single player
 /// keeps the jars across worlds).
 pub(crate) fn forget_world(state: &mut State) {
+    state.entity_incarnations.clear();
     for loaded in &mut state.jars {
         loaded.hook_state = crate::runtime::GameHookState::default();
+        loaded.host.forget_all_game_objects();
     }
 }
 
@@ -579,8 +599,8 @@ pub(crate) mod tests {
              public java.util.UUID getUUID() { return null; } }",
         ),
         (
-            "demo/Main.java",
-            "package demo; public final class Main { public void onInitialize() {} }",
+            "demoprobe/Main.java",
+            "package demoprobe; public final class Main { public void onInitialize() {} }",
         ),
         (
             "demo/DeathMixin.java",
@@ -604,8 +624,9 @@ pub(crate) mod tests {
         jar_bytes_with("deathdemo", &[], &["DeathMixin"])
     }
 
-    /// A Fabric jar `id` holding `demo.Main` and the Mixins `mixins`, compiled from
-    /// [`SOURCES`] and `extra` (compile-only stubs outside `demo/` are left out).
+    /// A Fabric jar `id` holding `demoprobe.Main` and the Mixins `mixins`, compiled from
+    /// [`SOURCES`] and `extra` (compile-only stubs outside `demo/` and `demoprobe/` are
+    /// left out).
     fn jar_bytes_with(id: &str, extra: &[(&str, &str)], mixins: &[&str]) -> Vec<u8> {
         let root = std::env::temp_dir().join(format!(
             "horizon-java-mod-hooks-{id}-{}",
@@ -638,7 +659,7 @@ pub(crate) mod tests {
             (
                 "fabric.mod.json".to_owned(),
                 format!(
-                    r#"{{"id":"{id}","version":"1","entrypoints":{{"main":["demo.Main"]}},"mixins":["{id}.mixins.json"]}}"#
+                    r#"{{"id":"{id}","version":"1","entrypoints":{{"main":["demoprobe.Main"]}},"mixins":["{id}.mixins.json"]}}"#
                 ),
             ),
             (
@@ -650,10 +671,13 @@ pub(crate) mod tests {
             zip.start_file(path, options).unwrap();
             zip.write_all(body.as_bytes()).unwrap();
         }
-        for name in std::iter::once(&"Main").chain(mixins) {
-            let path: &Path = &classes.join(format!("demo/{name}.class"));
-            zip.start_file(format!("demo/{name}.class"), options)
-                .unwrap();
+        // The entrypoint lives outside the Mixin config's `demo` package: real Fabric
+        // refuses to load any other class there.
+        let entries = std::iter::once("demoprobe/Main".to_owned())
+            .chain(mixins.iter().map(|name| format!("demo/{name}")));
+        for entry in entries {
+            let path: &Path = &classes.join(format!("{entry}.class"));
+            zip.start_file(format!("{entry}.class"), options).unwrap();
             zip.write_all(&std::fs::read(path).unwrap()).unwrap();
         }
         zip.finish().unwrap();

@@ -108,6 +108,7 @@ fn stubs() -> Vec<(String, String)> {
 }
 
 const HEADER: &str = "package demo;
+import demoprobe.Main;
 import com.llamalad7.mixinextras.injector.*;
 import com.llamalad7.mixinextras.injector.wrapmethod.WrapMethod;
 import com.llamalad7.mixinextras.injector.wrapoperation.*;
@@ -194,8 +195,9 @@ impl Fixture {
         let stubs = stubs();
         let mut sources: BTreeMap<String, String> = stubs.iter().cloned().collect();
         sources.insert(
-            "demo/Main.java".into(),
-            "package demo;\npublic final class Main { public void onInitialize() {} }\n".into(),
+            "demoprobe/Main.java".into(),
+            "package demoprobe;\npublic final class Main { public void onInitialize() {} }\n"
+                .into(),
         );
         for (class, body) in MIXINS {
             sources.insert(format!("demo/{class}.java"), format!("{HEADER}{body}\n"));
@@ -227,7 +229,7 @@ impl Fixture {
             serde_json::json!({
                 "id": "extras-demo",
                 "version": "1.0",
-                "entrypoints": { "main": ["demo.Main"] },
+                "entrypoints": { "main": ["demoprobe.Main"] },
                 "mixins": ["extras.mixins.json"],
             })
             .to_string()

@@ -105,6 +105,7 @@ fn facade(tick_count: i32) -> Arc<EventFacade> {
         departed: vec![],
         levels: vec![],
         server: Default::default(),
+        ..EventFacade::default()
     })
 }
 

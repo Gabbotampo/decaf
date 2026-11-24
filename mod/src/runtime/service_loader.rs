@@ -71,6 +71,10 @@ enum Lookup {
     Exact,
     /// A provider it cannot (counted); an object of its class stands for it.
     Opaque,
+    /// A provider real Fabric refuses to load (`mixin_class_loading.rs`): the JDK's
+    /// `Class.forName(cn, false, loader)` fails inside Knot. Nothing of it is built; each
+    /// use is counted.
+    Refused,
 }
 
 impl<H: Host> Runtime<'_, H> {
@@ -127,7 +131,11 @@ impl<H: Host> Runtime<'_, H> {
                 };
                 match (name, descriptor) {
                     ("type", "()Ljava/lang/Class;") => {
-                        self.lookup(&service, &provider)?;
+                        if let Lookup::Refused = self.lookup(&service, &provider)? {
+                            return self
+                                .count_refused_provider(&provider, "Ljava/lang/Class;")
+                                .map(Some);
+                        }
                         Ok(Some(crate::runtime::host_class::class_value(&provider)))
                     }
                     ("get", "()Ljava/lang/Object;") => {
@@ -190,11 +198,30 @@ impl<H: Host> Runtime<'_, H> {
                 // Each element looks its provider up when it is used, so a
                 // `findFirst()` never reaches a later provider's failure. The
                 // loader keeps one `Provider` per provider (`host_services.rs`).
-                let providers = self
-                    .service_names(&service)
-                    .into_iter()
-                    .map(|provider| host_services::provider(&service, &provider))
-                    .collect();
+                //
+                // A provider real Fabric refuses to load is left out. JDK 25's streams
+                // advance a lookup of their own (`lookupIterator2`, one per loader until
+                // `reload`), which throws Knot's exception when it reaches the provider
+                // and spends its name: measured, a second `stream()` of the same loader
+                // never tries it again. This stream is built whole, so whether the
+                // pipeline reaches it is not known: counted once per loader, when its
+                // first stream is made.
+                let reloads = self.int_slot(loader, "reloads");
+                let mut providers = Vec::new();
+                for provider in self.service_names(&service) {
+                    if self.is_unloadable_by_name(&provider) {
+                        let tried = slot(loader, &format!("stream-refused{reloads}:{provider}"));
+                        // A first insert is this loader's first stream to reach it.
+                        if self.fields.insert(tried, Value::Int(1)).is_none() {
+                            self.count_refused_provider(
+                                &provider,
+                                "Ljava/util/ServiceLoader$Provider;",
+                            )?;
+                        }
+                        continue;
+                    }
+                    providers.push(host_services::provider(&service, &provider));
+                }
                 // `ProviderSpliterator` is not `SIZED`.
                 let stream = self.new_stream("java/util/ServiceLoader", "stream", providers);
                 Ok(Some(stream))
@@ -279,8 +306,26 @@ impl<H: Host> Runtime<'_, H> {
         if self.int_slot(iterator, "index") < self.int_slot(&loader, "count") {
             return Ok(true);
         }
-        let lookup = self.int_slot(&loader, "lookup");
-        Ok((lookup as usize) < self.service_names(&service).len())
+        let names = self.service_names(&service);
+        loop {
+            let lookup = self.int_slot(&loader, "lookup");
+            let Some(next) = names.get(lookup as usize) else {
+                return Ok(false);
+            };
+            if !self.is_unloadable_by_name(next) {
+                return Ok(true);
+            }
+            // JDK 25's `hasNextService` loads the next provider class
+            // (`nextProviderClass`, after `pending.next()` took its name). One real
+            // Fabric refuses throws Knot's `RuntimeException` out of `hasNext`: not a
+            // `ServiceConfigurationError`, so `nextError` keeps nothing, and the name is
+            // spent. Measured on a real Fabric 26.3 server: the next `hasNext` goes on to
+            // the provider after it. Counted once, for that one load; this call then
+            // answers as the next one does.
+            self.fields
+                .insert(slot(&loader, "lookup"), Value::Int(lookup + 1));
+            self.count_refused_provider(next, "Z")?;
+        }
     }
 
     fn iterator_next(&mut self, iterator: &str) -> Result<Value, NativeError> {
@@ -310,6 +355,13 @@ impl<H: Host> Runtime<'_, H> {
             // can be built.
             self.fields
                 .insert(slot(&loader, "lookup"), Value::Int(lookup + 1));
+            if self.is_unloadable_by_name(&provider) {
+                // `next()` loads it the same way. Measured: it throws, the name is spent
+                // and nothing is cached (the following `next()` answers the provider
+                // after it), so this iterator's position and the loader's providers stay
+                // as they were.
+                return self.count_refused_provider(&provider, &format!("L{service};"));
+            }
             let value = self.provider_instance(&service, &provider)?;
             self.fields
                 .insert(slot(&loader, &format!("instance{count}")), value.clone());
@@ -331,6 +383,10 @@ impl<H: Host> Runtime<'_, H> {
 
     /// The JDK's provider lookup: the checks before construction.
     fn lookup(&mut self, service: &str, provider: &str) -> Result<Lookup, NativeError> {
+        // The lookup loads the provider class by name (`Class.forName(cn, false, loader)`).
+        if self.is_unloadable_by_name(provider) {
+            return Ok(Lookup::Refused);
+        }
         let class_path = self.on_class_path();
         let access = self.class(provider).map(checkcast::class_access);
         let Some(access) = access else {
@@ -405,13 +461,31 @@ impl<H: Host> Runtime<'_, H> {
         self.host.invoke(&call, &[]).map(|_| ())
     }
 
+    /// Count the use of a provider whose class real Fabric refuses to load
+    /// ([`Lookup::Refused`]): the counted placeholder of type `returns` stands for it.
+    fn count_refused_provider(
+        &mut self,
+        provider: &str,
+        returns: &str,
+    ) -> Result<Value, NativeError> {
+        self.host.unknown_operand_call(&MethodRef {
+            owner: provider.to_owned(),
+            name: "<load>".into(),
+            descriptor: format!("(){returns}"),
+        })
+    }
+
     /// Look the provider up and build one instance, as `Provider.get` does.
     fn provider_instance(&mut self, service: &str, provider: &str) -> Result<Value, NativeError> {
-        // A provider the runtime cannot build (counted in `lookup`) stands
-        // as an object of its class whose constructor did not run: never its
-        // name, which is a `String` (#156 P13c).
-        if let Lookup::Opaque = self.lookup(service, provider)? {
-            return Ok(self.new_object(provider));
+        match self.lookup(service, provider)? {
+            // A provider the runtime cannot build (counted in `lookup`) stands
+            // as an object of its class whose constructor did not run: never its
+            // name, which is a `String` (#156 P13c).
+            Lookup::Opaque => return Ok(self.new_object(provider)),
+            Lookup::Refused => {
+                return self.count_refused_provider(provider, &format!("L{service};"));
+            }
+            Lookup::Exact => {}
         }
         let cannot = || {
             service_error(
